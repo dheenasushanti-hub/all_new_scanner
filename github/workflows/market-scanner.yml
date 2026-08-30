@@ -1,0 +1,79 @@
+name: NIFTY Predictive Market Scanner
+
+on:
+  schedule:
+    # GitHub Actions minimum supported scheduled interval = 5 minutes.
+    # Runs every 5 minutes on weekdays.
+    - cron: "40 3-9 * * 1-5"
+    - cron: "*/5 4-8 * * 1-5"
+    - cron: "0-45/5 9 * * 1-5"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nifty-predictive-market-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
+    env:
+      UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
+
+      NIFTY_INSTRUMENT_KEY: "NSE_INDEX|Nifty 50"
+
+      EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+
+      SMTP_HOST: "smtp.gmail.com"
+      SMTP_PORT: "465"
+
+      REQUEST_TIMEOUT: "20"
+      SIGNAL_THRESHOLD: "70"
+      STATE_FILE: "state/market_state.json"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run predictive scanner
+        run: |
+          python market_scanner.py
+
+      - name: Persist scanner state
+        if: always()
+        run: |
+          if [ -f state/market_state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            git add state/market_state.json
+
+            if git diff --cached --quiet; then
+              echo "No state changes."
+            else
+              git commit -m "Update scanner state"
+              git push
+            fi
+          else
+            echo "No scanner state created."
+          fi
