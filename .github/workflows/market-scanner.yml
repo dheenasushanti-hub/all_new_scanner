@@ -2,12 +2,11 @@ name: NIFTY Predictive Market Scanner
 
 on:
   schedule:
-    # GitHub Actions minimum supported scheduled interval = 5 minutes.
-    # Runs every 5 minutes on weekdays.
-    - cron: "40 3-9 * * 1-5"
+    - cron: "40,45,50,55 3 * * 1-5"
     - cron: "*/5 4-8 * * 1-5"
-    - cron: "0-45/5 9 * * 1-5"
+    - cron: "0,5,10,15,20,25,30,35,40,45 9 * * 1-5"
 
+  workflow_dispatch:
   workflow_dispatch:
 
 permissions:
