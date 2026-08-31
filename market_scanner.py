@@ -448,48 +448,47 @@ def extract_ltp(
 # =============================================================================
 # INSTRUMENT DISCOVERY
 # =============================================================================
-
 def get_current_nifty_future() -> FuturesContract:
 
-    payload = api_get(
-        INSTRUMENT_SEARCH_URL,
-        {
-            "query": "NIFTY",
-            "exchanges": "NSE",
-            "segments": "FO",
-            "instrument_types": "FUT",
-            "expiry": "current_month",
-            "page_number": 1,
-            "records": 30,
-        },
-    )
+    all_contracts = []
 
-    contracts = payload.get("data", [])
+    # Try current month first, then next month.
+    for expiry_filter in ("current_month", "next_month"):
 
-    if not isinstance(contracts, list) or not contracts:
+        payload = api_get(
+            INSTRUMENT_SEARCH_URL,
+            {
+                "query": "NIFTY",
+                "exchanges": "NSE",
+                "segments": "FO",
+                "instrument_types": "FUT",
+                "expiry": expiry_filter,
+                "page_number": 1,
+                "records": 30,
+            },
+        )
+
+        contracts = payload.get("data", [])
+
+        if isinstance(contracts, list):
+            all_contracts.extend(contracts)
+
+    if not all_contracts:
         raise ScannerError(
-            "No current-month futures returned by Upstox."
+            "No active NIFTY futures returned by Upstox."
         )
 
     valid = []
 
-    for contract in contracts:
-
-        instrument_key = contract.get("instrument_key")
-        trading_symbol = contract.get("trading_symbol")
-        expiry = contract.get("expiry")
+    for contract in all_contracts:
 
         if not (
-            instrument_key
-            and trading_symbol
-            and expiry
+            contract.get("instrument_key")
+            and contract.get("trading_symbol")
+            and contract.get("expiry")
         ):
             continue
 
-        symbol = str(trading_symbol).upper()
-        name = str(
-            contract.get("name", "")
-        ).upper()
         underlying = str(
             contract.get(
                 "underlying_symbol",
@@ -497,47 +496,53 @@ def get_current_nifty_future() -> FuturesContract:
             )
         ).upper()
 
-        # Accept only NIFTY futures.
+        symbol = str(
+            contract.get(
+                "trading_symbol",
+                ""
+            )
+        ).upper()
+
         if (
-            "NIFTY" in symbol
-            or "NIFTY" in name
-            or "NIFTY" in underlying
+            "NIFTY" in underlying
+            or "NIFTY" in symbol
         ):
             valid.append(contract)
 
     if not valid:
         logger.error(
-            "Futures search returned %d contracts: %s",
-            len(contracts),
-            json.dumps(contracts[:10], default=str),
+            "Upstox futures response: %s",
+            json.dumps(
+                all_contracts,
+                default=str,
+            ),
         )
 
         raise ScannerError(
-            "No NIFTY future found in Upstox search response."
+            "No valid NIFTY future found."
         )
 
+    # Sort by expiry and select nearest available future.
     valid.sort(
         key=lambda x: str(
-            x.get("expiry", "")
+            x.get("expiry")
         )
     )
 
     selected = valid[0]
 
-    result = FuturesContract(
+    logger.info(
+        "Selected NIFTY future: %s | Expiry: %s | Key: %s",
+        selected["trading_symbol"],
+        selected["expiry"],
+        selected["instrument_key"],
+    )
+
+    return FuturesContract(
         instrument_key=selected["instrument_key"],
         trading_symbol=selected["trading_symbol"],
         expiry=str(selected["expiry"]),
     )
-
-    logger.info(
-        "Selected NIFTY future: %s | %s | %s",
-        result.trading_symbol,
-        result.instrument_key,
-        result.expiry,
-    )
-
-    return result
 
 def get_current_week_contracts() -> list[dict[str, Any]]:
 
