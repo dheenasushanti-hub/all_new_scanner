@@ -157,7 +157,9 @@ MARKET_STATUS_URL = (
 QUOTE_URL = (
     f"{BASE_URL}/v2/market-quote/quotes"
 )
-
+HISTORICAL_CANDLE_URL = (
+    f"{BASE_URL}/v2/historical-candle"
+)
 
 # =============================================================================
 # LOGGING
