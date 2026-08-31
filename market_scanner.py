@@ -464,88 +464,80 @@ def get_current_nifty_future() -> FuturesContract:
         },
     )
 
-    contracts = payload.get(
-        "data",
-        [],
-    )
+    contracts = payload.get("data", [])
 
-    if not isinstance(
-        contracts,
-        list,
-    ):
+    if not isinstance(contracts, list) or not contracts:
         raise ScannerError(
-            "Futures search data is invalid."
+            "No current-month futures returned by Upstox."
         )
 
     valid = []
 
     for contract in contracts:
 
-        if (
-            contract.get("instrument_type") == "FUT"
-            and contract.get("instrument_key")
-            and contract.get("trading_symbol")
-            and contract.get("expiry")
+        instrument_key = contract.get("instrument_key")
+        trading_symbol = contract.get("trading_symbol")
+        expiry = contract.get("expiry")
+
+        if not (
+            instrument_key
+            and trading_symbol
+            and expiry
         ):
-            underlying = str(
-                contract.get(
-                    "underlying_symbol",
-                    "",
-                )
-            ).upper()
+            continue
 
-            symbol = str(
-                contract.get(
-                    "trading_symbol",
-                    "",
-                )
-            ).upper()
+        symbol = str(trading_symbol).upper()
+        name = str(
+            contract.get("name", "")
+        ).upper()
+        underlying = str(
+            contract.get(
+                "underlying_symbol",
+                ""
+            )
+        ).upper()
 
-            if (
-                underlying == "NIFTY"
-                or "NIFTY" in symbol
-            ):
-                valid.append(
-                    contract
-                )
+        # Accept only NIFTY futures.
+        if (
+            "NIFTY" in symbol
+            or "NIFTY" in name
+            or "NIFTY" in underlying
+        ):
+            valid.append(contract)
 
     if not valid:
+        logger.error(
+            "Futures search returned %d contracts: %s",
+            len(contracts),
+            json.dumps(contracts[:10], default=str),
+        )
+
         raise ScannerError(
-            "No current-month NIFTY future found."
+            "No NIFTY future found in Upstox search response."
         )
 
     valid.sort(
         key=lambda x: str(
-            x.get(
-                "expiry",
-                ""
-            )
+            x.get("expiry", "")
         )
     )
 
     selected = valid[0]
 
     result = FuturesContract(
-        instrument_key=selected[
-            "instrument_key"
-        ],
-        trading_symbol=selected[
-            "trading_symbol"
-        ],
-        expiry=str(
-            selected["expiry"]
-        ),
+        instrument_key=selected["instrument_key"],
+        trading_symbol=selected["trading_symbol"],
+        expiry=str(selected["expiry"]),
     )
 
     logger.info(
-        "Current NIFTY future: %s | %s | %s",
+        "Selected NIFTY future: %s | %s | %s",
         result.trading_symbol,
         result.instrument_key,
         result.expiry,
     )
 
     return result
-
 
 def get_current_week_contracts() -> list[dict[str, Any]]:
 
