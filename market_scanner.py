@@ -158,7 +158,7 @@ QUOTE_URL = (
     f"{BASE_URL}/v2/market-quote/quotes"
 )
 HISTORICAL_CANDLE_URL = (
-    f"{BASE_URL}/v2/historical-candle"
+    f"{BASE_URL}/v3/historical-candle"
 )
 
 # =============================================================================
@@ -592,12 +592,12 @@ def get_intraday_candles(
     from_date = to_date - pd.Timedelta(days=10)
 
     url = (
-        f"{HISTORICAL_CANDLE_URL}/"
-        f"{encoded_key}/"
-        f"minutes/{interval_minutes}/"
-        f"{to_date}/"
-        f"{from_date}"
-    )
+    f"{HISTORICAL_CANDLE_URL}/"
+    f"{encoded_key}/"
+    f"minutes/{interval_minutes}/"
+    f"{to_date}/"
+    f"{from_date}"
+      )
 
     payload = api_get(url)
 
