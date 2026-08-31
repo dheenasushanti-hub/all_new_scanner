@@ -1,15 +1,33 @@
-name: Schedule Test
+name: NIFTY Predictive Market Scanner
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
-  test:
+  scan:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Confirm schedule
-        run: |
-          echo "Workflow triggered"
-          date
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run predictive scanner
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python market_scanner.py
+
+      - name: Persist scanner state
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanner-state
+          path: scanner_state.json
+          if-no-files-found: ignore
