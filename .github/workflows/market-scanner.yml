@@ -2,8 +2,12 @@
 name: NIFTY Predictive Market Scanner
 
 on:
+  push:
+    branches:
+      - main
+
   schedule:
-    - cron: "20-35/5 17 * * 1-5"
+    - cron: "*/5 * * * *"
       timezone: "Asia/Kolkata"
 
   workflow_dispatch:
