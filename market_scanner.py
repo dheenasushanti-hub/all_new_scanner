@@ -584,10 +584,17 @@ def get_intraday_candles(
         safe="",
     )
 
+    # Fetch a larger history window so Supertrend(10,3)
+    # always has sufficient candles.
+    to_date = datetime.now(IST).date()
+    from_date = to_date - pd.Timedelta(days=10)
+
     url = (
-        f"{BASE_URL}/v3/historical-candle/"
-        f"intraday/{encoded_key}/minutes/"
-        f"{interval_minutes}"
+        f"{HISTORICAL_CANDLE_URL}/"
+        f"{encoded_key}/"
+        f"minutes/{interval_minutes}/"
+        f"{to_date}/"
+        f"{from_date}"
     )
 
     payload = api_get(url)
@@ -602,47 +609,48 @@ def get_intraday_candles(
         [],
     )
 
-    if not isinstance(
-        candles,
-        list,
-    ) or not candles:
+    if not isinstance(candles, list) or not candles:
         raise ScannerError(
             f"No {interval_minutes}-minute candles "
-            f"for {instrument_key}."
+            f"returned for {instrument_key}."
         )
 
     records = []
 
     for row in candles:
 
-        if len(row) < 6:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
             continue
 
-        records.append(
-            {
-                "timestamp": row[0],
-                "open": float(row[1]),
-                "high": float(row[2]),
-                "low": float(row[3]),
-                "close": float(row[4]),
-                "volume": float(row[5]),
-                "oi": (
-                    float(row[6])
-                    if len(row) > 6
-                    and row[6] is not None
-                    else np.nan
-                ),
-            }
-        )
+        try:
+            records.append(
+                {
+                    "timestamp": row[0],
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                    "oi": (
+                        float(row[6])
+                        if len(row) > 6
+                        and row[6] is not None
+                        else np.nan
+                    ),
+                }
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            continue
 
-    df = pd.DataFrame(
-        records
-    )
+    df = pd.DataFrame(records)
 
-    if len(df) < 20:
+    if df.empty:
         raise ScannerError(
-            f"Insufficient {interval_minutes}-minute "
-            f"candle data: {len(df)} rows."
+            f"No valid {interval_minutes}-minute "
+            f"candles after parsing."
         )
 
     df["timestamp"] = pd.to_datetime(
@@ -659,6 +667,27 @@ def get_intraday_candles(
             subset=["timestamp"]
         )
         .reset_index(drop=True)
+    )
+
+    # Supertrend(10) technically needs at least 10 completed
+    # candles, but use 15 as a safer minimum.
+    min_required = max(
+        SUPERTREND_PERIOD + 5,
+        15,
+    )
+
+    if len(df) < min_required:
+        raise ScannerError(
+            f"Insufficient {interval_minutes}-minute candle "
+            f"history: got {len(df)}, "
+            f"need at least {min_required}."
+        )
+
+    logger.info(
+        "Loaded %d %d-minute candles for %s",
+        len(df),
+        interval_minutes,
+        instrument_key,
     )
 
     return df
