@@ -2,9 +2,12 @@ name: NIFTY Predictive Market Scanner
 
 on:
   schedule:
-    - cron: "40,45,50,55 3 * * 1-5"
-    - cron: "*/5 4-8 * * 1-5"
-    - cron: "0,5,10,15,20,25,30,35,40,45 9 * * 1-5"
+    - cron: "10-55/5 9 * * 1-5"
+      timezone: "Asia/Kolkata"
+    - cron: "*/5 10-14 * * 1-5"
+      timezone: "Asia/Kolkata"
+    - cron: "0-15/5 15 * * 1-5"
+      timezone: "Asia/Kolkata"
 
   workflow_dispatch:
 
