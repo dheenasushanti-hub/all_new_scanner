@@ -2559,50 +2559,51 @@ def execute_scan() -> Optional[Signal]:
         return None
 
     # If futures confirmation exists, require it to agree.
-    if futures_state != "UNAVAILABLE":
+    # =========================================================================
+    # FUTURES CONFIRMATION
+    # NEUTRAL or UNAVAILABLE does not block a valid setup.
+    # Only an explicitly opposite futures regime rejects the signal.
+    # =========================================================================
 
-        bullish_future = futures_state in (
-          "LONG_BUILDUP",
-          "SHORT_COVERING",
-      )
-      
-      bearish_future = futures_state in (
-          "SHORT_BUILDUP",
-          "LONG_UNWINDING",
-      )
-      
-      # Reject bullish trade only when futures are explicitly bearish.
-      if direction == "BULLISH" and bearish_future:
-          logger.info(
-              "Rejected: futures explicitly bearish (%s).",
-              futures_state,
-          )
-          return None
-      
-      # Reject bearish trade only when futures are explicitly bullish.
-      if direction == "BEARISH" and bullish_future:
-          logger.info(
-              "Rejected: futures explicitly bullish (%s).",
-              futures_state,
-          )
-          return None
-      
-      # NEUTRAL and UNAVAILABLE futures do not block the signal.
-      if futures_state in (
-          "NEUTRAL",
-          "UNAVAILABLE",
-      ):
-          logger.info(
-              "Futures state %s: not blocking %s setup.",
-              futures_state,
-              direction,
-          )
-      else:
-          logger.info(
-              "Futures confirmation: %s supports %s setup.",
-              futures_state,
-              direction,
-          )
+    bullish_future = futures_state in (
+        "LONG_BUILDUP",
+        "SHORT_COVERING",
+    )
+
+    bearish_future = futures_state in (
+        "SHORT_BUILDUP",
+        "LONG_UNWINDING",
+    )
+
+    if direction == "BULLISH" and bearish_future:
+        logger.info(
+            "Rejected: futures explicitly bearish (%s).",
+            futures_state,
+        )
+        return None
+
+    if direction == "BEARISH" and bullish_future:
+        logger.info(
+            "Rejected: futures explicitly bullish (%s).",
+            futures_state,
+        )
+        return None
+
+    if futures_state in (
+        "NEUTRAL",
+        "UNAVAILABLE",
+    ):
+        logger.info(
+            "Futures state %s: not blocking %s setup.",
+            futures_state,
+            direction,
+        )
+    else:
+        logger.info(
+            "Futures confirmation: %s supports %s setup.",
+            futures_state,
+            direction,
+        )
 
     option = select_directional_option(
         contracts,
