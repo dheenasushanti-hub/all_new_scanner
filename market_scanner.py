@@ -582,6 +582,8 @@ def get_current_week_contracts() -> list[dict[str, Any]]:
 def get_intraday_candles(
     instrument_key: str,
     interval_minutes: int,
+    max_candles: Optional[int] = None,
+    min_candles: int = 2,
 ) -> pd.DataFrame:
 
     encoded_key = urllib.parse.quote(
@@ -589,20 +591,13 @@ def get_intraday_candles(
         safe="",
     )
 
-    # Fetch only the current trading session.
-    # This keeps API usage small while preserving the full current-session
-    # history required for VWAP and enough candles for Supertrend/structure.
-    session_date = datetime.now(IST).date()
-    to_date = session_date
-    from_date = session_date
-
+    # Use Upstox V3 intraday candles for the current trading session.
+    # This is the correct V3 endpoint for current-day data and supports
+    # custom minute intervals such as 3 and 15 minutes.
     url = (
-    f"{HISTORICAL_CANDLE_URL}/"
-    f"{encoded_key}/"
-    f"minutes/{interval_minutes}/"
-    f"{to_date}/"
-    f"{from_date}"
-      )
+        f"{HISTORICAL_CANDLE_URL}/intraday/"
+        f"{encoded_key}/minutes/{interval_minutes}"
+    )
 
     payload = api_get(url)
 
@@ -618,14 +613,12 @@ def get_intraday_candles(
 
     if not isinstance(candles, list) or not candles:
         raise ScannerError(
-            f"No {interval_minutes}-minute candles "
-            f"returned for {instrument_key}."
+            f"No {interval_minutes}-minute candles returned for {instrument_key}."
         )
 
     records = []
 
     for row in candles:
-
         if not isinstance(row, (list, tuple)) or len(row) < 6:
             continue
 
@@ -640,24 +633,19 @@ def get_intraday_candles(
                     "volume": float(row[5]),
                     "oi": (
                         float(row[6])
-                        if len(row) > 6
-                        and row[6] is not None
+                        if len(row) > 6 and row[6] is not None
                         else np.nan
                     ),
                 }
             )
-        except (
-            TypeError,
-            ValueError,
-        ):
+        except (TypeError, ValueError):
             continue
 
     df = pd.DataFrame(records)
 
     if df.empty:
         raise ScannerError(
-            f"No valid {interval_minutes}-minute "
-            f"candles after parsing."
+            f"No valid {interval_minutes}-minute candles after parsing."
         )
 
     df["timestamp"] = pd.to_datetime(
@@ -670,35 +658,24 @@ def get_intraday_candles(
         df
         .dropna(subset=["timestamp"])
         .sort_values("timestamp")
-        .drop_duplicates(
-            subset=["timestamp"]
-        )
+        .drop_duplicates(subset=["timestamp"])
         .reset_index(drop=True)
     )
 
-    # Supertrend(10) technically needs at least 10 completed
-    # candles, but use 15 as a safer minimum.
-    min_required = max(
-        SUPERTREND_PERIOD + 5,
-        15,
-    )
-
-    if len(df) < min_required:
-        raise ScannerError(
-            f"Insufficient {interval_minutes}-minute candle "
-            f"history: got {len(df)}, "
-            f"need at least {min_required}."
-        )
-
-    # Keep only candles belonging to the current IST trading session.
+    # Keep only current-session records. The V3 intraday endpoint is current-day
+    # data, but this explicit filter protects the VWAP calculation.
+    session_date = now_ist().date()
     session_dates = df["timestamp"].dt.tz_convert(IST).dt.date
     df = df.loc[session_dates == session_date].reset_index(drop=True)
 
-    if len(df) < min_required:
+    if len(df) < min_candles:
         raise ScannerError(
             f"Insufficient current-session {interval_minutes}-minute candles: "
-            f"got {len(df)}, need at least {min_required}."
+            f"got {len(df)}, need at least {min_candles}."
         )
+
+    if max_candles is not None and len(df) > max_candles:
+        df = df.tail(max_candles).reset_index(drop=True)
 
     logger.info(
         "Loaded %d current-session %d-minute candles for %s",
@@ -1394,6 +1371,8 @@ def futures_regime(
     candles = get_intraday_candles(
         future.instrument_key,
         3,
+        max_candles=3,
+        min_candles=2,
     )
 
     if len(candles) < 3:
@@ -1533,7 +1512,7 @@ def option_price_oi_regime(option: OptionCandidate) -> str:
     the option premium is already extended.
     """
     try:
-        candles = get_intraday_candles(option.instrument_key, 3)
+        candles = get_intraday_candles(option.instrument_key, 3, max_candles=3, min_candles=2)
 
         if len(candles) < 3:
             return "UNAVAILABLE"
