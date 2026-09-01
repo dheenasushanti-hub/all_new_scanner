@@ -1693,8 +1693,10 @@ def predictive_direction(
     vwap_slope = session_vwap - previous_vwap
     above_vwap = float(live_spot) > session_vwap
 
-    bullish_vwap = above_vwap and vwap_slope >= 0
-    bearish_vwap = (not above_vwap) and vwap_slope <= 0
+    # Price location relative to VWAP is the primary VWAP signal.
+    # VWAP slope is a confidence/context factor, not a hard direction gate.
+    bullish_vwap = above_vwap
+    bearish_vwap = not above_vwap
 
     logger.info(
         "VWAP check: NIFTY=%.2f VWAP=%.2f slope=%.4f position=%s",
@@ -1707,20 +1709,19 @@ def predictive_direction(
     if bullish_vwap:
         bullish_score += 20
         bullish_reasons.append(
-            f"NIFTY {live_spot:.2f} is above rising/flat session VWAP {session_vwap:.2f}"
+            f"NIFTY {live_spot:.2f} is above session VWAP {session_vwap:.2f}; slope={vwap_slope:.4f}"
         )
-    elif bearish_vwap:
+        if vwap_slope > 0:
+            bullish_score += 5
+            bullish_reasons.append("VWAP slope is rising")
+    else:
         bearish_score += 20
         bearish_reasons.append(
-            f"NIFTY {live_spot:.2f} is below falling/flat session VWAP {session_vwap:.2f}"
+            f"NIFTY {live_spot:.2f} is below session VWAP {session_vwap:.2f}; slope={vwap_slope:.4f}"
         )
-    else:
-        bullish_reasons.append(
-            f"VWAP filter not bullish: NIFTY {live_spot:.2f}, VWAP {session_vwap:.2f}, slope {vwap_slope:.4f}"
-        )
-        bearish_reasons.append(
-            f"VWAP filter not bearish: NIFTY {live_spot:.2f}, VWAP {session_vwap:.2f}, slope {vwap_slope:.4f}"
-        )
+        if vwap_slope < 0:
+            bearish_score += 5
+            bearish_reasons.append("VWAP slope is falling")
 
     # -------------------------------------------------------------------------
     # 4. Supertrend — confirmation only
