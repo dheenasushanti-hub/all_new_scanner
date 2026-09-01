@@ -1,5 +1,18 @@
 {
   "market_snapshot": {
+    "timestamp": "2026-09-01T13:41:02.024943+05:30",
+    "nifty_spot": 24028.4,
+    "futures_state": "SHORT_BUILDUP",
+    "chain_bias": "NEUTRAL",
+    "chain_bias_score": -0.050503,
+    "change_oi_bias": "NEUTRAL",
+    "change_oi_score": -0.026934,
+    "vwap": 24209.7188,
+    "prediction_direction": "BEARISH",
+    "prediction_regime": "BEARISH_PREDICTIVE",
+    "prediction_confidence": 85.0
+  },
+  "previous_market_snapshot": {
     "timestamp": "2026-09-01T13:36:01.770394+05:30",
     "nifty_spot": 24062.5,
     "futures_state": "SHORT_COVERING",
@@ -12,23 +25,10 @@
     "prediction_regime": "BULLISH_PREDICTIVE",
     "prediction_confidence": 60.0
   },
-  "previous_market_snapshot": {
-    "timestamp": "2026-09-01T13:31:04.495691+05:30",
-    "nifty_spot": 24054.8,
-    "futures_state": "LONG_BUILDUP",
-    "chain_bias": "NEUTRAL",
-    "chain_bias_score": 0.001634,
-    "change_oi_bias": "NEUTRAL",
-    "change_oi_score": -0.016244,
-    "vwap": 24211.2538,
-    "prediction_direction": "NEUTRAL",
-    "prediction_regime": "NEUTRAL",
-    "prediction_confidence": 0.0
-  },
-  "locked_direction": "BULLISH",
-  "locked_strike": 24000.0,
-  "locked_option_type": "CE",
-  "locked_timestamp": "2026-09-01T13:36:03.487553+05:30",
+  "locked_direction": "BEARISH",
+  "locked_strike": 24100.0,
+  "locked_option_type": "PE",
+  "locked_timestamp": "2026-09-01T13:41:02.027750+05:30",
   "last_signal_hash": "cb85a43c4b7e7167fd7c5ff91591a664916c8ce0f4a90c7fde2491f47f4a1ee6",
   "last_signal": {
     "timestamp": "2026-09-01 13:36:02 IST",
