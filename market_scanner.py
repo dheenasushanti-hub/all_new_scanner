@@ -3,7 +3,7 @@ NIFTY Predictive Options Market Scanner
 
 Strategy:
 - NIFTY 3-minute and 15-minute Supertrend: (10, 3)
-- VWAP + price structure
+- Full current-session VWAP + price structure
 - Dynamic current-month NIFTY futures discovery
 - Futures price/OI regime
 - Current-week option-chain OI / previous OI
@@ -11,10 +11,10 @@ Strategy:
 - Option price/OI confirmation for the selected contract
 - Pre-breakout prediction instead of waiting for an option breakout
 - Reversal detection
-- Directional ATM+1 option selection:
-      bullish -> next higher strike CE
-      bearish -> next lower strike PE
-- Reject already-extended option moves
+- Directional ITM option selection:
+      bullish -> ATM-1 CE, fallback ATM-2 CE
+      bearish -> ATM+1 PE, fallback ATM+2 PE
+- No option-extension rejection for predictive entries
 - T1 based on projected 3-minute breakout level
 - T2 based on projected 15-minute resistance/support
 - Option premium targets translated using live option Delta/Gamma
@@ -589,11 +589,12 @@ def get_intraday_candles(
         safe="",
     )
 
-    # Only fetch the current day plus the previous calendar day.
-    # This is enough to seed the indicators while avoiding the old
-    # 10-day / hundreds-of-candles download on every 3-minute run.
-    to_date = datetime.now(IST).date()
-    from_date = to_date - pd.Timedelta(days=1)
+    # Fetch only the current trading session.
+    # This keeps API usage small while preserving the full current-session
+    # history required for VWAP and enough candles for Supertrend/structure.
+    session_date = datetime.now(IST).date()
+    to_date = session_date
+    from_date = session_date
 
     url = (
     f"{HISTORICAL_CANDLE_URL}/"
@@ -689,15 +690,18 @@ def get_intraday_candles(
             f"need at least {min_required}."
         )
 
-    # Keep only a compact recent window for downstream calculations.
-    # The API may return more candles for the requested dates; trimming here
-    # keeps the scanner lightweight and prevents unnecessary processing.
-    max_candles = 30 if interval_minutes == 3 else 25
-    if len(df) > max_candles:
-        df = df.tail(max_candles).reset_index(drop=True)
+    # Keep only candles belonging to the current IST trading session.
+    session_dates = df["timestamp"].dt.tz_convert(IST).dt.date
+    df = df.loc[session_dates == session_date].reset_index(drop=True)
+
+    if len(df) < min_required:
+        raise ScannerError(
+            f"Insufficient current-session {interval_minutes}-minute candles: "
+            f"got {len(df)}, need at least {min_required}."
+        )
 
     logger.info(
-        "Loaded %d recent %d-minute candles for %s",
+        "Loaded %d current-session %d-minute candles for %s",
         len(df),
         interval_minutes,
         instrument_key,
@@ -1576,6 +1580,7 @@ def predictive_direction(
     chain_bias: str,
     change_oi_bias_value: str,
     futures_state: str,
+    live_spot: float,
 ) -> tuple[str, str, float, list[str]]:
     """
     Predict direction before the breakout.
@@ -1649,20 +1654,36 @@ def predictive_direction(
     # 3. VWAP — primary price confirmation
     # -------------------------------------------------------------------------
     vwap_slope = float(latest_3["vwap"] - previous_3["vwap"])
-    above_vwap = float(latest_3["close"]) > float(latest_3["vwap"])
+    session_vwap = float(latest_3["vwap"])
+    above_vwap = float(live_spot) > session_vwap
 
     bullish_vwap = above_vwap and vwap_slope >= 0
     bearish_vwap = (not above_vwap) and vwap_slope <= 0
 
+    logger.info(
+        "VWAP check: NIFTY=%.2f VWAP=%.2f slope=%.4f position=%s",
+        live_spot,
+        session_vwap,
+        vwap_slope,
+        "ABOVE" if above_vwap else "BELOW",
+    )
+
     if bullish_vwap:
         bullish_score += 20
         bullish_reasons.append(
-            "NIFTY is above a rising/flat session VWAP"
+            f"NIFTY {live_spot:.2f} is above rising/flat session VWAP {session_vwap:.2f}"
         )
     elif bearish_vwap:
         bearish_score += 20
         bearish_reasons.append(
-            "NIFTY is below a falling/flat session VWAP"
+            f"NIFTY {live_spot:.2f} is below falling/flat session VWAP {session_vwap:.2f}"
+        )
+    else:
+        bullish_reasons.append(
+            f"VWAP filter not bullish: NIFTY {live_spot:.2f}, VWAP {session_vwap:.2f}, slope {vwap_slope:.4f}"
+        )
+        bearish_reasons.append(
+            f"VWAP filter not bearish: NIFTY {live_spot:.2f}, VWAP {session_vwap:.2f}, slope {vwap_slope:.4f}"
         )
 
     # -------------------------------------------------------------------------
@@ -2234,6 +2255,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         chain_bias,
         change_bias,
         futures_state,
+        live_spot=spot,
     )
 
     logger.info(
