@@ -7,7 +7,8 @@ Strategy:
 - Dynamic current-month NIFTY futures discovery
 - Futures price/OI regime
 - Current-week option-chain OI / previous OI
-- Strike-level CE/PE OI differential
+- Strike-level CE/PE OI differential with proximity weighting
+- Option price/OI confirmation for the selected contract
 - Pre-breakout prediction instead of waiting for an option breakout
 - Reversal detection
 - Directional ATM+1 option selection:
@@ -1169,121 +1170,100 @@ def oi_structure(
     chain: list[dict[str, Any]],
     spot: float,
 ) -> tuple[str, float, dict[float, dict[str, float]]]:
+    """
+    Build a localized option-positioning bias around ATM.
 
-    rows = chain_rows(
-        chain
-    )
+    Bullish pressure:
+      - PE OI increasing
+      - CE OI decreasing (unwinding)
 
-    strikes = sorted(
-        rows.keys()
-    )
+    Bearish pressure:
+      - CE OI increasing
+      - PE OI decreasing (unwinding)
 
-    atm = nearest_atm_strike(
-        spot,
-        strikes
-    )
+    The calculation is proximity-weighted so strikes nearest ATM have
+    more influence than distant strikes. This is intentionally different
+    from a simple aggregate CE-minus-PE total.
+    """
+    rows = chain_rows(chain)
+    strikes = sorted(rows.keys())
 
-    step = strike_interval(
-        strikes
-    )
+    atm = nearest_atm_strike(spot, strikes)
+    step = strike_interval(strikes)
 
     relevant = [
         strike
         for strike in strikes
-        if abs(
-            strike - atm
-        ) <= step * 3
+        if abs(strike - atm) <= step * 3
     ]
 
-    strike_data = {}
+    strike_data: dict[float, dict[str, float]] = {}
 
-    call_change_total = 0.0
-    put_change_total = 0.0
+    bullish_pressure = 0.0
+    bearish_pressure = 0.0
 
     for strike in relevant:
-
         row = rows[strike]
 
-        call = option_market_data(
-            row,
-            "CE",
+        call = option_market_data(row, "CE")
+        put = option_market_data(row, "PE")
+
+        call_oi = float(call["oi"] or 0)
+        call_prev = float(call["prev_oi"] or 0)
+        put_oi = float(put["oi"] or 0)
+        put_prev = float(put["prev_oi"] or 0)
+
+        call_change = call_oi - call_prev
+        put_change = put_oi - put_prev
+
+        # Near-ATM strikes matter more than distant strikes.
+        distance_steps = abs(strike - atm) / step if step > 0 else 0.0
+        weight = 1.0 / (1.0 + distance_steps)
+
+        # Bullish = put buildup + call unwinding.
+        bullish_pressure += weight * (
+            max(put_change, 0.0) + max(-call_change, 0.0)
         )
 
-        put = option_market_data(
-            row,
-            "PE",
+        # Bearish = call buildup + put unwinding.
+        bearish_pressure += weight * (
+            max(call_change, 0.0) + max(-put_change, 0.0)
         )
 
-        call_oi = float(
-            call["oi"] or 0
-        )
-
-        call_prev = float(
-            call["prev_oi"] or 0
-        )
-
-        put_oi = float(
-            put["oi"] or 0
-        )
-
-        put_prev = float(
-            put["prev_oi"] or 0
-        )
-
-        call_change = (
-            call_oi
-            - call_prev
-        )
-
-        put_change = (
-            put_oi
-            - put_prev
-        )
-
-        call_change_total += (
-            call_change
-        )
-
-        put_change_total += (
-            put_change
-        )
-
-        strike_data[
-            strike
-        ] = {
+        strike_data[strike] = {
             "call_oi": call_oi,
             "put_oi": put_oi,
             "call_change": call_change,
             "put_change": put_change,
+            "weight": weight,
         }
 
-    directional_denominator = (
-        abs(call_change_total)
-        + abs(put_change_total)
-    )
+    denominator = bullish_pressure + bearish_pressure
 
-    if directional_denominator == 0:
+    if denominator <= 0:
         score = 0.0
     else:
-        score = (
-            put_change_total
-            - call_change_total
-        ) / directional_denominator
+        score = (bullish_pressure - bearish_pressure) / denominator
 
-    if score >= 0.20:
+    # Keep the threshold modest because this is a localized pressure
+    # measurement, while Futures and VWAP provide the primary directional filter.
+    if score >= 0.08:
         bias = "BULLISH"
-
-    elif score <= -0.20:
+    elif score <= -0.08:
         bias = "BEARISH"
-
     else:
         bias = "NEUTRAL"
 
-    return (
+    logger.info(
+        "Localized OI: ATM=%.0f bullish_pressure=%.0f bearish_pressure=%.0f score=%.3f bias=%s",
+        atm,
+        bullish_pressure,
+        bearish_pressure,
+        score,
         bias,
-        float(score),
-        strike_data,
     )
+
+    return bias, float(score), strike_data
 
 
 # =============================================================================
@@ -1528,10 +1508,55 @@ def select_directional_option(
 def option_is_extended(
     option: OptionCandidate,
 ) -> bool:
-    # Intentionally disabled for predictive selection.
-    # The scanner now identifies the ITM contract when Futures/OI/VWAP
-    # first align, rather than waiting for an option Supertrend setup.
+    # Disabled deliberately: the scanner must not reject an otherwise
+    # valid predictive setup because the option has already started moving.
     return False
+
+
+def option_price_oi_regime(option: OptionCandidate) -> str:
+    """Return the selected option's latest 3-minute price/OI regime.
+
+    This is a confirmation field only. It never becomes the primary
+    prediction trigger because the goal is to identify the move before
+    the option premium is already extended.
+    """
+    try:
+        candles = get_intraday_candles(option.instrument_key, 3)
+
+        if len(candles) < 3:
+            return "UNAVAILABLE"
+
+        latest = candles.iloc[-1]
+        previous = candles.iloc[-2]
+
+        if pd.isna(latest["oi"]) or pd.isna(previous["oi"]):
+            return "UNAVAILABLE"
+
+        price_delta = float(latest["close"] - previous["close"])
+        oi_delta = float(latest["oi"] - previous["oi"])
+
+        if price_delta > 0 and oi_delta > 0:
+            return "LONG_BUILDUP"
+
+        if price_delta > 0 and oi_delta < 0:
+            return "SHORT_COVERING"
+
+        if price_delta < 0 and oi_delta > 0:
+            return "SHORT_BUILDUP"
+
+        if price_delta < 0 and oi_delta < 0:
+            return "LONG_UNWINDING"
+
+        return "NEUTRAL"
+
+    except ScannerError as exc:
+        logger.info(
+            "Option price/OI confirmation unavailable for %s: %s",
+            option.trading_symbol,
+            exc,
+        )
+        return "UNAVAILABLE"
+
 
 # =============================================================================
 # PRE-BREAKOUT ENGINE
@@ -1544,94 +1569,135 @@ def predictive_direction(
     change_oi_bias_value: str,
     futures_state: str,
 ) -> tuple[str, str, float, list[str]]:
+    """
+    Predict direction before the breakout.
 
+    Core trigger:
+      1. Futures price/OI regime
+      2. Localized option OI pressure OR Upstox Change-OI bias
+      3. NIFTY price relative to session VWAP and VWAP slope
+
+    Supertrend is deliberately NOT required for entry prediction.
+    It remains a confirmation/target framework.
+    """
     latest_3 = spot_3m.iloc[-1]
     previous_3 = spot_3m.iloc[-2]
+    latest_15 = spot_15m.iloc[-1]
 
-    bullish_votes = 0
-    bearish_votes = 0
     bullish_score = 0.0
     bearish_score = 0.0
     bullish_reasons: list[str] = []
     bearish_reasons: list[str] = []
 
-    # PRIMARY 1: Futures price/OI regime
-    if futures_state in ("LONG_BUILDUP", "SHORT_COVERING"):
-        bullish_votes += 1
+    # -------------------------------------------------------------------------
+    # 1. FUTURES — primary directional signal
+    # -------------------------------------------------------------------------
+    bullish_futures = futures_state in ("LONG_BUILDUP", "SHORT_COVERING")
+    bearish_futures = futures_state in ("SHORT_BUILDUP", "LONG_UNWINDING")
+
+    if bullish_futures:
         bullish_score += 40
-        bullish_reasons.append(f"Futures confirms bullish positioning: {futures_state}")
-    elif futures_state in ("SHORT_BUILDUP", "LONG_UNWINDING"):
-        bearish_votes += 1
+        bullish_reasons.append(
+            f"Futures confirms bullish positioning: {futures_state}"
+        )
+    elif bearish_futures:
         bearish_score += 40
-        bearish_reasons.append(f"Futures confirms bearish positioning: {futures_state}")
+        bearish_reasons.append(
+            f"Futures confirms bearish positioning: {futures_state}"
+        )
 
-    # PRIMARY 2: Current option OI difference
-    if chain_bias == "BULLISH":
-        bullish_votes += 1
-        bullish_score += 25
-        bullish_reasons.append("Option-chain OI differential is bullish")
-    elif chain_bias == "BEARISH":
-        bearish_votes += 1
-        bearish_score += 25
-        bearish_reasons.append("Option-chain OI differential is bearish")
-
-    # PRIMARY 3: Upstox change-in-OI direction
-    if change_oi_bias_value == "BULLISH":
-        bullish_votes += 1
-        bullish_score += 20
-        bullish_reasons.append("Current change-in-OI is bullish")
-    elif change_oi_bias_value == "BEARISH":
-        bearish_votes += 1
-        bearish_score += 20
-        bearish_reasons.append("Current change-in-OI is bearish")
-
-    # PRIMARY 4: VWAP confirms direction, but does not have to wait for ST crossover.
-    vwap_slope = float(latest_3["vwap"] - previous_3["vwap"])
-    above_vwap = float(latest_3["close"]) > float(latest_3["vwap"])
-
-    if above_vwap and vwap_slope >= 0:
-        bullish_score += 15
-        bullish_reasons.append("NIFTY is above a rising/flat 3-minute VWAP")
-    elif (not above_vwap) and vwap_slope <= 0:
-        bearish_score += 15
-        bearish_reasons.append("NIFTY is below a falling/flat 3-minute VWAP")
-
-    # Supertrend and 15m structure are confirmations only.
-    latest_15 = spot_15m.iloc[-1]
-    if latest_15["direction"] == 1:
-        bullish_score += 5
-        bullish_reasons.append("15-minute Supertrend supports bullish continuation")
-    elif latest_15["direction"] == -1:
-        bearish_score += 5
-        bearish_reasons.append("15-minute Supertrend supports bearish continuation")
-
+    # -------------------------------------------------------------------------
+    # 2. OPTION OI — localized strike pressure + Upstox change-OI
+    #
+    # Localized chain bias is primary. The Change-OI endpoint is a second
+    # confirmation source and is never required when unavailable.
+    # -------------------------------------------------------------------------
     bullish_oi = chain_bias == "BULLISH" or change_oi_bias_value == "BULLISH"
     bearish_oi = chain_bias == "BEARISH" or change_oi_bias_value == "BEARISH"
+
+    if chain_bias == "BULLISH":
+        bullish_score += 30
+        bullish_reasons.append(
+            "Localized option OI pressure is bullish"
+        )
+    elif chain_bias == "BEARISH":
+        bearish_score += 30
+        bearish_reasons.append(
+            "Localized option OI pressure is bearish"
+        )
+
+    if change_oi_bias_value == "BULLISH":
+        bullish_score += 10
+        bullish_reasons.append(
+            "Upstox Change-OI confirms bullish direction"
+        )
+    elif change_oi_bias_value == "BEARISH":
+        bearish_score += 10
+        bearish_reasons.append(
+            "Upstox Change-OI confirms bearish direction"
+        )
+
+    # -------------------------------------------------------------------------
+    # 3. VWAP — primary price confirmation
+    # -------------------------------------------------------------------------
+    vwap_slope = float(latest_3["vwap"] - previous_3["vwap"])
+    above_vwap = float(latest_3["close"]) > float(latest_3["vwap"])
 
     bullish_vwap = above_vwap and vwap_slope >= 0
     bearish_vwap = (not above_vwap) and vwap_slope <= 0
 
-    # Predictive signal requires the core confluence: Futures + at least one
-    # live OI direction + VWAP alignment. Supertrend is deliberately absent
-    # from the entry trigger.
-    bullish_futures = futures_state in ("LONG_BUILDUP", "SHORT_COVERING")
-    bearish_futures = futures_state in ("SHORT_BUILDUP", "LONG_UNWINDING")
+    if bullish_vwap:
+        bullish_score += 20
+        bullish_reasons.append(
+            "NIFTY is above a rising/flat session VWAP"
+        )
+    elif bearish_vwap:
+        bearish_score += 20
+        bearish_reasons.append(
+            "NIFTY is below a falling/flat session VWAP"
+        )
 
-    if bullish_futures and bullish_oi and bullish_vwap and bullish_score > bearish_score:
-        confidence = min(100.0, bullish_score)
+    # -------------------------------------------------------------------------
+    # 4. Supertrend — confirmation only
+    # -------------------------------------------------------------------------
+    if latest_15["direction"] == 1:
+        bullish_score += 5
+        bullish_reasons.append(
+            "15-minute Supertrend supports bullish continuation"
+        )
+    elif latest_15["direction"] == -1:
+        bearish_score += 5
+        bearish_reasons.append(
+            "15-minute Supertrend supports bearish continuation"
+        )
+
+    # -------------------------------------------------------------------------
+    # FINAL PREDICTIVE CONFLUENCE
+    # Futures + OI + VWAP must align.
+    # -------------------------------------------------------------------------
+    if (
+        bullish_futures
+        and bullish_oi
+        and bullish_vwap
+        and bullish_score > bearish_score
+    ):
         return (
             "BULLISH",
             "BULLISH_PREDICTIVE",
-            confidence,
+            min(100.0, bullish_score),
             bullish_reasons,
         )
 
-    if bearish_futures and bearish_oi and bearish_vwap and bearish_score > bullish_score:
-        confidence = min(100.0, bearish_score)
+    if (
+        bearish_futures
+        and bearish_oi
+        and bearish_vwap
+        and bearish_score > bullish_score
+    ):
         return (
             "BEARISH",
             "BEARISH_PREDICTIVE",
-            confidence,
+            min(100.0, bearish_score),
             bearish_reasons,
         )
 
@@ -1640,9 +1706,10 @@ def predictive_direction(
         "NEUTRAL",
         0.0,
         [
-            "Futures + OI difference + VWAP did not reach predictive confluence."
+            "Futures + localized OI/Change-OI + VWAP did not reach predictive confluence."
         ],
     )
+
 
 # =============================================================================
 # PRE-BREAKOUT VALIDATION
@@ -2090,110 +2157,75 @@ future price movement or profitability.
 # =============================================================================
 
 def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
-
     if not market_window_open():
-        logger.info(
-            "Outside NSE market hours."
-        )
+        logger.info("Outside NSE market hours.")
         return None
 
     status = get_market_status()
-
-    logger.info(
-        "NSE status: %s",
-        status,
-    )
+    logger.info("NSE status: %s", status)
 
     if status != "OPEN":
-        logger.info(
-            "NSE is not OPEN. No signal generated."
-        )
+        logger.info("NSE is not OPEN. No signal generated.")
         return None
 
-    future = get_current_nifty_future()
+    state = state if isinstance(state, dict) else {}
 
-    futures_state = futures_regime(
-        future
-    )
+    future = get_current_nifty_future()
+    futures_state = futures_regime(future)
 
     logger.info(
         "Futures regime: %s",
         futures_state,
     )
 
-    spot_3m = get_intraday_candles(
-        NIFTY_KEY,
-        3,
-    )
-
+    # -------------------------------------------------------------------------
+    # Underlying market data
+    # -------------------------------------------------------------------------
+    spot_3m = get_intraday_candles(NIFTY_KEY, 3)
     spot_3m = calculate_supertrend(
         spot_3m,
         SUPERTREND_PERIOD,
         SUPERTREND_FACTOR,
     )
+    spot_3m["vwap"] = calculate_vwap(spot_3m)
 
-    spot_3m["vwap"] = calculate_vwap(
-        spot_3m
-    )
-
-    spot_15m = get_intraday_candles(
-        NIFTY_KEY,
-        15,
-    )
-
+    spot_15m = get_intraday_candles(NIFTY_KEY, 15)
     spot_15m = calculate_supertrend(
         spot_15m,
         SUPERTREND_PERIOD,
         SUPERTREND_FACTOR,
     )
 
-    spot_quote = get_quote(
-        NIFTY_KEY
-    )
+    spot_quote = get_quote(NIFTY_KEY)
+    spot = extract_ltp(spot_quote)
 
-    spot = extract_ltp(
-        spot_quote
-    )
-
+    # -------------------------------------------------------------------------
+    # Option chain / OI
+    # -------------------------------------------------------------------------
     chain = get_chain()
+    chain_spot_value = chain_spot(chain)
 
-    chain_spot_value = chain_spot(
-        chain
-    )
-
-    if abs(
-        chain_spot_value - spot
-    ) > 100:
+    if abs(chain_spot_value - spot) > 100:
         raise ScannerError(
-            "Option-chain spot differs materially "
-            "from current quote."
+            "Option-chain spot differs materially from current quote."
         )
 
     contracts = get_current_week_contracts()
 
-    chain_bias, chain_bias_score, strike_data = (
-        oi_structure(
-            chain,
-            spot,
-        )
+    chain_bias, chain_bias_score, strike_data = oi_structure(
+        chain,
+        spot,
     )
 
     change_data = get_change_oi()
+    change_bias, change_bias_score = change_oi_bias(change_data)
 
-    change_bias, change_bias_score = (
-        change_oi_bias(
-            change_data
-        )
-    )
-
-    direction, regime, confidence, reasons = (
-        predictive_direction(
-            spot_3m,
-            spot_15m,
-            chain_bias,
-            change_bias,
-            futures_state,
-        )
+    direction, regime, confidence, reasons = predictive_direction(
+        spot_3m,
+        spot_15m,
+        chain_bias,
+        change_bias,
+        futures_state,
     )
 
     logger.info(
@@ -2214,18 +2246,13 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         )
         return None
 
-    # If futures confirmation exists, require it to agree.
-    # =========================================================================
-    # FUTURES CONFIRMATION
-    # NEUTRAL or UNAVAILABLE does not block a valid setup.
-    # Only an explicitly opposite futures regime rejects the signal.
-    # =========================================================================
-
+    # -------------------------------------------------------------------------
+    # Futures must never contradict the predictive direction.
+    # -------------------------------------------------------------------------
     bullish_future = futures_state in (
         "LONG_BUILDUP",
         "SHORT_COVERING",
     )
-
     bearish_future = futures_state in (
         "SHORT_BUILDUP",
         "LONG_UNWINDING",
@@ -2245,42 +2272,42 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         )
         return None
 
-    if futures_state in (
-        "NEUTRAL",
-        "UNAVAILABLE",
-    ):
-        logger.info(
-            "Futures state %s: not blocking %s setup.",
-            futures_state,
-            direction,
-        )
-    else:
-        logger.info(
-            "Futures confirmation: %s supports %s setup.",
-            futures_state,
-            direction,
-        )
-
-    state = state or {}
+    # -------------------------------------------------------------------------
+    # Strike lock
+    #
+    # Once a predictive setup first produces an ITM strike, keep that strike
+    # for LOCK_SETUP_MINUTES. This prevents chasing a later ATM shift.
+    # -------------------------------------------------------------------------
     locked_direction = state.get("locked_direction")
     locked_strike = state.get("locked_strike")
     locked_timestamp = state.get("locked_timestamp")
 
-    preferred_strike = None
+    preferred_strike: Optional[float] = None
+
     if (
         locked_direction == direction
         and locked_strike is not None
         and locked_timestamp
     ):
         try:
+            locked_at = datetime.fromisoformat(locked_timestamp)
             locked_age = (
-                now_ist() - datetime.fromisoformat(locked_timestamp)
+                now_ist() - locked_at
             ).total_seconds() / 60.0
+
             if 0 <= locked_age <= LOCK_SETUP_MINUTES:
                 preferred_strike = float(locked_strike)
                 logger.info(
                     "Using locked predictive strike: %s %.0f (age %.1f min).",
-                    direction, preferred_strike, locked_age,
+                    direction,
+                    preferred_strike,
+                    locked_age,
+                )
+            else:
+                logger.info(
+                    "Previous %s strike lock expired (age %.1f min).",
+                    locked_direction,
+                    locked_age,
                 )
         except (TypeError, ValueError):
             preferred_strike = None
@@ -2293,51 +2320,73 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         preferred_strike=preferred_strike,
     )
 
+    # If this is a new predictive setup, lock the chosen strike immediately.
+    # This records the strike at the moment the Futures/OI/VWAP prediction is
+    # detected, rather than after the market has already moved.
+    if preferred_strike is None:
+        state["locked_direction"] = direction
+        state["locked_strike"] = option.strike
+        state["locked_option_type"] = option.option_type
+        state["locked_timestamp"] = now_ist().isoformat()
+        save_state(state)
+
+        logger.info(
+            "NEW predictive strike locked: %s %.0f %s.",
+            direction,
+            option.strike,
+            option.option_type,
+        )
+
     logger.info(
-        "Candidate option: %s",
+        "Candidate option: %s | strike=%.0f | LTP=%.2f | OI=%.0f | prev_OI=%.0f",
         option.trading_symbol,
+        option.strike,
+        option.ltp,
+        option.oi,
+        option.prev_oi,
     )
 
-    valid, trigger_3m, target_15m, validation_reasons = (
-        validate_prebreakout(
-            spot_3m,
-            spot_15m,
-            direction,
-            option,
-        )
+    option_regime = option_price_oi_regime(option)
+    logger.info(
+        "Selected option price/OI confirmation: %s = %s",
+        option.trading_symbol,
+        option_regime,
+    )
+
+    valid, trigger_3m, target_15m, validation_reasons = validate_prebreakout(
+        spot_3m,
+        spot_15m,
+        direction,
+        option,
     )
 
     if not valid:
-        logger.info(
-            "Pre-breakout validation rejected."
-        )
+        logger.info("Pre-breakout validation rejected.")
         return None
 
-    target_1, target_2, stop_loss = (
-        create_targets(
-            option,
-            spot,
-            trigger_3m,
-            target_15m,
-            direction,
-        )
+    target_1, target_2, stop_loss = create_targets(
+        option,
+        spot,
+        trigger_3m,
+        target_15m,
+        direction,
     )
 
     all_reasons = (
         reasons
         + validation_reasons
         + [
-            f"Option-chain OI score={chain_bias_score:.3f}.",
-            f"Change-in-OI score={change_bias_score:.3f}.",
-            "Prediction trigger = Futures + OI difference + VWAP confluence.",
-            "Selected ITM strike is locked to avoid chasing a later ATM shift.",
+            f"Localized option OI score={chain_bias_score:.3f}.",
+            f"Upstox Change-OI score={change_bias_score:.3f}.",
+            f"Selected option price/OI confirmation={option_regime}.",
+            "Prediction trigger = Futures + localized OI/Change-OI + VWAP.",
+            "3-minute Supertrend is confirmation/target framework, not entry trigger.",
+            "ITM strike is locked at first predictive detection to avoid chasing ATM.",
         ]
     )
 
     return Signal(
-        timestamp=now_ist().strftime(
-            "%Y-%m-%d %H:%M:%S IST"
-        ),
+        timestamp=now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
         direction=direction,
         regime=regime,
         confidence=confidence,
