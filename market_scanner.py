@@ -110,9 +110,12 @@ STATE_FILE = Path(
 SIGNAL_THRESHOLD = float(
     os.getenv(
         "SIGNAL_THRESHOLD",
-        "70",
+        "60",
     )
 )
+
+PREDICTION_MIN_CONFLUENCE = 2
+LOCK_SETUP_MINUTES = 45
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -123,7 +126,6 @@ SUPERTREND_FACTOR = 3.0
 STRUCTURE_LOOKBACK_3M = 8
 STRUCTURE_LOOKBACK_15M = 6
 
-OPTION_EXTENSION_ATR_MULTIPLE = 2.25
 OPTION_MIN_DELTA = 0.35
 OPTION_MAX_DELTA = 0.85
 
@@ -873,28 +875,24 @@ def calculate_vwap(
     df: pd.DataFrame,
 ) -> pd.Series:
 
+    # VWAP must reset at the start of every trading session.
+    # Historical candles cover multiple days, so a single cumulative VWAP
+    # across the entire response would contaminate today's signal.
     typical = (
         df["high"]
         + df["low"]
         + df["close"]
     ) / 3.0
 
-    volume = df["volume"].clip(
-        lower=0
-    )
+    volume = df["volume"].clip(lower=0)
+    session = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(IST).dt.date
 
-    cumulative_volume = volume.cumsum()
-
-    cumulative_pv = (
-        typical * volume
-    ).cumsum()
+    cumulative_volume = volume.groupby(session).cumsum()
+    cumulative_pv = (typical * volume).groupby(session).cumsum()
 
     return (
         cumulative_pv
-        / cumulative_volume.replace(
-            0,
-            np.nan,
-        )
+        / cumulative_volume.replace(0, np.nan)
     )
 
 
@@ -1452,126 +1450,76 @@ def select_directional_option(
     chain: list[dict[str, Any]],
     direction: str,
     spot: float,
+    preferred_strike: Optional[float] = None,
 ) -> OptionCandidate:
 
-    rows = chain_rows(
-        chain
-    )
+    rows = chain_rows(chain)
+    chain_strikes = sorted(rows.keys())
 
-    chain_strikes = sorted(
-        rows.keys()
-    )
+    atm = nearest_atm_strike(spot, chain_strikes)
+    step = strike_interval(chain_strikes)
 
-    atm = nearest_atm_strike(
-        spot,
-        chain_strikes
-    )
+    # For bullish moves, buy ITM CE: ATM-1, then ATM-2.
+    # For bearish moves, buy ITM PE: ATM+1, then ATM+2.
+    if direction == "BULLISH":
+        candidates = [atm - step, atm - 2 * step]
+        option_type = "CE"
+    else:
+        candidates = [atm + step, atm + 2 * step]
+        option_type = "PE"
 
-    step = strike_interval(
-        chain_strikes
-    )
+    if preferred_strike is not None:
+        candidates = [float(preferred_strike)] + [
+            strike for strike in candidates
+            if float(strike) != float(preferred_strike)
+        ]
 
-    target_strike = (
-        atm + step
-        if direction == "BULLISH"
-        else atm - step
-    )
+    for target_strike in candidates:
+        if target_strike not in rows:
+            continue
 
-    option_type = (
-        "CE"
-        if direction == "BULLISH"
-        else "PE"
-    )
-
-    matches = [
-        contract
-        for contract in contracts
-        if (
-            str(
-                contract.get(
-                    "instrument_type",
-                    ""
-                )
-            ).upper()
-            == option_type
-            and
-            float(
-                contract.get(
-                    "strike_price",
-                    -1
-                )
+        matches = [
+            contract
+            for contract in contracts
+            if (
+                str(contract.get("instrument_type", "")).upper() == option_type
+                and float(contract.get("strike_price", -1)) == float(target_strike)
             )
-            == float(target_strike)
+        ]
+
+        if not matches:
+            continue
+
+        contract = matches[0]
+        market = option_market_data(rows[target_strike], option_type)
+        ltp = float(market["ltp"] or 0)
+        delta = market["delta"]
+
+        if ltp <= 0 or delta is None:
+            continue
+
+        logger.info(
+            "ITM option selected: direction=%s ATM=%.0f strike=%.0f type=%s LTP=%.2f Delta=%.3f",
+            direction, atm, target_strike, option_type, ltp, float(delta),
         )
-    ]
 
-    if not matches:
-        raise ScannerError(
-            f"{option_type} ATM+1 contract not found "
-            f"at strike {target_strike}."
+        return OptionCandidate(
+            instrument_key=contract["instrument_key"],
+            trading_symbol=contract["trading_symbol"],
+            option_type=option_type,
+            strike=float(target_strike),
+            expiry=str(contract["expiry"]),
+            ltp=ltp,
+            oi=float(market["oi"] or 0),
+            prev_oi=float(market["prev_oi"] or 0),
+            delta=float(delta),
+            gamma=float(market["gamma"] or 0),
+            iv=float(market["iv"] or 0),
         )
 
-    contract = matches[0]
-
-    row = rows[
-        target_strike
-    ]
-
-    market = option_market_data(
-        row,
-        option_type,
+    raise ScannerError(
+        f"No valid ITM {option_type} contract found for ATM={atm:.0f}."
     )
-
-    ltp = float(
-        market["ltp"] or 0
-    )
-
-    delta = market["delta"]
-
-    gamma = market["gamma"]
-
-    iv = market["iv"]
-
-    if ltp <= 0:
-        raise ScannerError(
-            "Selected option has invalid LTP."
-        )
-
-    if delta is None:
-        raise ScannerError(
-            "Selected option Delta is unavailable."
-        )
-
-    return OptionCandidate(
-        instrument_key=contract[
-            "instrument_key"
-        ],
-        trading_symbol=contract[
-            "trading_symbol"
-        ],
-        option_type=option_type,
-        strike=float(
-            target_strike
-        ),
-        expiry=str(
-            contract["expiry"]
-        ),
-        ltp=ltp,
-        oi=float(
-            market["oi"] or 0
-        ),
-        prev_oi=float(
-            market["prev_oi"] or 0
-        ),
-        delta=float(delta),
-        gamma=float(
-            gamma or 0
-        ),
-        iv=float(
-            iv or 0
-        ),
-    )
-
 
 # =============================================================================
 # OPTION EXTENSION FILTER
@@ -1580,45 +1528,10 @@ def select_directional_option(
 def option_is_extended(
     option: OptionCandidate,
 ) -> bool:
-
-    df = get_intraday_candles(
-        option.instrument_key,
-        3,
-    )
-
-    if len(df) < 20:
-        return True
-
-    df = calculate_supertrend(
-        df,
-        SUPERTREND_PERIOD,
-        SUPERTREND_FACTOR,
-    )
-
-    latest = df.iloc[-1]
-
-    atr = latest["atr"]
-
-    st = latest["supertrend"]
-
-    close = latest["close"]
-
-    if (
-        pd.isna(atr)
-        or pd.isna(st)
-        or atr <= 0
-    ):
-        return True
-
-    distance = abs(
-        close - st
-    )
-
-    return (
-        distance
-        > atr * OPTION_EXTENSION_ATR_MULTIPLE
-    )
-
+    # Intentionally disabled for predictive selection.
+    # The scanner now identifies the ITM contract when Futures/OI/VWAP
+    # first align, rather than waiting for an option Supertrend setup.
+    return False
 
 # =============================================================================
 # PRE-BREAKOUT ENGINE
@@ -1635,238 +1548,90 @@ def predictive_direction(
     latest_3 = spot_3m.iloc[-1]
     previous_3 = spot_3m.iloc[-2]
 
-    latest_15 = spot_15m.iloc[-1]
+    bullish_votes = 0
+    bearish_votes = 0
+    bullish_score = 0.0
+    bearish_score = 0.0
+    bullish_reasons: list[str] = []
+    bearish_reasons: list[str] = []
 
-    bullish = 0.0
-    bearish = 0.0
+    # PRIMARY 1: Futures price/OI regime
+    if futures_state in ("LONG_BUILDUP", "SHORT_COVERING"):
+        bullish_votes += 1
+        bullish_score += 40
+        bullish_reasons.append(f"Futures confirms bullish positioning: {futures_state}")
+    elif futures_state in ("SHORT_BUILDUP", "LONG_UNWINDING"):
+        bearish_votes += 1
+        bearish_score += 40
+        bearish_reasons.append(f"Futures confirms bearish positioning: {futures_state}")
 
-    bullish_reasons = []
-    bearish_reasons = []
-
-    # ---------------------------------------------------------
-    # VWAP
-    # ---------------------------------------------------------
-
-    if (
-        latest_3["close"]
-        > latest_3["vwap"]
-    ):
-        bullish += 15
-        bullish_reasons.append(
-            "NIFTY is above 3-minute VWAP"
-        )
-    else:
-        bearish += 15
-        bearish_reasons.append(
-            "NIFTY is below 3-minute VWAP"
-        )
-
-    vwap_slope = (
-        latest_3["vwap"]
-        - previous_3["vwap"]
-    )
-
-    if vwap_slope > 0:
-        bullish += 10
-        bullish_reasons.append(
-            "VWAP is rising"
-        )
-
-    elif vwap_slope < 0:
-        bearish += 10
-        bearish_reasons.append(
-            "VWAP is falling"
-        )
-
-    # ---------------------------------------------------------
-    # Structure
-    # ---------------------------------------------------------
-
-    structure_3 = structure_state(
-        spot_3m,
-        STRUCTURE_LOOKBACK_3M,
-    )
-
-    structure_15 = structure_state(
-        spot_15m,
-        STRUCTURE_LOOKBACK_15M,
-    )
-
-    if structure_3 == "BULLISH":
-        bullish += 12
-        bullish_reasons.append(
-            "3-minute market structure is bullish"
-        )
-
-    elif structure_3 == "BEARISH":
-        bearish += 12
-        bearish_reasons.append(
-            "3-minute market structure is bearish"
-        )
-
-    if structure_15 == "BULLISH":
-        bullish += 10
-        bullish_reasons.append(
-            "15-minute market structure is bullish"
-        )
-
-    elif structure_15 == "BEARISH":
-        bearish += 10
-        bearish_reasons.append(
-            "15-minute market structure is bearish"
-        )
-
-    # ---------------------------------------------------------
-    # Supertrend
-    # ---------------------------------------------------------
-
-    if latest_3["direction"] == 1:
-        bullish += 10
-        bullish_reasons.append(
-            "3-minute Supertrend is bullish"
-        )
-
-    elif latest_3["direction"] == -1:
-        bearish += 10
-        bearish_reasons.append(
-            "3-minute Supertrend is bearish"
-        )
-
-    if latest_15["direction"] == 1:
-        bullish += 10
-        bullish_reasons.append(
-            "15-minute Supertrend is bullish"
-        )
-
-    elif latest_15["direction"] == -1:
-        bearish += 10
-        bearish_reasons.append(
-            "15-minute Supertrend is bearish"
-        )
-
-    # ---------------------------------------------------------
-    # Option OI
-    # ---------------------------------------------------------
-
+    # PRIMARY 2: Current option OI difference
     if chain_bias == "BULLISH":
-        bullish += 15
-        bullish_reasons.append(
-            "Option-chain OI differential is bullish"
-        )
-
+        bullish_votes += 1
+        bullish_score += 25
+        bullish_reasons.append("Option-chain OI differential is bullish")
     elif chain_bias == "BEARISH":
-        bearish += 15
-        bearish_reasons.append(
-            "Option-chain OI differential is bearish"
-        )
+        bearish_votes += 1
+        bearish_score += 25
+        bearish_reasons.append("Option-chain OI differential is bearish")
 
+    # PRIMARY 3: Upstox change-in-OI direction
     if change_oi_bias_value == "BULLISH":
-        bullish += 10
-        bullish_reasons.append(
-            "Change-in-OI is bullish"
-        )
-
+        bullish_votes += 1
+        bullish_score += 20
+        bullish_reasons.append("Current change-in-OI is bullish")
     elif change_oi_bias_value == "BEARISH":
-        bearish += 10
-        bearish_reasons.append(
-            "Change-in-OI is bearish"
-        )
+        bearish_votes += 1
+        bearish_score += 20
+        bearish_reasons.append("Current change-in-OI is bearish")
 
-    # ---------------------------------------------------------
-    # Futures
-    # ---------------------------------------------------------
+    # PRIMARY 4: VWAP confirms direction, but does not have to wait for ST crossover.
+    vwap_slope = float(latest_3["vwap"] - previous_3["vwap"])
+    above_vwap = float(latest_3["close"]) > float(latest_3["vwap"])
 
-    if futures_state in (
-        "LONG_BUILDUP",
-        "SHORT_COVERING",
-    ):
-        bullish += 15
-        bullish_reasons.append(
-            f"Futures structure: {futures_state}"
-        )
+    if above_vwap and vwap_slope >= 0:
+        bullish_score += 15
+        bullish_reasons.append("NIFTY is above a rising/flat 3-minute VWAP")
+    elif (not above_vwap) and vwap_slope <= 0:
+        bearish_score += 15
+        bearish_reasons.append("NIFTY is below a falling/flat 3-minute VWAP")
 
-    elif futures_state in (
-        "SHORT_BUILDUP",
-        "LONG_UNWINDING",
-    ):
-        bearish += 15
-        bearish_reasons.append(
-            f"Futures structure: {futures_state}"
-        )
+    # Supertrend and 15m structure are confirmations only.
+    latest_15 = spot_15m.iloc[-1]
+    if latest_15["direction"] == 1:
+        bullish_score += 5
+        bullish_reasons.append("15-minute Supertrend supports bullish continuation")
+    elif latest_15["direction"] == -1:
+        bearish_score += 5
+        bearish_reasons.append("15-minute Supertrend supports bearish continuation")
 
-    # ---------------------------------------------------------
-    # Direction decision
-    # ---------------------------------------------------------
+    bullish_oi = chain_bias == "BULLISH" or change_oi_bias_value == "BULLISH"
+    bearish_oi = chain_bias == "BEARISH" or change_oi_bias_value == "BEARISH"
 
-    difference = abs(
-        bullish - bearish
-    )
+    bullish_vwap = above_vwap and vwap_slope >= 0
+    bearish_vwap = (not above_vwap) and vwap_slope <= 0
 
-    total = max(
-        bullish,
-        bearish,
-        1
-    )
+    # Predictive signal requires the core confluence: Futures + at least one
+    # live OI direction + VWAP alignment. Supertrend is deliberately absent
+    # from the entry trigger.
+    bullish_futures = futures_state in ("LONG_BUILDUP", "SHORT_COVERING")
+    bearish_futures = futures_state in ("SHORT_BUILDUP", "LONG_UNWINDING")
 
-    confidence = (
-        difference
-        / total
-        * 100
-    )
-
-    if (
-        bullish >= 55
-        and bullish > bearish
-        and confidence >= 30
-    ):
-        direction = "BULLISH"
-
-        reversal = (
-            structure_15 == "BEARISH"
-            or latest_15["direction"] == -1
-        )
-
-        regime = (
-            "BULLISH"
-            if not reversal
-            else "BULLISH_REVERSAL_WATCH"
-        )
-
+    if bullish_futures and bullish_oi and bullish_vwap and bullish_score > bearish_score:
+        confidence = min(100.0, bullish_score)
         return (
-            direction,
-            regime,
-            min(
-                bullish,
-                100.0
-            ),
+            "BULLISH",
+            "BULLISH_PREDICTIVE",
+            confidence,
             bullish_reasons,
         )
 
-    if (
-        bearish >= 55
-        and bearish > bullish
-        and confidence >= 30
-    ):
-        direction = "BEARISH"
-
-        reversal = (
-            structure_15 == "BULLISH"
-            or latest_15["direction"] == 1
-        )
-
-        regime = (
-            "BEARISH"
-            if not reversal
-            else "BEARISH_REVERSAL_WATCH"
-        )
-
+    if bearish_futures and bearish_oi and bearish_vwap and bearish_score > bullish_score:
+        confidence = min(100.0, bearish_score)
         return (
-            direction,
-            regime,
-            min(
-                bearish,
-                100.0
-            ),
+            "BEARISH",
+            "BEARISH_PREDICTIVE",
+            confidence,
             bearish_reasons,
         )
 
@@ -1875,10 +1640,9 @@ def predictive_direction(
         "NEUTRAL",
         0.0,
         [
-            "Directional evidence is not sufficiently aligned."
+            "Futures + OI difference + VWAP did not reach predictive confluence."
         ],
     )
-
 
 # =============================================================================
 # PRE-BREAKOUT VALIDATION
@@ -1893,154 +1657,46 @@ def validate_prebreakout(
 
     latest_3 = spot_3m.iloc[-1]
     latest_15 = spot_15m.iloc[-1]
+    spot = float(latest_3["close"])
 
-    spot = float(
-        latest_3["close"]
-    )
-
-    atr_3 = float(
-        latest_3["atr"]
-    )
-
-    atr_15 = float(
-        latest_15["atr"]
-    )
-
-    if (
-        not math.isfinite(atr_3)
-        or not math.isfinite(atr_15)
-        or atr_3 <= 0
-        or atr_15 <= 0
-    ):
-        return (
-            False,
-            0.0,
-            0.0,
-            [
-                "ATR unavailable."
-            ],
-        )
+    atr_3 = float(latest_3["atr"])
+    atr_15 = float(latest_15["atr"])
+    if not (math.isfinite(atr_3) and math.isfinite(atr_15) and atr_3 > 0 and atr_15 > 0):
+        return False, 0.0, 0.0, ["ATR unavailable."]
 
     if direction == "BULLISH":
-
-        trigger_3m = recent_swing_high(
-            spot_3m,
-            STRUCTURE_LOOKBACK_3M,
+        recent_trigger = recent_swing_high(spot_3m, STRUCTURE_LOOKBACK_3M)
+        trigger_3m = max(
+            recent_trigger,
+            spot + max(atr_3 * 0.25, 1.0),
         )
 
+        recent_15 = recent_swing_high(spot_15m, STRUCTURE_LOOKBACK_15M)
         target_15m = max(
-            recent_swing_high(
-                spot_15m,
-                STRUCTURE_LOOKBACK_15M,
-            ),
-            float(
-                latest_15["supertrend"]
-            ),
+            recent_15,
+            float(latest_15["supertrend"]),
+            trigger_3m + max(atr_15 * 0.50, atr_3 * 0.50),
         )
-
-        distance_to_trigger = (
-            trigger_3m
-            - spot
-        )
-
-        distance_to_target = (
-            target_15m
-            - spot
-        )
-
     else:
-
-        trigger_3m = recent_swing_low(
-            spot_3m,
-            STRUCTURE_LOOKBACK_3M,
+        recent_trigger = recent_swing_low(spot_3m, STRUCTURE_LOOKBACK_3M)
+        trigger_3m = min(
+            recent_trigger,
+            spot - max(atr_3 * 0.25, 1.0),
         )
 
+        recent_15 = recent_swing_low(spot_15m, STRUCTURE_LOOKBACK_15M)
         target_15m = min(
-            recent_swing_low(
-                spot_15m,
-                STRUCTURE_LOOKBACK_15M,
-            ),
-            float(
-                latest_15["supertrend"]
-            ),
+            recent_15,
+            float(latest_15["supertrend"]),
+            trigger_3m - max(atr_15 * 0.50, atr_3 * 0.50),
         )
 
-        distance_to_trigger = (
-            spot
-            - trigger_3m
-        )
-
-        distance_to_target = (
-            spot
-            - target_15m
-        )
-
-    # Price should still have a meaningful path to the
-    # predicted trigger. Once the move is too far beyond
-    # the trigger, the setup is rejected.
-    if distance_to_trigger < 0:
+    if not (OPTION_MIN_DELTA <= abs(option.delta) <= OPTION_MAX_DELTA):
         return (
             False,
             trigger_3m,
             target_15m,
-            [
-                "Rejected: 3-minute breakout level "
-                "has already been cleared."
-            ],
-        )
-
-    max_prebreakout_distance = (
-        atr_3 * 1.50
-    )
-
-    if (
-        distance_to_trigger
-        > max_prebreakout_distance
-    ):
-        return (
-            False,
-            trigger_3m,
-            target_15m,
-            [
-                "Rejected: predicted breakout is "
-                "too far from current price."
-            ],
-        )
-
-    if direction == "BULLISH":
-        if target_15m <= trigger_3m:
-            return (
-                False,
-                trigger_3m,
-                target_15m,
-                [
-                    "Rejected: insufficient 15-minute upside room."
-                ],
-            )
-    else:
-        if target_15m >= trigger_3m:
-            return (
-                False,
-                trigger_3m,
-                target_15m,
-                [
-                    "Rejected: insufficient 15-minute downside room."
-                ],
-            )
-
-    if not (
-        OPTION_MIN_DELTA
-        <= abs(option.delta)
-        <= OPTION_MAX_DELTA
-    ):
-        return (
-            False,
-            trigger_3m,
-            target_15m,
-            [
-                "Rejected: selected option Delta "
-                "is outside the trading range."
-            ],
+            [f"Rejected: selected option Delta={option.delta:.3f} is outside the trading range."],
         )
 
     return (
@@ -2048,12 +1704,12 @@ def validate_prebreakout(
         trigger_3m,
         target_15m,
         [
-            "3-minute breakout has not yet been exhausted.",
-            "15-minute objective provides continuation room.",
-            f"Selected option Delta={option.delta:.3f}.",
+            "Prediction is based on Futures + OI difference + VWAP.",
+            "3-minute Supertrend is used for target/confirmation, not as the entry trigger.",
+            f"ITM option selected at {option.strike:.0f} ({option.option_type}).",
+            f"Option Delta={option.delta:.3f}.",
         ],
     )
-
 
 # =============================================================================
 # PREMIUM TARGET ENGINE
@@ -2433,7 +2089,7 @@ future price movement or profitability.
 # MAIN SCANNER
 # =============================================================================
 
-def execute_scan() -> Optional[Signal]:
+def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
 
     if not market_window_open():
         logger.info(
@@ -2605,26 +2261,42 @@ def execute_scan() -> Optional[Signal]:
             direction,
         )
 
+    state = state or {}
+    locked_direction = state.get("locked_direction")
+    locked_strike = state.get("locked_strike")
+    locked_timestamp = state.get("locked_timestamp")
+
+    preferred_strike = None
+    if (
+        locked_direction == direction
+        and locked_strike is not None
+        and locked_timestamp
+    ):
+        try:
+            locked_age = (
+                now_ist() - datetime.fromisoformat(locked_timestamp)
+            ).total_seconds() / 60.0
+            if 0 <= locked_age <= LOCK_SETUP_MINUTES:
+                preferred_strike = float(locked_strike)
+                logger.info(
+                    "Using locked predictive strike: %s %.0f (age %.1f min).",
+                    direction, preferred_strike, locked_age,
+                )
+        except (TypeError, ValueError):
+            preferred_strike = None
+
     option = select_directional_option(
         contracts,
         chain,
         direction,
         spot,
+        preferred_strike=preferred_strike,
     )
 
     logger.info(
         "Candidate option: %s",
         option.trading_symbol,
     )
-
-    if option_is_extended(
-        option
-    ):
-        logger.info(
-            "Rejected: option has already extended "
-            "too far from its own 3-minute Supertrend."
-        )
-        return None
 
     valid, trigger_3m, target_15m, validation_reasons = (
         validate_prebreakout(
@@ -2657,8 +2329,8 @@ def execute_scan() -> Optional[Signal]:
         + [
             f"Option-chain OI score={chain_bias_score:.3f}.",
             f"Change-in-OI score={change_bias_score:.3f}.",
-            "Selected directional ATM+1 option is not extended.",
-            "Signal is generated before the projected 3-minute breakout trigger.",
+            "Prediction trigger = Futures + OI difference + VWAP confluence.",
+            "Selected ITM strike is locked to avoid chasing a later ATM shift.",
         ]
     )
 
@@ -2695,15 +2367,15 @@ def main() -> int:
 
     try:
 
-        signal = execute_scan()
+        state = load_state()
+
+        signal = execute_scan(state)
 
         if signal is None:
             logger.info(
                 "No actionable predictive setup."
             )
             return 0
-
-        state = load_state()
 
         current_hash = signal_hash(
             signal
@@ -2734,6 +2406,22 @@ def main() -> int:
         state[
             "last_signal_hash"
         ] = current_hash
+
+        state[
+            "locked_direction"
+        ] = signal.direction
+
+        state[
+            "locked_strike"
+        ] = signal.strike
+
+        state[
+            "locked_option_type"
+        ] = signal.option_type
+
+        state[
+            "locked_timestamp"
+        ] = now_ist().isoformat()
 
         state[
             "last_signal"
