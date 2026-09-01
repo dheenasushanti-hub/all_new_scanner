@@ -20,9 +20,10 @@ jobs:
 
       - name: Run predictive scanner
         env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+            UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
+            EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+            EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+            EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
         run: python market_scanner.py
 
       - name: Persist scanner state
