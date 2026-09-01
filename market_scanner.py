@@ -687,6 +687,42 @@ def get_intraday_candles(
     return df
 
 
+def get_session_candles_for_vwap(
+    instrument_key: str,
+    interval_minutes: int = 3,
+    min_candles: int = 20,
+) -> pd.DataFrame:
+    """Fetch and return the complete current-session candle set for VWAP.
+
+    This function intentionally does not accept max_candles. It prevents the
+    short Futures regime window (2-3 candles) from ever being reused as the
+    VWAP source.
+    """
+    df = get_intraday_candles(
+        instrument_key,
+        interval_minutes,
+        max_candles=None,
+        min_candles=min_candles,
+    )
+
+    usable_volume = pd.to_numeric(
+        df["volume"], errors="coerce"
+    ).fillna(0.0).clip(lower=0.0)
+
+    if len(df) < min_candles or float(usable_volume.sum()) <= 0.0:
+        raise ScannerError(
+            f"Insufficient usable Futures session data for VWAP: "
+            f"candles={len(df)}, volume={float(usable_volume.sum()):.0f}."
+        )
+
+    logger.info(
+        "VWAP source: NIFTY Futures | current-session candles=%d | volume=%0.f",
+        len(df),
+        float(usable_volume.sum()),
+    )
+    return df
+
+
 # =============================================================================
 # INDICATORS
 # =============================================================================
@@ -864,26 +900,29 @@ def calculate_supertrend(
 def calculate_vwap(
     df: pd.DataFrame,
 ) -> pd.Series:
+    """Calculate session VWAP and fail explicitly when usable volume is absent."""
+    if df.empty:
+        return pd.Series(np.nan, index=df.index, dtype=float)
 
-    # VWAP must reset at the start of every trading session.
-    # Historical candles cover multiple days, so a single cumulative VWAP
-    # across the entire response would contaminate today's signal.
     typical = (
         df["high"]
         + df["low"]
         + df["close"]
     ) / 3.0
 
-    volume = df["volume"].clip(lower=0)
-    session = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(IST).dt.date
+    volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    session = pd.to_datetime(
+        df["timestamp"], utc=True, errors="coerce"
+    ).dt.tz_convert(IST).dt.date
 
     cumulative_volume = volume.groupby(session).cumsum()
     cumulative_pv = (typical * volume).groupby(session).cumsum()
 
-    return (
-        cumulative_pv
-        / cumulative_volume.replace(0, np.nan)
-    )
+    vwap = cumulative_pv / cumulative_volume.replace(0, np.nan)
+
+    # Index candles can legitimately have zero volume. In that case this is
+    # not a real VWAP. The scanner uses NIFTY futures candles for VWAP instead.
+    return vwap
 
 
 # =============================================================================
@@ -1366,14 +1405,16 @@ def change_oi_bias(
 
 def futures_regime(
     future: FuturesContract,
+    candles: Optional[pd.DataFrame] = None,
 ) -> str:
 
-    candles = get_intraday_candles(
-        future.instrument_key,
-        3,
-        max_candles=3,
-        min_candles=2,
-    )
+    if candles is None:
+        candles = get_intraday_candles(
+            future.instrument_key,
+            3,
+            max_candles=3,
+            min_candles=2,
+        )
 
     if len(candles) < 3:
         return "UNAVAILABLE"
@@ -1560,6 +1601,7 @@ def predictive_direction(
     change_oi_bias_value: str,
     futures_state: str,
     live_spot: float,
+    futures_3m: Optional[pd.DataFrame] = None,
 ) -> tuple[str, str, float, list[str]]:
     """
     Predict direction before the breakout.
@@ -1632,8 +1674,23 @@ def predictive_direction(
     # -------------------------------------------------------------------------
     # 3. VWAP — primary price confirmation
     # -------------------------------------------------------------------------
-    vwap_slope = float(latest_3["vwap"] - previous_3["vwap"])
-    session_vwap = float(latest_3["vwap"])
+    # NIFTY index candles may have no exchange-traded volume, which makes an
+    # index VWAP undefined. Use the complete current-session NIFTY futures
+    # candles for the session VWAP.
+    if futures_3m is None or futures_3m.empty:
+        raise ScannerError("NIFTY futures candle data unavailable for VWAP.")
+
+    vwap_series = calculate_vwap(futures_3m)
+    valid_vwap = vwap_series.dropna()
+
+    if len(valid_vwap) < 2:
+        raise ScannerError(
+            "Session VWAP unavailable: NIFTY futures volume is zero/missing."
+        )
+
+    session_vwap = float(valid_vwap.iloc[-1])
+    previous_vwap = float(valid_vwap.iloc[-2])
+    vwap_slope = session_vwap - previous_vwap
     above_vwap = float(live_spot) > session_vwap
 
     bullish_vwap = above_vwap and vwap_slope >= 0
@@ -2179,24 +2236,40 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
     state = state if isinstance(state, dict) else {}
 
     future = get_current_nifty_future()
-    futures_state = futures_regime(future)
-
-    logger.info(
-        "Futures regime: %s",
-        futures_state,
-    )
 
     # -------------------------------------------------------------------------
     # Underlying market data
     # -------------------------------------------------------------------------
+    # Separate datasets by purpose. The latest 3 candles are used only for
+    # Futures price/OI regime. A complete current-session Futures dataset is
+    # fetched separately for the session VWAP and is never truncated.
+    futures_recent = get_intraday_candles(
+        future.instrument_key,
+        3,
+        max_candles=3,
+        min_candles=3,
+    )
+    futures_state = futures_regime(future, candles=futures_recent)
+
+    futures_vwap_candles = get_session_candles_for_vwap(
+        future.instrument_key,
+        interval_minutes=3,
+        min_candles=20,
+    )
+
+    logger.info(
+        "Futures regime: %s | regime candles=%d | VWAP candles=%d",
+        futures_state,
+        len(futures_recent),
+        len(futures_vwap_candles),
+    )
+
     spot_3m = get_intraday_candles(NIFTY_KEY, 3)
     spot_3m = calculate_supertrend(
         spot_3m,
         SUPERTREND_PERIOD,
         SUPERTREND_FACTOR,
     )
-    spot_3m["vwap"] = calculate_vwap(spot_3m)
-
     spot_15m = get_intraday_candles(NIFTY_KEY, 15)
     spot_15m = calculate_supertrend(
         spot_15m,
@@ -2235,6 +2308,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         change_bias,
         futures_state,
         live_spot=spot,
+        futures_3m=futures_vwap_candles,
     )
 
     logger.info(
