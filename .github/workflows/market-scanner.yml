@@ -27,8 +27,20 @@ jobs:
         run: python market_scanner.py
 
       - name: Persist scanner state
-        uses: actions/upload-artifact@v4
-        with:
-          name: scanner-state
-          path: scanner_state.json
-          if-no-files-found: ignore
+        if: always()
+        run: |
+          if [ -f state/market_state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            git add state/market_state.json
+
+            if git diff --cached --quiet; then
+              echo "No scanner state changes."
+            else
+              git commit -m "Update scanner state"
+              git push
+            fi
+          else
+            echo "No scanner state created."
+          fi
