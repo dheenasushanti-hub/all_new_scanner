@@ -1602,20 +1602,22 @@ def predictive_direction(
     futures_state: str,
     live_spot: float,
     futures_3m: Optional[pd.DataFrame] = None,
+    previous_snapshot: Optional[dict[str, Any]] = None,
 ) -> tuple[str, str, float, list[str]]:
     """
-    Predict direction before the breakout.
+    Predict the next directional move before the breakout.
 
-    Core trigger:
-      1. Futures price/OI regime
-      2. Localized option OI pressure OR Upstox Change-OI bias
-      3. NIFTY price relative to session VWAP and VWAP slope
+    Primary logic:
+      1. Futures price/OI regime is the strongest directional input.
+      2. NIFTY position relative to session VWAP is the next strongest input.
+      3. Localized option OI and Upstox Change-OI are confirmations.
+      4. A newly detected Futures regime transition receives extra weight.
+      5. 15-minute Supertrend remains confirmation/target context only.
 
-    Supertrend is deliberately NOT required for entry prediction.
-    It remains a confirmation/target framework.
+    Previous-run market state is supplied from persisted state so a transition
+    such as NEUTRAL -> SHORT_BUILDUP is detected and used instead of treating
+    every scan as an isolated snapshot.
     """
-    latest_3 = spot_3m.iloc[-1]
-    previous_3 = spot_3m.iloc[-2]
     latest_15 = spot_15m.iloc[-1]
 
     bullish_score = 0.0
@@ -1623,60 +1625,91 @@ def predictive_direction(
     bullish_reasons: list[str] = []
     bearish_reasons: list[str] = []
 
-    # -------------------------------------------------------------------------
-    # 1. FUTURES — primary directional signal
-    # -------------------------------------------------------------------------
     bullish_futures = futures_state in ("LONG_BUILDUP", "SHORT_COVERING")
     bearish_futures = futures_state in ("SHORT_BUILDUP", "LONG_UNWINDING")
 
+    previous_futures_state = str(
+        (previous_snapshot or {}).get("futures_state") or ""
+    )
+    previous_direction = str(
+        (previous_snapshot or {}).get("prediction_direction") or ""
+    )
+
+    futures_transition = (
+        previous_futures_state
+        and previous_futures_state != futures_state
+        and previous_futures_state != "UNAVAILABLE"
+        and futures_state != "UNAVAILABLE"
+    )
+
     if bullish_futures:
-        bullish_score += 40
+        bullish_score += 45
         bullish_reasons.append(
             f"Futures confirms bullish positioning: {futures_state}"
         )
     elif bearish_futures:
-        bearish_score += 40
+        bearish_score += 45
         bearish_reasons.append(
             f"Futures confirms bearish positioning: {futures_state}"
         )
 
-    # -------------------------------------------------------------------------
-    # 2. OPTION OI — localized strike pressure + Upstox change-OI
-    #
-    # Localized chain bias is primary. The Change-OI endpoint is a second
-    # confirmation source and is never required when unavailable.
-    # -------------------------------------------------------------------------
-    bullish_oi = chain_bias == "BULLISH" or change_oi_bias_value == "BULLISH"
-    bearish_oi = chain_bias == "BEARISH" or change_oi_bias_value == "BEARISH"
+    if futures_transition:
+        logger.info(
+            "Futures regime transition: %s -> %s",
+            previous_futures_state,
+            futures_state,
+        )
+        if bullish_futures:
+            bullish_score += 10
+            bullish_reasons.append(
+                f"Fresh Futures regime transition detected: {previous_futures_state} -> {futures_state}"
+            )
+        elif bearish_futures:
+            bearish_score += 10
+            bearish_reasons.append(
+                f"Fresh Futures regime transition detected: {previous_futures_state} -> {futures_state}"
+            )
 
+    # -------------------------------------------------------------------------
+    # OPTION OI — confirmation, not a hard gate.
+    # -------------------------------------------------------------------------
     if chain_bias == "BULLISH":
-        bullish_score += 30
-        bullish_reasons.append(
-            "Localized option OI pressure is bullish"
-        )
+        bullish_score += 15
+        bullish_reasons.append("Localized option OI pressure is bullish")
+        if bearish_futures:
+            bearish_score -= 8
+            bearish_reasons.append(
+                "Localized OI conflicts with current bearish Futures regime"
+            )
     elif chain_bias == "BEARISH":
-        bearish_score += 30
-        bearish_reasons.append(
-            "Localized option OI pressure is bearish"
-        )
+        bearish_score += 15
+        bearish_reasons.append("Localized option OI pressure is bearish")
+        if bullish_futures:
+            bullish_score -= 8
+            bullish_reasons.append(
+                "Localized OI conflicts with current bullish Futures regime"
+            )
 
     if change_oi_bias_value == "BULLISH":
         bullish_score += 10
-        bullish_reasons.append(
-            "Upstox Change-OI confirms bullish direction"
-        )
+        bullish_reasons.append("Upstox Change-OI confirms bullish direction")
+        if bearish_futures:
+            bearish_score -= 5
+            bearish_reasons.append(
+                "Change-OI conflicts with current bearish Futures regime"
+            )
     elif change_oi_bias_value == "BEARISH":
         bearish_score += 10
-        bearish_reasons.append(
-            "Upstox Change-OI confirms bearish direction"
-        )
+        bearish_reasons.append("Upstox Change-OI confirms bearish direction")
+        if bullish_futures:
+            bullish_score -= 5
+            bullish_reasons.append(
+                "Change-OI conflicts with current bullish Futures regime"
+            )
 
     # -------------------------------------------------------------------------
-    # 3. VWAP — primary price confirmation
+    # VWAP — position is decisive; slope is additional context.
     # -------------------------------------------------------------------------
-    # NIFTY index candles may have no exchange-traded volume, which makes an
-    # index VWAP undefined. Use the complete current-session NIFTY futures
-    # candles for the session VWAP.
     if futures_3m is None or futures_3m.empty:
         raise ScannerError("NIFTY futures candle data unavailable for VWAP.")
 
@@ -1693,11 +1726,6 @@ def predictive_direction(
     vwap_slope = session_vwap - previous_vwap
     above_vwap = float(live_spot) > session_vwap
 
-    # Price location relative to VWAP is the primary VWAP signal.
-    # VWAP slope is a confidence/context factor, not a hard direction gate.
-    bullish_vwap = above_vwap
-    bearish_vwap = not above_vwap
-
     logger.info(
         "VWAP check: NIFTY=%.2f VWAP=%.2f slope=%.4f position=%s",
         live_spot,
@@ -1706,47 +1734,53 @@ def predictive_direction(
         "ABOVE" if above_vwap else "BELOW",
     )
 
-    if bullish_vwap:
-        bullish_score += 20
+    if above_vwap:
+        bullish_score += 25
         bullish_reasons.append(
-            f"NIFTY {live_spot:.2f} is above session VWAP {session_vwap:.2f}; slope={vwap_slope:.4f}"
+            f"NIFTY {live_spot:.2f} is above session VWAP {session_vwap:.2f}"
         )
         if vwap_slope > 0:
             bullish_score += 5
             bullish_reasons.append("VWAP slope is rising")
+        elif vwap_slope < 0:
+            bullish_score -= 3
+            bullish_reasons.append("VWAP slope is falling against bullish price position")
     else:
-        bearish_score += 20
+        bearish_score += 25
         bearish_reasons.append(
-            f"NIFTY {live_spot:.2f} is below session VWAP {session_vwap:.2f}; slope={vwap_slope:.4f}"
+            f"NIFTY {live_spot:.2f} is below session VWAP {session_vwap:.2f}"
         )
         if vwap_slope < 0:
             bearish_score += 5
             bearish_reasons.append("VWAP slope is falling")
+        elif vwap_slope > 0:
+            bearish_score -= 3
+            bearish_reasons.append("VWAP slope is rising against bearish price position")
 
     # -------------------------------------------------------------------------
-    # 4. Supertrend — confirmation only
+    # 15M Supertrend — confirmation only.
     # -------------------------------------------------------------------------
     if latest_15["direction"] == 1:
         bullish_score += 5
-        bullish_reasons.append(
-            "15-minute Supertrend supports bullish continuation"
-        )
+        bullish_reasons.append("15-minute Supertrend supports bullish continuation")
     elif latest_15["direction"] == -1:
         bearish_score += 5
-        bearish_reasons.append(
-            "15-minute Supertrend supports bearish continuation"
-        )
+        bearish_reasons.append("15-minute Supertrend supports bearish continuation")
 
     # -------------------------------------------------------------------------
-    # FINAL PREDICTIVE CONFLUENCE
-    # Futures + OI + VWAP must align.
+    # Direction decision.
+    # Futures + VWAP are sufficient to identify an emerging move; OI inputs
+    # improve confidence but cannot completely suppress a fresh Futures regime
+    # transition.
     # -------------------------------------------------------------------------
-    if (
-        bullish_futures
-        and bullish_oi
-        and bullish_vwap
-        and bullish_score > bearish_score
-    ):
+    minimum_score = SIGNAL_THRESHOLD
+    score_gap = abs(bullish_score - bearish_score)
+
+    if bullish_futures and bullish_score >= minimum_score and bullish_score > bearish_score:
+        if previous_direction != "BULLISH" and previous_direction in {"BEARISH", "NEUTRAL", ""}:
+            bullish_reasons.append(
+                f"Directional state is newly bullish versus previous run: {previous_direction or 'NONE'} -> BULLISH"
+            )
         return (
             "BULLISH",
             "BULLISH_PREDICTIVE",
@@ -1754,12 +1788,11 @@ def predictive_direction(
             bullish_reasons,
         )
 
-    if (
-        bearish_futures
-        and bearish_oi
-        and bearish_vwap
-        and bearish_score > bullish_score
-    ):
+    if bearish_futures and bearish_score >= minimum_score and bearish_score > bullish_score:
+        if previous_direction != "BEARISH" and previous_direction in {"BULLISH", "NEUTRAL", ""}:
+            bearish_reasons.append(
+                f"Directional state is newly bearish versus previous run: {previous_direction or 'NONE'} -> BEARISH"
+            )
         return (
             "BEARISH",
             "BEARISH_PREDICTIVE",
@@ -1767,12 +1800,21 @@ def predictive_direction(
             bearish_reasons,
         )
 
+    logger.info(
+        "Prediction scores: bullish=%.1f bearish=%.1f gap=%.1f | previous_futures=%s previous_direction=%s",
+        bullish_score,
+        bearish_score,
+        score_gap,
+        previous_futures_state or "NONE",
+        previous_direction or "NONE",
+    )
+
     return (
         "NEUTRAL",
         "NEUTRAL",
         0.0,
         [
-            "Futures + localized OI/Change-OI + VWAP did not reach predictive confluence."
+            "Current Futures/VWAP/OI evidence did not cross the predictive threshold."
         ],
     )
 
@@ -2235,6 +2277,9 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         return None
 
     state = state if isinstance(state, dict) else {}
+    previous_snapshot = state.get("market_snapshot")
+    if not isinstance(previous_snapshot, dict):
+        previous_snapshot = {}
 
     future = get_current_nifty_future()
 
@@ -2310,7 +2355,37 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         futures_state,
         live_spot=spot,
         futures_3m=futures_vwap_candles,
+        previous_snapshot=previous_snapshot,
     )
+
+    # Persist every market snapshot, including neutral runs. This allows the
+    # next 3-minute run to detect and use regime transitions.
+    current_snapshot = {
+        "timestamp": now_ist().isoformat(),
+        "nifty_spot": round(float(spot), 2),
+        "futures_state": futures_state,
+        "chain_bias": chain_bias,
+        "chain_bias_score": round(float(chain_bias_score), 6),
+        "change_oi_bias": change_bias,
+        "change_oi_score": round(float(change_bias_score), 6),
+        "vwap": round(float(calculate_vwap(futures_vwap_candles).dropna().iloc[-1]), 4),
+        "prediction_direction": direction,
+        "prediction_regime": regime,
+        "prediction_confidence": round(float(confidence), 2),
+    }
+    state["market_snapshot"] = current_snapshot
+    state["previous_market_snapshot"] = previous_snapshot
+    save_state(state)
+
+    if previous_snapshot:
+        logger.info(
+            "Previous market state: time=%s futures=%s OI=%s changeOI=%s prediction=%s",
+            previous_snapshot.get("timestamp", ""),
+            previous_snapshot.get("futures_state", ""),
+            previous_snapshot.get("chain_bias", ""),
+            previous_snapshot.get("change_oi_bias", ""),
+            previous_snapshot.get("prediction_direction", ""),
+        )
 
     logger.info(
         "Prediction: direction=%s regime=%s confidence=%.2f",
