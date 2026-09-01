@@ -1,5 +1,18 @@
 {
   "market_snapshot": {
+    "timestamp": "2026-09-01T13:36:01.770394+05:30",
+    "nifty_spot": 24062.5,
+    "futures_state": "SHORT_COVERING",
+    "chain_bias": "NEUTRAL",
+    "chain_bias_score": -0.007314,
+    "change_oi_bias": "NEUTRAL",
+    "change_oi_score": -0.037078,
+    "vwap": 24211.0607,
+    "prediction_direction": "BULLISH",
+    "prediction_regime": "BULLISH_PREDICTIVE",
+    "prediction_confidence": 60.0
+  },
+  "previous_market_snapshot": {
     "timestamp": "2026-09-01T13:31:04.495691+05:30",
     "nifty_spot": 24054.8,
     "futures_state": "LONG_BUILDUP",
@@ -12,5 +25,46 @@
     "prediction_regime": "NEUTRAL",
     "prediction_confidence": 0.0
   },
-  "previous_market_snapshot": {}
+  "locked_direction": "BULLISH",
+  "locked_strike": 24000.0,
+  "locked_option_type": "CE",
+  "locked_timestamp": "2026-09-01T13:36:03.487553+05:30",
+  "last_signal_hash": "cb85a43c4b7e7167fd7c5ff91591a664916c8ce0f4a90c7fde2491f47f4a1ee6",
+  "last_signal": {
+    "timestamp": "2026-09-01 13:36:02 IST",
+    "direction": "BULLISH",
+    "regime": "BULLISH_PREDICTIVE",
+    "confidence": 60.0,
+    "spot": 24062.5,
+    "futures_state": "SHORT_COVERING",
+    "option_type": "CE",
+    "strike": 24000.0,
+    "trading_symbol": "NIFTY 24000 CE 01 SEP 26",
+    "instrument_key": "NSE_FO|46985",
+    "entry": 73.8,
+    "target_1": 75.29,
+    "target_2": 125.51,
+    "stop_loss": 62.73,
+    "underlying_trigger_3m": 24064.396468148905,
+    "underlying_target_15m": 24120.75,
+    "delta": 0.7829,
+    "gamma": 0.0036,
+    "reasons": [
+      "Futures confirms bullish positioning: SHORT_COVERING",
+      "Fresh Futures regime transition detected: LONG_BUILDUP -> SHORT_COVERING",
+      "15-minute Supertrend supports bullish continuation",
+      "Directional state is newly bullish versus previous run: NEUTRAL -> BULLISH",
+      "Prediction is based on Futures + OI difference + VWAP.",
+      "3-minute Supertrend is used for target/confirmation, not as the entry trigger.",
+      "ITM option selected at 24000 (CE).",
+      "Option Delta=0.783.",
+      "Localized option OI score=-0.007.",
+      "Upstox Change-OI score=-0.037.",
+      "Selected option price/OI confirmation=LONG_BUILDUP.",
+      "Prediction trigger = Futures + localized OI/Change-OI + VWAP.",
+      "3-minute Supertrend is confirmation/target framework, not entry trigger.",
+      "ITM strike is locked at first predictive detection to avoid chasing ATM."
+    ]
+  },
+  "last_signal_timestamp": "2026-09-01 13:36:02 IST"
 }
