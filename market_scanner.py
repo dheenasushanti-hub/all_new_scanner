@@ -136,6 +136,12 @@ BUY_OPTION_LOOKBACK = 6
 BUY_OPTION_MIN_CANDLES = 5
 BUY_OPTION_MIN_RETURN_PCT = 0.10
 
+# Noise controls for a 5-minute workflow.
+VWAP_FLAT_SLOPE_EPSILON = 0.10
+FUTURES_BASIS_EPSILON_POINTS = 1.00
+FUTURES_REGIME_MIN_PRICE_MOVE = 0.50
+FUTURES_REGIME_MIN_OI_CHANGE = 1.0
+
 MAX_SIGNAL_AGE_MINUTES = 15
 
 
@@ -1413,47 +1419,70 @@ def futures_regime(
     future: FuturesContract,
     candles: Optional[pd.DataFrame] = None,
 ) -> str:
+    """Classify Futures positioning with a small noise filter.
 
+    The latest move and the aggregate move across the supplied recent candles
+    must agree. A mixed/tiny move is NEUTRAL instead of being forced into a
+    regime, which reduces one-candle OI whipsaws.
+    """
     if candles is None:
         candles = get_intraday_candles(
             future.instrument_key,
             3,
             max_candles=3,
-            min_candles=2,
+            min_candles=3,
         )
 
     if len(candles) < 3:
         return "UNAVAILABLE"
 
-    latest = candles.iloc[-1]
-    previous = candles.iloc[-2]
-
-    if (
-        pd.isna(latest["oi"])
-        or pd.isna(previous["oi"])
-    ):
+    recent = candles.tail(3).copy()
+    closes = pd.to_numeric(recent["close"], errors="coerce")
+    ois = pd.to_numeric(recent["oi"], errors="coerce")
+    if closes.isna().any() or ois.isna().any():
         return "UNAVAILABLE"
 
-    price_delta = (
-        latest["close"]
-        - previous["close"]
+    latest_price_delta = float(closes.iloc[-1] - closes.iloc[-2])
+    latest_oi_delta = float(ois.iloc[-1] - ois.iloc[-2])
+    aggregate_price_delta = float(closes.iloc[-1] - closes.iloc[0])
+    aggregate_oi_delta = float(ois.iloc[-1] - ois.iloc[0])
+
+    if (
+        abs(latest_price_delta) < FUTURES_REGIME_MIN_PRICE_MOVE
+        or abs(aggregate_price_delta) < FUTURES_REGIME_MIN_PRICE_MOVE
+        or abs(latest_oi_delta) < FUTURES_REGIME_MIN_OI_CHANGE
+        or abs(aggregate_oi_delta) < FUTURES_REGIME_MIN_OI_CHANGE
+    ):
+        return "NEUTRAL"
+
+    price_sign = (
+        latest_price_delta > 0 and aggregate_price_delta > 0
+    ) or (
+        latest_price_delta < 0 and aggregate_price_delta < 0
+    )
+    oi_sign = (
+        latest_oi_delta > 0 and aggregate_oi_delta > 0
+    ) or (
+        latest_oi_delta < 0 and aggregate_oi_delta < 0
     )
 
-    oi_delta = (
-        latest["oi"]
-        - previous["oi"]
-    )
+    if not (price_sign and oi_sign):
+        logger.info(
+            "Futures regime noise/mixed: latest_price=%.2f aggregate_price=%.2f latest_oi=%.0f aggregate_oi=%.0f",
+            latest_price_delta,
+            aggregate_price_delta,
+            latest_oi_delta,
+            aggregate_oi_delta,
+        )
+        return "NEUTRAL"
 
-    if price_delta > 0 and oi_delta > 0:
+    if latest_price_delta > 0 and latest_oi_delta > 0:
         return "LONG_BUILDUP"
-
-    if price_delta < 0 and oi_delta > 0:
+    if latest_price_delta < 0 and latest_oi_delta > 0:
         return "SHORT_BUILDUP"
-
-    if price_delta > 0 and oi_delta < 0:
+    if latest_price_delta > 0 and latest_oi_delta < 0:
         return "SHORT_COVERING"
-
-    if price_delta < 0 and oi_delta < 0:
+    if latest_price_delta < 0 and latest_oi_delta < 0:
         return "LONG_UNWINDING"
 
     return "NEUTRAL"
@@ -1740,8 +1769,14 @@ def final_entry_direction_confirmation(
     change_oi_bias_value: str,
     live_spot: float,
     futures_vwap_candles: pd.DataFrame,
+    spot_3m: Optional[pd.DataFrame] = None,
 ) -> tuple[bool, list[str]]:
-    """Hard entry gate: Futures + OI + VWAP must agree before strike selection."""
+    """Hard BUY-side entry gate.
+
+    Before any CE/PE strike is selected, Futures + OI + VWAP must agree.
+    Futures premium/discount is an additional matrix confirmation; it does not
+    replace the three-factor hard gate.
+    """
     valid_vwap = calculate_vwap(futures_vwap_candles).dropna()
     if len(valid_vwap) < 2:
         return False, ["Session VWAP unavailable for final entry confirmation."]
@@ -1751,38 +1786,66 @@ def final_entry_direction_confirmation(
     vwap_slope = session_vwap - previous_vwap
     above_vwap = float(live_spot) > session_vwap
 
-    # SHORT_COVERING is contextual: bullish only above VWAP, bearish only below VWAP.
     if futures_state == "LONG_BUILDUP":
         futures_direction = "BULLISH"
-    elif futures_state in {"SHORT_BUILDUP", "LONG_UNWINDING"}:
+    elif futures_state == "SHORT_BUILDUP":
         futures_direction = "BEARISH"
     elif futures_state == "SHORT_COVERING":
         futures_direction = "BULLISH" if above_vwap else "BEARISH"
+    elif futures_state == "LONG_UNWINDING":
+        futures_direction = "BEARISH" if not above_vwap else "BULLISH"
     else:
         futures_direction = "NEUTRAL"
 
-    oi_direction = (
-        "BULLISH"
-        if chain_bias == "BULLISH" or change_oi_bias_value == "BULLISH"
-        else "BEARISH"
-        if chain_bias == "BEARISH" or change_oi_bias_value == "BEARISH"
-        else "NEUTRAL"
-    )
+    # OI sources must not contradict each other at entry time. A bullish
+    # localized OI signal plus bearish Change-OI (or vice versa) is treated as
+    # conflict/NEUTRAL rather than allowing the first matching condition to win.
+    oi_values = {str(chain_bias).upper(), str(change_oi_bias_value).upper()}
+    if "BULLISH" in oi_values and "BEARISH" in oi_values:
+        oi_direction = "NEUTRAL"
+    elif "BULLISH" in oi_values:
+        oi_direction = "BULLISH"
+    elif "BEARISH" in oi_values:
+        oi_direction = "BEARISH"
+    else:
+        oi_direction = "NEUTRAL"
     vwap_direction = "BULLISH" if above_vwap else "BEARISH"
 
     futures_ok = futures_direction == direction
     oi_ok = oi_direction == direction
     vwap_ok = vwap_direction == direction
 
+    basis_state = "UNAVAILABLE"
+    # Strong regimes require basis confirmation when data exists. Missing basis
+    # data does not manufacture a signal; weak regimes are rejected without it.
+    basis_ok = futures_state in {"LONG_BUILDUP", "SHORT_BUILDUP"}
+    if spot_3m is not None:
+        basis_state, _, _ = futures_premium_discount_state(
+            futures_vwap_candles,
+            spot_3m,
+            live_spot,
+        )
+        if basis_state != "UNAVAILABLE":
+            if futures_state == "LONG_BUILDUP":
+                basis_ok = basis_state == "WIDENING_PREMIUM"
+            elif futures_state == "SHORT_BUILDUP":
+                basis_ok = basis_state == "DEEPENING_DISCOUNT"
+            elif futures_state == "SHORT_COVERING":
+                basis_ok = direction == "BULLISH" and basis_state in {"SHRINKING_PREMIUM", "NARROWING_DISCOUNT"}
+            elif futures_state == "LONG_UNWINDING":
+                basis_ok = direction == "BEARISH" and basis_state in {"SHRINKING_PREMIUM", "NARROWING_DISCOUNT", "FLAT_PREMIUM", "FLAT_DISCOUNT"}
+
     logger.info(
-        "FINAL ENTRY CONFIRMATION: direction=%s futures=%s OI=%s VWAP=%s | FUT_OK=%s OI_OK=%s VWAP_OK=%s | VWAP=%.2f slope=%.4f",
+        "FINAL ENTRY CONFIRMATION: direction=%s futures=%s OI=%s VWAP=%s basis=%s | FUT_OK=%s OI_OK=%s VWAP_OK=%s BASIS_OK=%s | VWAP=%.2f slope=%.4f",
         direction,
         futures_direction,
         oi_direction,
         vwap_direction,
+        basis_state,
         futures_ok,
         oi_ok,
         vwap_ok,
+        basis_ok,
         session_vwap,
         vwap_slope,
     )
@@ -1791,9 +1854,70 @@ def final_entry_direction_confirmation(
         f"Futures={futures_state} interpreted as {futures_direction}: {'OK' if futures_ok else 'FAIL'}",
         f"OI=localized:{chain_bias}/changeOI:{change_oi_bias_value} interpreted as {oi_direction}: {'OK' if oi_ok else 'FAIL'}",
         f"NIFTY={live_spot:.2f} vs VWAP={session_vwap:.2f} interpreted as {vwap_direction}: {'OK' if vwap_ok else 'FAIL'}",
+        f"Futures premium/discount state={basis_state}: {'OK' if basis_ok else 'FAIL'}",
     ]
 
-    return futures_ok and oi_ok and vwap_ok, reasons
+    # The chart-aligned three-factor confirmation remains the mandatory gate.
+    # Premium/discount must be supportive when the data is available for a
+    # non-neutral Futures regime.
+    return futures_ok and oi_ok and vwap_ok and basis_ok, reasons
+
+
+def futures_premium_discount_state(
+    futures_candles: pd.DataFrame,
+    spot_3m: pd.DataFrame,
+    live_spot: float,
+    epsilon_points: float = FUTURES_BASIS_EPSILON_POINTS,
+) -> tuple[str, float, float]:
+    """Classify Futures premium/discount behavior for the sentiment matrix.
+
+    Matrix mapping:
+      LONG_BUILDUP   -> widening premium is supportive.
+      SHORT_BUILDUP  -> deepening discount is supportive.
+      SHORT_COVERING -> shrinking premium / narrowing discount is supportive.
+      LONG_UNWINDING -> shrinking premium / narrowing discount is supportive.
+    """
+    if futures_candles is None or spot_3m is None or futures_candles.empty or spot_3m.empty:
+        return "UNAVAILABLE", float("nan"), float("nan")
+    if len(futures_candles) < 2 or len(spot_3m) < 2:
+        return "UNAVAILABLE", float("nan"), float("nan")
+
+    try:
+        fut_latest = float(futures_candles["close"].iloc[-1])
+        fut_previous = float(futures_candles["close"].iloc[-2])
+        spot_previous = float(spot_3m["close"].iloc[-2])
+        current_basis = fut_latest - float(live_spot)
+        previous_basis = fut_previous - spot_previous
+        basis_change = current_basis - previous_basis
+    except (TypeError, ValueError, KeyError, IndexError):
+        return "UNAVAILABLE", float("nan"), float("nan")
+
+    if not all(math.isfinite(v) for v in (current_basis, previous_basis, basis_change)):
+        return "UNAVAILABLE", float("nan"), float("nan")
+
+    if current_basis >= 0:
+        if basis_change > epsilon_points:
+            state = "WIDENING_PREMIUM"
+        elif basis_change < -epsilon_points:
+            state = "SHRINKING_PREMIUM"
+        else:
+            state = "FLAT_PREMIUM"
+    else:
+        if basis_change < -epsilon_points:
+            state = "DEEPENING_DISCOUNT"
+        elif basis_change > epsilon_points:
+            state = "NARROWING_DISCOUNT"
+        else:
+            state = "FLAT_DISCOUNT"
+
+    logger.info(
+        "Futures premium/discount: current_basis=%.2f previous_basis=%.2f change=%.2f state=%s",
+        current_basis,
+        previous_basis,
+        basis_change,
+        state,
+    )
+    return state, current_basis, basis_change
 
 
 # =============================================================================
@@ -1810,19 +1934,24 @@ def predictive_direction(
     futures_3m: Optional[pd.DataFrame] = None,
     previous_snapshot: Optional[dict[str, Any]] = None,
 ) -> tuple[str, str, float, list[str]]:
-    """
-    Predict the next directional move before the breakout.
+    """Predict the next directional move before the breakout.
 
-    Primary logic:
-      1. Futures price/OI regime is the strongest directional input.
-      2. NIFTY position relative to session VWAP is the next strongest input.
-      3. Localized option OI and Upstox Change-OI are confirmations.
-      4. A newly detected Futures regime transition receives extra weight.
-      5. 15-minute Supertrend remains confirmation/target context only.
+    Sentiment matrix implemented here:
+      LONG_BUILDUP       -> STRONG BULLISH
+      SHORT_BUILDUP      -> STRONG BEARISH
+      SHORT_COVERING     -> WEAK BULLISH (context dependent)
+      LONG_UNWINDING     -> WEAK BEARISH (context dependent)
 
-    Previous-run market state is supplied from persisted state so a transition
-    such as NEUTRAL -> SHORT_BUILDUP is detected and used instead of treating
-    every scan as an isolated snapshot.
+    Inputs are weighted by importance:
+      Futures regime        = strongest
+      VWAP position         = primary price confirmation
+      Futures basis behavior= confirmation from premium/discount
+      Localized option OI   = confirmation
+      Change-OI             = confirmation
+      15m Supertrend        = context only
+
+    A fresh Futures regime transition receives extra weight. Supertrend is not
+    required for the predictive trigger.
     """
     latest_15 = spot_15m.iloc[-1]
 
@@ -1831,8 +1960,12 @@ def predictive_direction(
     bullish_reasons: list[str] = []
     bearish_reasons: list[str] = []
 
-    bullish_futures = futures_state in ("LONG_BUILDUP", "SHORT_COVERING")
-    bearish_futures = futures_state in ("SHORT_BUILDUP", "LONG_UNWINDING")
+    strong_bullish_futures = futures_state == "LONG_BUILDUP"
+    strong_bearish_futures = futures_state == "SHORT_BUILDUP"
+    weak_bullish_futures = futures_state == "SHORT_COVERING"
+    weak_bearish_futures = futures_state == "LONG_UNWINDING"
+    bullish_futures = strong_bullish_futures or weak_bullish_futures
+    bearish_futures = strong_bearish_futures or weak_bearish_futures
 
     previous_futures_state = str(
         (previous_snapshot or {}).get("futures_state") or ""
@@ -1848,84 +1981,80 @@ def predictive_direction(
         and futures_state != "UNAVAILABLE"
     )
 
-    if bullish_futures:
+    # -------------------------------------------------------------------------
+    # 1. FUTURES REGIME — strongest input, with chart-aligned strength.
+    # -------------------------------------------------------------------------
+    if strong_bullish_futures:
         bullish_score += 45
-        bullish_reasons.append(
-            f"Futures confirms bullish positioning: {futures_state}"
-        )
-    elif bearish_futures:
+        bullish_reasons.append("Futures = LONG_BUILDUP (strong bullish sentiment)")
+    elif weak_bullish_futures:
+        bullish_score += 20
+        bullish_reasons.append("Futures = SHORT_COVERING (weak bullish sentiment)")
+    elif strong_bearish_futures:
         bearish_score += 45
-        bearish_reasons.append(
-            f"Futures confirms bearish positioning: {futures_state}"
-        )
+        bearish_reasons.append("Futures = SHORT_BUILDUP (strong bearish sentiment)")
+    elif weak_bearish_futures:
+        bearish_score += 20
+        bearish_reasons.append("Futures = LONG_UNWINDING (weak bearish sentiment)")
 
     if futures_transition:
+        transition_bonus = 10 if futures_state in {"LONG_BUILDUP", "SHORT_BUILDUP"} else 5
         logger.info(
-            "Futures regime transition: %s -> %s",
+            "Futures regime transition: %s -> %s | bonus=%d",
             previous_futures_state,
             futures_state,
+            transition_bonus,
         )
         if bullish_futures:
-            bullish_score += 10
+            bullish_score += transition_bonus
             bullish_reasons.append(
-                f"Fresh Futures regime transition detected: {previous_futures_state} -> {futures_state}"
+                f"Fresh Futures transition: {previous_futures_state} -> {futures_state}"
             )
         elif bearish_futures:
-            bearish_score += 10
+            bearish_score += transition_bonus
             bearish_reasons.append(
-                f"Fresh Futures regime transition detected: {previous_futures_state} -> {futures_state}"
+                f"Fresh Futures transition: {previous_futures_state} -> {futures_state}"
             )
 
     # -------------------------------------------------------------------------
-    # OPTION OI — confirmation, not a hard gate.
+    # 2. OPTION OI — confirmation, with explicit opposing penalties.
     # -------------------------------------------------------------------------
     if chain_bias == "BULLISH":
         bullish_score += 15
         bullish_reasons.append("Localized option OI pressure is bullish")
         if bearish_futures:
             bearish_score -= 8
-            bearish_reasons.append(
-                "Localized OI conflicts with current bearish Futures regime"
-            )
+            bearish_reasons.append("Localized OI conflicts with current bearish Futures regime (-8)")
     elif chain_bias == "BEARISH":
         bearish_score += 15
         bearish_reasons.append("Localized option OI pressure is bearish")
         if bullish_futures:
             bullish_score -= 8
-            bullish_reasons.append(
-                "Localized OI conflicts with current bullish Futures regime"
-            )
+            bullish_reasons.append("Localized OI conflicts with current bullish Futures regime (-8)")
 
     if change_oi_bias_value == "BULLISH":
         bullish_score += 10
         bullish_reasons.append("Upstox Change-OI confirms bullish direction")
         if bearish_futures:
             bearish_score -= 5
-            bearish_reasons.append(
-                "Change-OI conflicts with current bearish Futures regime"
-            )
+            bearish_reasons.append("Change-OI conflicts with current bearish Futures regime (-5)")
     elif change_oi_bias_value == "BEARISH":
         bearish_score += 10
         bearish_reasons.append("Upstox Change-OI confirms bearish direction")
         if bullish_futures:
             bullish_score -= 5
-            bullish_reasons.append(
-                "Change-OI conflicts with current bullish Futures regime"
-            )
+            bullish_reasons.append("Change-OI conflicts with current bullish Futures regime (-5)")
 
     # -------------------------------------------------------------------------
-    # VWAP — position is decisive; slope is additional context.
+    # 3. VWAP — price position is primary; slope is only context.
     # -------------------------------------------------------------------------
     if futures_3m is None or futures_3m.empty:
         raise ScannerError("NIFTY futures candle data unavailable for VWAP.")
 
     vwap_series = calculate_vwap(futures_3m)
     valid_vwap = vwap_series.dropna()
-
     if len(valid_vwap) < 2:
-        raise ScannerError(
-            "Session VWAP unavailable: NIFTY futures volume is zero/missing."
-        )
+        raise ScannerError("Session VWAP unavailable: NIFTY futures volume is zero/missing.")
 
     session_vwap = float(valid_vwap.iloc[-1])
     previous_vwap = float(valid_vwap.iloc[-2])
@@ -1942,42 +2071,83 @@ def predictive_direction(
 
     if above_vwap:
         bullish_score += 25
-        bullish_reasons.append(
-            f"NIFTY {live_spot:.2f} is above session VWAP {session_vwap:.2f}"
-        )
-        if vwap_slope > 0:
+        bullish_reasons.append(f"NIFTY {live_spot:.2f} is above session VWAP {session_vwap:.2f}")
+        if vwap_slope > VWAP_FLAT_SLOPE_EPSILON:
             bullish_score += 5
-            bullish_reasons.append("VWAP slope is rising")
-        elif vwap_slope < 0:
+            bullish_reasons.append("VWAP slope is meaningfully rising (+5)")
+        elif vwap_slope < -VWAP_FLAT_SLOPE_EPSILON:
             bullish_score -= 3
-            bullish_reasons.append("VWAP slope is falling against bullish price position")
+            bullish_reasons.append("VWAP slope is meaningfully falling against bullish position (-3)")
+        else:
+            bullish_reasons.append("VWAP slope is flat: no slope points awarded")
     else:
         bearish_score += 25
-        bearish_reasons.append(
-            f"NIFTY {live_spot:.2f} is below session VWAP {session_vwap:.2f}"
-        )
-        if vwap_slope < 0:
+        bearish_reasons.append(f"NIFTY {live_spot:.2f} is below session VWAP {session_vwap:.2f}")
+        if vwap_slope < -VWAP_FLAT_SLOPE_EPSILON:
             bearish_score += 5
-            bearish_reasons.append("VWAP slope is falling")
-        elif vwap_slope > 0:
+            bearish_reasons.append("VWAP slope is meaningfully falling (+5)")
+        elif vwap_slope > VWAP_FLAT_SLOPE_EPSILON:
             bearish_score -= 3
-            bearish_reasons.append("VWAP slope is rising against bearish price position")
+            bearish_reasons.append("VWAP slope is meaningfully rising against bearish position (-3)")
+        else:
+            bearish_reasons.append("VWAP slope is flat: no slope points awarded")
 
     # -------------------------------------------------------------------------
-    # 15M Supertrend — confirmation only.
+    # 4. FUTURES PREMIUM / DISCOUNT — explicit chart-aligned confirmation.
+    # -------------------------------------------------------------------------
+    basis_state, basis_points, basis_change = futures_premium_discount_state(
+        futures_3m,
+        spot_3m,
+        live_spot,
+    )
+
+    supportive_basis = False
+    if basis_state != "UNAVAILABLE":
+        if strong_bullish_futures:
+            supportive_basis = basis_state == "WIDENING_PREMIUM"
+            if supportive_basis:
+                bullish_score += 10
+                bullish_reasons.append("Futures premium is widening (+10)")
+            else:
+                bullish_score -= 5
+                bullish_reasons.append(f"LONG_BUILDUP lacks widening premium support ({basis_state}) (-5)")
+        elif strong_bearish_futures:
+            supportive_basis = basis_state == "DEEPENING_DISCOUNT"
+            if supportive_basis:
+                bearish_score += 10
+                bearish_reasons.append("Futures discount is deepening (+10)")
+            else:
+                bearish_score -= 5
+                bearish_reasons.append(f"SHORT_BUILDUP lacks deepening discount support ({basis_state}) (-5)")
+        elif weak_bullish_futures:
+            supportive_basis = basis_state in {"SHRINKING_PREMIUM", "NARROWING_DISCOUNT"}
+            if supportive_basis:
+                bullish_score += 5
+                bullish_reasons.append(f"SHORT_COVERING basis behavior supportive: {basis_state} (+5)")
+            else:
+                bullish_score -= 3
+                bullish_reasons.append(f"SHORT_COVERING basis behavior weak/not supportive: {basis_state} (-3)")
+        elif weak_bearish_futures:
+            supportive_basis = basis_state in {"SHRINKING_PREMIUM", "NARROWING_DISCOUNT", "FLAT_PREMIUM", "FLAT_DISCOUNT"}
+            if supportive_basis:
+                bearish_score += 5
+                bearish_reasons.append(f"LONG_UNWINDING basis behavior supportive: {basis_state} (+5)")
+            else:
+                bearish_score -= 3
+                bearish_reasons.append(f"LONG_UNWINDING basis behavior weak/not supportive: {basis_state} (-3)")
+
+    # -------------------------------------------------------------------------
+    # 5. 15M SUPERTREND — confirmation/context only.
     # -------------------------------------------------------------------------
     if latest_15["direction"] == 1:
         bullish_score += 5
-        bullish_reasons.append("15-minute Supertrend supports bullish continuation")
+        bullish_reasons.append("15-minute Supertrend supports bullish continuation (+5)")
     elif latest_15["direction"] == -1:
         bearish_score += 5
-        bearish_reasons.append("15-minute Supertrend supports bearish continuation")
+        bearish_reasons.append("15-minute Supertrend supports bearish continuation (+5)")
 
     # -------------------------------------------------------------------------
-    # Direction decision.
-    # Futures + VWAP are sufficient to identify an emerging move; OI inputs
-    # improve confidence but cannot completely suppress a fresh Futures regime
-    # transition.
+    # Direction decision. Strong/weak Futures hierarchy is retained.
     # -------------------------------------------------------------------------
     minimum_score = SIGNAL_THRESHOLD
     score_gap = abs(bullish_score - bearish_score)
@@ -2007,21 +2177,22 @@ def predictive_direction(
         )
 
     logger.info(
-        "Prediction scores: bullish=%.1f bearish=%.1f gap=%.1f | previous_futures=%s previous_direction=%s",
+        "Prediction scores: bullish=%.1f bearish=%.1f gap=%.1f | previous_futures=%s previous_direction=%s | basis_state=%s basis=%.2f change=%.2f",
         bullish_score,
         bearish_score,
         score_gap,
         previous_futures_state or "NONE",
         previous_direction or "NONE",
+        basis_state,
+        basis_points if math.isfinite(basis_points) else float("nan"),
+        basis_change if math.isfinite(basis_change) else float("nan"),
     )
 
     return (
         "NEUTRAL",
         "NEUTRAL",
         0.0,
-        [
-            "Current Futures/VWAP/OI evidence did not cross the predictive threshold."
-        ],
+        ["Current Futures/VWAP/OI/premium-discount evidence did not cross the predictive threshold."],
     )
 
 
@@ -2566,10 +2737,18 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
 
     # Persist every market snapshot, including neutral runs. This allows the
     # next scheduled run to detect and use regime transitions.
+    basis_state_snapshot, basis_points_snapshot, basis_change_snapshot = futures_premium_discount_state(
+        futures_vwap_candles,
+        spot_3m,
+        spot,
+    )
     current_snapshot = {
         "timestamp": now_ist().isoformat(),
         "nifty_spot": round(float(spot), 2),
         "futures_state": futures_state,
+        "futures_basis_state": basis_state_snapshot,
+        "futures_basis_points": round(float(basis_points_snapshot), 4) if math.isfinite(basis_points_snapshot) else None,
+        "futures_basis_change": round(float(basis_change_snapshot), 4) if math.isfinite(basis_change_snapshot) else None,
         "chain_bias": chain_bias,
         "chain_bias_score": round(float(chain_bias_score), 6),
         "change_oi_bias": change_bias,
@@ -2644,6 +2823,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         change_bias,
         spot,
         futures_vwap_candles,
+        spot_3m=spot_3m,
     )
 
     if not final_confirmed:
