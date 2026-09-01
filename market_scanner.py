@@ -130,6 +130,12 @@ STRUCTURE_LOOKBACK_15M = 6
 OPTION_MIN_DELTA = 0.35
 OPTION_MAX_DELTA = 0.85
 
+# BUY-ONLY option momentum guardrails. A strike must show positive premium
+# momentum before it can be selected or locked.
+BUY_OPTION_LOOKBACK = 6
+BUY_OPTION_MIN_CANDLES = 5
+BUY_OPTION_MIN_RETURN_PCT = 0.10
+
 MAX_SIGNAL_AGE_MINUTES = 15
 
 
@@ -1457,6 +1463,124 @@ def futures_regime(
 # OPTION CONTRACT SELECTION
 # =============================================================================
 
+def option_buying_momentum(
+    option: OptionCandidate,
+) -> tuple[bool, dict[str, Any]]:
+    """Hard buying-side filter for the selected option premium.
+
+    The scanner only recommends option buying. A correct NIFTY direction is
+    therefore insufficient if the selected option premium is already falling.
+    The option must show positive recent price momentum and a positive short
+    EMA trend. Long buildup or short covering in the option is acceptable.
+    """
+    try:
+        candles = get_intraday_candles(
+            option.instrument_key,
+            3,
+            max_candles=BUY_OPTION_LOOKBACK,
+            min_candles=BUY_OPTION_MIN_CANDLES,
+        )
+    except ScannerError as exc:
+        return False, {
+            "reason": f"option candles unavailable: {exc}",
+            "regime": "UNAVAILABLE",
+        }
+
+    closes = pd.to_numeric(candles["close"], errors="coerce")
+    if closes.isna().any():
+        closes = closes.dropna()
+
+    if len(closes) < BUY_OPTION_MIN_CANDLES:
+        return False, {
+            "reason": f"only {len(closes)} usable option candles",
+            "regime": "UNAVAILABLE",
+        }
+
+    latest = float(closes.iloc[-1])
+    previous = float(closes.iloc[-2])
+    lookback_close = float(closes.iloc[-BUY_OPTION_MIN_CANDLES])
+
+    ema5_series = closes.ewm(span=5, adjust=False).mean()
+    ema5 = float(ema5_series.iloc[-1])
+    ema5_prev = float(ema5_series.iloc[-2])
+
+    oi_latest = candles["oi"].iloc[-1]
+    oi_previous = candles["oi"].iloc[-2]
+    price_delta = latest - previous
+    oi_delta = (
+        float(oi_latest) - float(oi_previous)
+        if pd.notna(oi_latest) and pd.notna(oi_previous)
+        else 0.0
+    )
+
+    if price_delta > 0 and oi_delta > 0:
+        regime = "LONG_BUILDUP"
+    elif price_delta > 0 and oi_delta < 0:
+        regime = "SHORT_COVERING"
+    elif price_delta < 0 and oi_delta > 0:
+        regime = "SHORT_BUILDUP"
+    elif price_delta < 0 and oi_delta < 0:
+        regime = "LONG_UNWINDING"
+    else:
+        regime = "NEUTRAL"
+
+    multi_return_pct = (
+        (latest - lookback_close) / lookback_close * 100.0
+        if lookback_close > 0
+        else 0.0
+    )
+    ltp_vs_last_pct = (
+        (option.ltp - latest) / latest * 100.0
+        if latest > 0
+        else -100.0
+    )
+
+    premium_rising = price_delta > 0 and option.ltp >= latest
+    trend_positive = latest > lookback_close
+    ema_positive = latest >= ema5 and ema5 >= ema5_prev
+    regime_positive = regime in {"LONG_BUILDUP", "SHORT_COVERING"}
+
+    valid = (
+        premium_rising
+        and trend_positive
+        and ema_positive
+        and regime_positive
+        and multi_return_pct >= BUY_OPTION_MIN_RETURN_PCT
+        and ltp_vs_last_pct >= -0.50
+    )
+
+    reason = (
+        "buying-side option premium momentum confirmed"
+        if valid
+        else "option premium momentum/price action is not suitable for buying"
+    )
+
+    metrics = {
+        "reason": reason,
+        "regime": regime,
+        "latest_close": latest,
+        "previous_close": previous,
+        "ema5": ema5,
+        "ema5_prev": ema5_prev,
+        "multi_return_pct": multi_return_pct,
+        "ltp_vs_last_pct": ltp_vs_last_pct,
+    }
+
+    logger.info(
+        "Buy-side option check: %s regime=%s LTP=%.2f last3m=%.2f 5-bar=%.2f%% EMA5=%.2f EMA5_prev=%.2f valid=%s",
+        option.trading_symbol,
+        regime,
+        option.ltp,
+        latest,
+        multi_return_pct,
+        ema5,
+        ema5_prev,
+        valid,
+    )
+
+    return valid, metrics
+
+
 def select_directional_option(
     contracts: list[dict[str, Any]],
     chain: list[dict[str, Any]],
@@ -1471,8 +1595,9 @@ def select_directional_option(
     atm = nearest_atm_strike(spot, chain_strikes)
     step = strike_interval(chain_strikes)
 
-    # For bullish moves, buy ITM CE: ATM-1, then ATM-2.
-    # For bearish moves, buy ITM PE: ATM+1, then ATM+2.
+    # BUY-ONLY ITM selection.
+    # Bullish -> ATM-1 CE, then ATM-2 CE.
+    # Bearish -> ATM+1 PE, then ATM+2 PE.
     if direction == "BULLISH":
         candidates = [atm - step, atm - 2 * step]
         option_type = "CE"
@@ -1480,14 +1605,16 @@ def select_directional_option(
         candidates = [atm + step, atm + 2 * step]
         option_type = "PE"
 
+    # A locked strike must remain the exact strike; if its premium is no longer
+    # suitable for buying, do not silently switch to another strike.
     if preferred_strike is not None:
-        candidates = [float(preferred_strike)] + [
-            strike for strike in candidates
-            if float(strike) != float(preferred_strike)
-        ]
+        candidates = [float(preferred_strike)]
+
+    last_rejection = "No valid buy-side option candidate."
 
     for target_strike in candidates:
         if target_strike not in rows:
+            last_rejection = f"Strike {target_strike:.0f} not present in option chain."
             continue
 
         matches = [
@@ -1500,6 +1627,7 @@ def select_directional_option(
         ]
 
         if not matches:
+            last_rejection = f"No {option_type} contract found at {target_strike:.0f}."
             continue
 
         contract = matches[0]
@@ -1508,14 +1636,10 @@ def select_directional_option(
         delta = market["delta"]
 
         if ltp <= 0 or delta is None:
+            last_rejection = f"Invalid LTP/delta at {target_strike:.0f}."
             continue
 
-        logger.info(
-            "ITM option selected: direction=%s ATM=%.0f strike=%.0f type=%s LTP=%.2f Delta=%.3f",
-            direction, atm, target_strike, option_type, ltp, float(delta),
-        )
-
-        return OptionCandidate(
+        candidate = OptionCandidate(
             instrument_key=contract["instrument_key"],
             trading_symbol=contract["trading_symbol"],
             option_type=option_type,
@@ -1529,9 +1653,28 @@ def select_directional_option(
             iv=float(market["iv"] or 0),
         )
 
-    raise ScannerError(
-        f"No valid ITM {option_type} contract found for ATM={atm:.0f}."
-    )
+        valid_buy, buy_metrics = option_buying_momentum(candidate)
+        if not valid_buy:
+            last_rejection = (
+                f"{candidate.trading_symbol} rejected for BUY-ONLY momentum: {buy_metrics.get('reason', 'unsuitable premium action')}"
+            )
+            logger.info(last_rejection)
+            continue
+
+        logger.info(
+            "ITM BUY option selected: direction=%s ATM=%.0f strike=%.0f type=%s LTP=%.2f Delta=%.3f",
+            direction,
+            atm,
+            target_strike,
+            option_type,
+            ltp,
+            float(delta),
+        )
+
+        return candidate
+
+    raise ScannerError(last_rejection)
+
 
 # =============================================================================
 # OPTION EXTENSION FILTER
@@ -1588,6 +1731,69 @@ def option_price_oi_regime(option: OptionCandidate) -> str:
             exc,
         )
         return "UNAVAILABLE"
+
+
+def final_entry_direction_confirmation(
+    direction: str,
+    futures_state: str,
+    chain_bias: str,
+    change_oi_bias_value: str,
+    live_spot: float,
+    futures_vwap_candles: pd.DataFrame,
+) -> tuple[bool, list[str]]:
+    """Hard entry gate: Futures + OI + VWAP must agree before strike selection."""
+    valid_vwap = calculate_vwap(futures_vwap_candles).dropna()
+    if len(valid_vwap) < 2:
+        return False, ["Session VWAP unavailable for final entry confirmation."]
+
+    session_vwap = float(valid_vwap.iloc[-1])
+    previous_vwap = float(valid_vwap.iloc[-2])
+    vwap_slope = session_vwap - previous_vwap
+    above_vwap = float(live_spot) > session_vwap
+
+    # SHORT_COVERING is contextual: bullish only above VWAP, bearish only below VWAP.
+    if futures_state == "LONG_BUILDUP":
+        futures_direction = "BULLISH"
+    elif futures_state in {"SHORT_BUILDUP", "LONG_UNWINDING"}:
+        futures_direction = "BEARISH"
+    elif futures_state == "SHORT_COVERING":
+        futures_direction = "BULLISH" if above_vwap else "BEARISH"
+    else:
+        futures_direction = "NEUTRAL"
+
+    oi_direction = (
+        "BULLISH"
+        if chain_bias == "BULLISH" or change_oi_bias_value == "BULLISH"
+        else "BEARISH"
+        if chain_bias == "BEARISH" or change_oi_bias_value == "BEARISH"
+        else "NEUTRAL"
+    )
+    vwap_direction = "BULLISH" if above_vwap else "BEARISH"
+
+    futures_ok = futures_direction == direction
+    oi_ok = oi_direction == direction
+    vwap_ok = vwap_direction == direction
+
+    logger.info(
+        "FINAL ENTRY CONFIRMATION: direction=%s futures=%s OI=%s VWAP=%s | FUT_OK=%s OI_OK=%s VWAP_OK=%s | VWAP=%.2f slope=%.4f",
+        direction,
+        futures_direction,
+        oi_direction,
+        vwap_direction,
+        futures_ok,
+        oi_ok,
+        vwap_ok,
+        session_vwap,
+        vwap_slope,
+    )
+
+    reasons = [
+        f"Futures={futures_state} interpreted as {futures_direction}: {'OK' if futures_ok else 'FAIL'}",
+        f"OI=localized:{chain_bias}/changeOI:{change_oi_bias_value} interpreted as {oi_direction}: {'OK' if oi_ok else 'FAIL'}",
+        f"NIFTY={live_spot:.2f} vs VWAP={session_vwap:.2f} interpreted as {vwap_direction}: {'OK' if vwap_ok else 'FAIL'}",
+    ]
+
+    return futures_ok and oi_ok and vwap_ok, reasons
 
 
 # =============================================================================
@@ -2359,7 +2565,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
     )
 
     # Persist every market snapshot, including neutral runs. This allows the
-    # next 3-minute run to detect and use regime transitions.
+    # next scheduled run to detect and use regime transitions.
     current_snapshot = {
         "timestamp": now_ist().isoformat(),
         "nifty_spot": round(float(spot), 2),
@@ -2431,6 +2637,19 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         )
         return None
 
+    final_confirmed, confirmation_reasons = final_entry_direction_confirmation(
+        direction,
+        futures_state,
+        chain_bias,
+        change_bias,
+        spot,
+        futures_vwap_candles,
+    )
+
+    if not final_confirmed:
+        logger.info("No strike selected: final Futures + OI + VWAP confirmation failed.")
+        return None
+
     # -------------------------------------------------------------------------
     # Strike lock
     #
@@ -2479,23 +2698,6 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         preferred_strike=preferred_strike,
     )
 
-    # If this is a new predictive setup, lock the chosen strike immediately.
-    # This records the strike at the moment the Futures/OI/VWAP prediction is
-    # detected, rather than after the market has already moved.
-    if preferred_strike is None:
-        state["locked_direction"] = direction
-        state["locked_strike"] = option.strike
-        state["locked_option_type"] = option.option_type
-        state["locked_timestamp"] = now_ist().isoformat()
-        save_state(state)
-
-        logger.info(
-            "NEW predictive strike locked: %s %.0f %s.",
-            direction,
-            option.strike,
-            option.option_type,
-        )
-
     logger.info(
         "Candidate option: %s | strike=%.0f | LTP=%.2f | OI=%.0f | prev_OI=%.0f",
         option.trading_symbol,
@@ -2523,6 +2725,29 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         logger.info("Pre-breakout validation rejected.")
         return None
 
+    option_buy_valid, option_buy_metrics = option_buying_momentum(option)
+    if not option_buy_valid:
+        logger.info(
+            "BUY-ONLY strike rejected before lock: %s",
+            option_buy_metrics.get("reason", "unsuitable option premium"),
+        )
+        return None
+
+    # Lock only after all directional and option-premium checks pass.
+    if preferred_strike is None:
+        state["locked_direction"] = direction
+        state["locked_strike"] = option.strike
+        state["locked_option_type"] = option.option_type
+        state["locked_timestamp"] = now_ist().isoformat()
+        save_state(state)
+
+        logger.info(
+            "NEW predictive BUY strike locked: %s %.0f %s.",
+            direction,
+            option.strike,
+            option.option_type,
+        )
+
     target_1, target_2, stop_loss = create_targets(
         option,
         spot,
@@ -2538,7 +2763,10 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
             f"Localized option OI score={chain_bias_score:.3f}.",
             f"Upstox Change-OI score={change_bias_score:.3f}.",
             f"Selected option price/OI confirmation={option_regime}.",
+            f"Final entry confirmation: {'; '.join(confirmation_reasons)}",
+            f"Buy-side premium momentum: {option_buy_metrics.get('reason', '')}; regime={option_buy_metrics.get('regime', '')}.",
             "Prediction trigger = Futures + localized OI/Change-OI + VWAP.",
+            "BUY-ONLY rule: option must show positive premium momentum before selection/lock.",
             "3-minute Supertrend is confirmation/target framework, not entry trigger.",
             "ITM strike is locked at first predictive detection to avoid chasing ATM.",
         ]
