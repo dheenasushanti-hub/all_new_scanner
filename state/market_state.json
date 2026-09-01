@@ -1,5 +1,18 @@
 {
   "market_snapshot": {
+    "timestamp": "2026-09-01T15:11:14.438633+05:30",
+    "nifty_spot": 23973.85,
+    "futures_state": "SHORT_BUILDUP",
+    "chain_bias": "BEARISH",
+    "chain_bias_score": -0.143646,
+    "change_oi_bias": "BEARISH",
+    "change_oi_score": -0.389107,
+    "vwap": 24159.1154,
+    "prediction_direction": "BEARISH",
+    "prediction_regime": "BEARISH_PREDICTIVE",
+    "prediction_confidence": 100.0
+  },
+  "previous_market_snapshot": {
     "timestamp": "2026-09-01T15:06:10.063230+05:30",
     "nifty_spot": 23980.5,
     "futures_state": "SHORT_BUILDUP",
@@ -8,19 +21,6 @@
     "change_oi_bias": "BEARISH",
     "change_oi_score": -0.405113,
     "vwap": 24159.9662,
-    "prediction_direction": "BEARISH",
-    "prediction_regime": "BEARISH_PREDICTIVE",
-    "prediction_confidence": 100.0
-  },
-  "previous_market_snapshot": {
-    "timestamp": "2026-09-01T15:01:16.657538+05:30",
-    "nifty_spot": 23975.85,
-    "futures_state": "LONG_UNWINDING",
-    "chain_bias": "BEARISH",
-    "chain_bias_score": -0.503424,
-    "change_oi_bias": "BEARISH",
-    "change_oi_score": -0.423349,
-    "vwap": 24161.885,
     "prediction_direction": "BEARISH",
     "prediction_regime": "BEARISH_PREDICTIVE",
     "prediction_confidence": 100.0
