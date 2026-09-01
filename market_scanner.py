@@ -589,10 +589,11 @@ def get_intraday_candles(
         safe="",
     )
 
-    # Fetch a larger history window so Supertrend(10,3)
-    # always has sufficient candles.
+    # Only fetch the current day plus the previous calendar day.
+    # This is enough to seed the indicators while avoiding the old
+    # 10-day / hundreds-of-candles download on every 3-minute run.
     to_date = datetime.now(IST).date()
-    from_date = to_date - pd.Timedelta(days=10)
+    from_date = to_date - pd.Timedelta(days=1)
 
     url = (
     f"{HISTORICAL_CANDLE_URL}/"
@@ -688,8 +689,15 @@ def get_intraday_candles(
             f"need at least {min_required}."
         )
 
+    # Keep only a compact recent window for downstream calculations.
+    # The API may return more candles for the requested dates; trimming here
+    # keeps the scanner lightweight and prevents unnecessary processing.
+    max_candles = 30 if interval_minutes == 3 else 25
+    if len(df) > max_candles:
+        df = df.tail(max_candles).reset_index(drop=True)
+
     logger.info(
-        "Loaded %d %d-minute candles for %s",
+        "Loaded %d recent %d-minute candles for %s",
         len(df),
         interval_minutes,
         instrument_key,
