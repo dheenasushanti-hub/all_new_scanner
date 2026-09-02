@@ -568,7 +568,7 @@ def get_current_week_contracts() -> list[dict[str, Any]]:
     exact_expiry = get_active_nifty_expiry()
 
     logger.info(
-        "Using exact NIFTY weekly Tuesday expiry for option contracts: %s",
+        "Using exact dynamically selected NIFTY weekly expiry for option contracts: %s",
         exact_expiry,
     )
 
@@ -584,7 +584,7 @@ def get_current_week_contracts() -> list[dict[str, Any]]:
 
     if not isinstance(contracts, list) or not contracts:
         raise ScannerError(
-            "No NIFTY option contracts returned for Tuesday expiry "
+            "No NIFTY option contracts returned for selected expiry "
             f"{exact_expiry}."
         )
 
@@ -1055,7 +1055,8 @@ def get_active_nifty_expiry() -> str:
         )
 
     today = now_ist().date()
-    expiries = set()
+    weekly_expiries = set()
+    all_expiries = set()
 
     for contract in contracts:
         if not isinstance(contract, dict):
@@ -1071,8 +1072,15 @@ def get_active_nifty_expiry() -> str:
         except (TypeError, ValueError):
             continue
 
-        if expiry_date >= today:
-            expiries.add(expiry_date)
+        if expiry_date < today:
+            continue
+
+        all_expiries.add(expiry_date)
+
+        if bool(contract.get("weekly")):
+            weekly_expiries.add(expiry_date)
+
+    expiries = weekly_expiries or all_expiries
 
     if not expiries:
         raise ScannerError(
@@ -1383,50 +1391,71 @@ def oi_structure(
 
 
 # =============================================================================
-# OI CHANGE API
+# OI CHANGE FROM LIVE OPTION CHAIN
 # =============================================================================
 
-def get_change_oi() -> dict[str, Any]:
+def get_change_oi_from_chain(
+    chain: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Calculate current-session Change-in-OI directly from the live option-chain
+    market_data. Upstox exposes both `oi` and `prev_oi` on each option, so this
+    avoids relying on a separate aggregate endpoint during every scan.
+    """
+    total_call_change = 0.0
+    total_put_change = 0.0
+    strike_changes: list[dict[str, float]] = []
+    valid_rows = 0
 
-    current_date = now_ist().strftime(
-        "%Y-%m-%d"
+    for row in chain:
+        if not isinstance(row, dict):
+            continue
+
+        try:
+            strike_value = float(row.get("strike_price"))
+        except (TypeError, ValueError):
+            continue
+
+        call = option_market_data(row, "CE")
+        put = option_market_data(row, "PE")
+
+        try:
+            call_oi = float(call.get("oi") or 0.0)
+            call_prev_oi = float(call.get("prev_oi") or 0.0)
+            put_oi = float(put.get("oi") or 0.0)
+            put_prev_oi = float(put.get("prev_oi") or 0.0)
+        except (TypeError, ValueError):
+            continue
+
+        call_change = call_oi - call_prev_oi
+        put_change = put_oi - put_prev_oi
+        total_call_change += call_change
+        total_put_change += put_change
+        strike_changes.append({
+            "strike_price": strike_value,
+            "call_change_oi": call_change,
+            "put_change_oi": put_change,
+        })
+        valid_rows += 1
+
+    if valid_rows == 0:
+        raise ScannerError(
+            "No valid current/previous OI values were found in the option chain."
+        )
+
+    logger.info(
+        "Chain Change-OI: rows=%d total_call_change=%+.0f total_put_change=%+.0f",
+        valid_rows,
+        total_call_change,
+        total_put_change,
     )
 
-    try:
+    return {
+        "total_call_change_oi": total_call_change,
+        "total_put_change_oi": total_put_change,
+        "call_put_oi_data_list": strike_changes,
+    }
 
-        payload = api_get(
-            CHANGE_OI_URL,
-            {
-                "instrument_key": NIFTY_KEY,
-                "expiry": "current_week",
-                "date": current_date,
-                "interval": 1,
-            },
-        )
-
-        data = payload.get(
-            "data",
-            {}
-        )
-
-        if not isinstance(
-            data,
-            dict,
-        ):
-            raise ScannerError(
-                "Invalid Change-in-OI data."
-            )
-
-        return data
-
-    except ScannerError as exc:
-
-        logger.warning(
-            "Change-in-OI unavailable: %s",
-            exc,
-        )
-
-        return {}
 
 
 def change_oi_bias(
@@ -2808,7 +2837,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         spot,
     )
 
-    change_data = get_change_oi()
+    change_data = get_change_oi_from_chain(chain)
     change_bias, change_bias_score = change_oi_bias(change_data)
 
     direction, regime, confidence, reasons = predictive_direction(
