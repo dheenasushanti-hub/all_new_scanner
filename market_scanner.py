@@ -36,6 +36,7 @@ import smtplib
 import sys
 import traceback
 import urllib.parse
+import time as time_module
 from dataclasses import dataclass, asdict
 from datetime import datetime, time
 from email.mime.multipart import MIMEMultipart
@@ -43,6 +44,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
+
 
 import numpy as np
 import pandas as pd
@@ -294,44 +296,103 @@ def api_headers() -> dict[str, str]:
 def api_get(
     url: str,
     params: Optional[dict[str, Any]] = None,
+    retries: int = 3,
 ) -> dict[str, Any]:
 
-    try:
-        response = requests.get(
-            url,
-            params=params,
-            headers=api_headers(),
-            timeout=REQUEST_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        raise ScannerError(
-            f"Network request failed: {exc}"
-        ) from exc
+    last_error = None
 
-    if response.status_code != 200:
-        raise ScannerError(
+    for attempt in range(1, retries + 1):
+
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                headers=api_headers(),
+                timeout=REQUEST_TIMEOUT,
+            )
+
+        except requests.RequestException as exc:
+
+            last_error = f"Network request failed: {exc}"
+
+            if attempt < retries:
+                wait_seconds = attempt * 2
+
+                logger.warning(
+                    "Request failed. Retry %d/%d in %d seconds: %s",
+                    attempt,
+                    retries,
+                    wait_seconds,
+                    last_error,
+                )
+
+                time_module.sleep(wait_seconds)
+                continue
+
+            raise ScannerError(last_error) from exc
+
+        if response.status_code == 200:
+
+            try:
+                payload = response.json()
+
+            except ValueError as exc:
+                raise ScannerError(
+                    "Upstox returned invalid JSON."
+                ) from exc
+
+            if not isinstance(payload, dict):
+                raise ScannerError(
+                    "Unexpected Upstox response structure."
+                )
+
+            if payload.get("status") == "error":
+                raise ScannerError(
+                    json.dumps(payload)[:1500]
+                )
+
+            return payload
+
+        last_error = (
             f"Upstox HTTP {response.status_code}: "
             f"{response.text[:1000]}"
         )
 
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise ScannerError(
-            "Upstox returned invalid JSON."
-        ) from exc
+        transient_error = response.status_code in {
+            500,
+            502,
+            503,
+            504,
+        }
 
-    if not isinstance(payload, dict):
-        raise ScannerError(
-            "Unexpected Upstox response structure."
+        logger.warning(
+            "Upstox request failed | attempt=%d/%d | "
+            "status=%s | url=%s | params=%s | response=%s",
+            attempt,
+            retries,
+            response.status_code,
+            url,
+            params,
+            response.text[:1000],
         )
 
-    if payload.get("status") == "error":
-        raise ScannerError(
-            json.dumps(payload)[:1500]
-        )
+        if transient_error and attempt < retries:
 
-    return payload
+            wait_seconds = attempt * 2
+
+            logger.info(
+                "Transient Upstox server error. Retrying in %d seconds...",
+                wait_seconds,
+            )
+
+            time_module.sleep(wait_seconds)
+            continue
+
+        raise ScannerError(last_error)
+
+    raise ScannerError(
+        last_error or "Unknown Upstox API error."
+    )
 
 # =============================================================================
 # MARKET HOLIDAY
@@ -1096,9 +1157,10 @@ def get_active_sensex_expiry() -> str:
 
 def get_chain() -> list[dict[str, Any]]:
     """
-    Load the option chain using the nearest active expiry discovered directly
-    from Upstox contract metadata.
+    Load the SENSEX option chain using a dynamically discovered
+    active expiry.
     """
+
     exact_expiry = get_active_sensex_expiry()
 
     logger.info(
@@ -1106,19 +1168,62 @@ def get_chain() -> list[dict[str, Any]]:
         exact_expiry,
     )
 
-    payload = api_get(
-        OPTION_CHAIN_URL,
+    # Verify the selected expiry through the option contracts endpoint
+    # before requesting the option chain.
+    contracts_payload = api_get(
+        OPTION_CONTRACT_URL,
         {
             "instrument_key": SENSEX_KEY,
             "expiry_date": exact_expiry,
         },
     )
 
+    contracts = contracts_payload.get("data", [])
+
+    if not isinstance(contracts, list) or not contracts:
+
+        raise ScannerError(
+            "Selected SENSEX expiry was discovered but no active option "
+            f"contracts were returned for expiry {exact_expiry}."
+        )
+
+    returned_expiries = sorted(
+        {
+            str(contract.get("expiry", "")).strip()[:10]
+            for contract in contracts
+            if isinstance(contract, dict)
+            and contract.get("expiry")
+        }
+    )
+
+    logger.info(
+        "Verified SENSEX option contracts: expiry=%s | contracts=%d",
+        exact_expiry,
+        len(contracts),
+    )
+
+    if exact_expiry not in returned_expiries:
+
+        raise ScannerError(
+            f"Expiry validation failed. Requested={exact_expiry}, "
+            f"returned={returned_expiries}"
+        )
+
+    payload = api_get(
+        OPTION_CHAIN_URL,
+        {
+            "instrument_key": SENSEX_KEY,
+            "expiry_date": exact_expiry,
+        },
+        retries=4,
+    )
+
     data = payload.get("data", [])
 
     if not isinstance(data, list) or not data:
+
         raise ScannerError(
-            "SENSEX option chain is empty for dynamically selected expiry "
+            "SENSEX option chain is empty for expiry "
             f"{exact_expiry}."
         )
 
