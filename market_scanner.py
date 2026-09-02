@@ -1305,7 +1305,52 @@ def market_regime(
         sideways_score,
     )
 
-    if sideways_score >= 5:
+# -----------------------------------------------------------------
+# STRONG SIDEWAYS / RANGE DETECTION
+# -----------------------------------------------------------------
+
+# The market can be sideways even if the 3-minute candles show
+# temporary directional movement. Give greater importance to the
+# 15-minute net movement because it represents the broader intraday
+# structure.
+
+strong_15m_compression = (
+    compressed_15m
+    and low_net_move_15m
+)
+
+timeframe_conflict = (
+    structure_3m in {"BULLISH", "BEARISH"}
+    and structure_15m in {"BULLISH", "BEARISH"}
+    and structure_3m != structure_15m
+)
+
+# Strong sideways condition:
+#
+# 1. 15-minute market remains compressed
+# 2. Net movement is small
+# 3. 3m and 15m disagree
+#
+# This prevents temporary 3-minute movement from being mistaken
+# for a genuine intraday trend.
+
+if (
+    strong_15m_compression
+    and timeframe_conflict
+):
+    sideways_score = max(sideways_score, 5)
+
+    reasons.append(
+        "Strong sideways condition: compressed 15-minute range "
+        "with minimal net movement and conflicting 3m/15m structure."
+    )
+
+
+# -----------------------------------------------------------------
+# NORMAL SIDEWAYS CLASSIFICATION
+# -----------------------------------------------------------------
+
+  if sideways_score >= 5:
 
         reasons.extend([
             "Market classified as SIDEWAYS/RANGE.",
