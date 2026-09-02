@@ -146,6 +146,27 @@ FUTURES_REGIME_MIN_OI_CHANGE = 1.0
 
 MAX_SIGNAL_AGE_MINUTES = 15
 
+# =============================================================================
+# SIDEWAYS / RANGE MARKET FILTER
+# =============================================================================
+
+SIDEWAYS_LOOKBACK_3M = 12
+SIDEWAYS_LOOKBACK_15M = 6
+
+# Total high-low range relative to ATR.
+SIDEWAYS_MAX_RANGE_ATR_3M = 3.0
+SIDEWAYS_MAX_RANGE_ATR_15M = 2.5
+
+# Net movement from first close to latest close relative to ATR.
+SIDEWAYS_MAX_NET_MOVE_ATR_3M = 0.75
+SIDEWAYS_MAX_NET_MOVE_ATR_15M = 0.75
+
+# Number of directional Supertrend flips allowed inside the lookback.
+SIDEWAYS_MAX_SUPERTREND_FLIPS = 2
+
+# OI score near zero means positioning is balanced.
+SIDEWAYS_CHAIN_OI_SCORE = 0.05
+SIDEWAYS_CHANGE_OI_SCORE = 0.10
 
 # =============================================================================
 # ENDPOINTS
@@ -1050,6 +1071,262 @@ def structure_state(
 
     return "NEUTRAL"
 
+def market_regime(
+    spot_3m: pd.DataFrame,
+    spot_15m: pd.DataFrame,
+    chain_bias: str,
+    chain_bias_score: float,
+    change_oi_bias_value: str,
+    change_oi_score: float,
+) -> tuple[str, list[str]]:
+
+    """
+    Classify the current market as TRENDING or SIDEWAYS.
+
+    The goal is to prevent a single Futures regime + VWAP position
+    from manufacturing a directional prediction while price action
+    is actually compressed inside a range.
+    """
+
+    reasons: list[str] = []
+
+    if (
+        len(spot_3m) < SIDEWAYS_LOOKBACK_3M
+        or len(spot_15m) < SIDEWAYS_LOOKBACK_15M
+    ):
+        return (
+            "UNKNOWN",
+            ["Insufficient candles for sideways/range classification."]
+        )
+
+    recent_3m = spot_3m.tail(
+        SIDEWAYS_LOOKBACK_3M
+    ).copy()
+
+    recent_15m = spot_15m.tail(
+        SIDEWAYS_LOOKBACK_15M
+    ).copy()
+
+    latest_3m = recent_3m.iloc[-1]
+    latest_15m = recent_15m.iloc[-1]
+
+    atr_3m = float(latest_3m.get("atr", np.nan))
+    atr_15m = float(latest_15m.get("atr", np.nan))
+
+    if (
+        not math.isfinite(atr_3m)
+        or not math.isfinite(atr_15m)
+        or atr_3m <= 0
+        or atr_15m <= 0
+    ):
+        return (
+            "UNKNOWN",
+            ["ATR unavailable for sideways/range classification."]
+        )
+
+    # -------------------------------------------------------------
+    # 3-minute range measurements
+    # -------------------------------------------------------------
+
+    range_3m = float(
+        recent_3m["high"].max()
+        - recent_3m["low"].min()
+    )
+
+    net_move_3m = abs(
+        float(recent_3m["close"].iloc[-1])
+        - float(recent_3m["close"].iloc[0])
+    )
+
+    range_atr_3m = range_3m / atr_3m
+    net_move_atr_3m = net_move_3m / atr_3m
+
+    # -------------------------------------------------------------
+    # 15-minute range measurements
+    # -------------------------------------------------------------
+
+    range_15m = float(
+        recent_15m["high"].max()
+        - recent_15m["low"].min()
+    )
+
+    net_move_15m = abs(
+        float(recent_15m["close"].iloc[-1])
+        - float(recent_15m["close"].iloc[0])
+    )
+
+    range_atr_15m = range_15m / atr_15m
+    net_move_atr_15m = net_move_15m / atr_15m
+
+    # -------------------------------------------------------------
+    # Supertrend flip count
+    # -------------------------------------------------------------
+
+    direction_3m = (
+        pd.to_numeric(
+            recent_3m["direction"],
+            errors="coerce"
+        )
+        .dropna()
+        .astype(int)
+    )
+
+    direction_15m = (
+        pd.to_numeric(
+            recent_15m["direction"],
+            errors="coerce"
+        )
+        .dropna()
+        .astype(int)
+    )
+
+    flips_3m = int(
+        direction_3m.ne(
+            direction_3m.shift()
+        ).sum() - 1
+    ) if len(direction_3m) > 1 else 0
+
+    flips_15m = int(
+        direction_15m.ne(
+            direction_15m.shift()
+        ).sum() - 1
+    ) if len(direction_15m) > 1 else 0
+
+    # -------------------------------------------------------------
+    # Price structure
+    # -------------------------------------------------------------
+
+    structure_3m = structure_state(
+        recent_3m,
+        min(
+            STRUCTURE_LOOKBACK_3M,
+            len(recent_3m)
+        ),
+    )
+
+    structure_15m = structure_state(
+        recent_15m,
+        min(
+            STRUCTURE_LOOKBACK_15M,
+            len(recent_15m)
+        ),
+    )
+
+    # -------------------------------------------------------------
+    # Sideways conditions
+    # -------------------------------------------------------------
+
+    compressed_3m = (
+        range_atr_3m <= SIDEWAYS_MAX_RANGE_ATR_3M
+    )
+
+    compressed_15m = (
+        range_atr_15m <= SIDEWAYS_MAX_RANGE_ATR_15M
+    )
+
+    low_net_move_3m = (
+        net_move_atr_3m <= SIDEWAYS_MAX_NET_MOVE_ATR_3M
+    )
+
+    low_net_move_15m = (
+        net_move_atr_15m <= SIDEWAYS_MAX_NET_MOVE_ATR_15M
+    )
+
+    unstable_3m = (
+        flips_3m >= SIDEWAYS_MAX_SUPERTREND_FLIPS
+    )
+
+    unstable_15m = (
+        flips_15m >= SIDEWAYS_MAX_SUPERTREND_FLIPS
+    )
+
+    oi_balanced = (
+        abs(float(chain_bias_score))
+        <= SIDEWAYS_CHAIN_OI_SCORE
+        and abs(float(change_oi_score))
+        <= SIDEWAYS_CHANGE_OI_SCORE
+    )
+
+    neutral_structure = (
+        structure_3m == "NEUTRAL"
+        or structure_15m == "NEUTRAL"
+        or structure_3m != structure_15m
+    )
+
+    sideways_score = 0
+
+    if compressed_3m:
+        sideways_score += 1
+
+    if low_net_move_3m:
+        sideways_score += 1
+
+    if compressed_15m:
+        sideways_score += 1
+
+    if low_net_move_15m:
+        sideways_score += 1
+
+    if unstable_3m:
+        sideways_score += 1
+
+    if unstable_15m:
+        sideways_score += 1
+
+    if oi_balanced:
+        sideways_score += 2
+
+    if neutral_structure:
+        sideways_score += 1
+
+    logger.info(
+        "Market regime check: "
+        "3m_range_ATR=%.2f "
+        "3m_net_ATR=%.2f "
+        "15m_range_ATR=%.2f "
+        "15m_net_ATR=%.2f "
+        "3m_flips=%d "
+        "15m_flips=%d "
+        "structure_3m=%s "
+        "structure_15m=%s "
+        "chain_OI=%.3f "
+        "change_OI=%.3f "
+        "sideways_score=%d",
+        range_atr_3m,
+        net_move_atr_3m,
+        range_atr_15m,
+        net_move_atr_15m,
+        flips_3m,
+        flips_15m,
+        structure_3m,
+        structure_15m,
+        float(chain_bias_score),
+        float(change_oi_score),
+        sideways_score,
+    )
+
+    if sideways_score >= 5:
+
+        reasons.extend([
+            "Market classified as SIDEWAYS/RANGE.",
+            f"3m range={range_atr_3m:.2f} ATR, net move={net_move_atr_3m:.2f} ATR.",
+            f"15m range={range_atr_15m:.2f} ATR, net move={net_move_atr_15m:.2f} ATR.",
+            f"3m structure={structure_3m}, 15m structure={structure_15m}.",
+            f"Supertrend flips: 3m={flips_3m}, 15m={flips_15m}.",
+            f"OI positioning: localized={chain_bias}, Change-OI={change_oi_bias_value}.",
+        ])
+
+        return "SIDEWAYS", reasons
+
+    reasons.extend([
+        "Market classified as TRENDING/EXPANDING.",
+        f"3m range={range_atr_3m:.2f} ATR, net move={net_move_atr_3m:.2f} ATR.",
+        f"15m range={range_atr_15m:.2f} ATR, net move={net_move_atr_15m:.2f} ATR.",
+        f"3m structure={structure_3m}, 15m structure={structure_15m}.",
+    ])
+
+    return "TRENDING", reasons
+      
 
 def recent_swing_high(
     df: pd.DataFrame,
@@ -2135,7 +2412,9 @@ def predictive_direction(
     spot_3m: pd.DataFrame,
     spot_15m: pd.DataFrame,
     chain_bias: str,
+    chain_bias_score: float,
     change_oi_bias_value: str,
+    change_oi_score: float,
     futures_state: str,
     live_spot: float,
     futures_3m: Optional[pd.DataFrame] = None,
