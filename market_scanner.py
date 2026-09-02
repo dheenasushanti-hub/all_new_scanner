@@ -764,7 +764,7 @@ def calculate_atr(
     return true_range.ewm(
         alpha=1 / period,
         adjust=False,
-        min_periods=period,
+        min_periods=1,
     ).mean()
 
 
