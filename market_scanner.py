@@ -821,16 +821,16 @@ def calculate_supertrend(
     )
 
       if result.empty:
-          raise ScannerError(
-              "Unable to calculate Supertrend: no candles available."
-          )
+      raise ScannerError(
+      "Unable to calculate Supertrend: no candles available."
+       )
       
       first_valid = result["atr"].first_valid_index()
       
       if first_valid is None:
-          raise ScannerError(
-              f"Unable to calculate Supertrend: ATR contains no valid values "
-              f"(candles={len(result)}, period={period})."
+      raise ScannerError(
+       f"Unable to calculate Supertrend: ATR contains no valid values "
+       f"(candles={len(result)}, period={period})."
           )
 
     start = result.index.get_loc(
