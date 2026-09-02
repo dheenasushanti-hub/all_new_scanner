@@ -1350,7 +1350,7 @@ if (
 # NORMAL SIDEWAYS CLASSIFICATION
 # -----------------------------------------------------------------
 
-  if sideways_score >= 5:
+if sideways_score >= 5:
 
         reasons.extend([
             "Market classified as SIDEWAYS/RANGE.",
