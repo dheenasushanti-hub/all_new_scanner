@@ -1352,25 +1352,50 @@ if (
 
 if sideways_score >= 5:
 
-        reasons.extend([
-            "Market classified as SIDEWAYS/RANGE.",
-            f"3m range={range_atr_3m:.2f} ATR, net move={net_move_atr_3m:.2f} ATR.",
-            f"15m range={range_atr_15m:.2f} ATR, net move={net_move_atr_15m:.2f} ATR.",
-            f"3m structure={structure_3m}, 15m structure={structure_15m}.",
-            f"Supertrend flips: 3m={flips_3m}, 15m={flips_15m}.",
-            f"OI positioning: localized={chain_bias}, Change-OI={change_oi_bias_value}.",
-        ])
-
-        return "SIDEWAYS", reasons
-
     reasons.extend([
-        "Market classified as TRENDING/EXPANDING.",
-        f"3m range={range_atr_3m:.2f} ATR, net move={net_move_atr_3m:.2f} ATR.",
-        f"15m range={range_atr_15m:.2f} ATR, net move={net_move_atr_15m:.2f} ATR.",
-        f"3m structure={structure_3m}, 15m structure={structure_15m}.",
+        "Market classified as SIDEWAYS/RANGE.",
+        (
+            f"3m range={range_atr_3m:.2f} ATR, "
+            f"net move={net_move_atr_3m:.2f} ATR."
+        ),
+        (
+            f"15m range={range_atr_15m:.2f} ATR, "
+            f"net move={net_move_atr_15m:.2f} ATR."
+        ),
+        (
+            f"3m structure={structure_3m}, "
+            f"15m structure={structure_15m}."
+        ),
+        (
+            f"Supertrend flips: "
+            f"3m={flips_3m}, 15m={flips_15m}."
+        ),
+        (
+            f"OI positioning: localized={chain_bias}, "
+            f"Change-OI={change_oi_bias_value}."
+        ),
     ])
 
-    return "TRENDING", reasons
+    return "SIDEWAYS", reasons
+
+
+reasons.extend([
+    "Market classified as TRENDING/EXPANDING.",
+    (
+        f"3m range={range_atr_3m:.2f} ATR, "
+        f"net move={net_move_atr_3m:.2f} ATR."
+    ),
+    (
+        f"15m range={range_atr_15m:.2f} ATR, "
+        f"net move={net_move_atr_15m:.2f} ATR."
+    ),
+    (
+        f"3m structure={structure_3m}, "
+        f"15m structure={structure_15m}."
+    ),
+])
+
+return "TRENDING", reasons
       
 
 def recent_swing_high(
