@@ -1,10 +1,10 @@
 """
-NIFTY Predictive Options Market Scanner
+SENSEX Predictive Options Market Scanner
 
 Strategy:
-- NIFTY 3-minute and 15-minute Supertrend: (10, 3)
+- SENSEX 3-minute and 15-minute Supertrend: (10, 3)
 - Full current-session VWAP + price structure
-- Dynamic current-month NIFTY futures discovery
+- Dynamic current-month SENSEX futures discovery
 - Futures price/OI regime
 - Current-week option-chain OI / previous OI
 - Strike-level CE/PE OI differential with proximity weighting
@@ -57,9 +57,9 @@ IST = ZoneInfo("Asia/Kolkata")
 
 BASE_URL = "https://api.upstox.com"
 
-NIFTY_KEY = os.getenv(
-    "NIFTY_INSTRUMENT_KEY",
-    "NSE_INDEX|Nifty 50",
+SENSEX_KEY = os.getenv(
+    "SENSEX_INSTRUMENT_KEY",
+    "BSE_INDEX|SENSEX",
 ).strip()
 
 UPSTOX_TOKEN = os.getenv(
@@ -104,7 +104,7 @@ REQUEST_TIMEOUT = int(
 STATE_FILE = Path(
     os.getenv(
         "STATE_FILE",
-        "state/market_state.json",
+        "state/sensex_market_state.json",
     )
 )
 
@@ -166,7 +166,7 @@ CHANGE_OI_URL = (
 )
 
 MARKET_STATUS_URL = (
-    f"{BASE_URL}/v2/market/status/NSE"
+    f"{BASE_URL}/v2/market/status/BSE"
 )
 
 QUOTE_URL = (
@@ -185,7 +185,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-logger = logging.getLogger("nifty_scanner")
+logger = logging.getLogger("sensex_scanner")
 
 
 # =============================================================================
@@ -262,7 +262,7 @@ def market_window_open() -> bool:
 
     if is_nse_holiday(current):
         logger.info(
-            "NSE holiday: %s. Scanner will not run.",
+            "BSE holiday: %s. Scanner will not run.",
             current.strftime("%Y-%m-%d"),
         )
         return False
@@ -337,12 +337,12 @@ def api_get(
 # MARKET HOLIDAY
 # =============================================================================
 
-def is_nse_holiday(
+def is_bse_holiday(
     current_date: datetime,
 ) -> bool:
     """
     Uses Upstox's market-holiday API to determine whether
-    NSE is closed on the current IST date.
+    BSE is closed on the current IST date.
     """
 
     date_string = current_date.strftime(
@@ -405,7 +405,7 @@ def get_market_status() -> str:
 
 
 # =============================================================================
-# NIFTY QUOTE
+# SENSEX QUOTE
 # =============================================================================
 
 def get_quote(
@@ -465,7 +465,7 @@ def extract_ltp(
 # =============================================================================
 # INSTRUMENT DISCOVERY
 # =============================================================================
-def get_current_nifty_future() -> FuturesContract:
+def get_current_sensex_future() -> FuturesContract:
 
     all_contracts = []
 
@@ -475,8 +475,8 @@ def get_current_nifty_future() -> FuturesContract:
         payload = api_get(
             INSTRUMENT_SEARCH_URL,
             {
-                "query": "NIFTY",
-                "exchanges": "NSE",
+                "query": "SENSEX",
+                "exchanges": "BSE",
                 "segments": "FO",
                 "instrument_types": "FUT",
                 "expiry": expiry_filter,
@@ -492,7 +492,7 @@ def get_current_nifty_future() -> FuturesContract:
 
     if not all_contracts:
         raise ScannerError(
-            "No active NIFTY futures returned by Upstox."
+            "No active SENSEX futures returned by Upstox."
         )
 
     valid = []
@@ -521,8 +521,8 @@ def get_current_nifty_future() -> FuturesContract:
         ).upper()
 
         if (
-            "NIFTY" in underlying
-            or "NIFTY" in symbol
+            "SENSEX" in underlying
+            or "SENSEX" in symbol
         ):
             valid.append(contract)
 
@@ -536,7 +536,7 @@ def get_current_nifty_future() -> FuturesContract:
         )
 
         raise ScannerError(
-            "No valid NIFTY future found."
+            "No valid SENSEX future found."
         )
 
     # Sort by expiry and select nearest available future.
@@ -549,7 +549,7 @@ def get_current_nifty_future() -> FuturesContract:
     selected = valid[0]
 
     logger.info(
-        "Selected NIFTY future: %s | Expiry: %s | Key: %s",
+        "Selected SENSEX future: %s | Expiry: %s | Key: %s",
         selected["trading_symbol"],
         selected["expiry"],
         selected["instrument_key"],
@@ -563,19 +563,19 @@ def get_current_nifty_future() -> FuturesContract:
 
 def get_current_week_contracts() -> list[dict[str, Any]]:
     """
-    Load NIFTY option contracts for the exact weekly Tuesday expiry.
+    Load SENSEX option contracts for the exact weekly Thursday expiry.
     """
-    exact_expiry = get_active_nifty_expiry()
+    exact_expiry = get_active_sensex_expiry()
 
     logger.info(
-        "Using exact dynamically selected NIFTY weekly expiry for option contracts: %s",
+        "Using exact dynamically selected SENSEX weekly expiry for option contracts: %s",
         exact_expiry,
     )
 
     payload = api_get(
         OPTION_CONTRACT_URL,
         {
-            "instrument_key": NIFTY_KEY,
+            "instrument_key": SENSEX_KEY,
             "expiry_date": exact_expiry,
         },
     )
@@ -584,7 +584,7 @@ def get_current_week_contracts() -> list[dict[str, Any]]:
 
     if not isinstance(contracts, list) or not contracts:
         raise ScannerError(
-            "No NIFTY option contracts returned for selected expiry "
+            "No SENSEX option contracts returned for selected expiry "
             f"{exact_expiry}."
         )
 
@@ -732,7 +732,7 @@ def get_session_candles_for_vwap(
         )
 
     logger.info(
-        "VWAP source: NIFTY Futures | current-session candles=%d | volume=%0.f",
+        "VWAP source: SENSEX Futures | current-session candles=%d | volume=%0.f",
         len(df),
         float(usable_volume.sum()),
     )
@@ -943,7 +943,7 @@ def calculate_vwap(
     vwap = cumulative_pv / cumulative_volume.replace(0, np.nan)
 
     # Index candles can legitimately have zero volume. In that case this is
-    # not a real VWAP. The scanner uses NIFTY futures candles for VWAP instead.
+    # not a real VWAP. The scanner uses SENSEX futures candles for VWAP instead.
     return vwap
 
 
@@ -1034,9 +1034,9 @@ def recent_swing_low(
 # OPTION CHAIN ANALYSIS
 # =============================================================================
 
-def get_active_nifty_expiry() -> str:
+def get_active_sensex_expiry() -> str:
     """
-    Dynamically select the nearest non-expired NIFTY option expiry.
+    Dynamically select the nearest non-expired SENSEX option expiry.
 
     The option-contract endpoint is queried without a relative expiry filter,
     then all valid expiry dates returned by Upstox are parsed and the nearest
@@ -1044,19 +1044,18 @@ def get_active_nifty_expiry() -> str:
     """
     payload = api_get(
         OPTION_CONTRACT_URL,
-        {"instrument_key": NIFTY_KEY},
+        {"instrument_key": SENSEX_KEY},
     )
 
     contracts = payload.get("data", [])
 
     if not isinstance(contracts, list) or not contracts:
         raise ScannerError(
-            "No NIFTY option contracts returned for dynamic expiry discovery."
+            "No SENSEX option contracts returned for dynamic expiry discovery."
         )
 
     today = now_ist().date()
     weekly_expiries = set()
-    all_expiries = set()
 
     for contract in contracts:
         if not isinstance(contract, dict):
@@ -1075,22 +1074,20 @@ def get_active_nifty_expiry() -> str:
         if expiry_date < today:
             continue
 
-        all_expiries.add(expiry_date)
-
         if bool(contract.get("weekly")):
             weekly_expiries.add(expiry_date)
 
-    expiries = weekly_expiries or all_expiries
-
-    if not expiries:
+    if not weekly_expiries:
         raise ScannerError(
-            "No valid non-expired NIFTY option expiry was found."
+            "No valid non-expired SENSEX weekly option expiry was found."
         )
+
+    expiries = weekly_expiries
 
     selected_expiry = min(expiries).isoformat()
 
     logger.info(
-        "Dynamically selected active NIFTY expiry: %s",
+        "Dynamically selected active SENSEX expiry: %s",
         selected_expiry,
     )
 
@@ -1102,17 +1099,17 @@ def get_chain() -> list[dict[str, Any]]:
     Load the option chain using the nearest active expiry discovered directly
     from Upstox contract metadata.
     """
-    exact_expiry = get_active_nifty_expiry()
+    exact_expiry = get_active_sensex_expiry()
 
     logger.info(
-        "Using dynamically selected NIFTY expiry for option chain: %s",
+        "Using dynamically selected SENSEX expiry for option chain: %s",
         exact_expiry,
     )
 
     payload = api_get(
         OPTION_CHAIN_URL,
         {
-            "instrument_key": NIFTY_KEY,
+            "instrument_key": SENSEX_KEY,
             "expiry_date": exact_expiry,
         },
     )
@@ -1121,12 +1118,12 @@ def get_chain() -> list[dict[str, Any]]:
 
     if not isinstance(data, list) or not data:
         raise ScannerError(
-            "NIFTY option chain is empty for dynamically selected expiry "
+            "SENSEX option chain is empty for dynamically selected expiry "
             f"{exact_expiry}."
         )
 
     logger.info(
-        "Loaded NIFTY option chain: expiry=%s | rows=%d",
+        "Loaded SENSEX option chain: expiry=%s | rows=%d",
         exact_expiry,
         len(data),
     )
@@ -1602,7 +1599,7 @@ def option_buying_momentum(
 ) -> tuple[bool, dict[str, Any]]:
     """Hard buying-side filter for the selected option premium.
 
-    The scanner only recommends option buying. A correct NIFTY direction is
+    The scanner only recommends option buying. A correct SENSEX direction is
     therefore insufficient if the selected option premium is already falling.
     The option must show positive recent price momentum and a positive short
     EMA trend. Long buildup or short covering in the option is acceptable.
@@ -1958,7 +1955,7 @@ def final_entry_direction_confirmation(
     reasons = [
         f"Futures={futures_state} interpreted as {futures_direction}: {'OK' if futures_ok else 'FAIL'}",
         f"OI=localized:{chain_bias}/changeOI:{change_oi_bias_value} interpreted as {oi_direction}: {'OK' if oi_ok else 'FAIL'}",
-        f"NIFTY={live_spot:.2f} vs VWAP={session_vwap:.2f} interpreted as {vwap_direction}: {'OK' if vwap_ok else 'FAIL'}",
+        f"SENSEX={live_spot:.2f} vs VWAP={session_vwap:.2f} interpreted as {vwap_direction}: {'OK' if vwap_ok else 'FAIL'}",
         f"Futures premium/discount state={basis_state}: {'OK' if basis_ok else 'FAIL'}",
     ]
 
@@ -2154,12 +2151,12 @@ def predictive_direction(
     # 3. VWAP — price position is primary; slope is only context.
     # -------------------------------------------------------------------------
     if futures_3m is None or futures_3m.empty:
-        raise ScannerError("NIFTY futures candle data unavailable for VWAP.")
+        raise ScannerError("SENSEX futures candle data unavailable for VWAP.")
 
     vwap_series = calculate_vwap(futures_3m)
     valid_vwap = vwap_series.dropna()
     if len(valid_vwap) < 2:
-        raise ScannerError("Session VWAP unavailable: NIFTY futures volume is zero/missing.")
+        raise ScannerError("Session VWAP unavailable: SENSEX futures volume is zero/missing.")
 
     session_vwap = float(valid_vwap.iloc[-1])
     previous_vwap = float(valid_vwap.iloc[-2])
@@ -2167,7 +2164,7 @@ def predictive_direction(
     above_vwap = float(live_spot) > session_vwap
 
     logger.info(
-        "VWAP check: NIFTY=%.2f VWAP=%.2f slope=%.4f position=%s",
+        "VWAP check: SENSEX=%.2f VWAP=%.2f slope=%.4f position=%s",
         live_spot,
         session_vwap,
         vwap_slope,
@@ -2176,7 +2173,7 @@ def predictive_direction(
 
     if above_vwap:
         bullish_score += 25
-        bullish_reasons.append(f"NIFTY {live_spot:.2f} is above session VWAP {session_vwap:.2f}")
+        bullish_reasons.append(f"SENSEX {live_spot:.2f} is above session VWAP {session_vwap:.2f}")
         if vwap_slope > VWAP_FLAT_SLOPE_EPSILON:
             bullish_score += 5
             bullish_reasons.append("VWAP slope is meaningfully rising (+5)")
@@ -2187,7 +2184,7 @@ def predictive_direction(
             bullish_reasons.append("VWAP slope is flat: no slope points awarded")
     else:
         bearish_score += 25
-        bearish_reasons.append(f"NIFTY {live_spot:.2f} is below session VWAP {session_vwap:.2f}")
+        bearish_reasons.append(f"SENSEX {live_spot:.2f} is below session VWAP {session_vwap:.2f}")
         if vwap_slope < -VWAP_FLAT_SLOPE_EPSILON:
             bearish_score += 5
             bearish_reasons.append("VWAP slope is meaningfully falling (+5)")
@@ -2637,7 +2634,7 @@ def email_body(
 <body>
 
 <h2>
-NIFTY Predictive {signal.direction} Signal
+SENSEX Predictive {signal.direction} Signal
 </h2>
 
 <table border="1"
@@ -2660,7 +2657,7 @@ NIFTY Predictive {signal.direction} Signal
 </tr>
 
 <tr>
-<td><b>NIFTY Spot</b></td>
+<td><b>SENSEX Spot</b></td>
 <td>{signal.spot:.2f}</td>
 </tr>
 
@@ -2748,14 +2745,14 @@ future price movement or profitability.
 
 def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
     if not market_window_open():
-        logger.info("Outside NSE market hours.")
+        logger.info("Outside BSE market hours.")
         return None
 
     status = get_market_status()
-    logger.info("NSE status: %s", status)
+    logger.info("BSE status: %s", status)
 
     if status != "OPEN":
-        logger.info("NSE is not OPEN. No signal generated.")
+        logger.info("BSE is not OPEN. No signal generated.")
         return None
 
     state = state if isinstance(state, dict) else {}
@@ -2763,7 +2760,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
     if not isinstance(previous_snapshot, dict):
         previous_snapshot = {}
 
-    future = get_current_nifty_future()
+    future = get_current_sensex_future()
 
     # -------------------------------------------------------------------------
     # Underlying market data
@@ -2793,7 +2790,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
     )
 
     spot_3m = get_intraday_candles(
-        NIFTY_KEY,
+        SENSEX_KEY,
         3,
         min_candles=3,
     )
@@ -2805,7 +2802,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
     )
 
     spot_15m = get_intraday_candles(
-        NIFTY_KEY,
+        SENSEX_KEY,
         15,
         min_candles=2,
     )
@@ -2816,7 +2813,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         SUPERTREND_FACTOR,
     )
 
-    spot_quote = get_quote(NIFTY_KEY)
+    spot_quote = get_quote(SENSEX_KEY)
     spot = extract_ltp(spot_quote)
 
     # -------------------------------------------------------------------------
@@ -2860,7 +2857,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
     )
     current_snapshot = {
         "timestamp": now_ist().isoformat(),
-        "nifty_spot": round(float(spot), 2),
+        "sensex_spot": round(float(spot), 2),
         "futures_state": futures_state,
         "futures_basis_state": basis_state_snapshot,
         "futures_basis_points": round(float(basis_points_snapshot), 4) if math.isfinite(basis_points_snapshot) else None,
@@ -3127,7 +3124,7 @@ def main() -> int:
 
         send_email(
             (
-                f"NIFTY {signal.direction} "
+                f"SENSEX {signal.direction} "
                 f"{signal.trading_symbol}"
             ),
             email_body(
