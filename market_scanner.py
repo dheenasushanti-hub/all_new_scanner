@@ -260,7 +260,7 @@ def market_window_open() -> bool:
     if current.weekday() >= 5:
         return False
 
-    if is_nse_holiday(current):
+    if is_bse_holiday(current):
         logger.info(
             "BSE holiday: %s. Scanner will not run.",
             current.strftime("%Y-%m-%d"),
