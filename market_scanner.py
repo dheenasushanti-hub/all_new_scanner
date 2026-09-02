@@ -2439,6 +2439,39 @@ def predictive_direction(
     A fresh Futures regime transition receives extra weight. Supertrend is not
     required for the predictive trigger.
     """
+    # -------------------------------------------------------------------------
+    # 0. MARKET REGIME FILTER
+    #
+    # A predictive signal must not be created merely because Futures and VWAP
+    # temporarily point in one direction while the underlying remains trapped
+    # inside a balanced intraday range.
+    # -------------------------------------------------------------------------
+
+    current_market_regime, regime_reasons = market_regime(
+        spot_3m=spot_3m,
+        spot_15m=spot_15m,
+        chain_bias=chain_bias,
+        chain_bias_score=chain_bias_score,
+        change_oi_bias_value=change_oi_bias_value,
+        change_oi_score=change_oi_score,
+    )
+
+    if current_market_regime == "SIDEWAYS":
+
+        logger.info(
+            "Prediction suppressed: SIDEWAYS/RANGE market. "
+            "Futures=%s | localized_OI=%s | Change_OI=%s",
+            futures_state,
+            chain_bias,
+            change_oi_bias_value,
+        )
+
+        return (
+            "NEUTRAL",
+            "SIDEWAYS",
+            0.0,
+            regime_reasons,
+        )        
     latest_15 = spot_15m.iloc[-1]
 
     bullish_score = 0.0
@@ -3222,15 +3255,18 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
     change_bias, change_bias_score = change_oi_bias(change_data)
 
     direction, regime, confidence, reasons = predictive_direction(
-        spot_3m,
-        spot_15m,
-        chain_bias,
-        change_bias,
-        futures_state,
-        live_spot=spot,
-        futures_3m=futures_vwap_candles,
-        previous_snapshot=previous_snapshot,
-    )
+    spot_3m,
+    spot_15m,
+    chain_bias,
+    chain_bias_score,
+    change_bias,
+    change_bias_score,
+    futures_state,
+    live_spot=spot,
+    futures_3m=futures_vwap_candles,
+    previous_snapshot=previous_snapshot,
+      )
+
 
     # Persist every market snapshot, including neutral runs. This allows the
     # next scheduled run to detect and use regime transitions.
