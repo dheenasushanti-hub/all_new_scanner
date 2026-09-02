@@ -1305,55 +1305,67 @@ def market_regime(
         sideways_score,
     )
 
-# -----------------------------------------------------------------
-# STRONG SIDEWAYS / RANGE DETECTION
-# -----------------------------------------------------------------
+    # -----------------------------------------------------------------
+    # STRONG SIDEWAYS / RANGE DETECTION
+    # -----------------------------------------------------------------
 
-# The market can be sideways even if the 3-minute candles show
-# temporary directional movement. Give greater importance to the
-# 15-minute net movement because it represents the broader intraday
-# structure.
-
-strong_15m_compression = (
-    compressed_15m
-    and low_net_move_15m
-)
-
-timeframe_conflict = (
-    structure_3m in {"BULLISH", "BEARISH"}
-    and structure_15m in {"BULLISH", "BEARISH"}
-    and structure_3m != structure_15m
-)
-
-# Strong sideways condition:
-#
-# 1. 15-minute market remains compressed
-# 2. Net movement is small
-# 3. 3m and 15m disagree
-#
-# This prevents temporary 3-minute movement from being mistaken
-# for a genuine intraday trend.
-
-if (
-    strong_15m_compression
-    and timeframe_conflict
-):
-    sideways_score = max(sideways_score, 5)
-
-    reasons.append(
-        "Strong sideways condition: compressed 15-minute range "
-        "with minimal net movement and conflicting 3m/15m structure."
+    # The market can be sideways even if the 3-minute candles show
+    # temporary directional movement. Give greater importance to the
+    # 15-minute net movement because it represents the broader intraday
+    # structure.
+    strong_15m_compression = (
+        compressed_15m
+        and low_net_move_15m
     )
 
+    timeframe_conflict = (
+        structure_3m in {"BULLISH", "BEARISH"}
+        and structure_15m in {"BULLISH", "BEARISH"}
+        and structure_3m != structure_15m
+    )
 
-# -----------------------------------------------------------------
-# NORMAL SIDEWAYS CLASSIFICATION
-# -----------------------------------------------------------------
+    # Strong sideways condition:
+    # 1. 15-minute market remains compressed.
+    # 2. Net movement is small.
+    # 3. 3m and 15m structures disagree.
+    if strong_15m_compression and timeframe_conflict:
+        sideways_score = max(sideways_score, 5)
+        reasons.append(
+            "Strong sideways condition: compressed 15-minute range "
+            "with minimal net movement and conflicting 3m/15m structure."
+        )
 
-if sideways_score >= 5:
+    # -----------------------------------------------------------------
+    # NORMAL SIDEWAYS CLASSIFICATION
+    # -----------------------------------------------------------------
+    if sideways_score >= 5:
+        reasons.extend([
+            "Market classified as SIDEWAYS/RANGE.",
+            (
+                f"3m range={range_atr_3m:.2f} ATR, "
+                f"net move={net_move_atr_3m:.2f} ATR."
+            ),
+            (
+                f"15m range={range_atr_15m:.2f} ATR, "
+                f"net move={net_move_atr_15m:.2f} ATR."
+            ),
+            (
+                f"3m structure={structure_3m}, "
+                f"15m structure={structure_15m}."
+            ),
+            (
+                f"Supertrend flips: "
+                f"3m={flips_3m}, 15m={flips_15m}."
+            ),
+            (
+                f"OI positioning: localized={chain_bias}, "
+                f"Change-OI={change_oi_bias_value}."
+            ),
+        ])
+        return "SIDEWAYS", reasons
 
     reasons.extend([
-        "Market classified as SIDEWAYS/RANGE.",
+        "Market classified as TRENDING/EXPANDING.",
         (
             f"3m range={range_atr_3m:.2f} ATR, "
             f"net move={net_move_atr_3m:.2f} ATR."
@@ -1366,37 +1378,9 @@ if sideways_score >= 5:
             f"3m structure={structure_3m}, "
             f"15m structure={structure_15m}."
         ),
-        (
-            f"Supertrend flips: "
-            f"3m={flips_3m}, 15m={flips_15m}."
-        ),
-        (
-            f"OI positioning: localized={chain_bias}, "
-            f"Change-OI={change_oi_bias_value}."
-        ),
     ])
 
-    return "SIDEWAYS", reasons
-
-
-reasons.extend([
-    "Market classified as TRENDING/EXPANDING.",
-    (
-        f"3m range={range_atr_3m:.2f} ATR, "
-        f"net move={net_move_atr_3m:.2f} ATR."
-    ),
-    (
-        f"15m range={range_atr_15m:.2f} ATR, "
-        f"net move={net_move_atr_15m:.2f} ATR."
-    ),
-    (
-        f"3m structure={structure_3m}, "
-        f"15m structure={structure_15m}."
-    ),
-])
-
-return "TRENDING", reasons
-      
+    return "TRENDING", reasons
 
 def recent_swing_high(
     df: pd.DataFrame,
