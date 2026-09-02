@@ -562,26 +562,30 @@ def get_current_nifty_future() -> FuturesContract:
     )
 
 def get_current_week_contracts() -> list[dict[str, Any]]:
+    """
+    Load NIFTY option contracts for the exact weekly Tuesday expiry.
+    """
+    exact_expiry = get_next_nifty_tuesday_expiry()
+
+    logger.info(
+        "Using exact NIFTY weekly Tuesday expiry for option contracts: %s",
+        exact_expiry,
+    )
 
     payload = api_get(
         OPTION_CONTRACT_URL,
         {
             "instrument_key": NIFTY_KEY,
-            "expiry_date": "current_week",
+            "expiry_date": exact_expiry,
         },
     )
 
-    contracts = payload.get(
-        "data",
-        [],
-    )
+    contracts = payload.get("data", [])
 
-    if not isinstance(
-        contracts,
-        list,
-    ) or not contracts:
+    if not isinstance(contracts, list) or not contracts:
         raise ScannerError(
-            "No current-week NIFTY option contracts returned."
+            "No NIFTY option contracts returned for Tuesday expiry "
+            f"{exact_expiry}."
         )
 
     return contracts
@@ -1030,63 +1034,70 @@ def recent_swing_low(
 # OPTION CHAIN ANALYSIS
 # =============================================================================
 
-def get_chain() -> list[dict[str, Any]]:
+def get_active_nifty_expiry() -> str:
     """
-    Load the active NIFTY weekly option chain.
+    Dynamically select the nearest non-expired NIFTY option expiry.
 
-    Upstox can occasionally return an empty chain for the relative
-    expiry value ``current_week`` even though the option contracts
-    endpoint returns the active weekly contracts. In that case, derive
-    the exact expiry date from those contracts and retry the chain API.
+    The option-contract endpoint is queried without a relative expiry filter,
+    then all valid expiry dates returned by Upstox are parsed and the nearest
+    active date is selected.
     """
-
-    # First attempt: Upstox relative expiry.
     payload = api_get(
-        OPTION_CHAIN_URL,
-        {
-            "instrument_key": NIFTY_KEY,
-            "expiry_date": "current_week",
-        },
+        OPTION_CONTRACT_URL,
+        {"instrument_key": NIFTY_KEY},
     )
 
-    data = payload.get("data", [])
+    contracts = payload.get("data", [])
 
-    if isinstance(data, list) and data:
-        logger.info(
-            "Loaded option chain using current_week: strikes=%d",
-            len(data),
+    if not isinstance(contracts, list) or not contracts:
+        raise ScannerError(
+            "No NIFTY option contracts returned for dynamic expiry discovery."
         )
-        return data
 
-    logger.warning(
-        "current_week option chain returned no rows. "
-        "Trying exact expiry-date fallback."
-    )
+    today = now_ist().date()
+    expiries = set()
 
-    # The contracts endpoint is already used by the scanner and is the
-    # authoritative source for the actual expiry attached to the active
-    # weekly contracts.
-    contracts = get_current_week_contracts()
+    for contract in contracts:
+        if not isinstance(contract, dict):
+            continue
 
-    expiries = sorted(
-        {
-            str(contract.get("expiry", "")).strip()
-            for contract in contracts
-            if isinstance(contract, dict)
-            and str(contract.get("expiry", "")).strip()
-        }
-    )
+        raw_expiry = str(contract.get("expiry", "")).strip()
+
+        try:
+            expiry_date = datetime.strptime(
+                raw_expiry[:10],
+                "%Y-%m-%d",
+            ).date()
+        except (TypeError, ValueError):
+            continue
+
+        if expiry_date >= today:
+            expiries.add(expiry_date)
 
     if not expiries:
         raise ScannerError(
-            "Current-week option contracts were returned, but no expiry "
-            "date could be determined."
+            "No valid non-expired NIFTY option expiry was found."
         )
 
-    exact_expiry = expiries[0]
+    selected_expiry = min(expiries).isoformat()
 
     logger.info(
-        "Retrying option chain with exact expiry: %s",
+        "Dynamically selected active NIFTY expiry: %s",
+        selected_expiry,
+    )
+
+    return selected_expiry
+
+
+def get_chain() -> list[dict[str, Any]]:
+    """
+    Load the option chain using the nearest active expiry discovered directly
+    from Upstox contract metadata.
+    """
+    exact_expiry = get_active_nifty_expiry()
+
+    logger.info(
+        "Using dynamically selected NIFTY expiry for option chain: %s",
         exact_expiry,
     )
 
@@ -1100,19 +1111,19 @@ def get_chain() -> list[dict[str, Any]]:
 
     data = payload.get("data", [])
 
-    if isinstance(data, list) and data:
-        logger.info(
-            "Loaded option chain using exact expiry fallback: "
-            "expiry=%s | strikes=%d",
-            exact_expiry,
-            len(data),
+    if not isinstance(data, list) or not data:
+        raise ScannerError(
+            "NIFTY option chain is empty for dynamically selected expiry "
+            f"{exact_expiry}."
         )
-        return data
 
-    raise ScannerError(
-        "Current-week option chain is empty after exact-expiry fallback. "
-        f"expiry={exact_expiry} | contracts={len(contracts)}"
+    logger.info(
+        "Loaded NIFTY option chain: expiry=%s | rows=%d",
+        exact_expiry,
+        len(data),
     )
+
+    return data
 
 
 def chain_spot(
