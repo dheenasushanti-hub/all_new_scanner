@@ -820,12 +820,18 @@ def calculate_supertrend(
         dtype=float,
     )
 
-    first_valid = result["atr"].first_valid_index()
-
-    if first_valid is None:
-        raise ScannerError(
-            "Unable to calculate Supertrend."
-        )
+      if result.empty:
+          raise ScannerError(
+              "Unable to calculate Supertrend: no candles available."
+          )
+      
+      first_valid = result["atr"].first_valid_index()
+      
+      if first_valid is None:
+          raise ScannerError(
+              f"Unable to calculate Supertrend: ATR contains no valid values "
+              f"(candles={len(result)}, period={period})."
+          )
 
     start = result.index.get_loc(
         first_valid
@@ -2687,18 +2693,29 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         len(futures_vwap_candles),
     )
 
-    spot_3m = get_intraday_candles(NIFTY_KEY, 3)
-    spot_3m = calculate_supertrend(
-        spot_3m,
-        SUPERTREND_PERIOD,
-        SUPERTREND_FACTOR,
-    )
-    spot_15m = get_intraday_candles(NIFTY_KEY, 15)
-    spot_15m = calculate_supertrend(
-        spot_15m,
-        SUPERTREND_PERIOD,
-        SUPERTREND_FACTOR,
-    )
+      spot_3m = get_intraday_candles(
+          NIFTY_KEY,
+          3,
+          min_candles=3,
+      )
+      
+      spot_3m = calculate_supertrend(
+          spot_3m,
+          SUPERTREND_PERIOD,
+          SUPERTREND_FACTOR,
+      )
+      
+      spot_15m = get_intraday_candles(
+          NIFTY_KEY,
+          15,
+          min_candles=2,
+      )
+      
+      spot_15m = calculate_supertrend(
+          spot_15m,
+          SUPERTREND_PERIOD,
+          SUPERTREND_FACTOR,
+      )
 
     spot_quote = get_quote(NIFTY_KEY)
     spot = extract_ltp(spot_quote)
