@@ -565,7 +565,7 @@ def get_current_week_contracts() -> list[dict[str, Any]]:
     """
     Load NIFTY option contracts for the exact weekly Tuesday expiry.
     """
-    exact_expiry = get_next_nifty_tuesday_expiry()
+    exact_expiry = get_active_nifty_expiry()
 
     logger.info(
         "Using exact NIFTY weekly Tuesday expiry for option contracts: %s",
