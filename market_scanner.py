@@ -788,7 +788,7 @@ def get_intraday_candles(
 def get_session_candles_for_vwap(
     instrument_key: str,
     interval_minutes: int = 3,
-    min_candles: int = 20,
+    min_candles: int = 5,
 ) -> pd.DataFrame:
     """Fetch and return the complete current-session candle set for VWAP.
 
@@ -3248,10 +3248,10 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
     futures_state = futures_regime(future, candles=futures_recent)
 
     futures_vwap_candles = get_session_candles_for_vwap(
-        future.instrument_key,
-        interval_minutes=3,
-        min_candles=20,
-    )
+    future.instrument_key,
+    interval_minutes=3,
+    min_candles=5,
+      )
 
     logger.info(
         "Futures regime: %s | regime candles=%d | VWAP candles=%d",
