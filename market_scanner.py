@@ -113,7 +113,7 @@ STATE_FILE = Path(
 SIGNAL_THRESHOLD = float(
     os.getenv(
         "SIGNAL_THRESHOLD",
-        "60",
+        "40",
     )
 )
 
@@ -788,7 +788,7 @@ def get_intraday_candles(
 def get_session_candles_for_vwap(
     instrument_key: str,
     interval_minutes: int = 3,
-    min_candles: int = 5,
+    min_candles: int = 20,
 ) -> pd.DataFrame:
     """Fetch and return the complete current-session candle set for VWAP.
 
@@ -1338,7 +1338,7 @@ def market_regime(
     # -----------------------------------------------------------------
     # NORMAL SIDEWAYS CLASSIFICATION
     # -----------------------------------------------------------------
-    if sideways_score >= 4:
+    if sideways_score >= 5:
         reasons.extend([
             "Market classified as SIDEWAYS/RANGE.",
             (
@@ -2725,10 +2725,19 @@ def predictive_direction(
     minimum_score = SIGNAL_THRESHOLD
     score_gap = abs(bullish_score - bearish_score)
 
-    if bullish_futures and bullish_score >= minimum_score and bullish_score > bearish_score:
-        if previous_direction != "BULLISH" and previous_direction in {"BEARISH", "NEUTRAL", ""}:
+    # Futures remains the highest-weight input, but it is not an absolute veto.
+    # A predictive scanner must be able to detect a developing reversal before the
+    # futures regime itself has fully flipped.
+    decisive_gap = max(8.0, minimum_score * 0.15)
+
+    if bullish_score >= minimum_score and bullish_score > bearish_score and score_gap >= decisive_gap:
+        if bullish_futures:
+            bullish_reasons.append("Futures regime aligns with bullish prediction.")
+        else:
+            bullish_reasons.append("Bullish evidence overrides the still-unflipped futures regime; reversal watch.")
+        if previous_direction != "BULLISH":
             bullish_reasons.append(
-                f"Directional state is newly bullish versus previous run: {previous_direction or 'NONE'} -> BULLISH"
+                f"Directional state changed: {previous_direction or 'NONE'} -> BULLISH"
             )
         return (
             "BULLISH",
@@ -2737,10 +2746,14 @@ def predictive_direction(
             bullish_reasons,
         )
 
-    if bearish_futures and bearish_score >= minimum_score and bearish_score > bullish_score:
-        if previous_direction != "BEARISH" and previous_direction in {"BULLISH", "NEUTRAL", ""}:
+    if bearish_score >= minimum_score and bearish_score > bullish_score and score_gap >= decisive_gap:
+        if bearish_futures:
+            bearish_reasons.append("Futures regime aligns with bearish prediction.")
+        else:
+            bearish_reasons.append("Bearish evidence overrides the still-unflipped futures regime; reversal watch.")
+        if previous_direction != "BEARISH":
             bearish_reasons.append(
-                f"Directional state is newly bearish versus previous run: {previous_direction or 'NONE'} -> BEARISH"
+                f"Directional state changed: {previous_direction or 'NONE'} -> BEARISH"
             )
         return (
             "BEARISH",
@@ -2949,6 +2962,7 @@ def create_targets(
 def load_state() -> dict[str, Any]:
 
     if not STATE_FILE.exists():
+        logger.info("State file not found: %s", STATE_FILE)
         return {}
 
     try:
@@ -2962,11 +2976,12 @@ def load_state() -> dict[str, Any]:
                 file
             )
 
-        return (
-            data
-            if isinstance(data, dict)
-            else {}
-        )
+        if isinstance(data, dict):
+            snapshot = data.get("market_snapshot")
+            logger.info("Loaded state from %s | previous_snapshot=%s", STATE_FILE, "YES" if isinstance(snapshot, dict) else "NO")
+            return data
+        logger.warning("State file contains invalid root data: %s", STATE_FILE)
+        return {}
 
     except Exception as exc:
 
@@ -3006,6 +3021,7 @@ def save_state(
     temp_file.replace(
         STATE_FILE
     )
+    logger.info("State saved: %s", STATE_FILE)
 
 
 def signal_hash(
@@ -3248,10 +3264,10 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
     futures_state = futures_regime(future, candles=futures_recent)
 
     futures_vwap_candles = get_session_candles_for_vwap(
-    future.instrument_key,
-    interval_minutes=3,
-    min_candles=5,
-      )
+        future.instrument_key,
+        interval_minutes=3,
+        min_candles=5,
+    )
 
     logger.info(
         "Futures regime: %s | regime candles=%d | VWAP candles=%d",
@@ -3390,18 +3406,10 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
     )
 
     if direction == "BULLISH" and bearish_future:
-        logger.info(
-            "Rejected: futures explicitly bearish (%s).",
-            futures_state,
-        )
-        return None
+        logger.info("Reversal-watch signal: futures still bearish (%s), allowing stronger confluence to proceed.", futures_state)
 
     if direction == "BEARISH" and bullish_future:
-        logger.info(
-            "Rejected: futures explicitly bullish (%s).",
-            futures_state,
-        )
-        return None
+        logger.info("Reversal-watch signal: futures still bullish (%s), allowing stronger confluence to proceed.", futures_state)
 
     final_confirmed, confirmation_reasons = final_entry_direction_confirmation(
         direction,
