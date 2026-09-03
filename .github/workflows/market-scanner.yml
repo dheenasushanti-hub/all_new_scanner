@@ -39,7 +39,8 @@ jobs:
               echo "No scanner state changes."
             else
               git commit -m "Update scanner state"
-              git push
+              git pull --rebase origin "${GITHUB_REF_NAME}"
+              git push origin HEAD:"${GITHUB_REF_NAME}"
             fi
           else
             echo "No scanner state created."
