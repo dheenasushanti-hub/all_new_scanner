@@ -1,7 +1,14 @@
-name: NIFTY Predictive Market Scanner
+name: SENSEX Predictive Market Scanner
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sensex-market-scanner
+  cancel-in-progress: false
 
 jobs:
   scan:
@@ -18,12 +25,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run predictive scanner
+      - name: Run SENSEX predictive scanner
         env:
-            UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
-            EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-            EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-            EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          STATE_FILE: state/market_state.json
         run: python market_scanner.py
 
       - name: Persist scanner state
@@ -38,7 +46,7 @@ jobs:
             if git diff --cached --quiet; then
               echo "No scanner state changes."
             else
-              git commit -m "Update scanner state"
+              git commit -m "Update SENSEX scanner state"
               git pull --rebase origin "${GITHUB_REF_NAME}"
               git push origin HEAD:"${GITHUB_REF_NAME}"
             fi
