@@ -28,6 +28,7 @@ No order placement is performed.
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import logging
 import math
@@ -145,6 +146,16 @@ FUTURES_REGIME_MIN_PRICE_MOVE = 0.50
 FUTURES_REGIME_MIN_OI_CHANGE = 1.0
 
 MAX_SIGNAL_AGE_MINUTES = 15
+
+# Active-trade persistence / monitoring. In GitHub Actions, each run is an
+# isolated process, so the active trade state is persisted through the GitHub
+# Contents API when GITHUB_TOKEN is available.
+GITHUB_STATE_PATH = os.getenv("GITHUB_STATE_PATH", "state/sensex_market_state.json").strip().lstrip("/")
+GITHUB_BRANCH = os.getenv("GITHUB_REF_NAME", "main").strip() or "main"
+
+# Do not select an option that is already materially collapsing at entry.
+# This is a strike-health preference, not a bullish/bearish market filter.
+OPTION_ENTRY_MAX_DRAWNDOWN_PCT = float(os.getenv("OPTION_ENTRY_MAX_DRAWDOWN_PCT", "0.75"))
 
 # Chart-driven OI-difference thresholds.
 # OI difference = weighted (PE OI - CE OI) around ATM.
@@ -2162,12 +2173,15 @@ def select_directional_option(
     spot: float,
     preferred_strike: Optional[float] = None,
 ) -> OptionCandidate:
-    """Select exactly the chart-requested ITM strike.
+    """Select the requested ITM strike, with a health check.
 
     Bullish -> ATM-1 CE, fallback ATM-2 CE.
     Bearish -> ATM+1 PE, fallback ATM+2 PE.
-    """
 
+    A candidate is rejected only when its own live/3-minute premium is already
+    materially collapsing. This prevents selecting a visibly failing premium
+    while keeping the chart-defined market direction as the primary signal.
+    """
     rows = chain_rows(chain)
     chain_strikes = sorted(rows.keys())
     atm = nearest_atm_strike(spot, chain_strikes)
@@ -2199,9 +2213,7 @@ def select_directional_option(
             and float(contract.get("strike_price", -1)) == float(target_strike)
         ]
         if not matches:
-            last_rejection = (
-                f"No {option_type} contract found at {target_strike:.0f}."
-            )
+            last_rejection = f"No {option_type} contract found at {target_strike:.0f}."
             continue
 
         market = option_market_data(row, option_type)
@@ -2234,9 +2246,46 @@ def select_directional_option(
             iv=iv,
         )
 
+        # Strike-health check. Failure here moves to the prescribed fallback.
+        try:
+            candles = get_intraday_candles(
+                candidate.instrument_key, 3, max_candles=3, min_candles=2
+            )
+            closes = pd.to_numeric(candles["close"], errors="coerce").dropna()
+            if len(closes) >= 2:
+                last_close = float(closes.iloc[-1])
+                prev_close = float(closes.iloc[-2])
+                latest_move_pct = ((ltp - last_close) / last_close * 100.0) if last_close > 0 else 0.0
+                candle_move_pct = ((last_close - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
+                failing = (
+                    latest_move_pct < -OPTION_ENTRY_MAX_DRAWNDOWN_PCT
+                    or candle_move_pct < -OPTION_ENTRY_MAX_DRAWNDOWN_PCT
+                )
+                logger.info(
+                    "OPTION ENTRY HEALTH: %s LTP=%.2f last3m=%.2f live_vs_last=%+.2f%% last_candle=%+.2f%% failing=%s",
+                    candidate.trading_symbol,
+                    ltp,
+                    last_close,
+                    latest_move_pct,
+                    candle_move_pct,
+                    failing,
+                )
+                if failing and preferred_strike is None:
+                    last_rejection = (
+                        f"{candidate.trading_symbol} is already weakening; trying prescribed fallback strike."
+                    )
+                    continue
+        except ScannerError as exc:
+            # Do not manufacture a rejection when the option's own candle feed is
+            # temporarily unavailable. Market direction remains the primary filter.
+            logger.info(
+                "OPTION ENTRY HEALTH unavailable for %s: %s; keeping candidate.",
+                candidate.trading_symbol,
+                exc,
+            )
+
         logger.info(
-            "SELECTED ITM OPTION: direction=%s ATM=%.0f -> strike=%.0f %s "
-            "LTP=%.2f Delta=%.3f",
+            "SELECTED ITM OPTION: direction=%s ATM=%.0f -> strike=%.0f %s LTP=%.2f Delta=%.3f",
             direction,
             atm,
             candidate.strike,
@@ -2247,7 +2296,6 @@ def select_directional_option(
         return candidate
 
     raise ScannerError(last_rejection)
-
 
 
 # =============================================================================
@@ -2882,10 +2930,211 @@ def create_targets(
 
 
 # =============================================================================
+# ACTIVE TRADE / PERSISTENT STATE
+# =============================================================================
+
+def _github_api_headers() -> dict[str, str]:
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if not token:
+        raise ScannerError("GITHUB_TOKEN is missing; persistent trade state cannot be guaranteed in GitHub Actions.")
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _github_state_url() -> str:
+    repo = os.getenv("GITHUB_REPOSITORY", "").strip()
+    if not repo or "/" not in repo:
+        raise ScannerError("GITHUB_REPOSITORY is unavailable; persistent trade state cannot be guaranteed in GitHub Actions.")
+    return f"https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(GITHUB_STATE_PATH, safe='/')}"
+
+
+def load_remote_state() -> Optional[dict[str, Any]]:
+    """Load the latest state from GitHub when running inside GitHub Actions."""
+    if os.getenv("GITHUB_ACTIONS", "").lower() != "true":
+        return None
+    try:
+        headers = _github_api_headers()
+        response = requests.get(
+            _github_state_url(),
+            params={"ref": GITHUB_BRANCH},
+            headers=headers,
+            timeout=15,
+        )
+        if response.status_code == 404:
+            logger.info("GitHub state file not found: %s", GITHUB_STATE_PATH)
+            return None
+        if response.status_code != 200:
+            raise ScannerError(
+                f"GitHub state read failed: HTTP {response.status_code}: {response.text[:500]}"
+            )
+        payload = response.json()
+        content = payload.get("content")
+        if not isinstance(content, str):
+            raise ScannerError("GitHub state response did not contain file content.")
+        decoded = base64.b64decode(content).decode("utf-8")
+        data = json.loads(decoded)
+        if not isinstance(data, dict):
+            raise ScannerError("GitHub state file root is not an object.")
+        logger.info("Loaded persistent state from GitHub: %s", GITHUB_STATE_PATH)
+        return data
+    except ScannerError:
+        raise
+    except (requests.RequestException, ValueError, UnicodeDecodeError) as exc:
+        raise ScannerError(f"Unable to load persistent GitHub state: {exc}") from exc
+
+
+def persist_state_remote(state: dict[str, Any]) -> None:
+    """Persist state to the repository so separate GitHub runs share trade state."""
+    if os.getenv("GITHUB_ACTIONS", "").lower() != "true":
+        return
+
+    headers = _github_api_headers()
+    url = _github_state_url()
+
+    # Read the current blob SHA when it exists, so PUT updates the same file.
+    sha = None
+    response = requests.get(
+        url,
+        params={"ref": GITHUB_BRANCH},
+        headers=headers,
+        timeout=15,
+    )
+    if response.status_code == 200:
+        sha = response.json().get("sha")
+    elif response.status_code != 404:
+        raise ScannerError(
+            f"GitHub state lookup before write failed: HTTP {response.status_code}: {response.text[:500]}"
+        )
+
+    encoded = base64.b64encode(
+        json.dumps(state, indent=2, ensure_ascii=False).encode("utf-8")
+    ).decode("ascii")
+    body: dict[str, Any] = {
+        "message": "Update SENSEX scanner state",
+        "content": encoded,
+        "branch": GITHUB_BRANCH,
+    }
+    if sha:
+        body["sha"] = sha
+
+    response = requests.put(
+        url,
+        headers={**headers, "Content-Type": "application/json"},
+        json=body,
+        timeout=20,
+    )
+    if response.status_code not in {200, 201}:
+        raise ScannerError(
+            f"GitHub state write failed: HTTP {response.status_code}: {response.text[:800]}"
+        )
+    logger.info("Persistent state written to GitHub: %s", GITHUB_STATE_PATH)
+
+
+def save_state_safely(state: dict[str, Any]) -> None:
+    """Save locally and, in GitHub Actions, remotely before any new signal email."""
+    save_state(state)
+    if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
+        persist_state_remote(state)
+
+
+def active_trade_from_state(state: dict[str, Any]) -> Optional[dict[str, Any]]:
+    trade = state.get("active_trade")
+    if not isinstance(trade, dict):
+        return None
+    if str(trade.get("status", "")).upper() != "ACTIVE":
+        return None
+    required = {"instrument_key", "trading_symbol", "option_type", "strike", "entry", "target_1", "target_2", "stop_loss"}
+    if not required.issubset(trade):
+        logger.warning("Ignoring incomplete active trade state.")
+        return None
+    return trade
+
+
+def monitor_active_trade(state: dict[str, Any]) -> str:
+    """Monitor the already-selected option until T1/T2/SL; never create another entry."""
+    trade = active_trade_from_state(state)
+    if trade is None:
+        return "NO_ACTIVE"
+
+    try:
+        ltp = extract_ltp(get_quote(str(trade["instrument_key"])))
+    except ScannerError as exc:
+        logger.info(
+            "ACTIVE TRADE MONITOR: %s | quote unavailable: %s",
+            trade.get("trading_symbol", ""),
+            exc,
+        )
+        return "ACTIVE"
+
+    entry = float(trade["entry"])
+    target_1 = float(trade["target_1"])
+    target_2 = float(trade["target_2"])
+    stop_loss = float(trade["stop_loss"])
+    trade["last_ltp"] = round(ltp, 2)
+    trade["last_monitored_at"] = now_ist().isoformat()
+    state["active_trade"] = trade
+
+    logger.info(
+        "ACTIVE TRADE MONITOR: %s | LTP=%.2f Entry=%.2f T1=%.2f T2=%.2f SL=%.2f",
+        trade["trading_symbol"], ltp, entry, target_1, target_2, stop_loss,
+    )
+
+    outcome = None
+    if ltp >= target_2:
+        outcome = "TARGET_2"
+    elif ltp >= target_1:
+        outcome = "TARGET_1"
+    elif ltp <= stop_loss:
+        outcome = "STOP_LOSS"
+
+    if outcome is None:
+        save_state_safely(state)
+        return "ACTIVE"
+
+    trade["status"] = "CLOSED"
+    trade["outcome"] = outcome
+    trade["exit_ltp"] = round(ltp, 2)
+    trade["closed_at"] = now_ist().isoformat()
+    state["active_trade"] = None
+    state["last_completed_trade"] = trade
+    save_state_safely(state)
+
+    logger.info(
+        "ACTIVE TRADE CLOSED: %s | outcome=%s exit_ltp=%.2f",
+        trade["trading_symbol"], outcome, ltp,
+    )
+
+    # One outcome email only. There is never an email on an unchanged active run.
+    try:
+        send_email(
+            f"SENSEX TRADE {outcome} - {trade['trading_symbol']}",
+            (
+                f"SENSEX {trade['direction']} trade closed.<br>"
+                f"Option: {trade['trading_symbol']}<br>"
+                f"Entry: ₹{entry:.2f}<br>"
+                f"Exit: ₹{ltp:.2f}<br>"
+                f"Outcome: {outcome}<br>"
+            ),
+        )
+    except ScannerError as exc:
+        logger.warning("Trade outcome email failed: %s", exc)
+
+    return "CLOSED"
+
+
+# =============================================================================
 # STATE
 # =============================================================================
 
 def load_state() -> dict[str, Any]:
+
+    if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
+        remote = load_remote_state()
+        if isinstance(remote, dict):
+            return remote
 
     if not STATE_FILE.exists():
         logger.info("State file not found: %s", STATE_FILE)
@@ -3168,6 +3417,22 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         return None
 
     state = state if isinstance(state, dict) else {}
+
+    # A selected trade owns the scanner until T1/T2/SL. Do not re-run
+    # directional analysis or generate another entry while it is active.
+    active = active_trade_from_state(state)
+    if active is not None:
+        active_date = str(active.get("trade_date", ""))[:10]
+        if active_date and active_date != now_ist().date().isoformat():
+            logger.info("Previous-day active trade state found; clearing stale trade before new session.")
+            state["last_completed_trade"] = active
+            state["active_trade"] = None
+            save_state_safely(state)
+        else:
+            monitor_result = monitor_active_trade(state)
+            if monitor_result in {"ACTIVE", "CLOSED"}:
+                return None
+
     previous_snapshot = state.get("market_snapshot")
     if not isinstance(previous_snapshot, dict):
         previous_snapshot = {}
@@ -3326,7 +3591,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         }
         state["previous_market_snapshot"] = previous_snapshot
         state["market_snapshot"] = current_snapshot
-        save_state(state)
+        save_state_safely(state)
 
         logger.info(
             "Prediction: direction=%s interpretation=%s confidence=%.2f",
@@ -3446,68 +3711,45 @@ def main() -> int:
             )
             return 0
 
-        current_hash = signal_hash(
-            signal
-        )
+        # Register the selected trade BEFORE sending its entry email. In GitHub
+        # Actions this guarantees the next run sees the active trade even though
+        # the runner filesystem is ephemeral.
+        active_trade = {
+            "status": "ACTIVE",
+            "trade_date": now_ist().date().isoformat(),
+            "opened_at": signal.timestamp,
+            "direction": signal.direction,
+            "regime": signal.regime,
+            "confidence": signal.confidence,
+            "instrument_key": signal.instrument_key,
+            "trading_symbol": signal.trading_symbol,
+            "option_type": signal.option_type,
+            "strike": signal.strike,
+            "entry": signal.entry,
+            "target_1": signal.target_1,
+            "target_2": signal.target_2,
+            "stop_loss": signal.stop_loss,
+            "underlying_trigger_3m": signal.underlying_trigger_3m,
+            "underlying_target_15m": signal.underlying_target_15m,
+            "delta": signal.delta,
+            "gamma": signal.gamma,
+            "last_ltp": signal.entry,
+        }
 
-        previous_hash = state.get(
-            "last_signal_hash"
-        )
-
-        if current_hash == previous_hash:
-
-            logger.info(
-                "Duplicate signal suppressed."
-            )
-
-            return 0
+        # Do not send the entry email until persistent state has been written.
+        state["active_trade"] = active_trade
+        state["last_signal"] = asdict(signal)
+        state["last_signal_timestamp"] = signal.timestamp
+        state["last_signal_hash"] = signal_hash(signal)
+        save_state_safely(state)
 
         send_email(
-            (
-                f"SENSEX {signal.direction} "
-                f"{signal.trading_symbol}"
-            ),
-            email_body(
-                signal
-            ),
-        )
-
-        state[
-            "last_signal_hash"
-        ] = current_hash
-
-        state[
-            "locked_direction"
-        ] = signal.direction
-
-        state[
-            "locked_strike"
-        ] = signal.strike
-
-        state[
-            "locked_option_type"
-        ] = signal.option_type
-
-        state[
-            "locked_timestamp"
-        ] = now_ist().isoformat()
-
-        state[
-            "last_signal"
-        ] = asdict(
-            signal
-        )
-
-        state[
-            "last_signal_timestamp"
-        ] = signal.timestamp
-
-        save_state(
-            state
+            f"SENSEX {signal.direction} {signal.trading_symbol}",
+            email_body(signal),
         )
 
         logger.info(
-            "NEW SIGNAL EMAILED: %s",
+            "NEW ACTIVE TRADE EMAILED AND LOCKED: %s | monitor until T1/T2/SL",
             signal.trading_symbol,
         )
 
