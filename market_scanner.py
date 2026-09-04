@@ -28,7 +28,6 @@ No order placement is performed.
 from __future__ import annotations
 
 import hashlib
-import base64
 import json
 import logging
 import math
@@ -107,7 +106,7 @@ REQUEST_TIMEOUT = int(
 STATE_FILE = Path(
     os.getenv(
         "STATE_FILE",
-        "state/sensex_market_state.json",
+        "state/market_state.json",
     )
 )
 
@@ -146,12 +145,6 @@ FUTURES_REGIME_MIN_PRICE_MOVE = 0.50
 FUTURES_REGIME_MIN_OI_CHANGE = 1.0
 
 MAX_SIGNAL_AGE_MINUTES = 15
-
-# Active-trade persistence / monitoring. In GitHub Actions, each run is an
-# isolated process, so the active trade state is persisted through the GitHub
-# Contents API when GITHUB_TOKEN is available.
-GITHUB_STATE_PATH = os.getenv("GITHUB_STATE_PATH", "state/sensex_market_state.json").strip().lstrip("/")
-GITHUB_BRANCH = os.getenv("GITHUB_REF_NAME", "main").strip() or "main"
 
 # Do not select an option that is already materially collapsing at entry.
 # This is a strike-health preference, not a bullish/bearish market filter.
@@ -2933,113 +2926,6 @@ def create_targets(
 # ACTIVE TRADE / PERSISTENT STATE
 # =============================================================================
 
-def _github_api_headers() -> dict[str, str]:
-    token = os.getenv("GITHUB_TOKEN", "").strip()
-    if not token:
-        raise ScannerError("GITHUB_TOKEN is missing; persistent trade state cannot be guaranteed in GitHub Actions.")
-    return {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-
-def _github_state_url() -> str:
-    repo = os.getenv("GITHUB_REPOSITORY", "").strip()
-    if not repo or "/" not in repo:
-        raise ScannerError("GITHUB_REPOSITORY is unavailable; persistent trade state cannot be guaranteed in GitHub Actions.")
-    return f"https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(GITHUB_STATE_PATH, safe='/')}"
-
-
-def load_remote_state() -> Optional[dict[str, Any]]:
-    """Load the latest state from GitHub when running inside GitHub Actions."""
-    if os.getenv("GITHUB_ACTIONS", "").lower() != "true":
-        return None
-    try:
-        headers = _github_api_headers()
-        response = requests.get(
-            _github_state_url(),
-            params={"ref": GITHUB_BRANCH},
-            headers=headers,
-            timeout=15,
-        )
-        if response.status_code == 404:
-            logger.info("GitHub state file not found: %s", GITHUB_STATE_PATH)
-            return None
-        if response.status_code != 200:
-            raise ScannerError(
-                f"GitHub state read failed: HTTP {response.status_code}: {response.text[:500]}"
-            )
-        payload = response.json()
-        content = payload.get("content")
-        if not isinstance(content, str):
-            raise ScannerError("GitHub state response did not contain file content.")
-        decoded = base64.b64decode(content).decode("utf-8")
-        data = json.loads(decoded)
-        if not isinstance(data, dict):
-            raise ScannerError("GitHub state file root is not an object.")
-        logger.info("Loaded persistent state from GitHub: %s", GITHUB_STATE_PATH)
-        return data
-    except ScannerError:
-        raise
-    except (requests.RequestException, ValueError, UnicodeDecodeError) as exc:
-        raise ScannerError(f"Unable to load persistent GitHub state: {exc}") from exc
-
-
-def persist_state_remote(state: dict[str, Any]) -> None:
-    """Persist state to the repository so separate GitHub runs share trade state."""
-    if os.getenv("GITHUB_ACTIONS", "").lower() != "true":
-        return
-
-    headers = _github_api_headers()
-    url = _github_state_url()
-
-    # Read the current blob SHA when it exists, so PUT updates the same file.
-    sha = None
-    response = requests.get(
-        url,
-        params={"ref": GITHUB_BRANCH},
-        headers=headers,
-        timeout=15,
-    )
-    if response.status_code == 200:
-        sha = response.json().get("sha")
-    elif response.status_code != 404:
-        raise ScannerError(
-            f"GitHub state lookup before write failed: HTTP {response.status_code}: {response.text[:500]}"
-        )
-
-    encoded = base64.b64encode(
-        json.dumps(state, indent=2, ensure_ascii=False).encode("utf-8")
-    ).decode("ascii")
-    body: dict[str, Any] = {
-        "message": "Update SENSEX scanner state",
-        "content": encoded,
-        "branch": GITHUB_BRANCH,
-    }
-    if sha:
-        body["sha"] = sha
-
-    response = requests.put(
-        url,
-        headers={**headers, "Content-Type": "application/json"},
-        json=body,
-        timeout=20,
-    )
-    if response.status_code not in {200, 201}:
-        raise ScannerError(
-            f"GitHub state write failed: HTTP {response.status_code}: {response.text[:800]}"
-        )
-    logger.info("Persistent state written to GitHub: %s", GITHUB_STATE_PATH)
-
-
-def save_state_safely(state: dict[str, Any]) -> None:
-    """Save locally and, in GitHub Actions, remotely before any new signal email."""
-    save_state(state)
-    if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
-        persist_state_remote(state)
-
-
 def active_trade_from_state(state: dict[str, Any]) -> Optional[dict[str, Any]]:
     trade = state.get("active_trade")
     if not isinstance(trade, dict):
@@ -3091,7 +2977,7 @@ def monitor_active_trade(state: dict[str, Any]) -> str:
         outcome = "STOP_LOSS"
 
     if outcome is None:
-        save_state_safely(state)
+        save_state(state)
         return "ACTIVE"
 
     trade["status"] = "CLOSED"
@@ -3100,7 +2986,7 @@ def monitor_active_trade(state: dict[str, Any]) -> str:
     trade["closed_at"] = now_ist().isoformat()
     state["active_trade"] = None
     state["last_completed_trade"] = trade
-    save_state_safely(state)
+    save_state(state)
 
     logger.info(
         "ACTIVE TRADE CLOSED: %s | outcome=%s exit_ltp=%.2f",
@@ -3130,41 +3016,29 @@ def monitor_active_trade(state: dict[str, Any]) -> str:
 # =============================================================================
 
 def load_state() -> dict[str, Any]:
-
-    if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
-        remote = load_remote_state()
-        if isinstance(remote, dict):
-            return remote
-
     if not STATE_FILE.exists():
         logger.info("State file not found: %s", STATE_FILE)
         return {}
 
     try:
-
-        with STATE_FILE.open(
-            "r",
-            encoding="utf-8",
-        ) as file:
-
-            data = json.load(
-                file
-            )
+        with STATE_FILE.open("r", encoding="utf-8") as file:
+            data = json.load(file)
 
         if isinstance(data, dict):
             snapshot = data.get("market_snapshot")
-            logger.info("Loaded state from %s | previous_snapshot=%s", STATE_FILE, "YES" if isinstance(snapshot, dict) else "NO")
+            logger.info(
+                "Loaded state from %s | previous_snapshot=%s | active_trade=%s",
+                STATE_FILE,
+                "YES" if isinstance(snapshot, dict) else "NO",
+                "YES" if active_trade_from_state(data) is not None else "NO",
+            )
             return data
+
         logger.warning("State file contains invalid root data: %s", STATE_FILE)
         return {}
 
     except Exception as exc:
-
-        logger.warning(
-            "State read failed: %s",
-            exc,
-        )
-
+        logger.warning("State read failed: %s", exc)
         return {}
 
 
@@ -3427,7 +3301,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
             logger.info("Previous-day active trade state found; clearing stale trade before new session.")
             state["last_completed_trade"] = active
             state["active_trade"] = None
-            save_state_safely(state)
+            save_state(state)
         else:
             monitor_result = monitor_active_trade(state)
             if monitor_result in {"ACTIVE", "CLOSED"}:
@@ -3591,7 +3465,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         }
         state["previous_market_snapshot"] = previous_snapshot
         state["market_snapshot"] = current_snapshot
-        save_state_safely(state)
+        save_state(state)
 
         logger.info(
             "Prediction: direction=%s interpretation=%s confidence=%.2f",
@@ -3741,7 +3615,7 @@ def main() -> int:
         state["last_signal"] = asdict(signal)
         state["last_signal_timestamp"] = signal.timestamp
         state["last_signal_hash"] = signal_hash(signal)
-        save_state_safely(state)
+        save_state(state)
 
         send_email(
             f"SENSEX {signal.direction} {signal.trading_symbol}",
