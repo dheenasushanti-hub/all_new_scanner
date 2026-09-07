@@ -2805,14 +2805,19 @@ def predictive_direction(
             "PE-CE OI difference is neutral.",
         ]
 
-    # Any combination not explicitly defined by the user's table remains
-    # neutral. The scanner must never invent a matrix row.
+    # Any combination not explicitly defined by the user's table is NOT
+    # Rangebound.  Rangebound is a specific row in the table and requires
+    # Price near VWAP + flat/marginal Futures OI + neutral PE-CE OI.
+    # Unknown combinations therefore remain neutral, but are explicitly
+    # labelled as NO MATRIX MATCH so the scanner cannot falsely report
+    # sideways conditions.
     else:
         direction = "NEUTRAL"
-        interpretation = "RANGEBOUND / SIDEWAYS"
+        interpretation = "NO MATRIX MATCH / WAIT"
         confidence = 0.0
         reasons = [
-            "The supplied Price-vs-VWAP, Futures OI, and Options OI conditions do not exactly match a defined table row.",
+            "The current Price-vs-VWAP, Futures OI, and Options OI conditions do not match any row explicitly defined in the supplied matrix.",
+            "No bullish or bearish market interpretation is permitted until a defined matrix row is satisfied.",
         ]
 
     reasons.extend([
