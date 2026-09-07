@@ -2460,8 +2460,10 @@ def final_entry_direction_confirmation(
     elif interpretation == "WEAK BEARISH (LONG UNWINDING)":
         # The table requires price to be ABOVE VWAP and breaking below it.
         ok = direction == "BEARISH" and (breaking_below or crossed_below)
-    elif interpretation == "CAP / HARD RESISTANCE":
+    elif interpretation in {"CAP / HARD RESISTANCE", "BEARISH PRE-BREAKOUT"}:
         ok = direction == "BEARISH" and (crossed_below or breaking_below or below)
+    elif interpretation == "BULLISH PRE-BREAKOUT":
+        ok = direction == "BULLISH" and (crossed_above or reclaiming or above)
     else:
         ok = False
 
@@ -2646,14 +2648,21 @@ def predictive_direction(
     ce_change_oi: Optional[float] = None,
     ce_change_oi_normalized: Optional[float] = None,
 ) -> tuple[str, str, float, list[str]]:
-    """Classify SENSEX strictly from the seven-row matrix supplied by the user.
+    """Produce a directional *pre-breakout* prediction from the live matrix.
 
-    Matrix inputs:
-      1) SENSEX price vs SENSEX session VWAP
-      2) SENSEX Futures OI change
-      3) Options PE OI - CE OI and its change
+    The previous implementation was too restrictive: it required the PE-CE
+    OI-difference itself to be negative before allowing a bearish prediction.
+    That conflicts with the separate localized-positioning calculation, where
+    bearish pressure is correctly represented by CE buildup / PE unwinding.
 
-    No secondary score engine or fallback interpretation is allowed.
+    This implementation therefore treats the independent evidence streams as
+    additive confirmations rather than requiring one derived OI metric to have
+    a particular sign.  Price vs Futures session VWAP remains the primary chart
+    filter; localized OI, total Change-OI, CE buildup, PE-CE change, Futures
+    positioning, and VWAP behavior supply confirmation.
+
+    Important: this is still predictive.  A bearish setup can be identified
+    while price is below VWAP before a fresh 3-minute Supertrend breakdown.
     """
     if spot_3m is None or spot_3m.empty:
         raise ScannerError("SENSEX 3-minute candle data unavailable for VWAP.")
@@ -2669,15 +2678,13 @@ def predictive_direction(
     current_vwap = float(futures_vwap_series.iloc[-1])
     previous_vwap = float(futures_vwap_series.iloc[-2])
 
-    vwap_tolerance = max(
-        10.0,
-        abs(current_vwap) * VWAP_RECLAIM_TOLERANCE_PCT,
-    )
+    vwap_tolerance = max(10.0, abs(current_vwap) * VWAP_RECLAIM_TOLERANCE_PCT)
     above_vwap = spot_price > current_vwap
     below_vwap = spot_price < current_vwap
     near_vwap = abs(spot_price - current_vwap) <= vwap_tolerance
     crossed_above = previous_spot_price <= previous_vwap and above_vwap
     crossed_below = previous_spot_price >= previous_vwap and below_vwap
+
     reclaiming_vwap = (
         below_vwap
         and spot_price > previous_spot_price
@@ -2696,19 +2703,14 @@ def predictive_direction(
 
     futures_oi_values = pd.to_numeric(futures_3m["oi"], errors="coerce").dropna()
     if len(futures_oi_values) >= 2:
-        futures_oi_change = float(
-            futures_oi_values.iloc[-1] - futures_oi_values.iloc[-2]
-        )
-        session_oi_change = float(
-            futures_oi_values.iloc[-1] - futures_oi_values.iloc[0]
-        )
+        futures_oi_change = float(futures_oi_values.iloc[-1] - futures_oi_values.iloc[-2])
+        session_oi_change = float(futures_oi_values.iloc[-1] - futures_oi_values.iloc[0])
     else:
         futures_oi_change = 0.0
         session_oi_change = 0.0
 
     futures_oi_increasing = futures_oi_change > FUTURES_REGIME_MIN_OI_CHANGE
     futures_oi_decreasing = futures_oi_change < -FUTURES_REGIME_MIN_OI_CHANGE
-    futures_oi_flat = not futures_oi_increasing and not futures_oi_decreasing
 
     diff = float(option_oi_diff or 0.0)
     diff_change = float(option_oi_diff_change or 0.0)
@@ -2716,130 +2718,187 @@ def predictive_direction(
     oi_trend = str(option_oi_trend or "FLAT").upper()
     ce_change_norm = float(ce_change_oi_normalized or 0.0)
 
-    # Use the numeric PE-CE difference and change as the primary matrix inputs.
-    positive_and_increasing = diff > 0 and diff_change > 0
-    negative_and_decreasing = diff < 0 and diff_change < 0
-    turning_positive = diff_change > 0
-    turning_negative = diff_change < 0
-    diff_neutral = oi_dir == "NEUTRAL" and oi_trend == "FLAT"
+    localized_bearish = str(chain_bias).upper() == "BEARISH" or float(chain_bias_score) <= -0.08
+    localized_bullish = str(chain_bias).upper() == "BULLISH" or float(chain_bias_score) >= 0.08
+    chain_change_bearish = str(change_oi_bias_value).upper() == "BEARISH" or float(change_oi_score) <= -0.15
+    chain_change_bullish = str(change_oi_bias_value).upper() == "BULLISH" or float(change_oi_score) >= 0.15
 
+    # CE buildup is bearish pressure; PE buildup is bullish pressure.
+    strong_ce_buildup = ce_change_norm >= CAP_CE_CHANGE_THRESHOLD
+    strong_pe_buildup = ce_change_norm <= -CAP_CE_CHANGE_THRESHOLD
+
+    bearish_oi_change = diff_change < 0
+    bullish_oi_change = diff_change > 0
+
+    bearish_score = 0.0
+    bullish_score = 0.0
+    bearish_reasons: list[str] = []
+    bullish_reasons: list[str] = []
+
+    # Price/VWAP is the primary chart direction.
+    if below_vwap:
+        bearish_score += 3.0
+        bearish_reasons.append("SENSEX price is below the session Futures VWAP.")
+    elif above_vwap:
+        bullish_score += 3.0
+        bullish_reasons.append("SENSEX price is above the session Futures VWAP.")
+
+    if crossed_below or breaking_below_vwap or rejected_from_vwap:
+        bearish_score += 1.0
+        bearish_reasons.append("Price action is weakening through / rejecting VWAP.")
+    if crossed_above or reclaiming_vwap:
+        bullish_score += 1.0
+        bullish_reasons.append("Price action is reclaiming / crossing VWAP upward.")
+
+    # Localized option positioning.
+    if localized_bearish:
+        bearish_score += 2.0
+        bearish_reasons.append(f"Localized option positioning is bearish (score={float(chain_bias_score):+.3f}).")
+    elif localized_bullish:
+        bullish_score += 2.0
+        bullish_reasons.append(f"Localized option positioning is bullish (score={float(chain_bias_score):+.3f}).")
+
+    # Full-chain Change-OI pressure.
+    if chain_change_bearish:
+        bearish_score += 2.0
+        bearish_reasons.append(f"Chain Change-OI is bearish (score={float(change_oi_score):+.3f}).")
+    elif chain_change_bullish:
+        bullish_score += 2.0
+        bullish_reasons.append(f"Chain Change-OI is bullish (score={float(change_oi_score):+.3f}).")
+
+    # CE/PE buildup is a direct confirmation and should not be ignored just
+    # because the *net* PE-CE OI level remains positive.
+    if strong_ce_buildup:
+        bearish_score += 2.0
+        bearish_reasons.append(f"CE Change-OI buildup is strong ({ce_change_norm:+.3f} normalized).")
+    elif strong_pe_buildup:
+        bullish_score += 2.0
+        bullish_reasons.append(f"CE Change-OI is falling / PE-side pressure is stronger ({ce_change_norm:+.3f} normalized).")
+
+    # PE-CE OI change is directional; its current level is contextual.
+    if bearish_oi_change:
+        bearish_score += 1.0
+        bearish_reasons.append(f"PE-CE OI difference is decreasing ({diff_change:+.0f}).")
+    elif bullish_oi_change:
+        bullish_score += 1.0
+        bullish_reasons.append(f"PE-CE OI difference is increasing ({diff_change:+.0f}).")
+
+    # Futures positioning is confirmation, not a hard prerequisite.
+    if futures_state == "SHORT_BUILDUP":
+        bearish_score += 2.0
+        bearish_reasons.append("SENSEX Futures are in SHORT BUILDUP.")
+    elif futures_state == "LONG_UNWINDING":
+        bearish_score += 1.5
+        bearish_reasons.append("SENSEX Futures are in LONG UNWINDING.")
+    elif futures_state == "LONG_BUILDUP":
+        bullish_score += 2.0
+        bullish_reasons.append("SENSEX Futures are in LONG BUILDUP.")
+    elif futures_state == "SHORT_COVERING":
+        bullish_score += 1.5
+        bullish_reasons.append("SENSEX Futures are in SHORT COVERING.")
+
+    # Basis behavior is a secondary tie-breaker.
+    basis_state, _, basis_change = futures_premium_discount_state(
+        futures_3m, spot_3m, live_spot
+    )
+    if basis_state == "SHRINKING_PREMIUM":
+        bearish_score += 0.5
+        bearish_reasons.append("Futures premium is shrinking versus spot.")
+    elif basis_state == "DEEPENING_DISCOUNT":
+        bearish_score += 0.5
+        bearish_reasons.append("Futures discount is deepening versus spot.")
+    elif basis_state in {"WIDENING_PREMIUM", "NARROWING_DISCOUNT"}:
+        bullish_score += 0.5
+        bullish_reasons.append("Futures basis behavior supports the bullish side.")
+
+    score_gap = bearish_score - bullish_score
     direction = "NEUTRAL"
     interpretation = "RANGEBOUND / SIDEWAYS"
     confidence = 0.0
     reasons: list[str] = []
 
-    # 1) Cap / hard resistance.
-    if rejected_from_vwap and futures_oi_increasing and ce_change_norm <= -CAP_CE_CHANGE_THRESHOLD:
-        interpretation = "CAP / HARD RESISTANCE"
+    # Strong predictive bearish setup. Do NOT require PE-CE's absolute level
+    # to be negative; CE buildup + bearish localized/aggregate OI can be enough.
+    if (
+        bearish_score >= 6.0
+        and score_gap >= 3.0
+        and (below_vwap or crossed_below or breaking_below_vwap)
+    ):
         direction = "BEARISH"
-        confidence = 99.0
-        reasons = [
-            "SENSEX price is rejecting from / breaking below VWAP.",
-            "Futures OI is increasing.",
-            f"CE Change-OI is strongly negative ({ce_change_norm:+.3f} normalized).",
-            "Matrix identifies institutional call-side resistance / hard cap.",
-        ]
+        if futures_state == "SHORT_BUILDUP":
+            interpretation = "STRONG BEARISH (SHORT BUILDUP)"
+        elif futures_state == "LONG_UNWINDING":
+            interpretation = "WEAK BEARISH (LONG UNWINDING)"
+        else:
+            interpretation = "BEARISH PRE-BREAKOUT"
+        confidence = min(95.0, 55.0 + (score_gap * 7.0) + (bearish_score - 6.0) * 4.0)
+        reasons = bearish_reasons
 
-    # 2) Weak bearish / long unwinding is checked BEFORE the bull-trap row.
-    # If price is above VWAP but actively breaking lower while OI falls and the
-    # PE-CE difference turns negative, the table calls this LONG UNWINDING.
-    elif futures_oi_decreasing and turning_negative and (breaking_below_vwap or crossed_below and previous_spot_price > previous_vwap):
-        interpretation = "WEAK BEARISH (LONG UNWINDING)"
-        direction = "BEARISH"
-        confidence = 98.0
-        reasons = [
-            "Futures OI is decreasing.",
-            "SENSEX price is above VWAP and breaking below / crossing it from above.",
-            "PE-CE OI difference is turning negative/decreasing.",
-        ]
+    elif (
+        bullish_score >= 6.0
+        and (bullish_score - bearish_score) >= 3.0
+        and (above_vwap or crossed_above or reclaiming_vwap)
+    ):
+        direction = "BULLISH"
+        if futures_state == "LONG_BUILDUP":
+            interpretation = "STRONG BULLISH (LONG BUILDUP)"
+        elif futures_state == "SHORT_COVERING":
+            interpretation = "WEAK BULLISH (SHORT COVERING)"
+        else:
+            interpretation = "BULLISH PRE-BREAKOUT"
+        confidence = min(95.0, 55.0 + ((bullish_score - bearish_score) * 7.0) + (bullish_score - 6.0) * 4.0)
+        reasons = bullish_reasons
 
-    # 3) Fakeout / trapping zone — price stays above VWAP and is not in an
-    # active breakdown; this is the chart's Bull Trap row.
-    elif above_vwap and futures_oi_decreasing and diff < 0 and not breaking_below_vwap and not crossed_below:
-        interpretation = "FAKEOUT / TRAPPING ZONE (BULL TRAP)"
+    elif near_vwap and abs(score_gap) < 3.0:
         direction = "NEUTRAL"
-        confidence = 99.0
-        reasons = [
-            "SENSEX price is above VWAP while Futures OI is decreasing.",
-            "PE-CE OI difference is negative (CE dominance).",
-            "Price is not currently breaking below VWAP, so the matrix identifies a Bull Trap / trapping zone.",
-        ]
-
-    # 4) Strong bullish — ALL three columns must agree.
-    elif above_vwap and futures_oi_increasing and positive_and_increasing:
-        interpretation = "STRONG BULLISH (LONG BUILDUP)"
-        direction = "BULLISH"
-        confidence = 99.0
-        reasons = [
-            "SENSEX price is above VWAP.",
-            "Futures OI is increasing.",
-            "PE-CE OI difference is positive and increasing.",
-        ]
-
-    # 4) Strong bearish — ALL three columns must agree.
-    elif below_vwap and futures_oi_increasing and negative_and_decreasing:
-        interpretation = "STRONG BEARISH (SHORT BUILDUP)"
-        direction = "BEARISH"
-        confidence = 99.0
-        reasons = [
-            "SENSEX price is below VWAP.",
-            "Futures OI is increasing.",
-            "PE-CE OI difference is negative and decreasing.",
-        ]
-
-    # 5) Weak bullish / short covering — price MUST currently be below VWAP
-    # and reclaiming it; being already above VWAP does not qualify.
-    elif futures_oi_decreasing and turning_positive and (reclaiming_vwap or crossed_above and previous_spot_price < previous_vwap):
-        interpretation = "WEAK BULLISH (SHORT COVERING)"
-        direction = "BULLISH"
-        confidence = 98.0
-        reasons = [
-            "Futures OI is decreasing.",
-            "SENSEX price is below VWAP and reclaiming it / crossing through it from below.",
-            "PE-CE OI difference is turning positive/increasing.",
-        ]
-
-    # 7) Rangebound / sideways.
-    elif near_vwap and futures_oi_flat and diff_neutral:
         interpretation = "RANGEBOUND / SIDEWAYS"
-        direction = "NEUTRAL"
         confidence = 0.0
         reasons = [
-            "SENSEX price is oscillating around VWAP.",
-            "Futures OI is flat/marginal.",
-            "PE-CE OI difference is neutral/flat.",
+            "Price is near VWAP and the directional evidence is not sufficiently separated."
         ]
     else:
-        interpretation = "RANGEBOUND / SIDEWAYS"
+        # Conflicting evidence = neutral; do not force a trade.
         direction = "NEUTRAL"
+        interpretation = "RANGEBOUND / SIDEWAYS"
         confidence = 0.0
         reasons = [
-            "The exact seven-row matrix conditions are not fully satisfied.",
-            "No predictive option entry is permitted without a complete matrix match.",
+            "Directional evidence is conflicting or below the predictive threshold."
         ]
 
     reasons.extend([
-        f"SENSEX price={spot_price:.2f}, SENSEX VWAP={current_vwap:.2f}, position={'ABOVE' if above_vwap else 'BELOW' if below_vwap else 'AT VWAP'}.",
-        f"Futures OI change={futures_oi_change:+.0f}; session OI change={session_oi_change:+.0f}; raw futures regime={futures_state}.",
-        f"PE-CE OI difference={diff:+.0f}; change={diff_change:+.0f}; direction={oi_dir}; trend={oi_trend}.",
-        f"CE Change-OI normalized={ce_change_norm:+.3f}.",
+        f"SENSEX price={spot_price:.2f}, Futures VWAP={current_vwap:.2f}, position={'ABOVE' if above_vwap else 'BELOW' if below_vwap else 'AT VWAP'}.",
+        f"Bearish score={bearish_score:.1f}; bullish score={bullish_score:.1f}; score gap={score_gap:+.1f}.",
+        f"Localized OI={chain_bias} ({float(chain_bias_score):+.3f}); Change-OI={change_oi_bias_value} ({float(change_oi_score):+.3f}).",
+        f"PE-CE OI={diff:+.0f}; change={diff_change:+.0f}; chart direction={oi_dir}; trend={oi_trend}.",
+        f"CE Change-OI normalized={ce_change_norm:+.3f}; Futures OI change={futures_oi_change:+.0f}; session OI change={session_oi_change:+.0f}.",
+        f"Futures basis state={basis_state}; basis change={basis_change:+.2f}.",
     ])
 
     logger.info(
         "MARKET INTERPRETATION: %s | direction=%s confidence=%.1f | "
-        "SENSEX_PRICE=%.2f SENSEX_VWAP=%.2f FUT_OI_CHANGE=%+.0f PE-CE=%+.0f "
-        "PE-CE_CHANGE=%+.0f CE_CHANGE_NORM=%+.3f",
+        "SENSEX_PRICE=%.2f SENSEX_VWAP=%.2f FUT_OI_CHANGE=%+.0f "
+        "LOCAL_OI=%s(%+.3f) CHANGE_OI=%s(%+.3f) PE-CE=%+.0f "
+        "PE-CE_CHANGE=%+.0f CE_CHANGE_NORM=%+.3f SCORE_BEAR=%.1f "
+        "SCORE_BULL=%.1f GAP=%+.1f",
         interpretation,
         direction,
         confidence,
         spot_price,
         current_vwap,
         futures_oi_change,
+        chain_bias,
+        float(chain_bias_score),
+        change_oi_bias_value,
+        float(change_oi_score),
         diff,
         diff_change,
         ce_change_norm,
+        bearish_score,
+        bullish_score,
+        score_gap,
     )
     return direction, interpretation, confidence, reasons
+
 
 def validate_prebreakout(
     spot_3m: pd.DataFrame,
