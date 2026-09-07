@@ -18,7 +18,7 @@ Strategy:
 - T1 based on projected 3-minute breakout level
 - T2 based on projected 15-minute resistance/support
 - Option premium targets translated using live option Delta/Gamma
-- Stop loss = 15% below entry premium
+- Stop loss = 10% below entry premium
 - Duplicate signal suppression via persisted state
 - Email notifications only for new actionable signals
 
@@ -103,7 +103,7 @@ REQUEST_TIMEOUT = int(
     )
 )
 
-SCANNER_VERSION = "2026-09-07-MATRIX-EXACT-FINAL"
+SCANNER_VERSION = "2026-09-07-MATRIX-REVALIDATION-10SL"
 
 STATE_FILE = Path(
     os.getenv(
@@ -121,6 +121,8 @@ SIGNAL_THRESHOLD = float(
 
 PREDICTION_MIN_CONFLUENCE = 2
 LOCK_SETUP_MINUTES = 45
+ACTIVE_TRADE_SL_PCT = 0.10
+ACTIVE_TRADE_SL_FACTOR = 1.0 - ACTIVE_TRADE_SL_PCT
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -3062,7 +3064,7 @@ def create_targets(
         )
 
     stop_loss = round(
-        entry * 0.85,
+        entry * ACTIVE_TRADE_SL_FACTOR,
         2,
     )
 
@@ -3083,15 +3085,74 @@ def active_trade_from_state(state: dict[str, Any]) -> Optional[dict[str, Any]]:
         return None
     if str(trade.get("status", "")).upper() != "ACTIVE":
         return None
-    required = {"instrument_key", "trading_symbol", "option_type", "strike", "entry", "target_1", "target_2", "stop_loss"}
+    required = {
+        "instrument_key",
+        "trading_symbol",
+        "option_type",
+        "strike",
+        "entry",
+        "target_1",
+        "target_2",
+        "stop_loss",
+    }
     if not required.issubset(trade):
         logger.warning("Ignoring incomplete active trade state.")
         return None
     return trade
 
 
-def monitor_active_trade(state: dict[str, Any]) -> str:
-    """Monitor the already-selected option until T1/T2/SL; never create another entry."""
+def market_logic_signature(
+    direction: str,
+    interpretation: str,
+    price_vs_vwap: str,
+    futures_state: str,
+    oi_direction: str,
+    oi_trend: str,
+    final_gate: bool,
+) -> str:
+    """Stable signature for the discrete market logic that owns an active strike."""
+    parts = [
+        str(direction).upper(),
+        str(interpretation).upper(),
+        str(price_vs_vwap).upper(),
+        str(futures_state).upper(),
+        str(oi_direction).upper(),
+        str(oi_trend).upper(),
+        "GATE_PASS" if final_gate else "GATE_FAIL",
+    ]
+    return "|".join(parts)
+
+
+def close_active_trade(
+    state: dict[str, Any],
+    trade: dict[str, Any],
+    outcome: str,
+    exit_ltp: Optional[float] = None,
+    reason: str = "",
+) -> None:
+    closed = dict(trade)
+    closed["status"] = "CLOSED"
+    closed["outcome"] = outcome
+    if exit_ltp is not None:
+        closed["exit_ltp"] = round(float(exit_ltp), 2)
+    closed["closed_at"] = now_ist().isoformat()
+    if reason:
+        closed["invalidation_reason"] = reason
+    state["active_trade"] = None
+    state["last_completed_trade"] = closed
+    save_state(state)
+
+
+def monitor_active_trade(
+    state: dict[str, Any],
+    current_direction: str,
+    current_interpretation: str,
+    current_confidence: float,
+    final_confirmed: bool,
+    selected_option: OptionCandidate,
+    current_logic_signature: str,
+) -> str:
+    """Revalidate the active strike on every scan, then monitor it to a 10% SL/T1/T2."""
     trade = active_trade_from_state(state)
     if trade is None:
         return "NO_ACTIVE"
@@ -3109,11 +3170,93 @@ def monitor_active_trade(state: dict[str, Any]) -> str:
     entry = float(trade["entry"])
     target_1 = float(trade["target_1"])
     target_2 = float(trade["target_2"])
-    stop_loss = float(trade["stop_loss"])
+
+    # Migrate legacy 15% states immediately to the new 10% stop-loss rule.
+    stop_loss = round(entry * ACTIVE_TRADE_SL_FACTOR, 2)
+    trade["stop_loss"] = stop_loss
     trade["last_ltp"] = round(ltp, 2)
     trade["last_monitored_at"] = now_ist().isoformat()
-    state["active_trade"] = trade
 
+    stored_signature = str(trade.get("market_logic_signature", ""))
+    active_direction = str(trade.get("direction", "")).upper()
+    active_interpretation = str(trade.get("regime", ""))
+    active_instrument = str(trade.get("instrument_key", ""))
+    active_option_type = str(trade.get("option_type", "")).upper()
+    active_strike = float(trade.get("strike"))
+
+    invalidation_reasons: list[str] = []
+    if active_direction != str(current_direction).upper():
+        invalidation_reasons.append(
+            f"direction changed {active_direction} -> {str(current_direction).upper()}"
+        )
+    if active_interpretation != str(current_interpretation):
+        invalidation_reasons.append(
+            f"market interpretation changed {active_interpretation} -> {current_interpretation}"
+        )
+    if float(current_confidence) < SIGNAL_THRESHOLD:
+        invalidation_reasons.append(
+            f"current confidence {float(current_confidence):.2f} < {SIGNAL_THRESHOLD:.2f}"
+        )
+    if not final_confirmed:
+        invalidation_reasons.append("current chart/VWAP entry gate failed")
+    if active_instrument != str(selected_option.instrument_key):
+        invalidation_reasons.append(
+            f"current selected instrument changed to {selected_option.trading_symbol}"
+        )
+    if active_option_type != str(selected_option.option_type).upper():
+        invalidation_reasons.append(
+            f"option type changed {active_option_type} -> {selected_option.option_type}"
+        )
+    if not math.isclose(active_strike, float(selected_option.strike), rel_tol=0.0, abs_tol=0.01):
+        invalidation_reasons.append(
+            f"strike changed {active_strike:.0f} -> {float(selected_option.strike):.0f}"
+        )
+    if stored_signature and stored_signature != current_logic_signature:
+        invalidation_reasons.append("matrix/VWAP market logic signature changed")
+
+    logger.info(
+        "ACTIVE TRADE REVALIDATION: %s | current_direction=%s current_interpretation=%s "
+        "current_selection=%s %.0f %s | logic_changed=%s",
+        trade["trading_symbol"],
+        current_direction,
+        current_interpretation,
+        selected_option.trading_symbol,
+        selected_option.strike,
+        selected_option.option_type,
+        bool(invalidation_reasons),
+    )
+
+    if invalidation_reasons:
+        reason = "; ".join(invalidation_reasons)
+        logger.warning(
+            "ACTIVE STRIKE INVALIDATED: %s | reason=%s",
+            trade["trading_symbol"],
+            reason,
+        )
+        close_active_trade(
+            state,
+            trade,
+            "INVALIDATED",
+            exit_ltp=ltp,
+            reason=reason,
+        )
+        try:
+            send_email(
+                f"SENSEX TRADE INVALIDATED - {trade['trading_symbol']}",
+                (
+                    f"SENSEX {trade['direction']} trade invalidated by live market revalidation.<br>"
+                    f"Option: {trade['trading_symbol']}<br>"
+                    f"Entry: ₹{entry:.2f}<br>"
+                    f"Current LTP: ₹{ltp:.2f}<br>"
+                    f"Reason: {reason}<br>"
+                    f"The scanner is now free to select a fresh current-market strike."
+                ),
+            )
+        except ScannerError as exc:
+            logger.warning("Trade invalidation email failed: %s", exc)
+        return "INVALIDATED"
+
+    state["active_trade"] = trade
     logger.info(
         "ACTIVE TRADE MONITOR: %s | LTP=%.2f Entry=%.2f T1=%.2f T2=%.2f SL=%.2f",
         trade["trading_symbol"], ltp, entry, target_1, target_2, stop_loss,
@@ -3131,20 +3274,13 @@ def monitor_active_trade(state: dict[str, Any]) -> str:
         save_state(state)
         return "ACTIVE"
 
-    trade["status"] = "CLOSED"
-    trade["outcome"] = outcome
-    trade["exit_ltp"] = round(ltp, 2)
-    trade["closed_at"] = now_ist().isoformat()
-    state["active_trade"] = None
-    state["last_completed_trade"] = trade
-    save_state(state)
+    close_active_trade(state, trade, outcome, exit_ltp=ltp)
 
     logger.info(
         "ACTIVE TRADE CLOSED: %s | outcome=%s exit_ltp=%.2f",
         trade["trading_symbol"], outcome, ltp,
     )
 
-    # One outcome email only. There is never an email on an unchanged active run.
     try:
         send_email(
             f"SENSEX TRADE {outcome} - {trade['trading_symbol']}",
@@ -3154,6 +3290,7 @@ def monitor_active_trade(state: dict[str, Any]) -> str:
                 f"Entry: ₹{entry:.2f}<br>"
                 f"Exit: ₹{ltp:.2f}<br>"
                 f"Outcome: {outcome}<br>"
+                f"Stop-loss policy: {ACTIVE_TRADE_SL_PCT * 100:.0f}% below entry."
             ),
         )
     except ScannerError as exc:
@@ -3443,21 +3580,6 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
 
     state = state if isinstance(state, dict) else {}
 
-    # A selected trade owns the scanner until T1/T2/SL. Do not re-run
-    # directional analysis or generate another entry while it is active.
-    active = active_trade_from_state(state)
-    if active is not None:
-        active_date = str(active.get("trade_date", ""))[:10]
-        if active_date and active_date != now_ist().date().isoformat():
-            logger.info("Previous-day active trade state found; clearing stale trade before new session.")
-            state["last_completed_trade"] = active
-            state["active_trade"] = None
-            save_state(state)
-        else:
-            monitor_result = monitor_active_trade(state)
-            if monitor_result in {"ACTIVE", "CLOSED"}:
-                return None
-
     previous_snapshot = state.get("market_snapshot")
     if not isinstance(previous_snapshot, dict):
         previous_snapshot = {}
@@ -3639,6 +3761,38 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
             confidence,
         )
 
+        active = active_trade_from_state(state)
+        if active is not None and (
+            direction == "NEUTRAL"
+            or interpretation in {
+                "FAKEOUT / TRAPPING ZONE (BULL TRAP)",
+                "RANGEBOUND / SIDEWAYS",
+                "NO MATRIX MATCH / WAIT",
+            }
+            or confidence < SIGNAL_THRESHOLD
+        ):
+            reason = (
+                f"current market no longer satisfies active-entry logic: "
+                f"direction={direction}, interpretation={interpretation}, confidence={confidence:.2f}"
+            )
+            logger.warning(
+                "ACTIVE STRIKE INVALIDATED: %s | %s",
+                active.get("trading_symbol", ""),
+                reason,
+            )
+            try:
+                active_ltp = extract_ltp(get_quote(str(active["instrument_key"])))
+            except ScannerError:
+                active_ltp = None
+            close_active_trade(
+                state,
+                active,
+                "INVALIDATED",
+                exit_ltp=active_ltp,
+                reason=reason,
+            )
+            active = None
+
         if direction == "NEUTRAL":
             return None
 
@@ -3665,6 +3819,16 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         )
         if not final_confirmed:
             logger.info("No strike selected: chart-aligned final VWAP gate failed.")
+            active = active_trade_from_state(state)
+            if active is not None:
+                close_active_trade(
+                    state,
+                    active,
+                    "INVALIDATED",
+                    exit_ltp=None,
+                    reason="current chart/VWAP entry gate failed before a valid current strike could be selected",
+                )
+                logger.warning("ACTIVE STRIKE INVALIDATED: %s | current chart/VWAP gate failed", active.get("trading_symbol", ""))
             return None
 
         # Always use the CURRENT ATM and CURRENT chart direction.
@@ -3676,6 +3840,43 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
             spot,
             preferred_strike=None,
         )
+
+        current_logic_signature = market_logic_signature(
+            direction=direction,
+            interpretation=interpretation,
+            price_vs_vwap=current_price_vs_vwap,
+            futures_state=futures_state,
+            oi_direction=oi_diff_direction,
+            oi_trend=oi_diff_trend,
+            final_gate=final_confirmed,
+        )
+
+        active = active_trade_from_state(state)
+        if active is not None:
+            active_date = str(active.get("trade_date", ""))[:10]
+            if active_date and active_date != now_ist().date().isoformat():
+                logger.info("Previous-day active trade state found; clearing stale trade before new session.")
+                state["last_completed_trade"] = active
+                state["active_trade"] = None
+                save_state(state)
+                active = None
+            else:
+                monitor_result = monitor_active_trade(
+                    state=state,
+                    current_direction=direction,
+                    current_interpretation=interpretation,
+                    current_confidence=confidence,
+                    final_confirmed=final_confirmed,
+                    selected_option=option,
+                    current_logic_signature=current_logic_signature,
+                )
+                if monitor_result in {"ACTIVE", "CLOSED"}:
+                    # A target/SL closure ends this scan. The next scheduled run
+                    # gets a genuinely fresh market/strike selection.
+                    return None
+                # INVALIDATED intentionally falls through so this same scan can
+                # evaluate the newly current market logic and, when valid, select
+                # a replacement strike.
 
         valid, trigger_3m, target_15m, validation_reasons = validate_prebreakout(
             spot_3m, spot_15m, direction, option
@@ -3699,7 +3900,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
             "Selected option from the chart-defined ITM side: Bullish=ATM-1 CE (fallback ATM-2 CE); Bearish=ATM+1 PE (fallback ATM+2 PE).",
             f"Final chart VWAP gate: {'PASS' if final_confirmed else 'FAIL'}.",
             "Entry is predictive/pre-breakout; the scanner does not wait for the breakout to occur.",
-            "Stop loss = 15% below option entry premium.",
+            "Stop loss = 10% below option entry premium; active trade is invalidated immediately if the current market logic changes.",
         ]
 
         return Signal(
@@ -3775,6 +3976,15 @@ def main() -> int:
             "delta": signal.delta,
             "gamma": signal.gamma,
             "last_ltp": signal.entry,
+            "market_logic_signature": market_logic_signature(
+                direction=signal.direction,
+                interpretation=signal.regime,
+                price_vs_vwap=str(state.get("market_snapshot", {}).get("price_vs_vwap", "")),
+                futures_state=signal.futures_state,
+                oi_direction=str(state.get("market_snapshot", {}).get("option_oi_direction", "")),
+                oi_trend=str(state.get("market_snapshot", {}).get("option_oi_trend", "")),
+                final_gate=True,
+            ),
         }
 
         # Do not send the entry email until persistent state has been written.
