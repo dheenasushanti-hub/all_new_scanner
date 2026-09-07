@@ -96,8 +96,9 @@
     ]
   },
   "last_signal_timestamp": "2026-09-07 12:34:25 IST",
-  "active_trade": {
-    "status": "ACTIVE",
+  "active_trade": null,
+  "last_completed_trade": {
+    "status": "CLOSED",
     "trade_date": "2026-09-07",
     "opened_at": "2026-09-07 12:34:25 IST",
     "direction": "BEARISH",
@@ -115,32 +116,10 @@
     "underlying_target_15m": 75779.55249918022,
     "delta": -0.5143,
     "gamma": 0.0005,
-    "last_ltp": 345.9,
-    "last_monitored_at": "2026-09-07T12:49:19.877730+05:30"
-  },
-  "last_completed_trade": {
-    "status": "CLOSED",
-    "trade_date": "2026-09-07",
-    "opened_at": "2026-09-07 12:24:53 IST",
-    "direction": "BEARISH",
-    "regime": "STRONG BEARISH (SHORT BUILDUP)",
-    "confidence": 95.0,
-    "instrument_key": "BSE_FO|860361",
-    "trading_symbol": "SENSEX 76200 PE 10 SEP 26",
-    "option_type": "PE",
-    "strike": 76200.0,
-    "entry": 335.0,
-    "target_1": 342.96,
-    "target_2": 503.73,
-    "stop_loss": 284.75,
-    "underlying_trigger_3m": 76053.76791229335,
-    "underlying_target_15m": 75779.55249918022,
-    "delta": -0.51,
-    "gamma": 0.0005,
-    "last_ltp": 354.65,
-    "last_monitored_at": "2026-09-07T12:31:17.781976+05:30",
+    "last_ltp": 358.15,
+    "last_monitored_at": "2026-09-07T12:52:18.462386+05:30",
     "outcome": "TARGET_1",
-    "exit_ltp": 354.65,
-    "closed_at": "2026-09-07T12:31:17.782314+05:30"
+    "exit_ltp": 358.15,
+    "closed_at": "2026-09-07T12:52:18.462724+05:30"
   }
 }
