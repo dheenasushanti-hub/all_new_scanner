@@ -96,8 +96,9 @@
     ]
   },
   "last_signal_timestamp": "2026-09-07 12:24:53 IST",
-  "active_trade": {
-    "status": "ACTIVE",
+  "active_trade": null,
+  "last_completed_trade": {
+    "status": "CLOSED",
     "trade_date": "2026-09-07",
     "opened_at": "2026-09-07 12:24:53 IST",
     "direction": "BEARISH",
@@ -115,29 +116,10 @@
     "underlying_target_15m": 75779.55249918022,
     "delta": -0.51,
     "gamma": 0.0005,
-    "last_ltp": 337.6,
-    "last_monitored_at": "2026-09-07T12:28:16.908238+05:30"
-  },
-  "last_completed_trade": {
-    "status": "ACTIVE",
-    "trade_date": "2026-09-04",
-    "opened_at": "2026-09-04 12:24:27 IST",
-    "direction": "BULLISH",
-    "regime": "WEAK BULLISH (SHORT COVERING)",
-    "confidence": 88.0,
-    "instrument_key": "BSE_FO|860310",
-    "trading_symbol": "SENSEX 76600 CE 10 SEP 26",
-    "option_type": "CE",
-    "strike": 76600.0,
-    "entry": 546.75,
-    "target_1": 616.06,
-    "target_2": 651.69,
-    "stop_loss": 464.74,
-    "underlying_trigger_3m": 76828.07,
-    "underlying_target_15m": 76883.14,
-    "delta": 0.5908,
-    "gamma": 0.0004,
-    "last_ltp": 491.7,
-    "last_monitored_at": "2026-09-04T15:27:32.757849+05:30"
+    "last_ltp": 354.65,
+    "last_monitored_at": "2026-09-07T12:31:17.781976+05:30",
+    "outcome": "TARGET_1",
+    "exit_ltp": 354.65,
+    "closed_at": "2026-09-07T12:31:17.782314+05:30"
   }
 }
