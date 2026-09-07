@@ -2396,18 +2396,22 @@ def final_entry_direction_confirmation(
         return False, ["SENSEX Futures session VWAP candles unavailable."]
 
     vwap_series = calculate_vwap(futures_vwap_candles).dropna()
-    if len(vwap_series) < 2:
-        return False, ["SENSEX session VWAP unavailable: insufficient usable volume."]
+    if len(vwap_series) < 1:
+        return False, ["SENSEX session VWAP unavailable: no usable Futures volume yet."]
 
     price = float(spot_3m["close"].iloc[-1])
     prev_price = float(spot_3m["close"].iloc[-2])
     vwap = float(vwap_series.iloc[-1])
-    prev_vwap = float(vwap_series.iloc[-2])
+    # Early-session BSE Futures data can contain volume on only one candle.
+    # The session VWAP itself is valid at that point; there simply is not yet
+    # a prior VWAP observation for transition/reclaim calculations.
+    prev_vwap = float(vwap_series.iloc[-2]) if len(vwap_series) >= 2 else vwap
 
     above = price > vwap
     below = price < vwap
-    crossed_above = prev_price <= prev_vwap and above
-    crossed_below = prev_price >= prev_vwap and below
+    have_prior_vwap = len(vwap_series) >= 2
+    crossed_above = have_prior_vwap and prev_price <= prev_vwap and above
+    crossed_below = have_prior_vwap and prev_price >= prev_vwap and below
     reclaiming = (
         below
         and price > prev_price
@@ -2636,21 +2640,24 @@ def predictive_direction(
         raise ScannerError("SENSEX Futures session VWAP candles unavailable.")
 
     futures_vwap_series = calculate_vwap(futures_vwap_candles).dropna()
-    if len(futures_vwap_series) < 2:
-        raise ScannerError("SENSEX Futures session VWAP unavailable: insufficient usable volume.")
+    if len(futures_vwap_series) < 1:
+        raise ScannerError("SENSEX Futures session VWAP unavailable: no usable Futures volume yet.")
 
     price = float(spot_3m["close"].iloc[-1])
     prev_price = float(spot_3m["close"].iloc[-2])
     vwap = float(futures_vwap_series.iloc[-1])
-    prev_vwap = float(futures_vwap_series.iloc[-2])
+    # First valid session VWAP point is sufficient for level-based matrix rows.
+    # Transition detection is disabled until a second VWAP observation exists.
+    prev_vwap = float(futures_vwap_series.iloc[-2]) if len(futures_vwap_series) >= 2 else vwap
 
     tol = max(10.0, abs(vwap) * VWAP_RECLAIM_TOLERANCE_PCT)
     above = price > vwap
     below = price < vwap
     near = abs(price - vwap) <= tol
 
-    crossed_above = prev_price <= prev_vwap and above
-    crossed_below = prev_price >= prev_vwap and below
+    have_prior_vwap = len(vwap_series) >= 2
+    crossed_above = have_prior_vwap and prev_price <= prev_vwap and above
+    crossed_below = have_prior_vwap and prev_price >= prev_vwap and below
 
     # The matrix uses VWAP *transitions* ("reclaiming" / "breaking below"),
     # not only the immediately previous candle.  A 3-minute workflow can miss
@@ -2658,7 +2665,7 @@ def predictive_direction(
     # recent candle window.
     recent_crossed_above = False
     recent_crossed_below = False
-    recent_n = min(VWAP_TRANSITION_LOOKBACK_CANDLES, len(spot_3m) - 1, len(futures_vwap_series) - 1)
+    recent_n = min(VWAP_TRANSITION_LOOKBACK_CANDLES, len(spot_3m) - 1, max(len(futures_vwap_series) - 1, 0))
     if recent_n >= 1:
         recent_prices = pd.to_numeric(spot_3m["close"].tail(recent_n + 1), errors="coerce").to_numpy()
         recent_vwaps = pd.to_numeric(futures_vwap_series.tail(recent_n + 1), errors="coerce").to_numpy()
