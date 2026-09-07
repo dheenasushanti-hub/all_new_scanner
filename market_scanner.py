@@ -2413,12 +2413,20 @@ def final_entry_direction_confirmation(
     direction: str,
     interpretation: str,
     spot_3m: pd.DataFrame,
+    futures_vwap_candles: pd.DataFrame,
 ) -> tuple[bool, list[str]]:
-    """Final VWAP safety gate using the SENSEX price, exactly as the matrix states."""
+    """Final VWAP safety gate using spot price against Futures session VWAP.
+
+    SENSEX index candles can legitimately report zero volume, so they must not
+    be used as the VWAP source.  The scanner already fetches the complete
+    current-session SENSEX Futures candles specifically for VWAP.
+    """
     if spot_3m is None or spot_3m.empty:
         return False, ["SENSEX 3-minute candles unavailable."]
+    if futures_vwap_candles is None or futures_vwap_candles.empty:
+        return False, ["SENSEX Futures session VWAP candles unavailable."]
 
-    vwap_series = calculate_vwap(spot_3m).dropna()
+    vwap_series = calculate_vwap(futures_vwap_candles).dropna()
     if len(vwap_series) < 2:
         return False, ["SENSEX session VWAP unavailable: insufficient usable volume."]
 
@@ -2652,14 +2660,14 @@ def predictive_direction(
     if futures_3m is None or futures_3m.empty:
         raise ScannerError("SENSEX futures 3-minute candle data unavailable for Futures OI.")
 
-    spot_vwap_series = calculate_vwap(spot_3m).dropna()
-    if len(spot_vwap_series) < 2:
-        raise ScannerError("SENSEX session VWAP unavailable: insufficient usable volume.")
+    futures_vwap_series = calculate_vwap(futures_3m).dropna()
+    if len(futures_vwap_series) < 2:
+        raise ScannerError("SENSEX Futures session VWAP unavailable: insufficient usable volume.")
 
     spot_price = float(spot_3m["close"].iloc[-1])
     previous_spot_price = float(spot_3m["close"].iloc[-2])
-    current_vwap = float(spot_vwap_series.iloc[-1])
-    previous_vwap = float(spot_vwap_series.iloc[-2])
+    current_vwap = float(futures_vwap_series.iloc[-1])
+    previous_vwap = float(futures_vwap_series.iloc[-2])
 
     vwap_tolerance = max(
         10.0,
@@ -3599,6 +3607,7 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
             direction,
             interpretation,
             spot_3m,
+            futures_vwap_candles,
         )
         if not final_confirmed:
             logger.info("No strike selected: chart-aligned final VWAP gate failed.")
