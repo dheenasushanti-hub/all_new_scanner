@@ -103,6 +103,8 @@ REQUEST_TIMEOUT = int(
     )
 )
 
+SCANNER_VERSION = "2026-09-07-PREBREAKOUT-MATRIX-V2"
+
 STATE_FILE = Path(
     os.getenv(
         "STATE_FILE",
@@ -3743,6 +3745,8 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
 # =============================================================================
 
 def main() -> int:
+
+    logger.info("SENSEX SCANNER VERSION: %s", SCANNER_VERSION)
 
     try:
 
