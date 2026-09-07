@@ -147,6 +147,7 @@ FUTURES_REGIME_MIN_PRICE_MOVE = 0.50
 FUTURES_REGIME_MIN_OI_CHANGE = 1.0
 
 MAX_SIGNAL_AGE_MINUTES = 15
+VWAP_TRANSITION_LOOKBACK_CANDLES = 5
 
 # Do not select an option that is already materially collapsing at entry.
 # This is a strike-health preference, not a bullish/bearish market filter.
@@ -2649,15 +2650,38 @@ def predictive_direction(
     crossed_above = prev_price <= prev_vwap and above
     crossed_below = prev_price >= prev_vwap and below
 
+    # The matrix uses VWAP *transitions* ("reclaiming" / "breaking below"),
+    # not only the immediately previous candle.  A 3-minute workflow can miss
+    # the exact crossing candle, so detect the most recent crossing in the
+    # recent candle window.
+    recent_crossed_above = False
+    recent_crossed_below = False
+    recent_n = min(VWAP_TRANSITION_LOOKBACK_CANDLES, len(spot_3m) - 1, len(futures_vwap_series) - 1)
+    if recent_n >= 1:
+        recent_prices = pd.to_numeric(spot_3m["close"].tail(recent_n + 1), errors="coerce").to_numpy()
+        recent_vwaps = pd.to_numeric(futures_vwap_series.tail(recent_n + 1), errors="coerce").to_numpy()
+        for i in range(1, len(recent_prices)):
+            if not (math.isfinite(float(recent_prices[i - 1])) and math.isfinite(float(recent_prices[i]))):
+                continue
+            if not (math.isfinite(float(recent_vwaps[i - 1])) and math.isfinite(float(recent_vwaps[i]))):
+                continue
+            if recent_prices[i - 1] <= recent_vwaps[i - 1] and recent_prices[i] > recent_vwaps[i]:
+                recent_crossed_above = True
+            if recent_prices[i - 1] >= recent_vwaps[i - 1] and recent_prices[i] < recent_vwaps[i]:
+                recent_crossed_below = True
+
     reclaiming = (
         below
-        and price > prev_price
-        and abs(vwap - price) < abs(prev_vwap - prev_price)
+        and price >= prev_price
+        and abs(vwap - price) <= abs(prev_vwap - prev_price)
     )
     breaking_below = (
-        above
-        and price < prev_price
-        and abs(price - vwap) < abs(prev_price - prev_vwap)
+        below
+        and price <= prev_price
+        and (
+            abs(price - vwap) <= abs(prev_price - prev_vwap)
+            or recent_crossed_below
+        )
     )
     rejecting_vwap = (
         above
@@ -2675,12 +2699,21 @@ def predictive_direction(
         raise ScannerError("Insufficient Futures OI observations for matrix decision.")
 
     latest_oi_change = float(ois.iloc[-1] - ois.iloc[-2])
+    window_oi_change = float(ois.iloc[-1] - ois.iloc[0])
+    oi_deltas = np.diff(ois.to_numpy(dtype=float))
     oi_threshold = float(max(FUTURES_REGIME_MIN_OI_CHANGE, 1.0))
 
-    if latest_oi_change > oi_threshold:
-        futures_oi_trend = "INCREASING"
-    elif latest_oi_change < -oi_threshold:
+    # The matrix asks for Futures OI CHANGE, not the price/OI regime label.
+    # Use the complete available 3-candle OI window so a single stale quote
+    # (e.g. latest delta = 0) does not incorrectly become FLAT when the short
+    # window is clearly trending down/up.
+    negative_steps = int(np.sum(oi_deltas < -oi_threshold))
+    positive_steps = int(np.sum(oi_deltas > oi_threshold))
+
+    if window_oi_change < -oi_threshold and negative_steps >= max(1, len(oi_deltas) // 2):
         futures_oi_trend = "DECREASING"
+    elif window_oi_change > oi_threshold and positive_steps >= max(1, len(oi_deltas) // 2):
+        futures_oi_trend = "INCREASING"
     else:
         futures_oi_trend = "FLAT / MARGINAL"
 
@@ -2784,12 +2817,12 @@ def predictive_direction(
         ]
 
     # 6. WEAK BEARISH (LONG UNWINDING)
-    elif (breaking_below or crossed_below) and futures_oi_trend == "DECREASING" and turning_negative:
+    elif (breaking_below or crossed_below or recent_crossed_below) and futures_oi_trend == "DECREASING" and turning_negative:
         direction = "BEARISH"
         interpretation = "WEAK BEARISH (LONG UNWINDING)"
         confidence = 85.0
         reasons = [
-            "Price is above VWAP and breaking below/re-crossing VWAP.",
+            "Price is in the above-VWAP to below-VWAP breaking/re-crossing transition.",
             "Futures OI is decreasing.",
             "PE-CE OI difference is turning negative (PE OI exiting / CE OI increasing).",
         ]
@@ -2822,7 +2855,7 @@ def predictive_direction(
 
     reasons.extend([
         f"Price={price:.2f}; Futures VWAP={vwap:.2f}; Price-vs-VWAP={'ABOVE' if above else 'BELOW' if below else 'AT VWAP'}.",
-        f"Futures OI latest change={latest_oi_change:+.0f}; trend={futures_oi_trend}.",
+        f"Futures OI latest change={latest_oi_change:+.0f}; window change={window_oi_change:+.0f}; trend={futures_oi_trend}.",
         f"PE-CE OI={diff:+.0f}; previous={previous_diff:+.0f}; change={diff_change:+.0f}; level={oi_level}; trend={oi_trend}.",
         f"Localized OI={chain_bias} ({float(chain_bias_score):+.3f}); chain Change-OI={change_oi_bias_value} ({float(change_oi_score):+.3f}).",
         f"CE Change-OI normalized={ce_change_norm:+.3f}; matrix_row={interpretation}.",
@@ -3551,12 +3584,26 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
 
         valid_vwap = calculate_vwap(futures_vwap_candles).dropna()
         current_vwap = float(valid_vwap.iloc[-1])
+        current_price_vs_vwap = (
+            "ABOVE" if spot > current_vwap
+            else "BELOW" if spot < current_vwap
+            else "AT_VWAP"
+        )
+        previous_price_vs_vwap = str(previous_snapshot.get("price_vs_vwap", ""))
+        if previous_price_vs_vwap == "ABOVE" and current_price_vs_vwap == "BELOW":
+            current_vwap_transition = "BREAKING_BELOW"
+        elif previous_price_vs_vwap == "BELOW" and current_price_vs_vwap == "ABOVE":
+            current_vwap_transition = "RECLAIMED_VWAP"
+        else:
+            current_vwap_transition = "NONE"
 
         current_snapshot = {
             "timestamp": now_ist().isoformat(),
             "sensex_spot": round(float(spot), 2),
             "futures_price": round(float(futures_vwap_candles["close"].iloc[-1]), 2),
             "futures_state": futures_state,
+            "price_vs_vwap": current_price_vs_vwap,
+            "vwap_transition": current_vwap_transition,
             "futures_basis_state": basis_state_snapshot,
             "futures_basis_points": (
                 round(float(basis_points_snapshot), 4)
