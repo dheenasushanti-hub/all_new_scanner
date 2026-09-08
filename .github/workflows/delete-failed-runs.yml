@@ -1,17 +1,19 @@
-name: Delete Failed Workflow Runs
+name: Delete Yesterday's Workflow Runs
 
 on:
-  workflow_dispatch: # Allows manual trigger from the Actions tab
+  workflow_dispatch: # Allows manual run from Actions tab
 
 jobs:
   del_runs:
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
     steps:
-      - name: Delete failed workflow runs
+      - name: Delete workflow runs older than 1 day
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
-          retain_days: 0
-          keep_minimum_runs: 0
-          delete_run_by_conclusion_pattern: failure, cancelled, timed_out
+          retain_days: 1         # Keeps runs from today (<24h), deletes older ones
+          keep_minimum_runs: 0   # Set to 0 to ensure runs aren't saved
