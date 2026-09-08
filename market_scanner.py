@@ -2655,7 +2655,7 @@ def predictive_direction(
     below = price < vwap
     near = abs(price - vwap) <= tol
 
-    have_prior_vwap = len(vwap_series) >= 2
+    have_prior_vwap = len(futures_vwap_series) >= 2
     crossed_above = have_prior_vwap and prev_price <= prev_vwap and above
     crossed_below = have_prior_vwap and prev_price >= prev_vwap and below
 
