@@ -103,7 +103,7 @@ REQUEST_TIMEOUT = int(
     )
 )
 
-SCANNER_VERSION = "2026-09-07-MATRIX-REVALIDATION-10SL"
+SCANNER_VERSION = "2026-09-09-MARKET-STRUCTURE-OVERHAUL-V2"
 
 STATE_FILE = Path(
     os.getenv(
@@ -119,8 +119,13 @@ SIGNAL_THRESHOLD = float(
     )
 )
 
-PREDICTION_MIN_CONFLUENCE = 2
+PREDICTION_MIN_CONFLUENCE = 3
+MIN_DIRECTIONAL_GROUPS = 3
 LOCK_SETUP_MINUTES = 45
+MARKET_SCORE_ENTRY = 5.0
+MARKET_SCORE_STRONG = 7.0
+REVERSAL_CONFIRMATIONS_REQUIRED = 2
+NEUTRAL_DOES_NOT_EXIT = True
 ACTIVE_TRADE_SL_PCT = 0.10
 ACTIVE_TRADE_SL_FACTOR = 1.0 - ACTIVE_TRADE_SL_PCT
 
@@ -2211,47 +2216,63 @@ def select_directional_option(
     spot: float,
     preferred_strike: Optional[float] = None,
 ) -> OptionCandidate:
-    """Select the directional ITM strike after the matrix approves direction.
+    """Select the required directional ITM strike from the CURRENT ATM.
 
-    Bullish -> ATM-1 CE, fallback ATM-2 CE
-    Bearish -> ATM+1 PE, fallback ATM+2 PE
+    Bullish -> ATM-1 CE, fallback ATM-2 CE.
+    Bearish -> ATM+1 PE, fallback ATM+2 PE.
 
-    Strike choice is downstream of the matrix direction; premium momentum is
-    not permitted to override or veto the matrix decision.
+    Market direction is decided upstream. This function only validates that
+    the requested strike exists and has usable option market data.
     """
+    if direction not in {"BULLISH", "BEARISH"}:
+        raise ScannerError("Cannot select an option for NEUTRAL direction.")
+
     rows = chain_rows(chain)
     chain_strikes = sorted(rows.keys())
+    if not chain_strikes:
+        raise ScannerError("Option chain contains no strikes.")
+
     atm = nearest_atm_strike(spot, chain_strikes)
     step = strike_interval(chain_strikes)
 
     if direction == "BULLISH":
         candidates = [atm - step, atm - 2 * step]
         option_type = "CE"
-    elif direction == "BEARISH":
+    else:
         candidates = [atm + step, atm + 2 * step]
         option_type = "PE"
-    else:
-        raise ScannerError("Cannot select an option for NEUTRAL direction.")
 
     if preferred_strike is not None:
         candidates = [float(preferred_strike)]
 
-    eligible: list[tuple[float, OptionCandidate, dict[str, Any]]] = []
     rejection_reasons: list[str] = []
 
     for target_strike in candidates:
         row = rows.get(float(target_strike))
         if row is None:
-            rejection_reasons.append(f"Strike {target_strike:.0f} not present in option chain")
+            rejection_reasons.append(
+                f"Strike {target_strike:.0f} not present in option chain"
+            )
             continue
 
-        matches = [
-            contract for contract in contracts
-            if str(contract.get("instrument_type", "")).upper() == option_type
-            and float(contract.get("strike_price", -1)) == float(target_strike)
-        ]
+        matches = []
+        for contract in contracts:
+            try:
+                strike = float(contract.get("strike_price", -1))
+            except (TypeError, ValueError):
+                continue
+            if (
+                str(contract.get("instrument_type", "")).upper() == option_type
+                and abs(strike - float(target_strike)) < 0.01
+                and contract.get("instrument_key")
+                and contract.get("trading_symbol")
+            ):
+                matches.append(contract)
+
         if not matches:
-            rejection_reasons.append(f"No {option_type} contract found at {target_strike:.0f}")
+            rejection_reasons.append(
+                f"No {option_type} contract found at {target_strike:.0f}"
+            )
             continue
 
         market = option_market_data(row, option_type)
@@ -2263,19 +2284,33 @@ def select_directional_option(
             gamma = float(market.get("gamma") or 0.0)
             iv = float(market.get("iv") or 0.0)
         except (TypeError, ValueError):
-            rejection_reasons.append(f"Invalid market data at {target_strike:.0f}")
+            rejection_reasons.append(
+                f"Invalid market data at {target_strike:.0f}"
+            )
             continue
 
-        if ltp <= 0:
+        if not math.isfinite(ltp) or ltp <= 0:
             rejection_reasons.append(f"Invalid LTP at {target_strike:.0f}")
             continue
+        if not math.isfinite(oi) or oi < 0:
+            rejection_reasons.append(f"Invalid OI at {target_strike:.0f}")
+            continue
+        if not math.isfinite(delta) or not (OPTION_MIN_DELTA <= abs(delta) <= OPTION_MAX_DELTA):
+            rejection_reasons.append(
+                f"Delta {delta!r} outside {OPTION_MIN_DELTA:.2f}-{OPTION_MAX_DELTA:.2f} at {target_strike:.0f}"
+            )
+            continue
+        if not math.isfinite(gamma):
+            gamma = 0.0
+        if not math.isfinite(iv):
+            iv = 0.0
 
-        candidate = OptionCandidate(
+        selected = OptionCandidate(
             instrument_key=str(matches[0]["instrument_key"]),
             trading_symbol=str(matches[0]["trading_symbol"]),
             option_type=option_type,
             strike=float(target_strike),
-            expiry=str(matches[0]["expiry"]),
+            expiry=str(matches[0].get("expiry", "")),
             ltp=ltp,
             oi=oi,
             prev_oi=prev_oi,
@@ -2284,41 +2319,17 @@ def select_directional_option(
             iv=iv,
         )
 
-        # Matrix-driven strike selection must not be vetoed by an option
-        # premium-momentum gate: that gate is outside the supplied matrix and
-        # was preventing valid predictive setups from selecting a strike.
-        eligible.append((0.0, candidate, {
-            "regime": "MATRIX_SELECTED",
-            "premium_score": 0.0,
-        }))
         logger.info(
-            "MATRIX ELIGIBLE STRIKE: %s strike=%.0f %s ltp=%.2f delta=%.3f",
-            candidate.trading_symbol,
-            candidate.strike,
-            candidate.option_type,
-            candidate.ltp,
-            candidate.delta,
+            "SELECTED DIRECTIONAL OPTION: direction=%s ATM=%.0f -> %s %.0f %s LTP=%.2f OI=%.0f Delta=%.3f",
+            direction, atm, selected.trading_symbol, selected.strike,
+            selected.option_type, selected.ltp, selected.oi, selected.delta,
         )
+        return selected
 
-    if not eligible:
-        details = "; ".join(rejection_reasons[-6:]) or "no candidate passed premium expansion gate"
-        raise ScannerError(f"No valid {option_type} strike available from matrix-directed selection: {details}")
-
-    eligible.sort(key=lambda item: item[0], reverse=True)
-    score, selected, metrics = eligible[0]
-
-    logger.info(
-        "SELECTED ITM OPTION: direction=%s ATM=%.0f -> strike=%.0f %s LTP=%.2f Delta=%.3f premium_score=%.4f regime=%s",
-        direction,
-        atm,
-        selected.strike,
-        selected.option_type,
-        selected.ltp,
-        selected.delta,
-        score,
-        metrics.get("regime", "UNKNOWN"),
+    details = "; ".join(rejection_reasons[-6:]) or "no valid directional strike"
+    raise ScannerError(
+        f"No valid {option_type} strike available for direction={direction}: {details}"
     )
-    return selected
 
 
 # =============================================================================
@@ -2384,85 +2395,55 @@ def final_entry_direction_confirmation(
     spot_3m: pd.DataFrame,
     futures_vwap_candles: pd.DataFrame,
 ) -> tuple[bool, list[str]]:
-    """Final VWAP safety gate using spot price against Futures session VWAP.
+    """Confirm direction without requiring a completed breakout candle.
 
-    SENSEX index candles can legitimately report zero volume, so they must not
-    be used as the VWAP source.  The scanner already fetches the complete
-    current-session SENSEX Futures candles specifically for VWAP.
+    This is deliberately a lightweight safety check. Market direction has
+    already been established by the weighted structure engine. A bullish setup
+    needs price above VWAP; a bearish setup needs price below VWAP. Near-VWAP
+    transitions are allowed when the 3m price is moving in the signal direction.
     """
-    if spot_3m is None or spot_3m.empty:
+    if spot_3m is None or len(spot_3m) < 2:
         return False, ["SENSEX 3-minute candles unavailable."]
     if futures_vwap_candles is None or futures_vwap_candles.empty:
-        return False, ["SENSEX Futures session VWAP candles unavailable."]
+        return False, ["SENSEX Futures VWAP candles unavailable."]
 
     vwap_series = calculate_vwap(futures_vwap_candles).dropna()
-    if len(vwap_series) < 1:
-        return False, ["SENSEX session VWAP unavailable: no usable Futures volume yet."]
+    if vwap_series.empty:
+        return False, ["SENSEX Futures session VWAP unavailable."]
 
     price = float(spot_3m["close"].iloc[-1])
     prev_price = float(spot_3m["close"].iloc[-2])
     vwap = float(vwap_series.iloc[-1])
-    # Early-session BSE Futures data can contain volume on only one candle.
-    # The session VWAP itself is valid at that point; there simply is not yet
-    # a prior VWAP observation for transition/reclaim calculations.
-    prev_vwap = float(vwap_series.iloc[-2]) if len(vwap_series) >= 2 else vwap
+    distance_pct = abs(price - vwap) / vwap * 100.0 if vwap else 0.0
 
-    above = price > vwap
-    below = price < vwap
-    have_prior_vwap = len(vwap_series) >= 2
-    crossed_above = have_prior_vwap and prev_price <= prev_vwap and above
-    crossed_below = have_prior_vwap and prev_price >= prev_vwap and below
-    reclaiming = (
-        below
-        and price > prev_price
-        and abs(vwap - price) < abs(prev_vwap - prev_price)
-    )
-    breaking_below = (
-        above
-        and price < prev_price
-        and abs(price - vwap) < abs(prev_price - prev_vwap)
-    )
+    bullish = direction == "BULLISH"
+    bearish = direction == "BEARISH"
+    above = price >= vwap
+    below = price <= vwap
 
-    if interpretation == "STRONG BULLISH (LONG BUILDUP)":
-        ok = direction == "BULLISH" and above
-    elif interpretation == "WEAK BULLISH (SHORT COVERING)":
-        # The table requires price to be BELOW VWAP and reclaiming it.
-        ok = direction == "BULLISH" and (reclaiming or (below and crossed_above))
-    elif interpretation == "STRONG BEARISH (SHORT BUILDUP)":
-        ok = direction == "BEARISH" and below
-    elif interpretation == "WEAK BEARISH (LONG UNWINDING)":
-        # The table requires price to be ABOVE VWAP and breaking below it.
-        ok = direction == "BEARISH" and (breaking_below or crossed_below)
-    elif interpretation in {"CAP / HARD RESISTANCE", "BEARISH PRE-BREAKOUT"}:
-        ok = direction == "BEARISH" and (crossed_below or breaking_below or below)
-    elif interpretation == "BULLISH PRE-BREAKOUT":
-        ok = direction == "BULLISH" and (crossed_above or reclaiming or above)
+    # Permit a very recent reclaim/break transition, but never permit a
+    # directional signal that is clearly on the wrong side of VWAP.
+    if bullish:
+        ok = above or (price > prev_price and distance_pct <= 0.20)
+    elif bearish:
+        ok = below or (price < prev_price and distance_pct <= 0.20)
     else:
         ok = False
 
-    logger.info(
-        "FINAL ENTRY GATE: interpretation=%s direction=%s SENSEX_PRICE=%.2f SENSEX_VWAP=%.2f "
-        "above=%s below=%s reclaiming=%s breaking_below=%s crossed_above=%s crossed_below=%s | OK=%s",
-        interpretation,
-        direction,
-        price,
-        vwap,
-        above,
-        below,
-        reclaiming,
-        breaking_below,
-        crossed_above,
-        crossed_below,
-        ok,
-    )
     reasons = [
-        f"Chart interpretation={interpretation}.",
-        f"SENSEX price={price:.2f} vs SENSEX VWAP={vwap:.2f}.",
-        f"Price position={'ABOVE' if above else 'BELOW' if below else 'AT VWAP'}.",
-        f"Reclaiming={reclaiming}; breaking_below={breaking_below}.",
-        f"Chart-defined VWAP gate={'PASS' if ok else 'FAIL'}.",
+        f"Market interpretation={interpretation}.",
+        f"SENSEX price={price:.2f}; Futures VWAP={vwap:.2f}; distance={distance_pct:.3f}%.",
+        f"Price position={'ABOVE' if price > vwap else 'BELOW' if price < vwap else 'AT VWAP'}.",
+        f"Pre-breakout VWAP confirmation={'PASS' if ok else 'FAIL'}.",
     ]
+
+    logger.info(
+        "FINAL PRE-BREAKOUT CONFIRMATION: direction=%s interpretation=%s price=%.2f VWAP=%.2f "
+        "distance=%.3f%% prev_price=%.2f OK=%s",
+        direction, interpretation, price, vwap, distance_pct, prev_price, ok,
+    )
     return ok, reasons
+
 
 def futures_premium_discount_state(
     futures_candles: pd.DataFrame,
@@ -2603,6 +2584,174 @@ def option_oi_difference(
     )
 
 
+def _sign(value: float, threshold: float = 0.0) -> int:
+    if not math.isfinite(float(value)):
+        return 0
+    if value > threshold:
+        return 1
+    if value < -threshold:
+        return -1
+    return 0
+
+
+def _trend_direction(df: pd.DataFrame, lookback: int = 5) -> int:
+    """Return direction from recent closes using both net and majority movement."""
+    if df is None or len(df) < 2:
+        return 0
+    closes = pd.to_numeric(df["close"], errors="coerce").dropna().tail(max(2, lookback))
+    if len(closes) < 2:
+        return 0
+    net = float(closes.iloc[-1] - closes.iloc[0])
+    diffs = np.diff(closes.to_numpy(dtype=float))
+    pos = int(np.sum(diffs > 0))
+    neg = int(np.sum(diffs < 0))
+    if net > 0 and pos >= neg:
+        return 1
+    if net < 0 and neg >= pos:
+        return -1
+    return _sign(net)
+
+
+def _supertrend_direction(df: pd.DataFrame) -> int:
+    if df is None or df.empty or "direction" not in df:
+        return 0
+    try:
+        value = float(pd.to_numeric(df["direction"], errors="coerce").dropna().iloc[-1])
+        return 1 if value > 0 else -1 if value < 0 else 0
+    except (IndexError, TypeError, ValueError):
+        return 0
+
+
+def _market_structure_snapshot(
+    spot_3m: pd.DataFrame,
+    spot_15m: pd.DataFrame,
+    futures_3m: pd.DataFrame,
+    futures_vwap_candles: pd.DataFrame,
+    live_spot: float,
+    option_oi_diff: float,
+    option_oi_diff_change: float,
+) -> dict[str, Any]:
+    """Build one coherent market view. No single input can manufacture direction."""
+    vwap_series = calculate_vwap(futures_vwap_candles).dropna()
+    if vwap_series.empty:
+        raise ScannerError("Futures VWAP unavailable for market structure.")
+    vwap = float(vwap_series.iloc[-1])
+    price_vs_vwap = _sign(float(live_spot) - vwap, max(abs(vwap) * 0.00015, 1.0))
+
+    st3 = _supertrend_direction(spot_3m)
+    st15 = _supertrend_direction(spot_15m)
+    structure3 = structure_state(spot_3m, min(STRUCTURE_LOOKBACK_3M, len(spot_3m))) if len(spot_3m) >= 3 else "NEUTRAL"
+    structure15 = structure_state(spot_15m, min(STRUCTURE_LOOKBACK_15M, len(spot_15m))) if len(spot_15m) >= 3 else "NEUTRAL"
+    price3 = _trend_direction(spot_3m, 6)
+    price15 = _trend_direction(spot_15m, 4)
+
+    fut_close = pd.to_numeric(futures_3m["close"], errors="coerce").dropna()
+    fut_oi = pd.to_numeric(futures_3m["oi"], errors="coerce").dropna()
+    fut_price_dir = _trend_direction(futures_3m, 6)
+    fut_oi_dir = _trend_direction(futures_3m.assign(close=futures_3m["oi"]), 6)
+    latest_fut_price_change = float(fut_close.iloc[-1] - fut_close.iloc[-2]) if len(fut_close) >= 2 else 0.0
+    latest_fut_oi_change = float(fut_oi.iloc[-1] - fut_oi.iloc[-2]) if len(fut_oi) >= 2 else 0.0
+
+    # Futures price/OI interpretation. This is intentionally separate from
+    # the old 3-candle hard gate: stale/flat OI on the last candle must not erase
+    # a clearly directional multi-candle move.
+    if fut_price_dir < 0 and fut_oi_dir > 0:
+        futures_bias, futures_regime = -1, "SHORT_BUILDUP"
+    elif fut_price_dir > 0 and fut_oi_dir > 0:
+        futures_bias, futures_regime = 1, "LONG_BUILDUP"
+    elif fut_price_dir < 0 and fut_oi_dir < 0:
+        futures_bias, futures_regime = -1, "LONG_UNWINDING"
+    elif fut_price_dir > 0 and fut_oi_dir < 0:
+        futures_bias, futures_regime = 1, "SHORT_COVERING"
+    else:
+        futures_bias, futures_regime = fut_price_dir, "PRICE_ONLY_BIAS" if fut_price_dir else "NEUTRAL"
+
+    oi_dir = _sign(option_oi_diff, max(abs(option_oi_diff) * 0.05, 1.0))
+    oi_change_dir = _sign(option_oi_diff_change, max(abs(option_oi_diff) * 0.05, 1.0))
+
+    # PE-CE OI difference: positive supports bulls, negative supports bears.
+    score = 0.0
+    reasons: list[str] = []
+
+    if price_vs_vwap > 0:
+        score += 2.0; reasons.append("SENSEX is above Futures VWAP.")
+    elif price_vs_vwap < 0:
+        score -= 2.0; reasons.append("SENSEX is below Futures VWAP.")
+
+    if st3 > 0:
+        score += 1.5; reasons.append("3m Supertrend is bullish.")
+    elif st3 < 0:
+        score -= 1.5; reasons.append("3m Supertrend is bearish.")
+
+    if st15 > 0:
+        score += 2.0; reasons.append("15m Supertrend is bullish.")
+    elif st15 < 0:
+        score -= 2.0; reasons.append("15m Supertrend is bearish.")
+
+    if structure3 == "BULLISH": score += 1.0
+    elif structure3 == "BEARISH": score -= 1.0
+    if structure15 == "BULLISH": score += 1.5
+    elif structure15 == "BEARISH": score -= 1.5
+
+    if futures_bias > 0:
+        score += 2.0; reasons.append(f"Futures structure is bullish ({futures_regime}).")
+    elif futures_bias < 0:
+        score -= 2.0; reasons.append(f"Futures structure is bearish ({futures_regime}).")
+
+    if oi_dir > 0:
+        score += 1.5; reasons.append("PE-CE OI difference is bullish.")
+    elif oi_dir < 0:
+        score -= 1.5; reasons.append("PE-CE OI difference is bearish.")
+
+    if oi_change_dir > 0:
+        score += 1.5; reasons.append("PE-CE OI difference is improving toward bulls.")
+    elif oi_change_dir < 0:
+        score -= 1.5; reasons.append("PE-CE OI difference is deteriorating toward bears.")
+
+    # Require alignment across independent groups, not merely a high raw score.
+    bullish_groups = sum(x > 0 for x in (price_vs_vwap, st3, st15, price3, price15, futures_bias, oi_dir, oi_change_dir))
+    bearish_groups = sum(x < 0 for x in (price_vs_vwap, st3, st15, price3, price15, futures_bias, oi_dir, oi_change_dir))
+
+    if score >= MARKET_SCORE_ENTRY and bullish_groups >= PREDICTION_MIN_CONFLUENCE:
+        direction = "BULLISH"
+    elif score <= -MARKET_SCORE_ENTRY and bearish_groups >= PREDICTION_MIN_CONFLUENCE:
+        direction = "BEARISH"
+    else:
+        direction = "NEUTRAL"
+
+    confidence = min(99.0, max(0.0, 50.0 + abs(score) * 5.5)) if direction != "NEUTRAL" else min(49.0, abs(score) * 5.0)
+    interpretation = (
+        "STRONG BULLISH MARKET STRUCTURE" if direction == "BULLISH" and score >= MARKET_SCORE_STRONG
+        else "BULLISH MARKET STRUCTURE" if direction == "BULLISH"
+        else "STRONG BEARISH MARKET STRUCTURE" if direction == "BEARISH" and score <= -MARKET_SCORE_STRONG
+        else "BEARISH MARKET STRUCTURE" if direction == "BEARISH"
+        else "WAIT / MIXED MARKET STRUCTURE"
+    )
+
+    logger.info(
+        "MARKET STRUCTURE: score=%+.1f direction=%s confidence=%.1f | VWAP=%s 3mST=%s 15mST=%s "
+        "3mStructure=%s 15mStructure=%s Futures=%s FutPriceDir=%+d FutOIDir=%+d PE-CE=%+.0f PE-CEchg=%+.0f",
+        score, direction, confidence,
+        "ABOVE" if price_vs_vwap > 0 else "BELOW" if price_vs_vwap < 0 else "AT",
+        "BULL" if st3 > 0 else "BEAR" if st3 < 0 else "NA",
+        "BULL" if st15 > 0 else "BEAR" if st15 < 0 else "NA",
+        structure3, structure15, futures_regime, fut_price_dir, fut_oi_dir,
+        option_oi_diff, option_oi_diff_change,
+    )
+
+    return {
+        "score": score, "direction": direction, "confidence": confidence,
+        "interpretation": interpretation, "reasons": reasons,
+        "vwap": vwap, "price_vs_vwap": price_vs_vwap,
+        "st3": st3, "st15": st15, "structure3": structure3, "structure15": structure15,
+        "futures_bias": futures_bias, "futures_regime": futures_regime,
+        "fut_price_dir": fut_price_dir, "fut_oi_dir": fut_oi_dir,
+        "latest_fut_price_change": latest_fut_price_change,
+        "latest_fut_oi_change": latest_fut_oi_change,
+        "oi_dir": oi_dir, "oi_change_dir": oi_change_dir,
+    }
+
+
 def predictive_direction(
     spot_3m: pd.DataFrame,
     spot_15m: pd.DataFrame,
@@ -2621,274 +2770,31 @@ def predictive_direction(
     option_oi_trend: Optional[str] = None,
     ce_change_oi: Optional[float] = None,
     ce_change_oi_normalized: Optional[float] = None,
-) -> tuple[str, str, float, list[str]]:
-    """Apply the supplied 3-column SENSEX sentiment matrix literally.
+) -> tuple[str, str, float, list[str], float]:
+    """Overhauled prediction engine: market structure first, option second.
 
-    Matrix decision inputs:
-      1) Price vs VWAP
-      2) Futures OI change
-      3) Options OI difference (PE OI - CE OI) and its direction of change
-
-    The localized OI score, chain Change-OI score, basis state and premium
-    behaviour are diagnostic only. They do not override the table.
+    The previous literal matrix rejected many valid combinations and returned
+    NEUTRAL whenever one column did not match a predefined row. This engine
+    requires multi-factor directional agreement instead.
     """
-    if spot_3m is None or len(spot_3m) < 2:
-        raise ScannerError("SENSEX 3-minute candle data unavailable for matrix decision.")
-    if futures_3m is None or len(futures_3m) < 2:
-        raise ScannerError("SENSEX Futures 3-minute OI data unavailable for matrix decision.")
+    if futures_3m is None or len(futures_3m) < 3:
+        raise ScannerError("Insufficient Futures candles for market structure.")
     if futures_vwap_candles is None or futures_vwap_candles.empty:
-        raise ScannerError("SENSEX Futures session VWAP candles unavailable.")
-
-    futures_vwap_series = calculate_vwap(futures_vwap_candles).dropna()
-    if len(futures_vwap_series) < 1:
-        raise ScannerError("SENSEX Futures session VWAP unavailable: no usable Futures volume yet.")
-
-    price = float(spot_3m["close"].iloc[-1])
-    prev_price = float(spot_3m["close"].iloc[-2])
-    vwap = float(futures_vwap_series.iloc[-1])
-    # First valid session VWAP point is sufficient for level-based matrix rows.
-    # Transition detection is disabled until a second VWAP observation exists.
-    prev_vwap = float(futures_vwap_series.iloc[-2]) if len(futures_vwap_series) >= 2 else vwap
-
-    tol = max(10.0, abs(vwap) * VWAP_RECLAIM_TOLERANCE_PCT)
-    above = price > vwap
-    below = price < vwap
-    near = abs(price - vwap) <= tol
-
-    have_prior_vwap = len(futures_vwap_series) >= 2
-    crossed_above = have_prior_vwap and prev_price <= prev_vwap and above
-    crossed_below = have_prior_vwap and prev_price >= prev_vwap and below
-
-    # The matrix uses VWAP *transitions* ("reclaiming" / "breaking below"),
-    # not only the immediately previous candle.  A 3-minute workflow can miss
-    # the exact crossing candle, so detect the most recent crossing in the
-    # recent candle window.
-    recent_crossed_above = False
-    recent_crossed_below = False
-    recent_n = min(VWAP_TRANSITION_LOOKBACK_CANDLES, len(spot_3m) - 1, max(len(futures_vwap_series) - 1, 0))
-    if recent_n >= 1:
-        recent_prices = pd.to_numeric(spot_3m["close"].tail(recent_n + 1), errors="coerce").to_numpy()
-        recent_vwaps = pd.to_numeric(futures_vwap_series.tail(recent_n + 1), errors="coerce").to_numpy()
-        for i in range(1, len(recent_prices)):
-            if not (math.isfinite(float(recent_prices[i - 1])) and math.isfinite(float(recent_prices[i]))):
-                continue
-            if not (math.isfinite(float(recent_vwaps[i - 1])) and math.isfinite(float(recent_vwaps[i]))):
-                continue
-            if recent_prices[i - 1] <= recent_vwaps[i - 1] and recent_prices[i] > recent_vwaps[i]:
-                recent_crossed_above = True
-            if recent_prices[i - 1] >= recent_vwaps[i - 1] and recent_prices[i] < recent_vwaps[i]:
-                recent_crossed_below = True
-
-    reclaiming = (
-        below
-        and price >= prev_price
-        and abs(vwap - price) <= abs(prev_vwap - prev_price)
+        raise ScannerError("Futures VWAP candles unavailable.")
+    snap = _market_structure_snapshot(
+        spot_3m, spot_15m, futures_3m, futures_vwap_candles, live_spot,
+        float(option_oi_diff or 0.0), float(option_oi_diff_change or 0.0),
     )
-    breaking_below = (
-        below
-        and price <= prev_price
-        and (
-            abs(price - vwap) <= abs(prev_price - prev_vwap)
-            or recent_crossed_below
-        )
-    )
-    rejecting_vwap = (
-        above
-        and price < prev_price
-        and abs(price - vwap) <= tol
-    )
-
-    # ------------------------------------------------------------------
-    # MATRIX COLUMN 2: FUTURES OI CHANGE
-    # Use the dedicated short Futures-OI window. Do not use the long
-    # current-session VWAP candle set for this column.
-    # ------------------------------------------------------------------
-    ois = pd.to_numeric(futures_3m["oi"], errors="coerce").dropna()
-    if len(ois) < 2:
-        raise ScannerError("Insufficient Futures OI observations for matrix decision.")
-
-    latest_oi_change = float(ois.iloc[-1] - ois.iloc[-2])
-    window_oi_change = float(ois.iloc[-1] - ois.iloc[0])
-    oi_deltas = np.diff(ois.to_numpy(dtype=float))
-    oi_threshold = float(max(FUTURES_REGIME_MIN_OI_CHANGE, 1.0))
-
-    # The matrix asks for Futures OI CHANGE, not the price/OI regime label.
-    # Use the complete available 3-candle OI window so a single stale quote
-    # (e.g. latest delta = 0) does not incorrectly become FLAT when the short
-    # window is clearly trending down/up.
-    negative_steps = int(np.sum(oi_deltas < -oi_threshold))
-    positive_steps = int(np.sum(oi_deltas > oi_threshold))
-
-    if window_oi_change < -oi_threshold and negative_steps >= max(1, len(oi_deltas) // 2):
-        futures_oi_trend = "DECREASING"
-    elif window_oi_change > oi_threshold and positive_steps >= max(1, len(oi_deltas) // 2):
-        futures_oi_trend = "INCREASING"
-    else:
-        futures_oi_trend = "FLAT / MARGINAL"
-
-    # ------------------------------------------------------------------
-    # MATRIX COLUMN 3: PE OI - CE OI
-    # Positive/negative is the current level.
-    # Increasing/decreasing is the current change.
-    # "Turning Positive/Negative" means direction of change, not a forced
-    # zero crossing. This is essential for the weak bullish/bearish rows.
-    # ------------------------------------------------------------------
-    diff = float(option_oi_diff or 0.0)
-    diff_change = float(option_oi_diff_change or 0.0)
-    previous_diff = diff - diff_change
-
-    if diff > 0:
-        oi_level = "POSITIVE"
-    elif diff < 0:
-        oi_level = "NEGATIVE"
-    else:
-        oi_level = "NEUTRAL"
-
-    oi_change_threshold = float(max(OI_DIFF_CHANGE_THRESHOLD, 0.0))
-    normalized_change_for_threshold = abs(diff_change) / max(abs(diff) + abs(diff_change), 1.0)
-
-    if diff_change > 0 and normalized_change_for_threshold >= oi_change_threshold:
-        oi_trend = "INCREASING"
-    elif diff_change < 0 and normalized_change_for_threshold >= oi_change_threshold:
-        oi_trend = "DECREASING"
-    else:
-        oi_trend = "FLAT"
-
-    turning_positive = diff_change > 0 and oi_trend == "INCREASING"
-    turning_negative = diff_change < 0 and oi_trend == "DECREASING"
-
-    ce_change_norm = float(ce_change_oi_normalized or 0.0)
-    large_negative_ce_change = ce_change_norm <= -CAP_CE_CHANGE_THRESHOLD
-
-    # ------------------------------------------------------------------
-    # EXACT TABLE MATRIX
-    # Priority is only for rows that can overlap; no additive score is used.
-    # ------------------------------------------------------------------
-    direction = "NEUTRAL"
-    interpretation = "RANGEBOUND / SIDEWAYS"
-    confidence = 0.0
-
-    reasons: list[str]
-
-    # 1. CAP / HARD RESISTANCE
-    if rejecting_vwap and futures_oi_trend == "INCREASING" and large_negative_ce_change:
-        direction = "BEARISH"
-        interpretation = "CAP / HARD RESISTANCE"
-        confidence = 90.0
-        reasons = [
-            "Price is above VWAP and rejecting off VWAP.",
-            "Futures OI is increasing.",
-            "CE Change-OI shows a large negative spike.",
-        ]
-
-    # 2. FAKEOUT / TRAPPING ZONE (BULL TRAP)
-    elif above and futures_oi_trend == "DECREASING" and oi_level == "NEGATIVE":
-        direction = "BEARISH"
-        interpretation = "FAKEOUT / TRAPPING ZONE (BULL TRAP)"
-        confidence = 85.0
-        reasons = [
-            "Price is above VWAP.",
-            "Futures OI is decreasing.",
-            "PE-CE OI difference is negative.",
-        ]
-
-    # 3. STRONG BULLISH (LONG BUILDUP)
-    elif above and futures_oi_trend == "INCREASING" and oi_level == "POSITIVE" and oi_trend == "INCREASING":
-        direction = "BULLISH"
-        interpretation = "STRONG BULLISH (LONG BUILDUP)"
-        confidence = 95.0
-        reasons = [
-            "Price is above VWAP.",
-            "Futures OI is increasing.",
-            "PE-CE OI difference is positive and increasing.",
-        ]
-
-    # 4. WEAK BULLISH (SHORT COVERING)
-    elif below and reclaiming and futures_oi_trend == "DECREASING" and turning_positive:
-        direction = "BULLISH"
-        interpretation = "WEAK BULLISH (SHORT COVERING)"
-        confidence = 85.0
-        reasons = [
-            "Price is below VWAP and reclaiming VWAP.",
-            "Futures OI is decreasing.",
-            "PE-CE OI difference is turning positive (PE OI increasing / CE OI exiting).",
-        ]
-
-    # 5. STRONG BEARISH (SHORT BUILDUP)
-    elif below and futures_oi_trend == "INCREASING" and oi_level == "NEGATIVE" and oi_trend == "DECREASING":
-        direction = "BEARISH"
-        interpretation = "STRONG BEARISH (SHORT BUILDUP)"
-        confidence = 95.0
-        reasons = [
-            "Price is below VWAP.",
-            "Futures OI is increasing.",
-            "PE-CE OI difference is negative and decreasing (CE OI > PE OI).",
-        ]
-
-    # 6. WEAK BEARISH (LONG UNWINDING)
-    elif (breaking_below or crossed_below or recent_crossed_below) and futures_oi_trend == "DECREASING" and turning_negative:
-        direction = "BEARISH"
-        interpretation = "WEAK BEARISH (LONG UNWINDING)"
-        confidence = 85.0
-        reasons = [
-            "Price is in the above-VWAP to below-VWAP breaking/re-crossing transition.",
-            "Futures OI is decreasing.",
-            "PE-CE OI difference is turning negative (PE OI exiting / CE OI increasing).",
-        ]
-
-    # 7. RANGEBOUND / SIDEWAYS
-    elif near and futures_oi_trend == "FLAT / MARGINAL" and oi_level == "NEUTRAL":
-        direction = "NEUTRAL"
-        interpretation = "RANGEBOUND / SIDEWAYS"
-        confidence = 0.0
-        reasons = [
-            "Price is oscillating around VWAP.",
-            "Futures OI change is flat/marginal.",
-            "PE-CE OI difference is neutral.",
-        ]
-
-    # Any combination not explicitly defined by the user's table is NOT
-    # Rangebound.  Rangebound is a specific row in the table and requires
-    # Price near VWAP + flat/marginal Futures OI + neutral PE-CE OI.
-    # Unknown combinations therefore remain neutral, but are explicitly
-    # labelled as NO MATRIX MATCH so the scanner cannot falsely report
-    # sideways conditions.
-    else:
-        direction = "NEUTRAL"
-        interpretation = "NO MATRIX MATCH / WAIT"
-        confidence = 0.0
-        reasons = [
-            "The current Price-vs-VWAP, Futures OI, and Options OI conditions do not match any row explicitly defined in the supplied matrix.",
-            "No bullish or bearish market interpretation is permitted until a defined matrix row is satisfied.",
-        ]
-
+    reasons = list(snap["reasons"])
     reasons.extend([
-        f"Price={price:.2f}; Futures VWAP={vwap:.2f}; Price-vs-VWAP={'ABOVE' if above else 'BELOW' if below else 'AT VWAP'}.",
-        f"Futures OI latest change={latest_oi_change:+.0f}; window change={window_oi_change:+.0f}; trend={futures_oi_trend}.",
-        f"PE-CE OI={diff:+.0f}; previous={previous_diff:+.0f}; change={diff_change:+.0f}; level={oi_level}; trend={oi_trend}.",
-        f"Localized OI={chain_bias} ({float(chain_bias_score):+.3f}); chain Change-OI={change_oi_bias_value} ({float(change_oi_score):+.3f}).",
-        f"CE Change-OI normalized={ce_change_norm:+.3f}; matrix_row={interpretation}.",
+        f"Market structure score={snap['score']:+.1f}.",
+        f"Price vs VWAP={'ABOVE' if snap['price_vs_vwap'] > 0 else 'BELOW' if snap['price_vs_vwap'] < 0 else 'AT'}.",
+        f"Futures regime={snap['futures_regime']} with price direction={snap['fut_price_dir']:+d} and OI direction={snap['fut_oi_dir']:+d}.",
+        f"PE-CE OI={float(option_oi_diff or 0.0):+.0f}; change={float(option_oi_diff_change or 0.0):+.0f}.",
+        f"Legacy localized OI={chain_bias} ({float(chain_bias_score):+.3f}); chain Change-OI={change_oi_bias_value} ({float(change_oi_score):+.3f}).",
+        "Prediction is based on the combined market structure, not a single matrix row.",
     ])
-
-    logger.info(
-        "MARKET INTERPRETATION: %s | direction=%s confidence=%.1f | "
-        "PRICE_VS_VWAP=%s FUTURES_OI=%s FUT_OI_CHANGE=%+.0f "
-        "PE-CE=%+.0f PREV_PE-CE=%+.0f PE-CE_CHANGE=%+.0f OI_LEVEL=%s OI_TREND=%s "
-        "MATRIX_ROW=%s",
-        interpretation,
-        direction,
-        confidence,
-        "ABOVE" if above else "BELOW" if below else "AT_VWAP",
-        futures_oi_trend,
-        latest_oi_change,
-        diff,
-        previous_diff,
-        diff_change,
-        oi_level,
-        oi_trend,
-        interpretation,
-    )
-    return direction, interpretation, confidence, reasons
+    return snap["direction"], snap["interpretation"], float(snap["confidence"]), reasons, float(snap["score"])
 
 def validate_prebreakout(
     spot_3m: pd.DataFrame,
@@ -3095,6 +3001,7 @@ def active_trade_from_state(state: dict[str, Any]) -> Optional[dict[str, Any]]:
     required = {
         "instrument_key",
         "trading_symbol",
+        "direction",
         "option_type",
         "strike",
         "entry",
@@ -3156,10 +3063,20 @@ def monitor_active_trade(
     current_interpretation: str,
     current_confidence: float,
     final_confirmed: bool,
-    selected_option: OptionCandidate,
+    selected_option: Optional[OptionCandidate],
     current_logic_signature: str,
 ) -> str:
-    """Revalidate the active strike on every scan, then monitor it to a 10% SL/T1/T2."""
+    """Monitor an active trade without treating normal market noise as an exit.
+
+    Exit hierarchy:
+      1. T2 / T1 / hard option SL.
+      2. Confirmed opposite market structure on two consecutive scans.
+      3. Neutral or temporary disagreement NEVER exits the trade.
+
+    The old implementation exited on any signature change, which caused a
+    bearish trade to be invalidated merely because Futures OI moved from
+    INCREASING to DECREASING on the next 3-minute scan.
+    """
     trade = active_trade_from_state(state)
     if trade is None:
         return "NO_ACTIVE"
@@ -3167,108 +3084,21 @@ def monitor_active_trade(
     try:
         ltp = extract_ltp(get_quote(str(trade["instrument_key"])))
     except ScannerError as exc:
-        logger.info(
-            "ACTIVE TRADE MONITOR: %s | quote unavailable: %s",
-            trade.get("trading_symbol", ""),
-            exc,
-        )
+        logger.info("ACTIVE TRADE MONITOR: quote unavailable: %s", exc)
         return "ACTIVE"
 
     entry = float(trade["entry"])
     target_1 = float(trade["target_1"])
     target_2 = float(trade["target_2"])
-
-    # Migrate legacy 15% states immediately to the new 10% stop-loss rule.
     stop_loss = round(entry * ACTIVE_TRADE_SL_FACTOR, 2)
     trade["stop_loss"] = stop_loss
     trade["last_ltp"] = round(ltp, 2)
     trade["last_monitored_at"] = now_ist().isoformat()
 
-    stored_signature = str(trade.get("market_logic_signature", ""))
     active_direction = str(trade.get("direction", "")).upper()
-    active_interpretation = str(trade.get("regime", ""))
-    active_instrument = str(trade.get("instrument_key", ""))
-    active_option_type = str(trade.get("option_type", "")).upper()
-    active_strike = float(trade.get("strike"))
+    reversal_count = int(trade.get("reversal_confirmations", 0) or 0)
 
-    invalidation_reasons: list[str] = []
-    if active_direction != str(current_direction).upper():
-        invalidation_reasons.append(
-            f"direction changed {active_direction} -> {str(current_direction).upper()}"
-        )
-    if active_interpretation != str(current_interpretation):
-        invalidation_reasons.append(
-            f"market interpretation changed {active_interpretation} -> {current_interpretation}"
-        )
-    if float(current_confidence) < SIGNAL_THRESHOLD:
-        invalidation_reasons.append(
-            f"current confidence {float(current_confidence):.2f} < {SIGNAL_THRESHOLD:.2f}"
-        )
-    if not final_confirmed:
-        invalidation_reasons.append("current chart/VWAP entry gate failed")
-    if active_instrument != str(selected_option.instrument_key):
-        invalidation_reasons.append(
-            f"current selected instrument changed to {selected_option.trading_symbol}"
-        )
-    if active_option_type != str(selected_option.option_type).upper():
-        invalidation_reasons.append(
-            f"option type changed {active_option_type} -> {selected_option.option_type}"
-        )
-    if not math.isclose(active_strike, float(selected_option.strike), rel_tol=0.0, abs_tol=0.01):
-        invalidation_reasons.append(
-            f"strike changed {active_strike:.0f} -> {float(selected_option.strike):.0f}"
-        )
-    if stored_signature and stored_signature != current_logic_signature:
-        invalidation_reasons.append("matrix/VWAP market logic signature changed")
-
-    logger.info(
-        "ACTIVE TRADE REVALIDATION: %s | current_direction=%s current_interpretation=%s "
-        "current_selection=%s %.0f %s | logic_changed=%s",
-        trade["trading_symbol"],
-        current_direction,
-        current_interpretation,
-        selected_option.trading_symbol,
-        selected_option.strike,
-        selected_option.option_type,
-        bool(invalidation_reasons),
-    )
-
-    if invalidation_reasons:
-        reason = "; ".join(invalidation_reasons)
-        logger.warning(
-            "ACTIVE STRIKE INVALIDATED: %s | reason=%s",
-            trade["trading_symbol"],
-            reason,
-        )
-        close_active_trade(
-            state,
-            trade,
-            "INVALIDATED",
-            exit_ltp=ltp,
-            reason=reason,
-        )
-        try:
-            send_email(
-                f"SENSEX TRADE INVALIDATED - {trade['trading_symbol']}",
-                (
-                    f"SENSEX {trade['direction']} trade invalidated by live market revalidation.<br>"
-                    f"Option: {trade['trading_symbol']}<br>"
-                    f"Entry: ₹{entry:.2f}<br>"
-                    f"Current LTP: ₹{ltp:.2f}<br>"
-                    f"Reason: {reason}<br>"
-                    f"The scanner is now free to select a fresh current-market strike."
-                ),
-            )
-        except ScannerError as exc:
-            logger.warning("Trade invalidation email failed: %s", exc)
-        return "INVALIDATED"
-
-    state["active_trade"] = trade
-    logger.info(
-        "ACTIVE TRADE MONITOR: %s | LTP=%.2f Entry=%.2f T1=%.2f T2=%.2f SL=%.2f",
-        trade["trading_symbol"], ltp, entry, target_1, target_2, stop_loss,
-    )
-
+    # Targets/SL are actual option-level exits and remain authoritative.
     outcome = None
     if ltp >= target_2:
         outcome = "TARGET_2"
@@ -3277,33 +3107,64 @@ def monitor_active_trade(
     elif ltp <= stop_loss:
         outcome = "STOP_LOSS"
 
-    if outcome is None:
-        save_state(state)
-        return "ACTIVE"
+    if outcome:
+        close_active_trade(state, trade, outcome, exit_ltp=ltp)
+        logger.info("ACTIVE TRADE CLOSED: %s | outcome=%s exit_ltp=%.2f", trade["trading_symbol"], outcome, ltp)
+        try:
+            send_email(
+                f"SENSEX TRADE {outcome} - {trade['trading_symbol']}",
+                f"SENSEX {trade['direction']} trade closed.<br>Option: {trade['trading_symbol']}<br>Entry: ₹{entry:.2f}<br>Exit: ₹{ltp:.2f}<br>Outcome: {outcome}<br>Exit was triggered by the option target/stop policy.",
+            )
+        except ScannerError as exc:
+            logger.warning("Trade outcome email failed: %s", exc)
+        return "CLOSED"
 
-    close_active_trade(state, trade, outcome, exit_ltp=ltp)
+    # Neutral is not an exit. Neither is a temporary VWAP/structure disagreement.
+    if current_direction == active_direction:
+        reversal_count = 0
+    elif current_direction in {"BULLISH", "BEARISH"}:
+        reversal_count += 1
+    else:
+        reversal_count = 0
+
+    trade["reversal_confirmations"] = reversal_count
+    trade["last_market_direction"] = current_direction
+    trade["last_market_interpretation"] = current_interpretation
+    trade["last_market_confidence"] = float(current_confidence)
 
     logger.info(
-        "ACTIVE TRADE CLOSED: %s | outcome=%s exit_ltp=%.2f",
-        trade["trading_symbol"], outcome, ltp,
+        "ACTIVE TRADE STRUCTURE MONITOR: %s | active=%s current=%s confidence=%.1f "
+        "reversal_confirmations=%d/%d | LTP=%.2f T1=%.2f T2=%.2f SL=%.2f",
+        trade["trading_symbol"], active_direction, current_direction, float(current_confidence),
+        reversal_count, REVERSAL_CONFIRMATIONS_REQUIRED, ltp, target_1, target_2, stop_loss,
     )
 
-    try:
-        send_email(
-            f"SENSEX TRADE {outcome} - {trade['trading_symbol']}",
-            (
-                f"SENSEX {trade['direction']} trade closed.<br>"
-                f"Option: {trade['trading_symbol']}<br>"
-                f"Entry: ₹{entry:.2f}<br>"
-                f"Exit: ₹{ltp:.2f}<br>"
-                f"Outcome: {outcome}<br>"
-                f"Stop-loss policy: {ACTIVE_TRADE_SL_PCT * 100:.0f}% below entry."
-            ),
+    # Only a strong opposite direction confirmed on consecutive scans can force
+    # a structural exit. A NEUTRAL result is explicitly ignored.
+    if (
+        current_direction in {"BULLISH", "BEARISH"}
+        and current_direction != active_direction
+        and float(current_confidence) >= 70.0
+        and reversal_count >= REVERSAL_CONFIRMATIONS_REQUIRED
+    ):
+        reason = (
+            f"confirmed opposite market structure: active={active_direction}, "
+            f"current={current_direction}, confidence={float(current_confidence):.1f}, "
+            f"confirmations={reversal_count}"
         )
-    except ScannerError as exc:
-        logger.warning("Trade outcome email failed: %s", exc)
+        close_active_trade(state, trade, "STRUCTURE_REVERSAL", exit_ltp=ltp, reason=reason)
+        try:
+            send_email(
+                f"SENSEX TRADE STRUCTURE REVERSAL - {trade['trading_symbol']}",
+                f"SENSEX {trade['direction']} trade exited on confirmed opposite market structure.<br>Option: {trade['trading_symbol']}<br>Entry: ₹{entry:.2f}<br>Exit: ₹{ltp:.2f}<br>Reason: {reason}",
+            )
+        except ScannerError as exc:
+            logger.warning("Structure reversal email failed: %s", exc)
+        return "CLOSED"
 
-    return "CLOSED"
+    state["active_trade"] = trade
+    save_state(state)
+    return "ACTIVE"
 
 
 # =============================================================================
@@ -3571,10 +3432,20 @@ future price movement or profitability.
 
 
 # =============================================================================
-# MAIN SCANNER
+# MAIN SCANNER — CLEAN EXECUTION PIPELINE
 # =============================================================================
 
 def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
+    """Run one complete SENSEX scan.
+
+    Pipeline:
+        Market Structure -> Direction -> Confirmation -> Strike Selection
+        -> Entry -> Monitoring -> Exit
+
+    Existing active trades are monitored BEFORE any new strike is selected.
+    This prevents a valid active trade from being invalidated by a transient
+    option-chain/Greek/strike-selection condition on the same scan.
+    """
     if not market_window_open():
         logger.info("Outside BSE market hours.")
         return None
@@ -3586,95 +3457,32 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
         return None
 
     state = state if isinstance(state, dict) else {}
-
     previous_snapshot = state.get("market_snapshot")
     if not isinstance(previous_snapshot, dict):
         previous_snapshot = {}
 
     try:
         future = get_current_sensex_future()
+        futures_3m = get_intraday_candles(future.instrument_key, 3, max_candles=12, min_candles=3)
+        futures_vwap = get_session_candles_for_vwap(future.instrument_key, interval_minutes=3, min_candles=5)
 
-        try:
-            futures_recent = get_intraday_candles(
-                future.instrument_key, 3, max_candles=3, min_candles=1
-            )
-        except ScannerError as exc:
-            logger.info("Market-data warm-up: futures 3m candles not ready: %s", exc)
-            return None
-
-        if len(futures_recent) < 3:
-            logger.info(
-                "Market-data warm-up: futures 3m candles=%d; need 3 for Futures OI regime.",
-                len(futures_recent),
-            )
-            return None
-
-        futures_state = futures_regime(future, candles=futures_recent)
-
-        try:
-            futures_vwap_candles = get_session_candles_for_vwap(
-                future.instrument_key, interval_minutes=3, min_candles=5
-            )
-        except ScannerError as exc:
-            logger.info("Market-data warm-up: futures VWAP not ready: %s", exc)
-            return None
-
-        try:
-            spot_3m = get_intraday_candles(
-                SENSEX_KEY, 3, min_candles=3
-            )
-            spot_3m = calculate_supertrend(
-                spot_3m, SUPERTREND_PERIOD, SUPERTREND_FACTOR
-            )
-        except ScannerError as exc:
-            logger.info("Market-data warm-up: SENSEX 3m data not ready: %s", exc)
-            return None
-
-        try:
-            spot_15m = get_intraday_candles(
-                SENSEX_KEY, 15, min_candles=1
-            )
-        except ScannerError as exc:
-            logger.info("Market-data warm-up: SENSEX 15m data not ready: %s", exc)
-            return None
-
-        if len(spot_15m) < 2:
-            logger.info(
-                "Market-data warm-up: current-session 15m candles=%d; need 2.",
-                len(spot_15m),
-            )
-            return None
-
-        spot_15m = calculate_supertrend(
-            spot_15m, SUPERTREND_PERIOD, SUPERTREND_FACTOR
-        )
+        spot_3m = get_intraday_candles(SENSEX_KEY, 3, max_candles=80, min_candles=3)
+        spot_15m = get_intraday_candles(SENSEX_KEY, 15, max_candles=80, min_candles=2)
+        spot_3m = calculate_supertrend(spot_3m, SUPERTREND_PERIOD, SUPERTREND_FACTOR)
+        spot_15m = calculate_supertrend(spot_15m, SUPERTREND_PERIOD, SUPERTREND_FACTOR)
 
         spot = extract_ltp(get_quote(SENSEX_KEY))
-
-        logger.info(
-            "Data ready: futures_state=%s futures_3m=%d futures_vwap=%d "
-            "spot_3m=%d spot_15m=%d",
-            futures_state,
-            len(futures_recent),
-            len(futures_vwap_candles),
-            len(spot_3m),
-            len(spot_15m),
-        )
-
         chain = get_chain()
+        contracts = get_current_week_contracts()
+
         chain_spot_value = chain_spot(chain)
         if abs(chain_spot_value - spot) > 100:
             raise ScannerError(
-                "Option-chain spot differs materially from current quote."
+                f"Option-chain spot mismatch: chain={chain_spot_value:.2f}, live={spot:.2f}."
             )
 
-        contracts = get_current_week_contracts()
-
-        # Keep existing chain analytics for logging/backward-compatible state.
-        chain_bias, chain_bias_score, strike_data = oi_structure(chain, spot)
-        change_data = get_change_oi_from_chain(chain)
-        change_bias, change_bias_score = change_oi_bias(change_data)
-
+        # Option OI difference is a confirmation input to market structure;
+        # it is not allowed to replace price/VWAP/Supertrend structure.
         (
             oi_diff,
             oi_diff_change,
@@ -3685,17 +3493,21 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
             ce_change_oi_normalized,
         ) = option_oi_difference(chain, spot)
 
-        direction, interpretation, confidence, reasons = predictive_direction(
+        chain_bias, chain_bias_score, _ = oi_structure(chain, spot)
+        change_data = get_change_oi_from_chain(chain)
+        change_bias, change_bias_score = change_oi_bias(change_data)
+
+        direction, interpretation, confidence, reasons, market_score = predictive_direction(
             spot_3m=spot_3m,
             spot_15m=spot_15m,
             chain_bias=chain_bias,
             chain_bias_score=chain_bias_score,
             change_oi_bias_value=change_bias,
             change_oi_score=change_bias_score,
-            futures_state=futures_state,
+            futures_state="STRUCTURE_ENGINE",
             live_spot=spot,
-            futures_3m=futures_recent,
-            futures_vwap_candles=futures_vwap_candles,
+            futures_3m=futures_3m,
+            futures_vwap_candles=futures_vwap,
             previous_snapshot=previous_snapshot,
             option_oi_diff=oi_diff,
             option_oi_diff_change=oi_diff_change,
@@ -3705,264 +3517,210 @@ def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
             ce_change_oi_normalized=ce_change_oi_normalized,
         )
 
-        basis_state_snapshot, basis_points_snapshot, basis_change_snapshot = (
-            futures_premium_discount_state(
-                futures_vwap_candles, spot_3m, spot
-            )
+        snap = _market_structure_snapshot(
+            spot_3m, spot_15m, futures_3m, futures_vwap, spot,
+            float(oi_diff), float(oi_diff_change),
         )
+        vwap = float(snap["vwap"])
+        price_vs_vwap = "ABOVE" if spot > vwap else "BELOW" if spot < vwap else "AT_VWAP"
 
-        valid_vwap = calculate_vwap(futures_vwap_candles).dropna()
-        current_vwap = float(valid_vwap.iloc[-1])
-        current_price_vs_vwap = (
-            "ABOVE" if spot > current_vwap
-            else "BELOW" if spot < current_vwap
-            else "AT_VWAP"
-        )
-        previous_price_vs_vwap = str(previous_snapshot.get("price_vs_vwap", ""))
-        if previous_price_vs_vwap == "ABOVE" and current_price_vs_vwap == "BELOW":
-            current_vwap_transition = "BREAKING_BELOW"
-        elif previous_price_vs_vwap == "BELOW" and current_price_vs_vwap == "ABOVE":
-            current_vwap_transition = "RECLAIMED_VWAP"
-        else:
-            current_vwap_transition = "NONE"
-
-        current_snapshot = {
+        state["market_snapshot"] = {
             "timestamp": now_ist().isoformat(),
             "sensex_spot": round(float(spot), 2),
-            "futures_price": round(float(futures_vwap_candles["close"].iloc[-1]), 2),
-            "futures_state": futures_state,
-            "price_vs_vwap": current_price_vs_vwap,
-            "vwap_transition": current_vwap_transition,
-            "futures_basis_state": basis_state_snapshot,
-            "futures_basis_points": (
-                round(float(basis_points_snapshot), 4)
-                if math.isfinite(basis_points_snapshot) else None
-            ),
-            "futures_basis_change": (
-                round(float(basis_change_snapshot), 4)
-                if math.isfinite(basis_change_snapshot) else None
-            ),
-            "futures_vwap": round(current_vwap, 4),
-            "chain_bias": chain_bias,
-            "chain_bias_score": round(float(chain_bias_score), 6),
-            "change_oi_bias": change_bias,
-            "change_oi_score": round(float(change_bias_score), 6),
+            "futures_price": round(float(futures_3m["close"].iloc[-1]), 2),
+            "futures_state": snap["futures_regime"],
+            "price_vs_vwap": price_vs_vwap,
+            "futures_vwap": round(vwap, 4),
             "option_oi_difference": round(float(oi_diff), 2),
             "option_oi_difference_change": round(float(oi_diff_change), 2),
             "option_oi_difference_normalized": round(float(oi_diff_normalized), 6),
             "option_oi_direction": oi_diff_direction,
             "option_oi_trend": oi_diff_trend,
-            "ce_change_oi": round(float(ce_change_oi), 2),
-            "ce_change_oi_normalized": round(float(ce_change_oi_normalized), 6),
             "prediction_direction": direction,
             "prediction_regime": interpretation,
             "prediction_confidence": round(float(confidence), 2),
+            "market_structure_score": round(float(market_score), 3),
+            "three_min_supertrend": "BULLISH" if snap["st3"] > 0 else "BEARISH" if snap["st3"] < 0 else "NEUTRAL",
+            "fifteen_min_supertrend": "BULLISH" if snap["st15"] > 0 else "BEARISH" if snap["st15"] < 0 else "NEUTRAL",
+            "futures_price_direction": int(snap["fut_price_dir"]),
+            "futures_oi_direction": int(snap["fut_oi_dir"]),
         }
-        state["market_snapshot"] = current_snapshot
         save_state(state)
 
         logger.info(
-            "Prediction: direction=%s interpretation=%s confidence=%.2f",
-            direction,
-            interpretation,
-            confidence,
+            "PREDICTION: direction=%s regime=%s confidence=%.1f score=%+.2f",
+            direction, interpretation, confidence, market_score,
         )
 
-        active = active_trade_from_state(state)
-        if active is not None and (
-            direction == "NEUTRAL"
-            or interpretation in {
-                "FAKEOUT / TRAPPING ZONE (BULL TRAP)",
-                "RANGEBOUND / SIDEWAYS",
-                "NO MATRIX MATCH / WAIT",
-            }
-            or confidence < SIGNAL_THRESHOLD
-        ):
-            reason = (
-                f"current market no longer satisfies active-entry logic: "
-                f"direction={direction}, interpretation={interpretation}, confidence={confidence:.2f}"
-            )
-            logger.warning(
-                "ACTIVE STRIKE INVALIDATED: %s | %s",
-                active.get("trading_symbol", ""),
-                reason,
-            )
-            try:
-                active_ltp = extract_ltp(get_quote(str(active["instrument_key"])))
-            except ScannerError:
-                active_ltp = None
-            close_active_trade(
-                state,
-                active,
-                "INVALIDATED",
-                exit_ltp=active_ltp,
-                reason=reason,
-            )
-            active = None
-
-        if direction == "NEUTRAL":
-            return None
-
-        if interpretation in {
-            "FAKEOUT / TRAPPING ZONE (BULL TRAP)",
-            "RANGEBOUND / SIDEWAYS",
-        }:
-            logger.info("Prediction blocked: non-actionable chart interpretation=%s", interpretation)
-            return None
-
-        if confidence < SIGNAL_THRESHOLD:
-            logger.info(
-                "Rejected: confidence %.2f < threshold %.2f",
-                confidence,
-                SIGNAL_THRESHOLD,
-            )
-            return None
-
-        final_confirmed, confirmation_reasons = final_entry_direction_confirmation(
-            direction,
-            interpretation,
-            spot_3m,
-            futures_vwap_candles,
-        )
-        if not final_confirmed:
-            logger.info("No strike selected: chart-aligned final VWAP gate failed.")
-            active = active_trade_from_state(state)
-            if active is not None:
-                close_active_trade(
-                    state,
-                    active,
-                    "INVALIDATED",
-                    exit_ltp=None,
-                    reason="current chart/VWAP entry gate failed before a valid current strike could be selected",
-                )
-                logger.warning("ACTIVE STRIKE INVALIDATED: %s | current chart/VWAP gate failed", active.get("trading_symbol", ""))
-            return None
-
-        # Always use the CURRENT ATM and CURRENT chart direction.
-        # Do not lock a stale strike across runs.
-        option = select_directional_option(
-            contracts,
-            chain,
-            direction,
-            spot,
-            preferred_strike=None,
-        )
-
-        current_logic_signature = market_logic_signature(
-            direction=direction,
-            interpretation=interpretation,
-            price_vs_vwap=current_price_vs_vwap,
-            futures_state=futures_state,
-            oi_direction=oi_diff_direction,
-            oi_trend=oi_diff_trend,
-            final_gate=final_confirmed,
-        )
-
+        # ------------------------------------------------------------------
+        # ACTIVE TRADE: monitor first. Never re-select or invalidate it merely
+        # because current entry conditions are temporarily unavailable.
+        # ------------------------------------------------------------------
         active = active_trade_from_state(state)
         if active is not None:
-            active_date = str(active.get("trade_date", ""))[:10]
-            if active_date and active_date != now_ist().date().isoformat():
-                logger.info("Previous-day active trade state found; clearing stale trade before new session.")
-                state["last_completed_trade"] = active
+            trade_date = str(active.get("trade_date", ""))[:10]
+            today = now_ist().date().isoformat()
+            if trade_date and trade_date != today:
+                logger.info("Clearing stale previous-session active trade: %s", active.get("trading_symbol", ""))
+                state["last_completed_trade"] = dict(active, status="CLOSED", outcome="SESSION_END_CLEANUP")
                 state["active_trade"] = None
                 save_state(state)
-                active = None
             else:
                 monitor_result = monitor_active_trade(
                     state=state,
                     current_direction=direction,
                     current_interpretation=interpretation,
                     current_confidence=confidence,
-                    final_confirmed=final_confirmed,
-                    selected_option=option,
-                    current_logic_signature=current_logic_signature,
+                    final_confirmed=(direction != "NEUTRAL"),
+                    selected_option=None,
+                    current_logic_signature="",
                 )
-                if monitor_result in {"ACTIVE", "CLOSED"}:
-                    # A target/SL closure ends this scan. The next scheduled run
-                    # gets a genuinely fresh market/strike selection.
-                    return None
-                # INVALIDATED intentionally falls through so this same scan can
-                # evaluate the newly current market logic and, when valid, select
-                # a replacement strike.
+                # An existing trade owns this scan. Do not create a second trade.
+                return None
+
+        if direction == "NEUTRAL":
+            logger.info("No entry: market structure is neutral/mixed.")
+            return None
+
+        if confidence < SIGNAL_THRESHOLD:
+            logger.info("No entry: confidence %.1f < %.1f.", confidence, SIGNAL_THRESHOLD)
+            return None
+
+        # Pre-breakout confirmation: direction must already be established,
+        # but the breakout itself must NOT have occurred.
+        confirmed, confirmation_reasons = final_entry_direction_confirmation(
+            direction, interpretation, spot_3m, futures_vwap
+        )
+        if not confirmed:
+            logger.info("No entry: pre-breakout VWAP confirmation failed.")
+            return None
+
+        option = select_directional_option(
+            contracts=contracts,
+            chain=chain,
+            direction=direction,
+            spot=spot,
+            preferred_strike=None,
+        )
 
         valid, trigger_3m, target_15m, validation_reasons = validate_prebreakout(
             spot_3m, spot_15m, direction, option
         )
         if not valid:
-            logger.info("Pre-breakout validation rejected.")
+            logger.info("No entry: pre-breakout structural validation failed.")
             return None
 
         target_1, target_2, stop_loss = create_targets(
-            option,
-            spot,
-            trigger_3m,
-            target_15m,
-            direction,
+            option, spot, trigger_3m, target_15m, direction
         )
 
-        all_reasons = reasons + validation_reasons + [
-            f"Market interpretation = {interpretation}.",
-            f"PE-CE OI difference={oi_diff:+.0f}, change={oi_diff_change:+.0f}; CE change normalized={ce_change_oi_normalized:+.3f}.",
-            f"Option selection rule = {'ATM-1/ATM-2 CE' if direction == 'BULLISH' else 'ATM+1/ATM+2 PE'}.",
-            "Selected option from the chart-defined ITM side: Bullish=ATM-1 CE (fallback ATM-2 CE); Bearish=ATM+1 PE (fallback ATM+2 PE).",
-            f"Final chart VWAP gate: {'PASS' if final_confirmed else 'FAIL'}.",
-            "Entry is predictive/pre-breakout; the scanner does not wait for the breakout to occur.",
-            "Stop loss = 10% below option entry premium; active trade is invalidated immediately if the current market logic changes.",
+        all_reasons = list(reasons) + list(confirmation_reasons) + list(validation_reasons) + [
+            f"Market structure score={market_score:+.2f}.",
+            f"PE-CE OI difference={oi_diff:+.0f}; change={oi_diff_change:+.0f}.",
+            f"Futures regime={snap['futures_regime']}.",
+            f"Strike rule={'ATM-1 CE, fallback ATM-2 CE' if direction == 'BULLISH' else 'ATM+1 PE, fallback ATM+2 PE'}.",
+            "Entry is predictive and pre-breakout; no completed breakout candle is required.",
+            "Active trade exits only at T1/T2/SL or after two consecutive strong opposite-structure confirmations.",
         ]
 
         return Signal(
             timestamp=now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
             direction=direction,
             regime=interpretation,
-            confidence=confidence,
-            spot=spot,
-            futures_state=futures_state,
+            confidence=float(confidence),
+            spot=float(spot),
+            futures_state=str(snap["futures_regime"]),
             option_type=option.option_type,
-            strike=option.strike,
+            strike=float(option.strike),
             trading_symbol=option.trading_symbol,
             instrument_key=option.instrument_key,
-            entry=option.ltp,
-            target_1=target_1,
-            target_2=target_2,
-            stop_loss=stop_loss,
-            underlying_trigger_3m=trigger_3m,
-            underlying_target_15m=target_15m,
-            delta=option.delta,
-            gamma=option.gamma,
+            entry=float(option.ltp),
+            target_1=float(target_1),
+            target_2=float(target_2),
+            stop_loss=float(stop_loss),
+            underlying_trigger_3m=float(trigger_3m),
+            underlying_target_15m=float(target_15m),
+            delta=float(option.delta),
+            gamma=float(option.gamma),
             reasons=all_reasons,
         )
 
     except ScannerError as exc:
-        # One scan failure must not create a fake "signal" or terminate a
-        # continuous workflow because an early-session data window is missing.
-        logger.info("Scanner cycle skipped: %s", exc)
+        logger.info("Scanner cycle skipped safely: %s", exc)
+        return None
+    except Exception:
+        logger.error("Unexpected scan failure:\n%s", traceback.format_exc())
         return None
 
 
+def self_test() -> None:
+    """Offline deterministic tests for core decision/state logic."""
+    def candles(values: list[float], oi: Optional[list[float]] = None) -> pd.DataFrame:
+        idx = pd.date_range("2026-09-09 09:15", periods=len(values), freq="3min")
+        df = pd.DataFrame({
+            "timestamp": idx,
+            "open": values,
+            "high": [v + 2 for v in values],
+            "low": [v - 2 for v in values],
+            "close": values,
+            "volume": [1000] * len(values),
+        }, index=idx)
+        if oi is not None:
+            df["oi"] = oi
+        return df
 
-# =============================================================================
-# PROGRAM ENTRY
-# =============================================================================
+    # Direction engine: strongly bearish and bullish synthetic structures.
+    bear3 = calculate_supertrend(candles([100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 89]), 10, 3.0)
+    bear15 = calculate_supertrend(candles([100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 89]), 10, 3.0)
+    fut_bear = candles([100, 99, 98, 97, 96, 95], [1000, 1020, 1040, 1060, 1080, 1100])
+    vwap_bear = fut_bear.copy()
+    bear = _market_structure_snapshot(bear3, bear15, fut_bear, vwap_bear, 89.0, -1000.0, -100.0)
+    assert bear["direction"] == "BEARISH", f"bearish test failed: {bear}"
+
+    bull3 = calculate_supertrend(candles([90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101]), 10, 3.0)
+    bull15 = calculate_supertrend(candles([90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101]), 10, 3.0)
+    fut_bull = candles([90, 91, 92, 93, 94, 95], [1000, 1020, 1040, 1060, 1080, 1100])
+    vwap_bull = fut_bull.copy()
+    bull = _market_structure_snapshot(bull3, bull15, fut_bull, vwap_bull, 101.0, 1000.0, 100.0)
+    assert bull["direction"] == "BULLISH", f"bullish test failed: {bull}"
+
+    # Strike selection: deterministic ATM +/- one, fallback +/- two.
+    chain = []
+    contracts = []
+    for strike in [74000, 74050, 74100, 74150, 74200]:
+        chain.append({"strike_price": strike,
+                      "call_options": {"instrument_key": f"CE{strike}", "market_data": {"ltp": 100, "oi": 1000, "prev_oi": 900}, "option_greeks": {"delta": .5, "gamma": .01, "iv": 20}},
+                      "put_options": {"instrument_key": f"PE{strike}", "market_data": {"ltp": 100, "oi": 1000, "prev_oi": 900}, "option_greeks": {"delta": -.5, "gamma": .01, "iv": 20}}})
+        contracts.extend([
+            {"instrument_key": f"CE{strike}", "trading_symbol": f"SENSEX{strike}CE", "instrument_type": "CE", "strike_price": strike, "expiry": "2026-09-15"},
+            {"instrument_key": f"PE{strike}", "trading_symbol": f"SENSEX{strike}PE", "instrument_type": "PE", "strike_price": strike, "expiry": "2026-09-15"},
+        ])
+    selected_bull = select_directional_option(contracts, chain, "BULLISH", 74100)
+    selected_bear = select_directional_option(contracts, chain, "BEARISH", 74100)
+    assert selected_bull.strike == 74050 and selected_bull.option_type == "CE"
+    assert selected_bear.strike == 74150 and selected_bear.option_type == "PE"
+
+    # Target ordering and SL.
+    t1, t2, sl = create_targets(selected_bull, 74100, 74150, 74250, "BULLISH")
+    assert t2 > t1 > selected_bull.ltp and sl < selected_bull.ltp
+
+    logger.info("SELF-TEST PASSED: market direction, strike selection, and target engine.")
+
 
 def main() -> int:
-
     logger.info("SENSEX SCANNER VERSION: %s", SCANNER_VERSION)
 
+    if "--self-test" in sys.argv:
+        self_test()
+        return 0
+
     try:
-
         state = load_state()
-
         signal = execute_scan(state)
-
         if signal is None:
-            logger.info(
-                "No actionable setup on this scan."
-            )
+            logger.info("No actionable setup on this scan.")
             return 0
 
-        # Register the selected trade BEFORE sending its entry email. In GitHub
-        # Actions this guarantees the next run sees the active trade even though
-        # the runner filesystem is ephemeral.
         active_trade = {
             "status": "ACTIVE",
             "trade_date": now_ist().date().isoformat(),
@@ -3983,18 +3741,10 @@ def main() -> int:
             "delta": signal.delta,
             "gamma": signal.gamma,
             "last_ltp": signal.entry,
-            "market_logic_signature": market_logic_signature(
-                direction=signal.direction,
-                interpretation=signal.regime,
-                price_vs_vwap=str(state.get("market_snapshot", {}).get("price_vs_vwap", "")),
-                futures_state=signal.futures_state,
-                oi_direction=str(state.get("market_snapshot", {}).get("option_oi_direction", "")),
-                oi_trend=str(state.get("market_snapshot", {}).get("option_oi_trend", "")),
-                final_gate=True,
-            ),
+            "reversal_confirmations": 0,
+            "last_market_direction": signal.direction,
+            "last_market_confidence": signal.confidence,
         }
-
-        # Do not send the entry email until persistent state has been written.
         state["active_trade"] = active_trade
         state["last_signal"] = asdict(signal)
         state["last_signal_timestamp"] = signal.timestamp
@@ -4005,34 +3755,16 @@ def main() -> int:
             f"SENSEX {signal.direction} {signal.trading_symbol}",
             email_body(signal),
         )
-
-        logger.info(
-            "NEW ACTIVE TRADE EMAILED AND LOCKED: %s | monitor until T1/T2/SL",
-            signal.trading_symbol,
-        )
-
+        logger.info("NEW ACTIVE TRADE LOCKED: %s", signal.trading_symbol)
         return 0
 
     except ScannerError as exc:
-
-        logger.error(
-            "Scanner error: %s",
-            exc,
-        )
-
+        logger.error("Scanner error: %s", exc)
         return 1
-
     except Exception:
-
-        logger.error(
-            "Unexpected scanner failure:\n%s",
-            traceback.format_exc(),
-        )
-
+        logger.error("Fatal scanner failure:\n%s", traceback.format_exc())
         return 1
 
 
 if __name__ == "__main__":
-    sys.exit(
-        main()
-    )
+    sys.exit(main())
