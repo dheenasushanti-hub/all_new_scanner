@@ -1,23 +1,23 @@
 {
   "market_snapshot": {
-    "timestamp": "2026-09-10T13:03:37.880022+05:30",
-    "sensex_spot": 74789.43,
-    "futures_price": 75150.0,
-    "futures_state": "PRICE_ONLY_BIAS",
+    "timestamp": "2026-09-10T13:06:36.260441+05:30",
+    "sensex_spot": 74751.12,
+    "futures_price": 75163.6,
+    "futures_state": "LONG_UNWINDING",
     "price_vs_vwap": "BELOW",
-    "futures_vwap": 75192.3932,
-    "option_oi_difference": 4007283.33,
-    "option_oi_difference_change": 4091313.33,
-    "option_oi_difference_normalized": 0.127622,
+    "futures_vwap": 75192.3513,
+    "option_oi_difference": 3862048.33,
+    "option_oi_difference_change": 3946078.33,
+    "option_oi_difference_normalized": 0.122288,
     "option_oi_direction": "BULLISH",
     "option_oi_trend": "INCREASING",
     "prediction_direction": "NEUTRAL",
     "prediction_regime": "WAIT / MIXED MARKET STRUCTURE",
     "prediction_confidence": 7.5,
-    "market_structure_score": 1.5,
-    "three_min_supertrend": "BULLISH",
+    "market_structure_score": -1.5,
+    "three_min_supertrend": "BEARISH",
     "fifteen_min_supertrend": "BULLISH",
     "futures_price_direction": -1,
-    "futures_oi_direction": 0
+    "futures_oi_direction": -1
   }
 }
