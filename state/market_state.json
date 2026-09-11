@@ -1,24 +1,24 @@
 {
   "market_snapshot": {
-    "timestamp": "2026-09-11T12:15:44.389703+05:30",
-    "sensex_spot": 74481.27,
+    "timestamp": "2026-09-11T12:18:36.735973+05:30",
+    "sensex_spot": 74504.28,
     "futures_price": 74751.25,
-    "futures_state": "LONG_UNWINDING",
+    "futures_state": "SHORT_BUILDUP",
     "price_vs_vwap": "BELOW",
     "futures_vwap": 74652.9175,
-    "option_oi_difference": 507340.0,
-    "option_oi_difference_change": 323130.0,
-    "option_oi_difference_normalized": 0.165266,
+    "option_oi_difference": 532720.0,
+    "option_oi_difference_change": 348510.0,
+    "option_oi_difference_normalized": 0.170113,
     "option_oi_direction": "BULLISH",
     "option_oi_trend": "INCREASING",
     "prediction_direction": "NEUTRAL",
     "prediction_regime": "WAIT / MIXED MARKET STRUCTURE",
-    "prediction_confidence": 15.0,
-    "market_structure_score": 3.0,
+    "prediction_confidence": 7.5,
+    "market_structure_score": 1.5,
     "three_min_supertrend": "BULLISH",
     "fifteen_min_supertrend": "BULLISH",
     "futures_price_direction": -1,
-    "futures_oi_direction": -1
+    "futures_oi_direction": 1
   },
   "active_trade": {
     "status": "ACTIVE",
@@ -39,11 +39,11 @@
     "underlying_target_15m": 74649.78086453638,
     "delta": 0.573,
     "gamma": 0.0003,
-    "last_ltp": 510.45,
+    "last_ltp": 531.65,
     "reversal_confirmations": 0,
     "last_market_direction": "NEUTRAL",
-    "last_market_confidence": 15.0,
-    "last_monitored_at": "2026-09-11T12:15:44.675194+05:30",
+    "last_market_confidence": 7.5,
+    "last_monitored_at": "2026-09-11T12:18:37.010845+05:30",
     "last_market_interpretation": "WAIT / MIXED MARKET STRUCTURE"
   },
   "last_signal": {
