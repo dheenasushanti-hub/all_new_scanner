@@ -1,14 +1,14 @@
 {
   "market_snapshot": {
-    "timestamp": "2026-09-11T14:04:18.251166+05:30",
-    "sensex_spot": 74866.53,
-    "futures_price": 75138.2,
-    "futures_state": "SHORT_COVERING",
+    "timestamp": "2026-09-11T14:06:56.064751+05:30",
+    "sensex_spot": 74804.63,
+    "futures_price": 75100.1,
+    "futures_state": "LONG_BUILDUP",
     "price_vs_vwap": "ABOVE",
-    "futures_vwap": 74746.124,
-    "option_oi_difference": -450640.0,
-    "option_oi_difference_change": -430471.67,
-    "option_oi_difference_normalized": -0.255183,
+    "futures_vwap": 74748.5255,
+    "option_oi_difference": -106816.67,
+    "option_oi_difference_change": -134748.33,
+    "option_oi_difference_normalized": -0.049181,
     "option_oi_direction": "BEARISH",
     "option_oi_trend": "DECREASING",
     "prediction_direction": "BULLISH",
@@ -18,7 +18,7 @@
     "three_min_supertrend": "BULLISH",
     "fifteen_min_supertrend": "BULLISH",
     "futures_price_direction": 1,
-    "futures_oi_direction": -1
+    "futures_oi_direction": 1
   },
   "active_trade": {
     "status": "ACTIVE",
@@ -39,10 +39,12 @@
     "underlying_target_15m": 74949.92821706204,
     "delta": 0.5678,
     "gamma": 0.0003,
-    "last_ltp": 577.85,
+    "last_ltp": 546.0,
     "reversal_confirmations": 0,
     "last_market_direction": "BULLISH",
-    "last_market_confidence": 88.5
+    "last_market_confidence": 88.5,
+    "last_monitored_at": "2026-09-11T14:06:56.321935+05:30",
+    "last_market_interpretation": "STRONG BULLISH MARKET STRUCTURE"
   },
   "last_signal": {
     "timestamp": "2026-09-11 14:04:18 IST",
