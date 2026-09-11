@@ -1,14 +1,14 @@
 {
   "market_snapshot": {
-    "timestamp": "2026-09-11T11:24:34.155034+05:30",
-    "sensex_spot": 74549.4,
-    "futures_price": 74771.0,
+    "timestamp": "2026-09-11T11:27:33.442662+05:30",
+    "sensex_spot": 74543.97,
+    "futures_price": 74810.0,
     "futures_state": "SHORT_COVERING",
     "price_vs_vwap": "BELOW",
-    "futures_vwap": 74586.1048,
-    "option_oi_difference": 247890.0,
-    "option_oi_difference_change": 63680.0,
-    "option_oi_difference_normalized": 0.09113,
+    "futures_vwap": 74587.3429,
+    "option_oi_difference": 305881.67,
+    "option_oi_difference_change": 121671.67,
+    "option_oi_difference_normalized": 0.110719,
     "option_oi_direction": "BULLISH",
     "option_oi_trend": "INCREASING",
     "prediction_direction": "BULLISH",
@@ -39,10 +39,12 @@
     "underlying_target_15m": 74626.69612726265,
     "delta": 0.588,
     "gamma": 0.0003,
-    "last_ltp": 617.6,
+    "last_ltp": 610.85,
     "reversal_confirmations": 0,
     "last_market_direction": "BULLISH",
-    "last_market_confidence": 99.0
+    "last_market_confidence": 99.0,
+    "last_monitored_at": "2026-09-11T11:27:33.740350+05:30",
+    "last_market_interpretation": "STRONG BULLISH MARKET STRUCTURE"
   },
   "last_signal": {
     "timestamp": "2026-09-11 11:24:34 IST",
