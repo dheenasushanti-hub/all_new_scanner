@@ -1,14 +1,14 @@
 {
   "market_snapshot": {
-    "timestamp": "2026-09-15T14:58:00.762145+05:30",
-    "sensex_spot": 74181.66,
-    "futures_price": 74308.05,
-    "futures_state": "SHORT_BUILDUP",
+    "timestamp": "2026-09-15T15:01:15.135925+05:30",
+    "sensex_spot": 74158.5,
+    "futures_price": 74251.0,
+    "futures_state": "LONG_UNWINDING",
     "price_vs_vwap": "BELOW",
-    "futures_vwap": 74847.4092,
-    "option_oi_difference": 262970.0,
-    "option_oi_difference_change": -692390.0,
-    "option_oi_difference_normalized": 0.106033,
+    "futures_vwap": 74844.7393,
+    "option_oi_difference": 238255.0,
+    "option_oi_difference_change": -717105.0,
+    "option_oi_difference_normalized": 0.095898,
     "option_oi_direction": "BULLISH",
     "option_oi_trend": "DECREASING",
     "prediction_direction": "BEARISH",
@@ -18,7 +18,7 @@
     "three_min_supertrend": "BEARISH",
     "fifteen_min_supertrend": "BULLISH",
     "futures_price_direction": -1,
-    "futures_oi_direction": 1
+    "futures_oi_direction": -1
   },
   "active_trade": {
     "status": "ACTIVE",
@@ -39,11 +39,11 @@
     "underlying_target_15m": 74077.38922964658,
     "delta": -0.5217,
     "gamma": 0.0004,
-    "last_ltp": 473.9,
+    "last_ltp": 486.75,
     "reversal_confirmations": 0,
     "last_market_direction": "BEARISH",
     "last_market_confidence": 83.0,
-    "last_monitored_at": "2026-09-15T14:58:01.041804+05:30",
+    "last_monitored_at": "2026-09-15T15:01:15.404911+05:30",
     "last_market_interpretation": "BEARISH MARKET STRUCTURE"
   },
   "last_signal": {
