@@ -1,14 +1,14 @@
 {
   "market_snapshot": {
-    "timestamp": "2026-09-15T14:21:54.599613+05:30",
-    "sensex_spot": 74259.34,
-    "futures_price": 74417.35,
+    "timestamp": "2026-09-15T14:24:57.923705+05:30",
+    "sensex_spot": 74248.36,
+    "futures_price": 74424.95,
     "futures_state": "SHORT_BUILDUP",
     "price_vs_vwap": "BELOW",
-    "futures_vwap": 74918.6485,
-    "option_oi_difference": 238478.33,
-    "option_oi_difference_change": -612365.0,
-    "option_oi_difference_normalized": 0.086045,
+    "futures_vwap": 74915.4285,
+    "option_oi_difference": 592966.67,
+    "option_oi_difference_change": -362393.33,
+    "option_oi_difference_normalized": 0.251141,
     "option_oi_direction": "BULLISH",
     "option_oi_trend": "DECREASING",
     "prediction_direction": "BEARISH",
@@ -39,10 +39,12 @@
     "underlying_target_15m": 74114.51911951274,
     "delta": -0.5354,
     "gamma": 0.0004,
-    "last_ltp": 455.0,
+    "last_ltp": 464.9,
     "reversal_confirmations": 0,
     "last_market_direction": "BEARISH",
-    "last_market_confidence": 83.0
+    "last_market_confidence": 83.0,
+    "last_monitored_at": "2026-09-15T14:24:58.226282+05:30",
+    "last_market_interpretation": "BEARISH MARKET STRUCTURE"
   },
   "last_signal": {
     "timestamp": "2026-09-15 14:21:54 IST",
