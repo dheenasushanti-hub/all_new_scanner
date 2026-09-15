@@ -1,50 +1,66 @@
 """
-SENSEX Predictive Options Market Scanner
+SENSEX Predictive Options Market Scanner — Market Structure Engine
 
-Strategy:
-- SENSEX 3-minute and 15-minute Supertrend: (10, 3)
-- Full current-session VWAP + price structure
-- Dynamic current-month SENSEX futures discovery
-- Futures price/OI regime
-- Current-week option-chain OI / previous OI
-- Strike-level CE/PE OI differential with proximity weighting
-- Option price/OI confirmation for the selected contract
-- Pre-breakout prediction instead of waiting for an option breakout
-- Reversal detection
-- Directional ITM option selection:
-      bullish -> ATM-1 CE, fallback ATM-2 CE
-      bearish -> ATM+1 PE, fallback ATM+2 PE
-- No option-extension rejection for predictive entries
-- T1 based on projected 3-minute breakout level
-- T2 based on projected 15-minute resistance/support
-- Option premium targets translated using live option Delta/Gamma
-- Stop loss = 10% below entry premium
-- Duplicate signal suppression via persisted state
-- Email notifications only for new actionable signals
+What this version fixes:
+- Uses completed/currently-available multi-timeframe SENSEX structure:
+  3m, 15m, 30m, 60m, 120m, 180m Supertrend.
+- Uses SENSEX futures price/OI regime as a primary directional factor.
+- Uses Futures VWAP level + VWAP slope/position.
+- Uses both option-chain OI concentration and Change-in-OI to derive
+  dynamic support/resistance and directional pressure.
+- Predicts direction before an option breakout; option momentum is a
+  health/liquidity filter, not the primary market-direction trigger.
+- Selects Bullish ATM-1/ATM-2 CE or Bearish ATM+1/ATM+2 PE, but ranks
+  candidates by liquidity, delta, theta burden, spread, and structure.
+- Builds T1/T2/SL dynamically from underlying ATR, Supertrend,
+  option-chain support/resistance, and option Greeks.
+- No order placement. The script only creates a signal, persists state,
+  and sends email.
+- Uses current Upstox endpoints: v2 for option chain/contracts/quotes/
+  status/instrument search/OI/change-OI; v3 for candle data because the
+  older v2 intraday candle API is deprecated.
 
-No order placement is performed.
+Run:
+    python market_scanner_new_refactored.py --self-test
+    python market_scanner_new_refactored.py
+
+Environment:
+    UPSTOX_ANALYTICS_TOKEN   required
+    SENSEX_INSTRUMENT_KEY     optional, default BSE_INDEX|SENSEX
+
+Optional email:
+    EMAIL_SENDER
+    EMAIL_PASSWORD
+    EMAIL_RECEIVER
+    SMTP_HOST (default smtp.gmail.com)
+    SMTP_PORT (default 465)
+
+Optional tuning:
+    STATE_FILE
+    SIGNAL_THRESHOLD (default 60)
+    MAX_HISTORY_DAYS (default 45)
 """
 
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import logging
 import math
 import os
 import smtplib
 import sys
+import time as time_module
 import traceback
 import urllib.parse
-import time as time_module
-from dataclasses import dataclass, asdict
-from datetime import datetime, time
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, time, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
-
 
 import numpy as np
 import pandas as pd
@@ -52,200 +68,121 @@ import requests
 
 
 # =============================================================================
-# CONFIGURATION
+# CONFIG
 # =============================================================================
 
 IST = ZoneInfo("Asia/Kolkata")
-
 BASE_URL = "https://api.upstox.com"
 
-SENSEX_KEY = os.getenv(
-    "SENSEX_INSTRUMENT_KEY",
-    "BSE_INDEX|SENSEX",
-).strip()
+SENSEX_KEY = os.getenv("SENSEX_INSTRUMENT_KEY", "BSE_INDEX|SENSEX").strip()
+UPSTOX_TOKEN = os.getenv("UPSTOX_ANALYTICS_TOKEN", "").strip()
 
-UPSTOX_TOKEN = os.getenv(
-    "UPSTOX_ANALYTICS_TOKEN",
-    "",
-).strip()
+EMAIL_SENDER = os.getenv("EMAIL_SENDER", "").strip()
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "").strip()
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", "").strip()
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 
-EMAIL_SENDER = os.getenv(
-    "EMAIL_SENDER",
-    "",
-).strip()
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+MAX_HISTORY_DAYS = int(os.getenv("MAX_HISTORY_DAYS", "45"))
+SIGNAL_THRESHOLD = float(os.getenv("SIGNAL_THRESHOLD", "60"))
 
-EMAIL_PASSWORD = os.getenv(
-    "EMAIL_PASSWORD",
-    "",
-).strip()
+STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-EMAIL_RECEIVER = os.getenv(
-    "EMAIL_RECEIVER",
-    "",
-).strip()
-
-SMTP_HOST = os.getenv(
-    "SMTP_HOST",
-    "smtp.gmail.com",
-).strip()
-
-SMTP_PORT = int(
-    os.getenv(
-        "SMTP_PORT",
-        "465",
-    )
-)
-
-REQUEST_TIMEOUT = int(
-    os.getenv(
-        "REQUEST_TIMEOUT",
-        "20",
-    )
-)
-
-SCANNER_VERSION = "2026-09-09-MARKET-STRUCTURE-OVERHAUL-V2"
-
-STATE_FILE = Path(
-    os.getenv(
-        "STATE_FILE",
-        "state/market_state.json",
-    )
-)
-
-SIGNAL_THRESHOLD = float(
-    os.getenv(
-        "SIGNAL_THRESHOLD",
-        "40",
-    )
-)
-
-PREDICTION_MIN_CONFLUENCE = 3
-MIN_DIRECTIONAL_GROUPS = 3
-LOCK_SETUP_MINUTES = 45
-MARKET_SCORE_ENTRY = 5.0
-MARKET_SCORE_STRONG = 7.0
-REVERSAL_CONFIRMATIONS_REQUIRED = 2
-NEUTRAL_DOES_NOT_EXIT = True
-ACTIVE_TRADE_SL_PCT = 0.10
-ACTIVE_TRADE_SL_FACTOR = 1.0 - ACTIVE_TRADE_SL_PCT
+SCANNER_VERSION = "2026-09-15-MULTI-TF-MARKET-STRUCTURE-V2-FUTURES-OI-CHAIN-SR"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
 
 SUPERTREND_PERIOD = 10
 SUPERTREND_FACTOR = 3.0
+TIMEFRAMES = (3, 15, 30, 60, 120, 180)
 
-STRUCTURE_LOOKBACK_3M = 8
-STRUCTURE_LOOKBACK_15M = 6
+ATR_PERIOD = 14
+ATR_BUFFER_MULTIPLIER = 0.30
 
-OPTION_MIN_DELTA = 0.35
-OPTION_MAX_DELTA = 0.85
+# Structure weights. Short/intermediate timeframes are most responsive;
+# higher timeframes are stabilizers, not vetoes.
+TF_WEIGHTS = {
+    3: 1.40,
+    15: 1.35,
+    30: 1.15,
+    60: 1.00,
+    120: 0.85,
+    180: 0.75,
+}
 
-# BUY-ONLY option momentum guardrails. A strike must show positive premium
-# momentum before it can be selected or locked.
-BUY_OPTION_LOOKBACK = 6
-BUY_OPTION_MIN_CANDLES = 5
-BUY_OPTION_MIN_RETURN_PCT = 0.10
+# Directional score components.
+W_VWAP_LEVEL = 2.0
+W_VWAP_SLOPE = 1.25
+W_FUTURES = 2.50
+W_PRICE_STRUCTURE_3 = 1.20
+W_PRICE_STRUCTURE_15 = 1.50
+W_OPTION_OI = 1.70
+W_OPTION_OI_CHANGE = 1.50
+W_CHAIN_LEVELS = 1.30
 
-# Noise controls for a 5-minute workflow.
-VWAP_FLAT_SLOPE_EPSILON = 0.10
-FUTURES_BASIS_EPSILON_POINTS = 1.00
-FUTURES_REGIME_MIN_PRICE_MOVE = 0.50
-FUTURES_REGIME_MIN_OI_CHANGE = 1.0
+# Predictive hard-confirmation thresholds. These are intentionally separate
+# from the weighted score so Futures OI and option-chain structure cannot be
+# drowned out by six Supertrend votes.
+FUTURES_OI_MIN_PERSISTENCE = 0.50
+FUTURES_OI_STRENGTH_THRESHOLD = 0.25
+CHAIN_PREDICTIVE_STRENGTH_THRESHOLD = 0.15
+CHAIN_WALL_PROXIMITY_ATR = 1.00
+CHAIN_CHANGE_CONFIRM_THRESHOLD = 0.08
+FUTURES_LIVE_OI_WEIGHT = 0.35
 
-MAX_SIGNAL_AGE_MINUTES = 15
-VWAP_TRANSITION_LOOKBACK_CANDLES = 5
+MIN_DIRECTIONAL_COMPONENTS = 4
+ENTRY_SCORE = 4.50
 
-# Do not select an option that is already materially collapsing at entry.
-# This is a strike-health preference, not a bullish/bearish market filter.
-OPTION_ENTRY_MAX_DRAWNDOWN_PCT = float(os.getenv("OPTION_ENTRY_MAX_DRAWDOWN_PCT", "0.50"))
-OPTION_ENTRY_MAX_PEAK_PULLBACK_PCT = float(os.getenv("OPTION_ENTRY_MAX_PEAK_PULLBACK_PCT", "0.75"))
-OPTION_ENTRY_MIN_3M_RETURN_PCT = float(os.getenv("OPTION_ENTRY_MIN_3M_RETURN_PCT", "0.10"))
+# Strike health.
+MIN_DELTA = 0.35
+MAX_DELTA = 0.85
+MAX_SPREAD_PCT = 0.06
+MAX_THETA_BURDEN_PCT_PER_DAY = 0.10
+MIN_OI = 100.0
+MIN_VOLUME = 1.0
 
-# Chart-driven OI-difference thresholds.
-# OI difference = weighted (PE OI - CE OI) around ATM.
-OI_DIFF_POSITIVE_THRESHOLD = 0.03
-OI_DIFF_CHANGE_THRESHOLD = 0.01
-VWAP_RECLAIM_TOLERANCE_PCT = 0.0015
-CAP_CE_CHANGE_THRESHOLD = 0.10
+# Dynamic target and stop constraints.
+MIN_T1_RISK_REWARD = 1.10
+MIN_T2_RISK_REWARD = 1.60
+OPTION_MAX_STOP_PCT = 0.30
+OPTION_MIN_STOP_PCT = 0.15
 
-# =============================================================================
-# SIDEWAYS / RANGE MARKET FILTER
-# =============================================================================
+# Trade monitoring.
+REVERSAL_CONFIRMATIONS_REQUIRED = 2
+STRUCTURE_REVERSAL_CONFIDENCE = 75.0
 
-SIDEWAYS_LOOKBACK_3M = 12
-SIDEWAYS_LOOKBACK_15M = 6
-
-# Total high-low range relative to ATR.
-SIDEWAYS_MAX_RANGE_ATR_3M = 3.0
-SIDEWAYS_MAX_RANGE_ATR_15M = 2.5
-
-# Net movement from first close to latest close relative to ATR.
-SIDEWAYS_MAX_NET_MOVE_ATR_3M = 0.75
-SIDEWAYS_MAX_NET_MOVE_ATR_15M = 0.75
-
-# Number of directional Supertrend flips allowed inside the lookback.
-SIDEWAYS_MAX_SUPERTREND_FLIPS = 2
-
-# OI score near zero means positioning is balanced.
-SIDEWAYS_CHAIN_OI_SCORE = 0.05
-SIDEWAYS_CHANGE_OI_SCORE = 0.10
-
-# =============================================================================
-# ENDPOINTS
-# =============================================================================
-
-INSTRUMENT_SEARCH_URL = (
-    f"{BASE_URL}/v2/instruments/search"
-)
-
-OPTION_CHAIN_URL = (
-    f"{BASE_URL}/v2/option/chain"
-)
-
-OPTION_CONTRACT_URL = (
-    f"{BASE_URL}/v2/option/contract"
-)
-
-CHANGE_OI_URL = (
-    f"{BASE_URL}/v2/market/change-oi"
-)
-
-MARKET_STATUS_URL = (
-    f"{BASE_URL}/v2/market/status/BSE"
-)
-
-QUOTE_URL = (
-    f"{BASE_URL}/v2/market-quote/quotes"
-)
-HISTORICAL_CANDLE_URL = (
-    f"{BASE_URL}/v3/historical-candle"
-)
-
-# =============================================================================
-# LOGGING
-# =============================================================================
+# URLs.
+INSTRUMENT_SEARCH_URL = f"{BASE_URL}/v2/instruments/search"
+OPTION_CONTRACT_URL = f"{BASE_URL}/v2/option/contract"
+OPTION_CHAIN_URL = f"{BASE_URL}/v2/option/chain"
+MARKET_QUOTE_URL = f"{BASE_URL}/v2/market-quote/quotes"
+MARKET_STATUS_URL = f"{BASE_URL}/v2/market/status/BSE"
+MARKET_HOLIDAY_URL = f"{BASE_URL}/v2/market/holidays"
+MARKET_OI_URL = f"{BASE_URL}/v2/market/oi"
+CHANGE_OI_URL = f"{BASE_URL}/v2/market/change-oi"
+HISTORICAL_V3_URL = f"{BASE_URL}/v3/historical-candle"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
 logger = logging.getLogger("sensex_scanner")
 
 
 # =============================================================================
-# DATA CLASSES
+# DATA TYPES
 # =============================================================================
 
-@dataclass
+@dataclass(frozen=True)
 class FuturesContract:
     instrument_key: str
     trading_symbol: str
     expiry: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class OptionCandidate:
     instrument_key: str
     trading_symbol: str
@@ -255,12 +192,49 @@ class OptionCandidate:
     ltp: float
     oi: float
     prev_oi: float
+    volume: float
+    bid: float
+    ask: float
+    bid_qty: float
+    ask_qty: float
     delta: float
     gamma: float
+    theta: float
     iv: float
+    spread_pct: float
+    theta_burden_pct_day: float
 
 
-@dataclass
+@dataclass(frozen=True)
+class StructureResult:
+    direction: str
+    score: float
+    confidence: float
+    interpretation: str
+    components: dict[str, float]
+    timeframe_directions: dict[str, int]
+    vwap: float
+    vwap_slope: float
+    futures_regime: str
+    futures_bias: int
+    futures_oi_strength: float
+    futures_oi_persistence: float
+    futures_live_oi_change: float
+    chain_predictive_bias: int
+    chain_predictive_strength: float
+    chain_level_bias: int
+    support_strength: float
+    resistance_strength: float
+    support_change_strength: float
+    resistance_change_strength: float
+    support_1: float
+    support_2: float
+    resistance_1: float
+    resistance_2: float
+    reasons: list[str]
+
+
+@dataclass(frozen=True)
 class Signal:
     timestamp: str
     direction: str
@@ -276,60 +250,64 @@ class Signal:
     target_1: float
     target_2: float
     stop_loss: float
-    underlying_trigger_3m: float
-    underlying_target_15m: float
+    underlying_stop: float
+    underlying_target_1: float
+    underlying_target_2: float
     delta: float
     gamma: float
+    theta: float
+    support_1: float
+    support_2: float
+    resistance_1: float
+    resistance_2: float
     reasons: list[str]
 
 
-# =============================================================================
-# EXCEPTIONS
-# =============================================================================
-
 class ScannerError(Exception):
-    pass
+    """Expected scanner/API failure."""
 
 
 # =============================================================================
-# TIME HELPERS
+# BASIC HELPERS
 # =============================================================================
 
 def now_ist() -> datetime:
     return datetime.now(IST)
 
 
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        v = float(value)
+        return v if math.isfinite(v) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_date(raw: str) -> Optional[date]:
+    try:
+        return datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
 def market_window_open() -> bool:
-
-    current = now_ist()
-
-    if current.weekday() >= 5:
+    now = now_ist()
+    if now.weekday() >= 5:
         return False
-
-    if is_bse_holiday(current):
-        logger.info(
-            "BSE holiday: %s. Scanner will not run.",
-            current.strftime("%Y-%m-%d"),
-        )
+    if is_bse_holiday(now):
         return False
-
-    return (
-        MARKET_START
-        <= current.time()
-        <= MARKET_END
-    )
+    return MARKET_START <= now.time() <= MARKET_END
 
 
 # =============================================================================
-# API HELPERS
+# UPSTOX HTTP
 # =============================================================================
 
 def api_headers() -> dict[str, str]:
     if not UPSTOX_TOKEN:
         raise ScannerError(
-            "UPSTOX_ANALYTICS_TOKEN is missing."
+            "UPSTOX_ANALYTICS_TOKEN is missing. Set it in the environment."
         )
-
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -342,11 +320,9 @@ def api_get(
     params: Optional[dict[str, Any]] = None,
     retries: int = 3,
 ) -> dict[str, Any]:
-
-    last_error = None
+    last_error = "Unknown Upstox error."
 
     for attempt in range(1, retries + 1):
-
         try:
             response = requests.get(
                 url,
@@ -354,229 +330,113 @@ def api_get(
                 headers=api_headers(),
                 timeout=REQUEST_TIMEOUT,
             )
-
         except requests.RequestException as exc:
-
-            last_error = f"Network request failed: {exc}"
-
+            last_error = f"Network error: {exc}"
             if attempt < retries:
-                wait_seconds = attempt * 2
-
-                logger.warning(
-                    "Request failed. Retry %d/%d in %d seconds: %s",
-                    attempt,
-                    retries,
-                    wait_seconds,
-                    last_error,
-                )
-
-                time_module.sleep(wait_seconds)
+                time_module.sleep(attempt)
                 continue
-
             raise ScannerError(last_error) from exc
 
         if response.status_code == 200:
-
             try:
                 payload = response.json()
-
             except ValueError as exc:
                 raise ScannerError(
-                    "Upstox returned invalid JSON."
+                    f"Upstox returned invalid JSON from {url}"
                 ) from exc
 
             if not isinstance(payload, dict):
-                raise ScannerError(
-                    "Unexpected Upstox response structure."
-                )
-
-            if payload.get("status") == "error":
-                raise ScannerError(
-                    json.dumps(payload)[:1500]
-                )
-
+                raise ScannerError(f"Unexpected Upstox payload from {url}.")
+            if str(payload.get("status", "")).lower() == "error":
+                raise ScannerError(json.dumps(payload)[:2000])
             return payload
 
         last_error = (
-            f"Upstox HTTP {response.status_code}: "
-            f"{response.text[:1000]}"
+            f"Upstox HTTP {response.status_code} | "
+            f"{url} | {response.text[:1500]}"
         )
 
-        transient_error = response.status_code in {
-            500,
-            502,
-            503,
-            504,
-        }
-
-        logger.warning(
-            "Upstox request failed | attempt=%d/%d | "
-            "status=%s | url=%s | params=%s | response=%s",
-            attempt,
-            retries,
-            response.status_code,
-            url,
-            params,
-            response.text[:1000],
-        )
-
-        if transient_error and attempt < retries:
-
-            wait_seconds = attempt * 2
-
-            logger.info(
-                "Transient Upstox server error. Retrying in %d seconds...",
-                wait_seconds,
-            )
-
-            time_module.sleep(wait_seconds)
+        transient = response.status_code in {429, 500, 502, 503, 504}
+        if transient and attempt < retries:
+            time_module.sleep(min(2 * attempt, 6))
             continue
 
         raise ScannerError(last_error)
 
-    raise ScannerError(
-        last_error or "Unknown Upstox API error."
-    )
+    raise ScannerError(last_error)
+
 
 # =============================================================================
-# MARKET HOLIDAY
+# MARKET STATUS / HOLIDAYS
 # =============================================================================
 
-def is_bse_holiday(
-    current_date: datetime,
-) -> bool:
-    """
-    Uses Upstox's market-holiday API to determine whether
-    BSE is closed on the current IST date.
-    """
-
-    date_string = current_date.strftime(
-        "%Y-%m-%d"
-    )
-
-    url = (
-        f"{BASE_URL}/v2/market/holidays/{date_string}"
-    )
-
+def is_bse_holiday(current: datetime) -> bool:
+    url = f"{MARKET_HOLIDAY_URL}/{current.strftime('%Y-%m-%d')}"
     try:
-        payload = api_get(url)
-
-        data = payload.get(
-            "data"
-        )
-
-        # Upstox returns holiday information when the
-        # requested date is a holiday.
-        if isinstance(data, dict):
-            return bool(data)
-
-        if isinstance(data, list):
-            return len(data) > 0
-
-        return False
-
+        payload = api_get(url, retries=2)
     except ScannerError as exc:
-        logger.warning(
-            "Holiday API unavailable: %s",
-            exc,
-        )
-
-        # Do not silently assume a trading holiday when
-        # the holiday service itself is unavailable.
+        # Availability of holiday API should not create a false "closed" result.
+        logger.warning("Holiday API unavailable: %s", exc)
         return False
 
-# =============================================================================
-# MARKET STATUS
-# =============================================================================
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return bool(data)
+    if isinstance(data, list):
+        return bool(data)
+    return False
+
 
 def get_market_status() -> str:
-
-    payload = api_get(
-        MARKET_STATUS_URL
-    )
-
-    serialized = json.dumps(
-        payload,
-        default=str,
-    ).lower()
-
-    if '"open"' in serialized or "open" in serialized:
-        return "OPEN"
-
-    if "closed" in serialized:
-        return "CLOSED"
+    payload = api_get(MARKET_STATUS_URL, retries=3)
+    data = payload.get("data", {})
+    if isinstance(data, dict):
+        status = str(data.get("status", "")).upper()
+        if status in {"NORMAL_OPEN", "OPEN"}:
+            return "OPEN"
+        if status in {"NORMAL_CLOSE", "CLOSED"}:
+            return "CLOSED"
+        return status or "UNKNOWN"
 
     return "UNKNOWN"
 
 
 # =============================================================================
-# SENSEX QUOTE
+# QUOTES
 # =============================================================================
 
-def get_quote(
-    instrument_key: str,
-) -> dict[str, Any]:
-
+def get_quote(instrument_key: str) -> dict[str, Any]:
     payload = api_get(
-        QUOTE_URL,
-        {
-            "instrument_key": instrument_key,
-        },
+        MARKET_QUOTE_URL,
+        {"instrument_key": instrument_key},
+        retries=3,
     )
-
-    data = payload.get(
-        "data",
-        {},
-    )
-
+    data = payload.get("data", {})
     if not isinstance(data, dict):
-        raise ScannerError(
-            "Quote response data is not an object."
-        )
-
+        raise ScannerError("Upstox quote data is not an object.")
     if instrument_key in data:
         return data[instrument_key]
-
     if len(data) == 1:
         return next(iter(data.values()))
-
-    raise ScannerError(
-        f"Quote not found for {instrument_key}."
-    )
+    raise ScannerError(f"Quote not found for {instrument_key}.")
 
 
-def extract_ltp(
-    quote: dict[str, Any],
-) -> float:
-
-    for field in (
-        "last_price",
-        "ltp",
-        "lastPrice",
-    ):
-        value = quote.get(field)
-
-        if value is not None:
-            price = float(value)
-
-            if price > 0:
-                return price
-
-    raise ScannerError(
-        "LTP not present in quote."
-    )
+def extract_ltp(quote: dict[str, Any]) -> float:
+    for key in ("last_price", "ltp", "lastPrice"):
+        value = safe_float(quote.get(key), 0.0)
+        if value > 0:
+            return value
+    raise ScannerError("LTP not present in quote.")
 
 
 # =============================================================================
 # INSTRUMENT DISCOVERY
 # =============================================================================
+
 def get_current_sensex_future() -> FuturesContract:
+    candidates: list[dict[str, Any]] = []
 
-    all_contracts = []
-
-    # Try current month first, then next month.
     for expiry_filter in ("current_month", "next_month"):
-
         payload = api_get(
             INSTRUMENT_SEARCH_URL,
             {
@@ -589,162 +449,63 @@ def get_current_sensex_future() -> FuturesContract:
                 "records": 30,
             },
         )
+        rows = payload.get("data", [])
+        if isinstance(rows, list):
+            candidates.extend(x for x in rows if isinstance(x, dict))
 
-        contracts = payload.get("data", [])
+    today = now_ist().date()
+    valid: list[dict[str, Any]] = []
 
-        if isinstance(contracts, list):
-            all_contracts.extend(contracts)
-
-    if not all_contracts:
-        raise ScannerError(
-            "No active SENSEX futures returned by Upstox."
-        )
-
-    valid = []
-
-    for contract in all_contracts:
-
-        if not (
-            contract.get("instrument_key")
-            and contract.get("trading_symbol")
-            and contract.get("expiry")
-        ):
-            continue
-
-        underlying = str(
-            contract.get(
-                "underlying_symbol",
-                ""
-            )
-        ).upper()
-
-        symbol = str(
-            contract.get(
-                "trading_symbol",
-                ""
-            )
-        ).upper()
+    for row in candidates:
+        key = str(row.get("instrument_key", "")).strip()
+        symbol = str(row.get("trading_symbol", "")).strip()
+        expiry = parse_date(str(row.get("expiry", "")))
+        underlying = str(row.get("underlying_symbol", "")).upper()
 
         if (
-            "SENSEX" in underlying
-            or "SENSEX" in symbol
+            key
+            and symbol
+            and expiry
+            and expiry >= today
+            and ("SENSEX" in underlying or "SENSEX" in symbol.upper())
         ):
-            valid.append(contract)
+            valid.append(row)
 
     if not valid:
-        logger.error(
-            "Upstox futures response: %s",
-            json.dumps(
-                all_contracts,
-                default=str,
-            ),
-        )
+        raise ScannerError("No active SENSEX futures found.")
 
-        raise ScannerError(
-            "No valid SENSEX future found."
-        )
-
-    # Sort by expiry and select nearest available future.
-    valid.sort(
-        key=lambda x: str(
-            x.get("expiry")
-        )
-    )
-
+    valid.sort(key=lambda x: parse_date(str(x["expiry"])) or date.max)
     selected = valid[0]
 
     logger.info(
-        "Selected SENSEX future: %s | Expiry: %s | Key: %s",
+        "Selected SENSEX future: %s | expiry=%s | key=%s",
         selected["trading_symbol"],
         selected["expiry"],
         selected["instrument_key"],
     )
 
     return FuturesContract(
-        instrument_key=selected["instrument_key"],
-        trading_symbol=selected["trading_symbol"],
-        expiry=str(selected["expiry"]),
+        instrument_key=str(selected["instrument_key"]),
+        trading_symbol=str(selected["trading_symbol"]),
+        expiry=str(selected["expiry"])[:10],
     )
-
-def get_current_week_contracts() -> list[dict[str, Any]]:
-    """
-    Load SENSEX option contracts for the exact weekly Thursday expiry.
-    """
-    exact_expiry = get_active_sensex_expiry()
-
-    logger.info(
-        "Using exact dynamically selected SENSEX weekly expiry for option contracts: %s",
-        exact_expiry,
-    )
-
-    payload = api_get(
-        OPTION_CONTRACT_URL,
-        {
-            "instrument_key": SENSEX_KEY,
-            "expiry_date": exact_expiry,
-        },
-    )
-
-    contracts = payload.get("data", [])
-
-    if not isinstance(contracts, list) or not contracts:
-        raise ScannerError(
-            "No SENSEX option contracts returned for selected expiry "
-            f"{exact_expiry}."
-        )
-
-    return contracts
 
 
 # =============================================================================
-# CANDLE DATA
+# CANDLES
 # =============================================================================
 
-def get_intraday_candles(
-    instrument_key: str,
-    interval_minutes: int,
-    max_candles: Optional[int] = None,
-    min_candles: int = 2,
-) -> pd.DataFrame:
+def _parse_candles(candles: Any) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
 
-    encoded_key = urllib.parse.quote(
-        instrument_key,
-        safe="",
-    )
-
-    # Use Upstox V3 intraday candles for the current trading session.
-    # This is the correct V3 endpoint for current-day data and supports
-    # custom minute intervals such as 3 and 15 minutes.
-    url = (
-        f"{HISTORICAL_CANDLE_URL}/intraday/"
-        f"{encoded_key}/minutes/{interval_minutes}"
-    )
-
-    payload = api_get(url)
-
-    data = payload.get(
-        "data",
-        {},
-    )
-
-    candles = data.get(
-        "candles",
-        [],
-    )
-
-    if not isinstance(candles, list) or not candles:
-        raise ScannerError(
-            f"No {interval_minutes}-minute candles returned for {instrument_key}."
-        )
-
-    records = []
+    if not isinstance(candles, list):
+        return pd.DataFrame()
 
     for row in candles:
         if not isinstance(row, (list, tuple)) or len(row) < 6:
             continue
-
         try:
-            records.append(
+            rows.append(
                 {
                     "timestamp": row[0],
                     "open": float(row[1]),
@@ -754,7 +515,7 @@ def get_intraday_candles(
                     "volume": float(row[5]),
                     "oi": (
                         float(row[6])
-                        if len(row) > 6 and row[6] is not None
+                        if len(row) >= 7 and row[6] is not None
                         else np.nan
                     ),
                 }
@@ -762,115 +523,165 @@ def get_intraday_candles(
         except (TypeError, ValueError):
             continue
 
-    df = pd.DataFrame(records)
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"], utc=True, errors="coerce"
+    )
+    df = (
+        df.dropna(subset=["timestamp"])
+        .sort_values("timestamp")
+        .drop_duplicates("timestamp")
+        .reset_index(drop=True)
+    )
+    return df
+
+
+def get_intraday_candles(
+    instrument_key: str,
+    interval_minutes: int,
+) -> pd.DataFrame:
+    encoded = urllib.parse.quote(instrument_key, safe="")
+    url = f"{HISTORICAL_V3_URL}/intraday/{encoded}/minutes/{interval_minutes}"
+
+    payload = api_get(url, retries=3)
+    data = payload.get("data", {})
+    df = _parse_candles(data.get("candles", []) if isinstance(data, dict) else [])
 
     if df.empty:
         raise ScannerError(
-            f"No valid {interval_minutes}-minute candles after parsing."
+            f"No intraday {interval_minutes}m candles for {instrument_key}."
         )
 
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
-        utc=True,
-        errors="coerce",
+    session_date = now_ist().date()
+    local_dates = df["timestamp"].dt.tz_convert(IST).dt.date
+    df = df.loc[local_dates == session_date].reset_index(drop=True)
+
+    if df.empty:
+        raise ScannerError(
+            f"No current-session {interval_minutes}m candles for {instrument_key}."
+        )
+    return df
+
+
+def get_historical_candles(
+    instrument_key: str,
+    interval_minutes: int,
+    lookback_days: int = MAX_HISTORY_DAYS,
+) -> pd.DataFrame:
+    encoded = urllib.parse.quote(instrument_key, safe="")
+    end = now_ist().date()
+    start = end - timedelta(days=lookback_days)
+
+    url = (
+        f"{HISTORICAL_V3_URL}/{encoded}/minutes/{interval_minutes}"
+        f"/{end.isoformat()}/{start.isoformat()}"
     )
 
-    df = (
-        df
-        .dropna(subset=["timestamp"])
-        .sort_values("timestamp")
-        .drop_duplicates(subset=["timestamp"])
+    payload = api_get(url, retries=3)
+    data = payload.get("data", {})
+    df = _parse_candles(data.get("candles", []) if isinstance(data, dict) else [])
+
+    if df.empty:
+        raise ScannerError(
+            f"No historical {interval_minutes}m candles for {instrument_key}."
+        )
+    return df
+
+
+def merge_current_into_history(
+    historical: pd.DataFrame,
+    current: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    if current is None or current.empty:
+        return historical
+    combined = pd.concat([historical, current], ignore_index=True)
+    return (
+        combined.sort_values("timestamp")
+        .drop_duplicates("timestamp", keep="last")
         .reset_index(drop=True)
     )
 
-    # Keep only current-session records. The V3 intraday endpoint is current-day
-    # data, but this explicit filter protects the VWAP calculation.
-    session_date = now_ist().date()
-    session_dates = df["timestamp"].dt.tz_convert(IST).dt.date
-    df = df.loc[session_dates == session_date].reset_index(drop=True)
 
-    if len(df) < min_candles:
-        raise ScannerError(
-            f"Insufficient current-session {interval_minutes}-minute candles: "
-            f"got {len(df)}, need at least {min_candles}."
-        )
-
-    if max_candles is not None and len(df) > max_candles:
-        df = df.tail(max_candles).reset_index(drop=True)
-
-    logger.info(
-        "Loaded %d current-session %d-minute candles for %s",
-        len(df),
-        interval_minutes,
-        instrument_key,
-    )
-
-    return df
-
-
-def get_session_candles_for_vwap(
+def get_timeframe_candles(
     instrument_key: str,
-    interval_minutes: int = 3,
-    min_candles: int = 20,
+    interval_minutes: int,
+    min_bars: int = 25,
 ) -> pd.DataFrame:
-    """Fetch and return the complete current-session candle set for VWAP.
-
-    This function intentionally does not accept max_candles. It prevents the
-    short Futures regime window (2-3 candles) from ever being reused as the
-    VWAP source.
     """
-    df = get_intraday_candles(
+    Use historical V3 data for indicator warm-up and merge today's intraday data.
+    This is critical for 60/120/180m Supertrend: computing ST from only 1-3
+    current-day candles is structurally invalid.
+    """
+    history_days = 35 if interval_minutes <= 15 else 60
+
+    historical = get_historical_candles(
         instrument_key,
         interval_minutes,
-        max_candles=None,
-        min_candles=min_candles,
+        lookback_days=history_days,
     )
 
-    usable_volume = pd.to_numeric(
-        df["volume"], errors="coerce"
-    ).fillna(0.0).clip(lower=0.0)
-
-    if len(df) < min_candles or float(usable_volume.sum()) <= 0.0:
-        raise ScannerError(
-            f"Insufficient usable Futures session data for VWAP: "
-            f"candles={len(df)}, volume={float(usable_volume.sum()):.0f}."
+    current = None
+    try:
+        current = get_intraday_candles(instrument_key, interval_minutes)
+    except ScannerError as exc:
+        logger.info(
+            "Current intraday %dm refresh unavailable; using historical data: %s",
+            interval_minutes,
+            exc,
         )
 
-    logger.info(
-        "VWAP source: SENSEX Futures | current-session candles=%d | volume=%0.f",
-        len(df),
-        float(usable_volume.sum()),
-    )
-    return df
+    merged = merge_current_into_history(historical, current)
+
+    if len(merged) < min_bars:
+        raise ScannerError(
+            f"Insufficient {interval_minutes}m bars: {len(merged)} < {min_bars}."
+        )
+
+    return merged
+
+
+def filter_completed_candles(
+    df: pd.DataFrame,
+    interval_minutes: int,
+    now: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """
+    Keep only bars whose full interval has completed.
+
+    Timestamp is assumed to be the candle start time, which is the standard
+    representation of OHLC time series returned by Upstox.
+    """
+    if df.empty:
+        return df
+
+    current = now or now_ist()
+    local_ts = df["timestamp"].dt.tz_convert(IST)
+    interval = pd.to_timedelta(interval_minutes, unit="m")
+    completed = local_ts + interval <= current
+
+    result = df.loc[completed].copy()
+    return result.reset_index(drop=True)
 
 
 # =============================================================================
 # INDICATORS
 # =============================================================================
 
-def calculate_atr(
-    df: pd.DataFrame,
-    period: int,
-) -> pd.Series:
-
-    previous_close = df["close"].shift(1)
-
-    true_range = pd.concat(
+def calculate_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
+    previous = df["close"].shift(1)
+    tr = pd.concat(
         [
             df["high"] - df["low"],
-            (
-                df["high"]
-                - previous_close
-            ).abs(),
-            (
-                df["low"]
-                - previous_close
-            ).abs(),
+            (df["high"] - previous).abs(),
+            (df["low"] - previous).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    return true_range.ewm(
+    return tr.ewm(
         alpha=1 / period,
         adjust=False,
         min_periods=1,
@@ -882,2289 +693,1333 @@ def calculate_supertrend(
     period: int = SUPERTREND_PERIOD,
     factor: float = SUPERTREND_FACTOR,
 ) -> pd.DataFrame:
-
-    result = df.copy()
-
-    result["atr"] = calculate_atr(
-        result,
-        period,
-    )
-
-    hl2 = (
-        result["high"]
-        + result["low"]
-    ) / 2.0
-
-    basic_upper = (
-        hl2
-        + factor * result["atr"]
-    )
-
-    basic_lower = (
-        hl2
-        - factor * result["atr"]
-    )
-
-    final_upper = pd.Series(
-        np.nan,
-        index=result.index,
-        dtype=float,
-    )
-
-    final_lower = pd.Series(
-        np.nan,
-        index=result.index,
-        dtype=float,
-    )
-
-    direction = pd.Series(
-        np.nan,
-        index=result.index,
-        dtype=float,
-    )
-
-    supertrend = pd.Series(
-        np.nan,
-        index=result.index,
-        dtype=float,
-    )
-
-    if result.empty:
-        raise ScannerError(
-            "Unable to calculate Supertrend: no candles available."
-        )
-
-    first_valid = result["atr"].first_valid_index()
-
-    if first_valid is None:
-        raise ScannerError(
-            f"Unable to calculate Supertrend: ATR contains no valid values "
-            f"(candles={len(result)}, period={period})."
-        )
-
-    start = result.index.get_loc(
-        first_valid
-    )
-
-    final_upper.iloc[start] = (
-        basic_upper.iloc[start]
-    )
-
-    final_lower.iloc[start] = (
-        basic_lower.iloc[start]
-    )
-
-    direction.iloc[start] = 1
-
-    supertrend.iloc[start] = (
-        final_lower.iloc[start]
-    )
-
-    for i in range(
-        start + 1,
-        len(result),
-    ):
-
-        prev = i - 1
-
-        if (
-            basic_upper.iloc[i]
-            < final_upper.iloc[prev]
-            or result["close"].iloc[prev]
-            > final_upper.iloc[prev]
-        ):
-            final_upper.iloc[i] = (
-                basic_upper.iloc[i]
-            )
-        else:
-            final_upper.iloc[i] = (
-                final_upper.iloc[prev]
-            )
-
-        if (
-            basic_lower.iloc[i]
-            > final_lower.iloc[prev]
-            or result["close"].iloc[prev]
-            < final_lower.iloc[prev]
-        ):
-            final_lower.iloc[i] = (
-                basic_lower.iloc[i]
-            )
-        else:
-            final_lower.iloc[i] = (
-                final_lower.iloc[prev]
-            )
-
-        if (
-            result["close"].iloc[i]
-            > final_upper.iloc[prev]
-        ):
-            direction.iloc[i] = 1
-
-        elif (
-            result["close"].iloc[i]
-            < final_lower.iloc[prev]
-        ):
-            direction.iloc[i] = -1
-
-        else:
-            direction.iloc[i] = (
-                direction.iloc[prev]
-            )
-
-        supertrend.iloc[i] = (
-            final_lower.iloc[i]
-            if direction.iloc[i] == 1
-            else final_upper.iloc[i]
-        )
-
-    result["supertrend"] = supertrend
-    result["direction"] = direction
-
-    return result
-
-
-def calculate_vwap(
-    df: pd.DataFrame,
-) -> pd.Series:
-    """Calculate session VWAP and fail explicitly when usable volume is absent."""
     if df.empty:
-        return pd.Series(np.nan, index=df.index, dtype=float)
-
-    typical = (
-        df["high"]
-        + df["low"]
-        + df["close"]
-    ) / 3.0
-
-    volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
-    session = pd.to_datetime(
-        df["timestamp"], utc=True, errors="coerce"
-    ).dt.tz_convert(IST).dt.date
-
-    cumulative_volume = volume.groupby(session).cumsum()
-    cumulative_pv = (typical * volume).groupby(session).cumsum()
-
-    vwap = cumulative_pv / cumulative_volume.replace(0, np.nan)
-
-    # Index candles can legitimately have zero volume. In that case this is
-    # not a real VWAP. The scanner uses SENSEX futures candles for VWAP instead.
-    return vwap
-
-
-# =============================================================================
-# MARKET STRUCTURE
-# =============================================================================
-
-def structure_state(
-    df: pd.DataFrame,
-    lookback: int,
-) -> str:
-
-    if len(df) < lookback:
-        return "NEUTRAL"
-
-    recent = df.tail(
-        lookback
-    )
-
-    highs = recent[
-        "high"
-    ].to_numpy()
-
-    lows = recent[
-        "low"
-    ].to_numpy()
-
-    bullish = (
-        highs[-1] > highs[0]
-        and lows[-1] > lows[0]
-    )
-
-    bearish = (
-        highs[-1] < highs[0]
-        and lows[-1] < lows[0]
-    )
-
-    if bullish:
-        return "BULLISH"
-
-    if bearish:
-        return "BEARISH"
-
-    return "NEUTRAL"
-
-def market_regime(
-    spot_3m: pd.DataFrame,
-    spot_15m: pd.DataFrame,
-    chain_bias: str,
-    chain_bias_score: float,
-    change_oi_bias_value: str,
-    change_oi_score: float,
-) -> tuple[str, list[str]]:
-
-    """
-    Classify the current market as TRENDING or SIDEWAYS.
-
-    The goal is to prevent a single Futures regime + VWAP position
-    from manufacturing a directional prediction while price action
-    is actually compressed inside a range.
-    """
-
-    reasons: list[str] = []
-
-    if (
-        len(spot_3m) < SIDEWAYS_LOOKBACK_3M
-        or len(spot_15m) < SIDEWAYS_LOOKBACK_15M
-    ):
-        return (
-            "UNKNOWN",
-            ["Insufficient candles for sideways/range classification."]
-        )
-
-    recent_3m = spot_3m.tail(
-        SIDEWAYS_LOOKBACK_3M
-    ).copy()
-
-    recent_15m = spot_15m.tail(
-        SIDEWAYS_LOOKBACK_15M
-    ).copy()
-
-    latest_3m = recent_3m.iloc[-1]
-    latest_15m = recent_15m.iloc[-1]
-
-    atr_3m = float(latest_3m.get("atr", np.nan))
-    atr_15m = float(latest_15m.get("atr", np.nan))
-
-    if (
-        not math.isfinite(atr_3m)
-        or not math.isfinite(atr_15m)
-        or atr_3m <= 0
-        or atr_15m <= 0
-    ):
-        return (
-            "UNKNOWN",
-            ["ATR unavailable for sideways/range classification."]
-        )
-
-    # -------------------------------------------------------------
-    # 3-minute range measurements
-    # -------------------------------------------------------------
-
-    range_3m = float(
-        recent_3m["high"].max()
-        - recent_3m["low"].min()
-    )
-
-    net_move_3m = abs(
-        float(recent_3m["close"].iloc[-1])
-        - float(recent_3m["close"].iloc[0])
-    )
-
-    range_atr_3m = range_3m / atr_3m
-    net_move_atr_3m = net_move_3m / atr_3m
-
-    # -------------------------------------------------------------
-    # 15-minute range measurements
-    # -------------------------------------------------------------
-
-    range_15m = float(
-        recent_15m["high"].max()
-        - recent_15m["low"].min()
-    )
-
-    net_move_15m = abs(
-        float(recent_15m["close"].iloc[-1])
-        - float(recent_15m["close"].iloc[0])
-    )
-
-    range_atr_15m = range_15m / atr_15m
-    net_move_atr_15m = net_move_15m / atr_15m
-
-    # -------------------------------------------------------------
-    # Supertrend flip count
-    # -------------------------------------------------------------
-
-    direction_3m = (
-        pd.to_numeric(
-            recent_3m["direction"],
-            errors="coerce"
-        )
-        .dropna()
-        .astype(int)
-    )
-
-    direction_15m = (
-        pd.to_numeric(
-            recent_15m["direction"],
-            errors="coerce"
-        )
-        .dropna()
-        .astype(int)
-    )
-
-    flips_3m = int(
-        direction_3m.ne(
-            direction_3m.shift()
-        ).sum() - 1
-    ) if len(direction_3m) > 1 else 0
-
-    flips_15m = int(
-        direction_15m.ne(
-            direction_15m.shift()
-        ).sum() - 1
-    ) if len(direction_15m) > 1 else 0
-
-    # -------------------------------------------------------------
-    # Price structure
-    # -------------------------------------------------------------
-
-    structure_3m = structure_state(
-        recent_3m,
-        min(
-            STRUCTURE_LOOKBACK_3M,
-            len(recent_3m)
-        ),
-    )
-
-    structure_15m = structure_state(
-        recent_15m,
-        min(
-            STRUCTURE_LOOKBACK_15M,
-            len(recent_15m)
-        ),
-    )
-
-    # -------------------------------------------------------------
-    # Sideways conditions
-    # -------------------------------------------------------------
-
-    compressed_3m = (
-        range_atr_3m <= SIDEWAYS_MAX_RANGE_ATR_3M
-    )
-
-    compressed_15m = (
-        range_atr_15m <= SIDEWAYS_MAX_RANGE_ATR_15M
-    )
-
-    low_net_move_3m = (
-        net_move_atr_3m <= SIDEWAYS_MAX_NET_MOVE_ATR_3M
-    )
-
-    low_net_move_15m = (
-        net_move_atr_15m <= SIDEWAYS_MAX_NET_MOVE_ATR_15M
-    )
-
-    unstable_3m = (
-        flips_3m >= SIDEWAYS_MAX_SUPERTREND_FLIPS
-    )
-
-    unstable_15m = (
-        flips_15m >= SIDEWAYS_MAX_SUPERTREND_FLIPS
-    )
-
-    oi_balanced = (
-        abs(float(chain_bias_score))
-        <= SIDEWAYS_CHAIN_OI_SCORE
-        and abs(float(change_oi_score))
-        <= SIDEWAYS_CHANGE_OI_SCORE
-    )
-
-    neutral_structure = (
-        structure_3m == "NEUTRAL"
-        or structure_15m == "NEUTRAL"
-        or structure_3m != structure_15m
-    )
-
-    sideways_score = 0
-
-    if compressed_3m:
-        sideways_score += 1
-
-    if low_net_move_3m:
-        sideways_score += 1
-
-    if compressed_15m:
-        sideways_score += 1
-
-    if low_net_move_15m:
-        sideways_score += 1
-
-    if unstable_3m:
-        sideways_score += 1
-
-    if unstable_15m:
-        sideways_score += 1
-
-    if oi_balanced:
-        sideways_score += 2
-
-    if neutral_structure:
-        sideways_score += 1
-
-    logger.info(
-        "Market regime check: "
-        "3m_range_ATR=%.2f "
-        "3m_net_ATR=%.2f "
-        "15m_range_ATR=%.2f "
-        "15m_net_ATR=%.2f "
-        "3m_flips=%d "
-        "15m_flips=%d "
-        "structure_3m=%s "
-        "structure_15m=%s "
-        "chain_OI=%.3f "
-        "change_OI=%.3f "
-        "sideways_score=%d",
-        range_atr_3m,
-        net_move_atr_3m,
-        range_atr_15m,
-        net_move_atr_15m,
-        flips_3m,
-        flips_15m,
-        structure_3m,
-        structure_15m,
-        float(chain_bias_score),
-        float(change_oi_score),
-        sideways_score,
-    )
-
-    # -----------------------------------------------------------------
-    # STRONG SIDEWAYS / RANGE DETECTION
-    # -----------------------------------------------------------------
-
-    # The market can be sideways even if the 3-minute candles show
-    # temporary directional movement. Give greater importance to the
-    # 15-minute net movement because it represents the broader intraday
-    # structure.
-    strong_15m_compression = (
-        compressed_15m
-        and low_net_move_15m
-    )
-
-    timeframe_conflict = (
-        structure_3m in {"BULLISH", "BEARISH"}
-        and structure_15m in {"BULLISH", "BEARISH"}
-        and structure_3m != structure_15m
-    )
-
-    # Strong sideways condition:
-    # 1. 15-minute market remains compressed.
-    # 2. Net movement is small.
-    # 3. 3m and 15m structures disagree.
-    if strong_15m_compression and timeframe_conflict:
-        sideways_score = max(sideways_score, 5)
-        reasons.append(
-            "Strong sideways condition: compressed 15-minute range "
-            "with minimal net movement and conflicting 3m/15m structure."
-        )
-
-    # -----------------------------------------------------------------
-    # NORMAL SIDEWAYS CLASSIFICATION
-    # -----------------------------------------------------------------
-    if sideways_score >= 5:
-        reasons.extend([
-            "Market classified as SIDEWAYS/RANGE.",
-            (
-                f"3m range={range_atr_3m:.2f} ATR, "
-                f"net move={net_move_atr_3m:.2f} ATR."
-            ),
-            (
-                f"15m range={range_atr_15m:.2f} ATR, "
-                f"net move={net_move_atr_15m:.2f} ATR."
-            ),
-            (
-                f"3m structure={structure_3m}, "
-                f"15m structure={structure_15m}."
-            ),
-            (
-                f"Supertrend flips: "
-                f"3m={flips_3m}, 15m={flips_15m}."
-            ),
-            (
-                f"OI positioning: localized={chain_bias}, "
-                f"Change-OI={change_oi_bias_value}."
-            ),
-        ])
-        return "SIDEWAYS", reasons
-
-    reasons.extend([
-        "Market classified as TRENDING/EXPANDING.",
-        (
-            f"3m range={range_atr_3m:.2f} ATR, "
-            f"net move={net_move_atr_3m:.2f} ATR."
-        ),
-        (
-            f"15m range={range_atr_15m:.2f} ATR, "
-            f"net move={net_move_atr_15m:.2f} ATR."
-        ),
-        (
-            f"3m structure={structure_3m}, "
-            f"15m structure={structure_15m}."
-        ),
-    ])
-
-    return "TRENDING", reasons
-
-def recent_swing_high(
-    df: pd.DataFrame,
-    lookback: int,
-) -> float:
-
-    if len(df) < lookback:
-        raise ScannerError(
-            "Insufficient data for swing high."
-        )
-
-    return float(
-        df["high"]
-        .iloc[
-            -lookback:
-            -1
-        ]
-        .max()
-    )
-
-
-def recent_swing_low(
-    df: pd.DataFrame,
-    lookback: int,
-) -> float:
-
-    if len(df) < lookback:
-        raise ScannerError(
-            "Insufficient data for swing low."
-        )
-
-    return float(
-        df["low"]
-        .iloc[
-            -lookback:
-            -1
-        ]
-        .min()
-    )
-
-
-# =============================================================================
-# OPTION CHAIN ANALYSIS
-# =============================================================================
-
-def get_active_sensex_expiry() -> str:
-    """
-    Dynamically select the nearest non-expired SENSEX option expiry.
-
-    The option-contract endpoint is queried without a relative expiry filter,
-    then all valid expiry dates returned by Upstox are parsed and the nearest
-    active date is selected.
-    """
-    payload = api_get(
-        OPTION_CONTRACT_URL,
-        {"instrument_key": SENSEX_KEY},
-    )
-
-    contracts = payload.get("data", [])
-
-    if not isinstance(contracts, list) or not contracts:
-        raise ScannerError(
-            "No SENSEX option contracts returned for dynamic expiry discovery."
-        )
-
-    today = now_ist().date()
-    weekly_expiries = set()
-
-    for contract in contracts:
-        if not isinstance(contract, dict):
-            continue
-
-        raw_expiry = str(contract.get("expiry", "")).strip()
-
-        try:
-            expiry_date = datetime.strptime(
-                raw_expiry[:10],
-                "%Y-%m-%d",
-            ).date()
-        except (TypeError, ValueError):
-            continue
-
-        if expiry_date < today:
-            continue
-
-        if bool(contract.get("weekly")):
-            weekly_expiries.add(expiry_date)
-
-    if not weekly_expiries:
-        raise ScannerError(
-            "No valid non-expired SENSEX weekly option expiry was found."
-        )
-
-    expiries = weekly_expiries
-
-    selected_expiry = min(expiries).isoformat()
-
-    logger.info(
-        "Dynamically selected active SENSEX expiry: %s",
-        selected_expiry,
-    )
-
-    return selected_expiry
-
-
-def get_chain() -> list[dict[str, Any]]:
-    """
-    Load the SENSEX option chain using a dynamically discovered
-    active expiry.
-    """
-
-    exact_expiry = get_active_sensex_expiry()
-
-    logger.info(
-        "Using dynamically selected SENSEX expiry for option chain: %s",
-        exact_expiry,
-    )
-
-    # Verify the selected expiry through the option contracts endpoint
-    # before requesting the option chain.
-    contracts_payload = api_get(
-        OPTION_CONTRACT_URL,
-        {
-            "instrument_key": SENSEX_KEY,
-            "expiry_date": exact_expiry,
-        },
-    )
-
-    contracts = contracts_payload.get("data", [])
-
-    if not isinstance(contracts, list) or not contracts:
-
-        raise ScannerError(
-            "Selected SENSEX expiry was discovered but no active option "
-            f"contracts were returned for expiry {exact_expiry}."
-        )
-
-    returned_expiries = sorted(
-        {
-            str(contract.get("expiry", "")).strip()[:10]
-            for contract in contracts
-            if isinstance(contract, dict)
-            and contract.get("expiry")
-        }
-    )
-
-    logger.info(
-        "Verified SENSEX option contracts: expiry=%s | contracts=%d",
-        exact_expiry,
-        len(contracts),
-    )
-
-    if exact_expiry not in returned_expiries:
-
-        raise ScannerError(
-            f"Expiry validation failed. Requested={exact_expiry}, "
-            f"returned={returned_expiries}"
-        )
-
-    payload = api_get(
-        OPTION_CHAIN_URL,
-        {
-            "instrument_key": SENSEX_KEY,
-            "expiry_date": exact_expiry,
-        },
-        retries=4,
-    )
-
-    data = payload.get("data", [])
-
-    if not isinstance(data, list) or not data:
-
-        raise ScannerError(
-            "SENSEX option chain is empty for expiry "
-            f"{exact_expiry}."
-        )
-
-    logger.info(
-        "Loaded SENSEX option chain: expiry=%s | rows=%d",
-        exact_expiry,
-        len(data),
-    )
-
-    return data
-
-
-def chain_spot(
-    chain: list[dict[str, Any]],
-) -> float:
-
-    values = []
-
-    for row in chain:
-
-        value = row.get(
-            "underlying_spot_price"
-        )
-
-        if value is not None:
-            try:
-                values.append(
-                    float(value)
-                )
-            except (
-                TypeError,
-                ValueError,
-            ):
-                continue
-
-    if not values:
-        raise ScannerError(
-            "Underlying spot unavailable in option chain."
-        )
-
-    return float(
-        np.median(values)
-    )
-
-
-def chain_rows(
-    chain: list[dict[str, Any]],
-) -> dict[float, dict[str, Any]]:
-
-    result = {}
-
-    for row in chain:
-
-        strike = row.get(
-            "strike_price"
-        )
-
-        if strike is None:
-            continue
-
-        try:
-            result[
-                float(strike)
-            ] = row
-        except (
-            TypeError,
-            ValueError,
+        raise ScannerError("Cannot calculate Supertrend on empty data.")
+
+    out = df.copy().reset_index(drop=True)
+    atr = calculate_atr(out, period=period)
+    out["atr"] = atr
+
+    hl2 = (out["high"] + out["low"]) / 2.0
+    upper_basic = hl2 + factor * atr
+    lower_basic = hl2 - factor * atr
+
+    upper = pd.Series(np.nan, index=out.index, dtype=float)
+    lower = pd.Series(np.nan, index=out.index, dtype=float)
+    direction = pd.Series(np.nan, index=out.index, dtype=float)
+    st = pd.Series(np.nan, index=out.index, dtype=float)
+
+    upper.iloc[0] = upper_basic.iloc[0]
+    lower.iloc[0] = lower_basic.iloc[0]
+    direction.iloc[0] = 1
+    st.iloc[0] = lower.iloc[0]
+
+    for i in range(1, len(out)):
+        if (
+            upper_basic.iloc[i] < upper.iloc[i - 1]
+            or out["close"].iloc[i - 1] > upper.iloc[i - 1]
         ):
-            continue
-
-    if not result:
-        raise ScannerError(
-            "No valid option strikes in chain."
-        )
-
-    return result
-
-
-def nearest_atm_strike(
-    spot: float,
-    strikes: list[float],
-) -> float:
-
-    return min(
-        strikes,
-        key=lambda x: abs(
-            x - spot
-        ),
-    )
-
-
-def strike_interval(
-    strikes: list[float],
-) -> float:
-
-    unique = sorted(
-        set(strikes)
-    )
-
-    differences = [
-        unique[i + 1] - unique[i]
-        for i in range(
-            len(unique) - 1
-        )
-        if unique[i + 1] > unique[i]
-    ]
-
-    if not differences:
-        raise ScannerError(
-            "Unable to determine option strike interval."
-        )
-
-    return min(
-        differences
-    )
-
-
-def option_market_data(
-    row: dict[str, Any],
-    option_type: str,
-) -> dict[str, Any]:
-
-    key = (
-        "call_options"
-        if option_type == "CE"
-        else "put_options"
-    )
-
-    data = row.get(
-        key,
-        {},
-    )
-
-    market = data.get(
-        "market_data",
-        {},
-    )
-
-    greeks = data.get(
-        "option_greeks",
-        {},
-    )
-
-    return {
-        "instrument_key": data.get(
-            "instrument_key"
-        ),
-        "ltp": market.get(
-            "ltp"
-        ),
-        "oi": market.get(
-            "oi"
-        ),
-        "prev_oi": market.get(
-            "prev_oi"
-        ),
-        "delta": greeks.get(
-            "delta"
-        ),
-        "gamma": greeks.get(
-            "gamma"
-        ),
-        "iv": greeks.get(
-            "iv"
-        ),
-    }
-
-
-def oi_structure(
-    chain: list[dict[str, Any]],
-    spot: float,
-) -> tuple[str, float, dict[float, dict[str, float]]]:
-    """
-    Build a localized option-positioning bias around ATM.
-
-    Bullish pressure:
-      - PE OI increasing
-      - CE OI decreasing (unwinding)
-
-    Bearish pressure:
-      - CE OI increasing
-      - PE OI decreasing (unwinding)
-
-    The calculation is proximity-weighted so strikes nearest ATM have
-    more influence than distant strikes. This is intentionally different
-    from a simple aggregate CE-minus-PE total.
-    """
-    rows = chain_rows(chain)
-    strikes = sorted(rows.keys())
-
-    atm = nearest_atm_strike(spot, strikes)
-    step = strike_interval(strikes)
-
-    relevant = [
-        strike
-        for strike in strikes
-        if abs(strike - atm) <= step * 3
-    ]
-
-    strike_data: dict[float, dict[str, float]] = {}
-
-    bullish_pressure = 0.0
-    bearish_pressure = 0.0
-
-    for strike in relevant:
-        row = rows[strike]
-
-        call = option_market_data(row, "CE")
-        put = option_market_data(row, "PE")
-
-        call_oi = float(call["oi"] or 0)
-        call_prev = float(call["prev_oi"] or 0)
-        put_oi = float(put["oi"] or 0)
-        put_prev = float(put["prev_oi"] or 0)
-
-        call_change = call_oi - call_prev
-        put_change = put_oi - put_prev
-
-        # Near-ATM strikes matter more than distant strikes.
-        distance_steps = abs(strike - atm) / step if step > 0 else 0.0
-        weight = 1.0 / (1.0 + distance_steps)
-
-        # Bullish = put buildup + call unwinding.
-        bullish_pressure += weight * (
-            max(put_change, 0.0) + max(-call_change, 0.0)
-        )
-
-        # Bearish = call buildup + put unwinding.
-        bearish_pressure += weight * (
-            max(call_change, 0.0) + max(-put_change, 0.0)
-        )
-
-        strike_data[strike] = {
-            "call_oi": call_oi,
-            "put_oi": put_oi,
-            "call_change": call_change,
-            "put_change": put_change,
-            "weight": weight,
-        }
-
-    denominator = bullish_pressure + bearish_pressure
-
-    if denominator <= 0:
-        score = 0.0
-    else:
-        score = (bullish_pressure - bearish_pressure) / denominator
-
-    # Keep the threshold modest because this is a localized pressure
-    # measurement, while Futures and VWAP provide the primary directional filter.
-    if score >= 0.08:
-        bias = "BULLISH"
-    elif score <= -0.08:
-        bias = "BEARISH"
-    else:
-        bias = "NEUTRAL"
-
-    logger.info(
-        "Localized OI: ATM=%.0f bullish_pressure=%.0f bearish_pressure=%.0f score=%.3f bias=%s",
-        atm,
-        bullish_pressure,
-        bearish_pressure,
-        score,
-        bias,
-    )
-
-    return bias, float(score), strike_data
-
-
-# =============================================================================
-# OI CHANGE FROM LIVE OPTION CHAIN
-# =============================================================================
-
-def get_change_oi_from_chain(
-    chain: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """
-    Calculate current-session Change-in-OI directly from the live option-chain
-    market_data. Upstox exposes both `oi` and `prev_oi` on each option, so this
-    avoids relying on a separate aggregate endpoint during every scan.
-    """
-    total_call_change = 0.0
-    total_put_change = 0.0
-    strike_changes: list[dict[str, float]] = []
-    valid_rows = 0
-
-    for row in chain:
-        if not isinstance(row, dict):
-            continue
-
-        try:
-            strike_value = float(row.get("strike_price"))
-        except (TypeError, ValueError):
-            continue
-
-        call = option_market_data(row, "CE")
-        put = option_market_data(row, "PE")
-
-        try:
-            call_oi = float(call.get("oi") or 0.0)
-            call_prev_oi = float(call.get("prev_oi") or 0.0)
-            put_oi = float(put.get("oi") or 0.0)
-            put_prev_oi = float(put.get("prev_oi") or 0.0)
-        except (TypeError, ValueError):
-            continue
-
-        call_change = call_oi - call_prev_oi
-        put_change = put_oi - put_prev_oi
-        total_call_change += call_change
-        total_put_change += put_change
-        strike_changes.append({
-            "strike_price": strike_value,
-            "call_change_oi": call_change,
-            "put_change_oi": put_change,
-        })
-        valid_rows += 1
-
-    if valid_rows == 0:
-        raise ScannerError(
-            "No valid current/previous OI values were found in the option chain."
-        )
-
-    logger.info(
-        "Chain Change-OI: rows=%d total_call_change=%+.0f total_put_change=%+.0f",
-        valid_rows,
-        total_call_change,
-        total_put_change,
-    )
-
-    return {
-        "total_call_change_oi": total_call_change,
-        "total_put_change_oi": total_put_change,
-        "call_put_oi_data_list": strike_changes,
-    }
-
-
-
-def change_oi_bias(
-    data: dict[str, Any],
-) -> tuple[str, float]:
-
-    if not data:
-        return (
-            "UNAVAILABLE",
-            0.0,
-        )
-
-    call_change = float(
-        data.get(
-            "total_call_change_oi",
-            0,
-        )
-    )
-
-    put_change = float(
-        data.get(
-            "total_put_change_oi",
-            0,
-        )
-    )
-
-    denominator = (
-        abs(call_change)
-        + abs(put_change)
-    )
-
-    if denominator == 0:
-        return (
-            "NEUTRAL",
-            0.0,
-        )
-
-    score = (
-        put_change
-        - call_change
-    ) / denominator
-
-    if score >= 0.15:
-        return (
-            "BULLISH",
-            float(score),
-        )
-
-    if score <= -0.15:
-        return (
-            "BEARISH",
-            float(score),
-        )
-
-    return (
-        "NEUTRAL",
-        float(score),
-    )
-
-
-# =============================================================================
-# FUTURES ANALYSIS
-# =============================================================================
-
-def futures_regime(
-    future: FuturesContract,
-    candles: Optional[pd.DataFrame] = None,
-) -> str:
-    """Classify Futures positioning with a small noise filter.
-
-    The latest move and the aggregate move across the supplied recent candles
-    must agree. A mixed/tiny move is NEUTRAL instead of being forced into a
-    regime, which reduces one-candle OI whipsaws.
-    """
-    if candles is None:
-        candles = get_intraday_candles(
-            future.instrument_key,
-            3,
-            max_candles=3,
-            min_candles=3,
-        )
-
-    if len(candles) < 3:
-        return "UNAVAILABLE"
-
-    recent = candles.tail(3).copy()
-    closes = pd.to_numeric(recent["close"], errors="coerce")
-    ois = pd.to_numeric(recent["oi"], errors="coerce")
-    if closes.isna().any() or ois.isna().any():
-        return "UNAVAILABLE"
-
-    latest_price_delta = float(closes.iloc[-1] - closes.iloc[-2])
-    latest_oi_delta = float(ois.iloc[-1] - ois.iloc[-2])
-    aggregate_price_delta = float(closes.iloc[-1] - closes.iloc[0])
-    aggregate_oi_delta = float(ois.iloc[-1] - ois.iloc[0])
-
-    if (
-        abs(latest_price_delta) < FUTURES_REGIME_MIN_PRICE_MOVE
-        or abs(aggregate_price_delta) < FUTURES_REGIME_MIN_PRICE_MOVE
-        or abs(latest_oi_delta) < FUTURES_REGIME_MIN_OI_CHANGE
-        or abs(aggregate_oi_delta) < FUTURES_REGIME_MIN_OI_CHANGE
-    ):
-        return "NEUTRAL"
-
-    price_sign = (
-        latest_price_delta > 0 and aggregate_price_delta > 0
-    ) or (
-        latest_price_delta < 0 and aggregate_price_delta < 0
-    )
-    oi_sign = (
-        latest_oi_delta > 0 and aggregate_oi_delta > 0
-    ) or (
-        latest_oi_delta < 0 and aggregate_oi_delta < 0
-    )
-
-    if not (price_sign and oi_sign):
-        logger.info(
-            "Futures regime noise/mixed: latest_price=%.2f aggregate_price=%.2f latest_oi=%.0f aggregate_oi=%.0f",
-            latest_price_delta,
-            aggregate_price_delta,
-            latest_oi_delta,
-            aggregate_oi_delta,
-        )
-        return "NEUTRAL"
-
-    if latest_price_delta > 0 and latest_oi_delta > 0:
-        return "LONG_BUILDUP"
-    if latest_price_delta < 0 and latest_oi_delta > 0:
-        return "SHORT_BUILDUP"
-    if latest_price_delta > 0 and latest_oi_delta < 0:
-        return "SHORT_COVERING"
-    if latest_price_delta < 0 and latest_oi_delta < 0:
-        return "LONG_UNWINDING"
-
-    return "NEUTRAL"
-
-
-# =============================================================================
-# OPTION CONTRACT SELECTION
-# =============================================================================
-
-def option_buying_momentum(
-    option: OptionCandidate,
-) -> tuple[bool, dict[str, Any]]:
-    """Strict premium-expansion gate for BUY-only entries.
-
-    A directionally correct market is NOT enough to buy an option.  The option
-    itself must already be expanding in price, have a positive EMA slope, avoid
-    a recent peak-to-current drawdown, and show a buy-side OI regime.
-    """
-    try:
-        candles = get_intraday_candles(
-            option.instrument_key,
-            3,
-            max_candles=BUY_OPTION_LOOKBACK,
-            min_candles=BUY_OPTION_MIN_CANDLES,
-        )
-    except ScannerError as exc:
-        return False, {
-            "reason": f"option candles unavailable: {exc}",
-            "regime": "UNAVAILABLE",
-        }
-
-    closes = pd.to_numeric(candles["close"], errors="coerce").dropna()
-    if len(closes) < BUY_OPTION_MIN_CANDLES:
-        return False, {
-            "reason": f"only {len(closes)} usable option candles",
-            "regime": "UNAVAILABLE",
-        }
-
-    latest = float(closes.iloc[-1])
-    previous = float(closes.iloc[-2])
-    lookback_close = float(closes.iloc[-BUY_OPTION_MIN_CANDLES])
-    recent_peak = float(closes.tail(min(5, len(closes))).max())
-
-    ema5_series = closes.ewm(span=5, adjust=False).mean()
-    ema5 = float(ema5_series.iloc[-1])
-    ema5_prev = float(ema5_series.iloc[-2])
-
-    oi_latest = candles["oi"].iloc[-1]
-    oi_previous = candles["oi"].iloc[-2]
-    price_delta = latest - previous
-    oi_delta = (
-        float(oi_latest) - float(oi_previous)
-        if pd.notna(oi_latest) and pd.notna(oi_previous)
-        else 0.0
-    )
-
-    if price_delta > 0 and oi_delta > 0:
-        regime = "LONG_BUILDUP"
-    elif price_delta > 0 and oi_delta < 0:
-        regime = "SHORT_COVERING"
-    elif price_delta < 0 and oi_delta > 0:
-        regime = "SHORT_BUILDUP"
-    elif price_delta < 0 and oi_delta < 0:
-        regime = "LONG_UNWINDING"
-    else:
-        regime = "NEUTRAL"
-
-    multi_return_pct = (
-        (latest - lookback_close) / lookback_close * 100.0
-        if lookback_close > 0
-        else 0.0
-    )
-    ltp_vs_last_pct = (
-        (option.ltp - latest) / latest * 100.0
-        if latest > 0
-        else -100.0
-    )
-    peak_pullback_pct = (
-        (recent_peak - option.ltp) / recent_peak * 100.0
-        if recent_peak > 0
-        else 100.0
-    )
-
-    recent_closes = closes.tail(3).tolist()
-    no_recent_rollover = (
-        len(recent_closes) < 3
-        or recent_closes[-1] >= recent_closes[-2] >= recent_closes[-3]
-    )
-
-    premium_rising = price_delta > 0 and option.ltp >= latest
-    trend_positive = latest > lookback_close
-    ema_positive = latest >= ema5 and ema5 > ema5_prev
-    regime_positive = regime in {"LONG_BUILDUP", "SHORT_COVERING"}
-    live_price_ok = ltp_vs_last_pct >= 0.0
-    pullback_ok = peak_pullback_pct <= OPTION_ENTRY_MAX_PEAK_PULLBACK_PCT
-    recent_structure_ok = no_recent_rollover
-
-    valid = (
-        premium_rising
-        and trend_positive
-        and ema_positive
-        and regime_positive
-        and multi_return_pct >= OPTION_ENTRY_MIN_3M_RETURN_PCT
-        and live_price_ok
-        and pullback_ok
-        and recent_structure_ok
-    )
-
-    failed = []
-    if not premium_rising:
-        failed.append("latest premium is not rising")
-    if not trend_positive:
-        failed.append("short lookback trend is not positive")
-    if not ema_positive:
-        failed.append("EMA5 slope is not positive")
-    if not regime_positive:
-        failed.append(f"option regime={regime} is not buy-side")
-    if multi_return_pct < OPTION_ENTRY_MIN_3M_RETURN_PCT:
-        failed.append(f"3m momentum={multi_return_pct:.2f}% below minimum")
-    if not live_price_ok:
-        failed.append(f"LTP vs last close={ltp_vs_last_pct:+.2f}%")
-    if not pullback_ok:
-        failed.append(f"peak pullback={peak_pullback_pct:.2f}% too large")
-    if not recent_structure_ok:
-        failed.append("recent premium candles show rollover/decay")
-
-    reason = (
-        "premium-expansion gate passed"
-        if valid
-        else "; ".join(failed)
-    )
-
-    metrics = {
-        "reason": reason,
-        "regime": regime,
-        "latest_close": latest,
-        "previous_close": previous,
-        "ema5": ema5,
-        "ema5_prev": ema5_prev,
-        "multi_return_pct": multi_return_pct,
-        "ltp_vs_last_pct": ltp_vs_last_pct,
-        "peak_pullback_pct": peak_pullback_pct,
-        "premium_score": (
-            max(multi_return_pct, 0.0)
-            + max(ltp_vs_last_pct, 0.0)
-            + max((ema5 - ema5_prev) / ema5 * 100.0 if ema5 > 0 else 0.0, 0.0)
-        ),
-    }
-
-    logger.info(
-        "BUY PREMIUM GATE: %s regime=%s LTP=%.2f last3m=%.2f 3m_return=%+.2f%% "
-        "EMA5=%.2f slope=%+.4f%% peak_pullback=%.2f%% no_rollover=%s valid=%s",
-        option.trading_symbol,
-        regime,
-        option.ltp,
-        latest,
-        multi_return_pct,
-        ema5,
-        ((ema5 - ema5_prev) / ema5_prev * 100.0) if ema5_prev > 0 else 0.0,
-        peak_pullback_pct,
-        no_recent_rollover,
-        valid,
-    )
-    return valid, metrics
-
-def select_directional_option(
-    contracts: list[dict[str, Any]],
-    chain: list[dict[str, Any]],
-    direction: str,
-    spot: float,
-    preferred_strike: Optional[float] = None,
-) -> OptionCandidate:
-    """Select the required directional ITM strike from the CURRENT ATM.
-
-    Bullish -> ATM-1 CE, fallback ATM-2 CE.
-    Bearish -> ATM+1 PE, fallback ATM+2 PE.
-
-    Market direction is decided upstream. This function only validates that
-    the requested strike exists and has usable option market data.
-    """
-    if direction not in {"BULLISH", "BEARISH"}:
-        raise ScannerError("Cannot select an option for NEUTRAL direction.")
-
-    rows = chain_rows(chain)
-    chain_strikes = sorted(rows.keys())
-    if not chain_strikes:
-        raise ScannerError("Option chain contains no strikes.")
-
-    atm = nearest_atm_strike(spot, chain_strikes)
-    step = strike_interval(chain_strikes)
-
-    if direction == "BULLISH":
-        candidates = [atm - step, atm - 2 * step]
-        option_type = "CE"
-    else:
-        candidates = [atm + step, atm + 2 * step]
-        option_type = "PE"
-
-    if preferred_strike is not None:
-        candidates = [float(preferred_strike)]
-
-    rejection_reasons: list[str] = []
-
-    for target_strike in candidates:
-        row = rows.get(float(target_strike))
-        if row is None:
-            rejection_reasons.append(
-                f"Strike {target_strike:.0f} not present in option chain"
-            )
-            continue
-
-        matches = []
-        for contract in contracts:
-            try:
-                strike = float(contract.get("strike_price", -1))
-            except (TypeError, ValueError):
-                continue
-            if (
-                str(contract.get("instrument_type", "")).upper() == option_type
-                and abs(strike - float(target_strike)) < 0.01
-                and contract.get("instrument_key")
-                and contract.get("trading_symbol")
-            ):
-                matches.append(contract)
-
-        if not matches:
-            rejection_reasons.append(
-                f"No {option_type} contract found at {target_strike:.0f}"
-            )
-            continue
-
-        market = option_market_data(row, option_type)
-        try:
-            ltp = float(market.get("ltp") or 0.0)
-            oi = float(market.get("oi") or 0.0)
-            prev_oi = float(market.get("prev_oi") or 0.0)
-            delta = float(market.get("delta"))
-            gamma = float(market.get("gamma") or 0.0)
-            iv = float(market.get("iv") or 0.0)
-        except (TypeError, ValueError):
-            rejection_reasons.append(
-                f"Invalid market data at {target_strike:.0f}"
-            )
-            continue
-
-        if not math.isfinite(ltp) or ltp <= 0:
-            rejection_reasons.append(f"Invalid LTP at {target_strike:.0f}")
-            continue
-        if not math.isfinite(oi) or oi < 0:
-            rejection_reasons.append(f"Invalid OI at {target_strike:.0f}")
-            continue
-        if not math.isfinite(delta) or not (OPTION_MIN_DELTA <= abs(delta) <= OPTION_MAX_DELTA):
-            rejection_reasons.append(
-                f"Delta {delta!r} outside {OPTION_MIN_DELTA:.2f}-{OPTION_MAX_DELTA:.2f} at {target_strike:.0f}"
-            )
-            continue
-        if not math.isfinite(gamma):
-            gamma = 0.0
-        if not math.isfinite(iv):
-            iv = 0.0
-
-        selected = OptionCandidate(
-            instrument_key=str(matches[0]["instrument_key"]),
-            trading_symbol=str(matches[0]["trading_symbol"]),
-            option_type=option_type,
-            strike=float(target_strike),
-            expiry=str(matches[0].get("expiry", "")),
-            ltp=ltp,
-            oi=oi,
-            prev_oi=prev_oi,
-            delta=delta,
-            gamma=gamma,
-            iv=iv,
-        )
-
-        logger.info(
-            "SELECTED DIRECTIONAL OPTION: direction=%s ATM=%.0f -> %s %.0f %s LTP=%.2f OI=%.0f Delta=%.3f",
-            direction, atm, selected.trading_symbol, selected.strike,
-            selected.option_type, selected.ltp, selected.oi, selected.delta,
-        )
-        return selected
-
-    details = "; ".join(rejection_reasons[-6:]) or "no valid directional strike"
-    raise ScannerError(
-        f"No valid {option_type} strike available for direction={direction}: {details}"
-    )
-
-
-# =============================================================================
-# OPTION EXTENSION FILTER
-# =============================================================================
-
-def option_is_extended(
-    option: OptionCandidate,
-) -> bool:
-    # Disabled deliberately: the scanner must not reject an otherwise
-    # valid predictive setup because the option has already started moving.
-    return False
-
-
-def option_price_oi_regime(option: OptionCandidate) -> str:
-    """Return the selected option's latest 3-minute price/OI regime.
-
-    This is a confirmation field only. It never becomes the primary
-    prediction trigger because the goal is to identify the move before
-    the option premium is already extended.
-    """
-    try:
-        candles = get_intraday_candles(option.instrument_key, 3, max_candles=3, min_candles=2)
-
-        if len(candles) < 3:
-            return "UNAVAILABLE"
-
-        latest = candles.iloc[-1]
-        previous = candles.iloc[-2]
-
-        if pd.isna(latest["oi"]) or pd.isna(previous["oi"]):
-            return "UNAVAILABLE"
-
-        price_delta = float(latest["close"] - previous["close"])
-        oi_delta = float(latest["oi"] - previous["oi"])
-
-        if price_delta > 0 and oi_delta > 0:
-            return "LONG_BUILDUP"
-
-        if price_delta > 0 and oi_delta < 0:
-            return "SHORT_COVERING"
-
-        if price_delta < 0 and oi_delta > 0:
-            return "SHORT_BUILDUP"
-
-        if price_delta < 0 and oi_delta < 0:
-            return "LONG_UNWINDING"
-
-        return "NEUTRAL"
-
-    except ScannerError as exc:
-        logger.info(
-            "Option price/OI confirmation unavailable for %s: %s",
-            option.trading_symbol,
-            exc,
-        )
-        return "UNAVAILABLE"
-
-
-def final_entry_direction_confirmation(
-    direction: str,
-    interpretation: str,
-    spot_3m: pd.DataFrame,
-    futures_vwap_candles: pd.DataFrame,
-) -> tuple[bool, list[str]]:
-    """Confirm direction without requiring a completed breakout candle.
-
-    This is deliberately a lightweight safety check. Market direction has
-    already been established by the weighted structure engine. A bullish setup
-    needs price above VWAP; a bearish setup needs price below VWAP. Near-VWAP
-    transitions are allowed when the 3m price is moving in the signal direction.
-    """
-    if spot_3m is None or len(spot_3m) < 2:
-        return False, ["SENSEX 3-minute candles unavailable."]
-    if futures_vwap_candles is None or futures_vwap_candles.empty:
-        return False, ["SENSEX Futures VWAP candles unavailable."]
-
-    vwap_series = calculate_vwap(futures_vwap_candles).dropna()
-    if vwap_series.empty:
-        return False, ["SENSEX Futures session VWAP unavailable."]
-
-    price = float(spot_3m["close"].iloc[-1])
-    prev_price = float(spot_3m["close"].iloc[-2])
-    vwap = float(vwap_series.iloc[-1])
-    distance_pct = abs(price - vwap) / vwap * 100.0 if vwap else 0.0
-
-    bullish = direction == "BULLISH"
-    bearish = direction == "BEARISH"
-    above = price >= vwap
-    below = price <= vwap
-
-    # Permit a very recent reclaim/break transition, but never permit a
-    # directional signal that is clearly on the wrong side of VWAP.
-    if bullish:
-        ok = above or (price > prev_price and distance_pct <= 0.20)
-    elif bearish:
-        ok = below or (price < prev_price and distance_pct <= 0.20)
-    else:
-        ok = False
-
-    reasons = [
-        f"Market interpretation={interpretation}.",
-        f"SENSEX price={price:.2f}; Futures VWAP={vwap:.2f}; distance={distance_pct:.3f}%.",
-        f"Price position={'ABOVE' if price > vwap else 'BELOW' if price < vwap else 'AT VWAP'}.",
-        f"Pre-breakout VWAP confirmation={'PASS' if ok else 'FAIL'}.",
-    ]
-
-    logger.info(
-        "FINAL PRE-BREAKOUT CONFIRMATION: direction=%s interpretation=%s price=%.2f VWAP=%.2f "
-        "distance=%.3f%% prev_price=%.2f OK=%s",
-        direction, interpretation, price, vwap, distance_pct, prev_price, ok,
-    )
-    return ok, reasons
-
-
-def futures_premium_discount_state(
-    futures_candles: pd.DataFrame,
-    spot_3m: pd.DataFrame,
-    live_spot: float,
-    epsilon_points: float = FUTURES_BASIS_EPSILON_POINTS,
-) -> tuple[str, float, float]:
-    """Classify Futures premium/discount behavior for the sentiment matrix.
-
-    Matrix mapping:
-      LONG_BUILDUP   -> widening premium is supportive.
-      SHORT_BUILDUP  -> deepening discount is supportive.
-      SHORT_COVERING -> shrinking premium / narrowing discount is supportive.
-      LONG_UNWINDING -> shrinking premium / narrowing discount is supportive.
-    """
-    if futures_candles is None or spot_3m is None or futures_candles.empty or spot_3m.empty:
-        return "UNAVAILABLE", float("nan"), float("nan")
-    if len(futures_candles) < 2 or len(spot_3m) < 2:
-        return "UNAVAILABLE", float("nan"), float("nan")
-
-    try:
-        fut_latest = float(futures_candles["close"].iloc[-1])
-        fut_previous = float(futures_candles["close"].iloc[-2])
-        spot_previous = float(spot_3m["close"].iloc[-2])
-        current_basis = fut_latest - float(live_spot)
-        previous_basis = fut_previous - spot_previous
-        basis_change = current_basis - previous_basis
-    except (TypeError, ValueError, KeyError, IndexError):
-        return "UNAVAILABLE", float("nan"), float("nan")
-
-    if not all(math.isfinite(v) for v in (current_basis, previous_basis, basis_change)):
-        return "UNAVAILABLE", float("nan"), float("nan")
-
-    if current_basis >= 0:
-        if basis_change > epsilon_points:
-            state = "WIDENING_PREMIUM"
-        elif basis_change < -epsilon_points:
-            state = "SHRINKING_PREMIUM"
+            upper.iloc[i] = upper_basic.iloc[i]
         else:
-            state = "FLAT_PREMIUM"
-    else:
-        if basis_change < -epsilon_points:
-            state = "DEEPENING_DISCOUNT"
-        elif basis_change > epsilon_points:
-            state = "NARROWING_DISCOUNT"
+            upper.iloc[i] = upper.iloc[i - 1]
+
+        if (
+            lower_basic.iloc[i] > lower.iloc[i - 1]
+            or out["close"].iloc[i - 1] < lower.iloc[i - 1]
+        ):
+            lower.iloc[i] = lower_basic.iloc[i]
         else:
-            state = "FLAT_DISCOUNT"
+            lower.iloc[i] = lower.iloc[i - 1]
 
-    logger.info(
-        "Futures premium/discount: current_basis=%.2f previous_basis=%.2f change=%.2f state=%s",
-        current_basis,
-        previous_basis,
-        basis_change,
-        state,
-    )
-    return state, current_basis, basis_change
+        if out["close"].iloc[i] > upper.iloc[i - 1]:
+            direction.iloc[i] = 1
+        elif out["close"].iloc[i] < lower.iloc[i - 1]:
+            direction.iloc[i] = -1
+        else:
+            direction.iloc[i] = direction.iloc[i - 1]
+
+        st.iloc[i] = (
+            lower.iloc[i] if direction.iloc[i] > 0 else upper.iloc[i]
+        )
+
+    out["supertrend"] = st
+    out["direction"] = direction
+    return out
 
 
-# =============================================================================
-# PRE-BREAKOUT ENGINE
-# =============================================================================
+def calculate_vwap(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype=float)
 
-def option_oi_difference(
-    chain: list[dict[str, Any]],
-    spot: float,
-) -> tuple[float, float, float, str, str, float, float]:
-    """Calculate the chart's PE-CE OI difference around the live ATM strike.
-
-    Returns:
-        raw_diff: weighted PE OI - CE OI
-        raw_change: weighted change in (PE OI - CE OI) from previous OI
-        normalized_diff: raw_diff / weighted total OI
-        direction: BULLISH/BEARISH/NEUTRAL
-        trend: INCREASING/DECREASING/FLAT
-        ce_change: weighted CE change-OI
-        ce_change_normalized: weighted CE change-OI / weighted CE OI
-    """
-    rows = chain_rows(chain)
-    strikes = sorted(rows.keys())
-    atm = nearest_atm_strike(float(spot), strikes)
-    step = strike_interval(strikes)
-    relevant = [strike for strike in strikes if abs(strike - atm) <= step * 3]
-    if not relevant:
-        raise ScannerError("No option strikes available around ATM.")
-
-    diff = 0.0
-    diff_change = 0.0
-    weighted_total = 0.0
-    weighted_ce_oi = 0.0
-    ce_change = 0.0
-
-    for strike in relevant:
-        row = rows[strike]
-        call = option_market_data(row, "CE")
-        put = option_market_data(row, "PE")
-
-        call_oi = float(call.get("oi") or 0.0)
-        call_prev = float(call.get("prev_oi") or 0.0)
-        put_oi = float(put.get("oi") or 0.0)
-        put_prev = float(put.get("prev_oi") or 0.0)
-
-        distance_steps = abs(strike - atm) / step if step > 0 else 0.0
-        weight = 1.0 / (1.0 + distance_steps)
-
-        diff += weight * (put_oi - call_oi)
-        diff_change += weight * ((put_oi - put_prev) - (call_oi - call_prev))
-        weighted_total += weight * (put_oi + call_oi)
-        weighted_ce_oi += weight * call_oi
-        ce_change += weight * (call_oi - call_prev)
-
-    normalized_diff = diff / weighted_total if weighted_total > 0 else 0.0
-    normalized_change = diff_change / weighted_total if weighted_total > 0 else 0.0
-    ce_change_normalized = ce_change / weighted_ce_oi if weighted_ce_oi > 0 else 0.0
-
-    if normalized_diff >= OI_DIFF_POSITIVE_THRESHOLD:
-        oi_direction = "BULLISH"
-    elif normalized_diff <= -OI_DIFF_POSITIVE_THRESHOLD:
-        oi_direction = "BEARISH"
-    else:
-        oi_direction = "NEUTRAL"
-
-    if normalized_change >= OI_DIFF_CHANGE_THRESHOLD:
-        oi_trend = "INCREASING"
-    elif normalized_change <= -OI_DIFF_CHANGE_THRESHOLD:
-        oi_trend = "DECREASING"
-    else:
-        oi_trend = "FLAT"
-
-    logger.info(
-        "Chart OI Difference: ATM=%.0f PE-CE=%+.0f normalized=%.3f "
-        "change=%+.0f change_normalized=%.3f direction=%s trend=%s CE_change=%+.0f CE_change_norm=%.3f",
-        atm, diff, normalized_diff, diff_change, normalized_change,
-        oi_direction, oi_trend, ce_change, ce_change_normalized,
-    )
-    return (
-        float(diff), float(diff_change), float(normalized_diff),
-        oi_direction, oi_trend, float(ce_change), float(ce_change_normalized),
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    volume = (
+        pd.to_numeric(df["volume"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
     )
 
+    local_date = (
+        pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        .dt.tz_convert(IST)
+        .dt.date
+    )
 
-def _sign(value: float, threshold: float = 0.0) -> int:
-    if not math.isfinite(float(value)):
-        return 0
-    if value > threshold:
-        return 1
-    if value < -threshold:
-        return -1
-    return 0
+    cum_vol = volume.groupby(local_date).cumsum()
+    cum_pv = (typical * volume).groupby(local_date).cumsum()
+
+    return cum_pv / cum_vol.replace(0, np.nan)
 
 
-def _trend_direction(df: pd.DataFrame, lookback: int = 5) -> int:
-    """Return direction from recent closes using both net and majority movement."""
+def trend_direction(
+    df: pd.DataFrame,
+    lookback: int = 6,
+) -> int:
     if df is None or len(df) < 2:
         return 0
-    closes = pd.to_numeric(df["close"], errors="coerce").dropna().tail(max(2, lookback))
+
+    closes = (
+        pd.to_numeric(df["close"], errors="coerce")
+        .dropna()
+        .tail(max(2, lookback))
+    )
     if len(closes) < 2:
         return 0
-    net = float(closes.iloc[-1] - closes.iloc[0])
+
     diffs = np.diff(closes.to_numpy(dtype=float))
+    net = float(closes.iloc[-1] - closes.iloc[0])
     pos = int(np.sum(diffs > 0))
     neg = int(np.sum(diffs < 0))
+
     if net > 0 and pos >= neg:
         return 1
     if net < 0 and neg >= pos:
         return -1
-    return _sign(net)
+    return 1 if net > 0 else -1 if net < 0 else 0
 
 
-def _supertrend_direction(df: pd.DataFrame) -> int:
-    if df is None or df.empty or "direction" not in df:
-        return 0
-    try:
-        value = float(pd.to_numeric(df["direction"], errors="coerce").dropna().iloc[-1])
-        return 1 if value > 0 else -1 if value < 0 else 0
-    except (IndexError, TypeError, ValueError):
-        return 0
+def market_structure_state(
+    df: pd.DataFrame,
+    lookback: int = 8,
+) -> str:
+    if len(df) < 3:
+        return "NEUTRAL"
+
+    n = min(lookback, len(df))
+    recent = df.tail(n)
+    if len(recent) < 3:
+        return "NEUTRAL"
+
+    highs = recent["high"].to_numpy(dtype=float)
+    lows = recent["low"].to_numpy(dtype=float)
+
+    # Compare the latest third to the earliest third rather than one candle
+    # against one candle; this is less noisy and captures HH/HL or LH/LL.
+    split = max(1, len(recent) // 3)
+    early_high = float(np.mean(highs[:split]))
+    late_high = float(np.mean(highs[-split:]))
+    early_low = float(np.mean(lows[:split]))
+    late_low = float(np.mean(lows[-split:]))
+
+    if late_high > early_high and late_low > early_low:
+        return "BULLISH"
+    if late_high < early_high and late_low < early_low:
+        return "BEARISH"
+    return "NEUTRAL"
 
 
-def _market_structure_snapshot(
-    spot_3m: pd.DataFrame,
-    spot_15m: pd.DataFrame,
+# =============================================================================
+# FUTURES PRICE/OI REGIME
+# =============================================================================
+
+def _extract_quote_oi(quote: Optional[dict[str, Any]]) -> float:
+    """Extract live futures OI from the common Upstox v2 quote shapes."""
+    if not isinstance(quote, dict):
+        return float("nan")
+
+    candidates = [
+        quote.get("oi"),
+        quote.get("open_interest"),
+        (quote.get("eFeedDetails") or {}).get("oi")
+        if isinstance(quote.get("eFeedDetails"), dict) else None,
+    ]
+    for value in candidates:
+        parsed = safe_float(value, float("nan"))
+        if math.isfinite(parsed) and parsed >= 0:
+            return parsed
+    return float("nan")
+
+
+def futures_oi_structure(
     futures_3m: pd.DataFrame,
-    futures_vwap_candles: pd.DataFrame,
-    live_spot: float,
-    option_oi_diff: float,
-    option_oi_diff_change: float,
+    live_quote: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Build one coherent market view. No single input can manufacture direction."""
-    vwap_series = calculate_vwap(futures_vwap_candles).dropna()
-    if vwap_series.empty:
-        raise ScannerError("Futures VWAP unavailable for market structure.")
-    vwap = float(vwap_series.iloc[-1])
-    price_vs_vwap = _sign(float(live_spot) - vwap, max(abs(vwap) * 0.00015, 1.0))
+    """Build a predictive Futures price/OI regime.
 
-    st3 = _supertrend_direction(spot_3m)
-    st15 = _supertrend_direction(spot_15m)
-    structure3 = structure_state(spot_3m, min(STRUCTURE_LOOKBACK_3M, len(spot_3m))) if len(spot_3m) >= 3 else "NEUTRAL"
-    structure15 = structure_state(spot_15m, min(STRUCTURE_LOOKBACK_15M, len(spot_15m))) if len(spot_15m) >= 3 else "NEUTRAL"
-    price3 = _trend_direction(spot_3m, 6)
-    price15 = _trend_direction(spot_15m, 4)
+    Unlike a single-candle OI test, this measures:
+      - multi-candle price/OI direction,
+      - directional OI persistence,
+      - OI acceleration versus recent typical change, and
+      - the live quote OI versus the most recent completed candle.
 
-    fut_close = pd.to_numeric(futures_3m["close"], errors="coerce").dropna()
-    fut_oi = pd.to_numeric(futures_3m["oi"], errors="coerce").dropna()
-    fut_price_dir = _trend_direction(futures_3m, 6)
-    fut_oi_dir = _trend_direction(futures_3m.assign(close=futures_3m["oi"]), 6)
-    latest_fut_price_change = float(fut_close.iloc[-1] - fut_close.iloc[-2]) if len(fut_close) >= 2 else 0.0
-    latest_fut_oi_change = float(fut_oi.iloc[-1] - fut_oi.iloc[-2]) if len(fut_oi) >= 2 else 0.0
+    The result is deliberately independent from the option-chain score.
+    """
+    if futures_3m is None or len(futures_3m) < 4:
+        return {
+            "regime": "UNAVAILABLE", "bias": 0, "price_delta": 0.0,
+            "oi_delta": 0.0, "oi_strength": 0.0, "oi_persistence": 0.0,
+            "live_oi_change": float("nan"), "oi_acceleration": 0.0,
+        }
 
-    # Futures price/OI interpretation. This is intentionally separate from
-    # the old 3-candle hard gate: stale/flat OI on the last candle must not erase
-    # a clearly directional multi-candle move.
-    if fut_price_dir < 0 and fut_oi_dir > 0:
-        futures_bias, futures_regime = -1, "SHORT_BUILDUP"
-    elif fut_price_dir > 0 and fut_oi_dir > 0:
-        futures_bias, futures_regime = 1, "LONG_BUILDUP"
-    elif fut_price_dir < 0 and fut_oi_dir < 0:
-        futures_bias, futures_regime = -1, "LONG_UNWINDING"
-    elif fut_price_dir > 0 and fut_oi_dir < 0:
-        futures_bias, futures_regime = 1, "SHORT_COVERING"
-    else:
-        futures_bias, futures_regime = fut_price_dir, "PRICE_ONLY_BIAS" if fut_price_dir else "NEUTRAL"
+    recent = futures_3m.tail(12).copy()
+    price = pd.to_numeric(recent["close"], errors="coerce")
+    oi = pd.to_numeric(recent["oi"], errors="coerce")
+    valid = pd.DataFrame({"price": price, "oi": oi}).dropna()
 
-    oi_dir = _sign(option_oi_diff, max(abs(option_oi_diff) * 0.05, 1.0))
-    oi_change_dir = _sign(option_oi_diff_change, max(abs(option_oi_diff) * 0.05, 1.0))
+    if len(valid) < 4:
+        pdir = trend_direction(recent, min(6, len(recent)))
+        return {
+            "regime": "PRICE_ONLY_BULLISH" if pdir > 0 else "PRICE_ONLY_BEARISH" if pdir < 0 else "NEUTRAL",
+            "bias": pdir, "price_delta": float(price.dropna().iloc[-1] - price.dropna().iloc[0]) if price.notna().sum() >= 2 else 0.0,
+            "oi_delta": 0.0, "oi_strength": 0.0, "oi_persistence": 0.0,
+            "live_oi_change": float("nan"), "oi_acceleration": 0.0,
+        }
 
-    # PE-CE OI difference: positive supports bulls, negative supports bears.
-    score = 0.0
-    reasons: list[str] = []
+    price_delta = float(valid["price"].iloc[-1] - valid["price"].iloc[0])
+    oi_delta = float(valid["oi"].iloc[-1] - valid["oi"].iloc[0])
+    price_dir = 1 if price_delta > 0 else -1 if price_delta < 0 else 0
+    oi_dir = 1 if oi_delta > 0 else -1 if oi_delta < 0 else 0
 
-    if price_vs_vwap > 0:
-        score += 2.0; reasons.append("SENSEX is above Futures VWAP.")
-    elif price_vs_vwap < 0:
-        score -= 2.0; reasons.append("SENSEX is below Futures VWAP.")
+    price_deltas = valid["price"].diff().dropna()
+    oi_deltas = valid["oi"].diff().dropna()
+    aligned = ((price_deltas < 0) & (oi_deltas > 0)) if price_dir < 0 else ((price_deltas > 0) & (oi_deltas > 0)) if price_dir > 0 else pd.Series(dtype=bool)
+    opposing = ((price_deltas < 0) & (oi_deltas < 0)) if price_dir < 0 else ((price_deltas > 0) & (oi_deltas < 0)) if price_dir > 0 else pd.Series(dtype=bool)
+    persistence = float(aligned.mean()) if len(aligned) else 0.0
 
-    if st3 > 0:
-        score += 1.5; reasons.append("3m Supertrend is bullish.")
-    elif st3 < 0:
-        score -= 1.5; reasons.append("3m Supertrend is bearish.")
-
-    if st15 > 0:
-        score += 2.0; reasons.append("15m Supertrend is bullish.")
-    elif st15 < 0:
-        score -= 2.0; reasons.append("15m Supertrend is bearish.")
-
-    if structure3 == "BULLISH": score += 1.0
-    elif structure3 == "BEARISH": score -= 1.0
-    if structure15 == "BULLISH": score += 1.5
-    elif structure15 == "BEARISH": score -= 1.5
-
-    if futures_bias > 0:
-        score += 2.0; reasons.append(f"Futures structure is bullish ({futures_regime}).")
-    elif futures_bias < 0:
-        score -= 2.0; reasons.append(f"Futures structure is bearish ({futures_regime}).")
-
-    if oi_dir > 0:
-        score += 1.5; reasons.append("PE-CE OI difference is bullish.")
-    elif oi_dir < 0:
-        score -= 1.5; reasons.append("PE-CE OI difference is bearish.")
-
-    if oi_change_dir > 0:
-        score += 1.5; reasons.append("PE-CE OI difference is improving toward bulls.")
-    elif oi_change_dir < 0:
-        score -= 1.5; reasons.append("PE-CE OI difference is deteriorating toward bears.")
-
-    # Require alignment across independent groups, not merely a high raw score.
-    bullish_groups = sum(x > 0 for x in (price_vs_vwap, st3, st15, price3, price15, futures_bias, oi_dir, oi_change_dir))
-    bearish_groups = sum(x < 0 for x in (price_vs_vwap, st3, st15, price3, price15, futures_bias, oi_dir, oi_change_dir))
-
-    if score >= MARKET_SCORE_ENTRY and bullish_groups >= PREDICTION_MIN_CONFLUENCE:
-        direction = "BULLISH"
-    elif score <= -MARKET_SCORE_ENTRY and bearish_groups >= PREDICTION_MIN_CONFLUENCE:
-        direction = "BEARISH"
-    else:
-        direction = "NEUTRAL"
-
-    confidence = min(99.0, max(0.0, 50.0 + abs(score) * 5.5)) if direction != "NEUTRAL" else min(49.0, abs(score) * 5.0)
-    interpretation = (
-        "STRONG BULLISH MARKET STRUCTURE" if direction == "BULLISH" and score >= MARKET_SCORE_STRONG
-        else "BULLISH MARKET STRUCTURE" if direction == "BULLISH"
-        else "STRONG BEARISH MARKET STRUCTURE" if direction == "BEARISH" and score <= -MARKET_SCORE_STRONG
-        else "BEARISH MARKET STRUCTURE" if direction == "BEARISH"
-        else "WAIT / MIXED MARKET STRUCTURE"
+    median_abs_oi_change = float(np.median(np.abs(oi_deltas.to_numpy(dtype=float)))) if len(oi_deltas) else 0.0
+    last_oi_change = float(oi_deltas.iloc[-1]) if len(oi_deltas) else 0.0
+    acceleration = (
+        last_oi_change / median_abs_oi_change
+        if median_abs_oi_change > 0 else 0.0
     )
 
+    live_oi = _extract_quote_oi(live_quote)
+    last_completed_oi = float(valid["oi"].iloc[-1])
+    live_oi_change = live_oi - last_completed_oi if math.isfinite(live_oi) else float("nan")
+
+    bullish_regime = price_dir > 0 and oi_dir > 0
+    bearish_regime = price_dir < 0 and oi_dir > 0
+    bullish_cover = price_dir > 0 and oi_dir < 0
+    bearish_unwind = price_dir < 0 and oi_dir < 0
+
+    if bearish_regime:
+        regime, bias = "SHORT_BUILDUP", -1
+    elif bullish_regime:
+        regime, bias = "LONG_BUILDUP", 1
+    elif bullish_cover:
+        regime, bias = "SHORT_COVERING", 1
+    elif bearish_unwind:
+        regime, bias = "LONG_UNWINDING", -1
+    elif price_dir < 0:
+        regime, bias = "PRICE_ONLY_BEARISH", -1
+    elif price_dir > 0:
+        regime, bias = "PRICE_ONLY_BULLISH", 1
+    else:
+        regime, bias = "NEUTRAL", 0
+
+    # Strength is intentionally dominated by persistence and OI magnitude.
+    price_range = float(valid["price"].max() - valid["price"].min())
+    price_component = min(abs(price_delta) / max(price_range, 1.0), 1.0)
+    persistence_component = min(persistence / FUTURES_OI_MIN_PERSISTENCE, 1.0)
+    acceleration_component = min(abs(acceleration) / 2.0, 1.0)
+    live_component = (
+        min(abs(live_oi_change) / max(median_abs_oi_change, 1.0), 1.0)
+        if math.isfinite(live_oi_change) else 0.0
+    )
+    strength = 0.40 * persistence_component + 0.25 * price_component + 0.20 * acceleration_component + 0.15 * live_component
+
+    # For short build-up, only a positive OI trend is predictive; an OI fall
+    # while price falls is a different regime (long unwinding).
+    if regime in {"SHORT_BUILDUP", "LONG_BUILDUP"} and persistence < FUTURES_OI_MIN_PERSISTENCE:
+        strength *= 0.70
+
     logger.info(
-        "MARKET STRUCTURE: score=%+.1f direction=%s confidence=%.1f | VWAP=%s 3mST=%s 15mST=%s "
-        "3mStructure=%s 15mStructure=%s Futures=%s FutPriceDir=%+d FutOIDir=%+d PE-CE=%+.0f PE-CEchg=%+.0f",
-        score, direction, confidence,
-        "ABOVE" if price_vs_vwap > 0 else "BELOW" if price_vs_vwap < 0 else "AT",
-        "BULL" if st3 > 0 else "BEAR" if st3 < 0 else "NA",
-        "BULL" if st15 > 0 else "BEAR" if st15 < 0 else "NA",
-        structure3, structure15, futures_regime, fut_price_dir, fut_oi_dir,
-        option_oi_diff, option_oi_diff_change,
+        "FUTURES OI ENGINE: regime=%s bias=%+d price_delta=%+.2f oi_delta=%+.0f "
+        "persistence=%.2f acceleration=%.2f live_oi_change=%+.0f strength=%.3f",
+        regime, bias, price_delta, oi_delta, persistence, acceleration,
+        live_oi_change if math.isfinite(live_oi_change) else float("nan"), strength,
     )
 
     return {
-        "score": score, "direction": direction, "confidence": confidence,
-        "interpretation": interpretation, "reasons": reasons,
-        "vwap": vwap, "price_vs_vwap": price_vs_vwap,
-        "st3": st3, "st15": st15, "structure3": structure3, "structure15": structure15,
-        "futures_bias": futures_bias, "futures_regime": futures_regime,
-        "fut_price_dir": fut_price_dir, "fut_oi_dir": fut_oi_dir,
-        "latest_fut_price_change": latest_fut_price_change,
-        "latest_fut_oi_change": latest_fut_oi_change,
-        "oi_dir": oi_dir, "oi_change_dir": oi_change_dir,
+        "regime": regime,
+        "bias": bias,
+        "price_delta": price_delta,
+        "oi_delta": oi_delta,
+        "oi_strength": float(strength),
+        "oi_persistence": persistence,
+        "live_oi_change": live_oi_change,
+        "oi_acceleration": float(acceleration),
+        "opposing_fraction": float(opposing.mean()) if len(opposing) else 0.0,
     }
 
 
-def predictive_direction(
-    spot_3m: pd.DataFrame,
-    spot_15m: pd.DataFrame,
-    chain_bias: str,
-    chain_bias_score: float,
-    change_oi_bias_value: str,
-    change_oi_score: float,
-    futures_state: str,
-    live_spot: float,
-    futures_3m: Optional[pd.DataFrame] = None,
-    futures_vwap_candles: Optional[pd.DataFrame] = None,
-    previous_snapshot: Optional[dict[str, Any]] = None,
-    option_oi_diff: Optional[float] = None,
-    option_oi_diff_change: Optional[float] = None,
-    option_oi_direction: Optional[str] = None,
-    option_oi_trend: Optional[str] = None,
-    ce_change_oi: Optional[float] = None,
-    ce_change_oi_normalized: Optional[float] = None,
-) -> tuple[str, str, float, list[str], float]:
-    """Overhauled prediction engine: market structure first, option second.
-
-    The previous literal matrix rejected many valid combinations and returned
-    NEUTRAL whenever one column did not match a predefined row. This engine
-    requires multi-factor directional agreement instead.
-    """
-    if futures_3m is None or len(futures_3m) < 3:
-        raise ScannerError("Insufficient Futures candles for market structure.")
-    if futures_vwap_candles is None or futures_vwap_candles.empty:
-        raise ScannerError("Futures VWAP candles unavailable.")
-    snap = _market_structure_snapshot(
-        spot_3m, spot_15m, futures_3m, futures_vwap_candles, live_spot,
-        float(option_oi_diff or 0.0), float(option_oi_diff_change or 0.0),
-    )
-    reasons = list(snap["reasons"])
-    reasons.extend([
-        f"Market structure score={snap['score']:+.1f}.",
-        f"Price vs VWAP={'ABOVE' if snap['price_vs_vwap'] > 0 else 'BELOW' if snap['price_vs_vwap'] < 0 else 'AT'}.",
-        f"Futures regime={snap['futures_regime']} with price direction={snap['fut_price_dir']:+d} and OI direction={snap['fut_oi_dir']:+d}.",
-        f"PE-CE OI={float(option_oi_diff or 0.0):+.0f}; change={float(option_oi_diff_change or 0.0):+.0f}.",
-        f"Legacy localized OI={chain_bias} ({float(chain_bias_score):+.3f}); chain Change-OI={change_oi_bias_value} ({float(change_oi_score):+.3f}).",
-        "Prediction is based on the combined market structure, not a single matrix row.",
-    ])
-    return snap["direction"], snap["interpretation"], float(snap["confidence"]), reasons, float(snap["score"])
-
-def validate_prebreakout(
-    spot_3m: pd.DataFrame,
-    spot_15m: pd.DataFrame,
-    direction: str,
-    option: OptionCandidate,
-) -> tuple[bool, float, float, list[str]]:
-    """Build target levels without requiring a future breakout to occur first."""
-
-    if spot_3m.empty or spot_15m.empty:
-        return False, 0.0, 0.0, ["Underlying candles unavailable."]
-
-    latest_3 = spot_3m.iloc[-1]
-    latest_15 = spot_15m.iloc[-1]
-    spot = float(latest_3["close"])
-
-    atr_3 = float(latest_3.get("atr", np.nan))
-    atr_15 = float(latest_15.get("atr", np.nan))
-    if not (math.isfinite(atr_3) and atr_3 > 0):
-        atr_3 = max(float(spot_3m["high"].iloc[-1] - spot_3m["low"].iloc[-1]), 1.0)
-    if not (math.isfinite(atr_15) and atr_15 > 0):
-        atr_15 = max(float(spot_15m["high"].iloc[-1] - spot_15m["low"].iloc[-1]), atr_3)
-
-    # Use available structure; early-session scans do not fail just because
-    # there are fewer than the preferred 8/6 candles.
-    n3 = max(1, min(STRUCTURE_LOOKBACK_3M, len(spot_3m) - 1))
-    n15 = max(1, min(STRUCTURE_LOOKBACK_15M, len(spot_15m) - 1))
-
-    if direction == "BULLISH":
-        if n3 >= 1:
-            recent_trigger = float(spot_3m["high"].iloc[-n3-1:-1].max()) if len(spot_3m) > 1 else float(latest_3["high"])
-        else:
-            recent_trigger = float(latest_3["high"])
-        trigger_3m = max(
-            recent_trigger,
-            spot + max(atr_3 * 0.25, 1.0),
-        )
-
-        recent_15 = (
-            float(spot_15m["high"].iloc[-n15-1:-1].max())
-            if len(spot_15m) > 1
-            else float(latest_15["high"])
-        )
-        supertrend_15 = float(latest_15.get("supertrend", np.nan))
-        st_level = supertrend_15 if math.isfinite(supertrend_15) else recent_15
-        target_15m = max(
-            recent_15,
-            st_level,
-            trigger_3m + max(atr_15 * 0.50, atr_3 * 0.50),
-        )
-    else:
-        recent_trigger = (
-            float(spot_3m["low"].iloc[-n3-1:-1].min())
-            if len(spot_3m) > 1
-            else float(latest_3["low"])
-        )
-        trigger_3m = min(
-            recent_trigger,
-            spot - max(atr_3 * 0.25, 1.0),
-        )
-
-        recent_15 = (
-            float(spot_15m["low"].iloc[-n15-1:-1].min())
-            if len(spot_15m) > 1
-            else float(latest_15["low"])
-        )
-        supertrend_15 = float(latest_15.get("supertrend", np.nan))
-        st_level = supertrend_15 if math.isfinite(supertrend_15) else recent_15
-        target_15m = min(
-            recent_15,
-            st_level,
-            trigger_3m - max(atr_15 * 0.50, atr_3 * 0.50),
-        )
-
+def futures_price_oi_regime(
+    futures_3m: pd.DataFrame,
+    live_quote: Optional[dict[str, Any]] = None,
+) -> tuple[str, int, float, float]:
+    result = futures_oi_structure(futures_3m, live_quote)
     return (
-        True,
-        float(trigger_3m),
-        float(target_15m),
-        [
-            "Pre-breakout entry: market interpretation occurs before the 3m breakout.",
-            f"3m projected trigger={trigger_3m:.2f}.",
-            f"15m projected target/resistance={target_15m:.2f}.",
-            f"Selected ITM option={option.strike:.0f} {option.option_type}.",
-        ],
+        str(result["regime"]),
+        int(result["bias"]),
+        float(result["price_delta"]),
+        float(result["oi_delta"]),
     )
 
 
 # =============================================================================
-# PREMIUM TARGET ENGINE
+# OPTION CHAIN
 # =============================================================================
 
-def premium_target_from_underlying_move(
-    entry: float,
-    current_underlying: float,
-    target_underlying: float,
-    delta: float,
-    gamma: float,
-    direction: str,
-) -> float:
-
-    if direction == "BULLISH":
-        move = (
-            target_underlying
-            - current_underlying
-        )
-    else:
-        move = (
-            current_underlying
-            - target_underlying
-        )
-
-    if move <= 0:
-        raise ScannerError(
-            "Underlying target is not beyond current price."
-        )
-
-    absolute_delta = abs(delta)
-
-    first_order = (
-        absolute_delta
-        * move
-    )
-
-    second_order = (
-        0.5
-        * abs(gamma)
-        * move
-        * move
-    )
-
-    premium_change = (
-        first_order
-        + second_order
-    )
-
-    # Prevent a pathological Greek-derived projection
-    # from creating a mathematically extreme alert.
-    premium_change = min(
-        premium_change,
-        entry * 2.0,
-    )
-
-    return round(
-        entry + premium_change,
-        2,
-    )
-
-
-def create_targets(
-    option: OptionCandidate,
-    spot: float,
-    trigger_3m: float,
-    target_15m: float,
-    direction: str,
-) -> tuple[float, float, float]:
-
-    entry = option.ltp
-
-    target_1 = premium_target_from_underlying_move(
-        entry=entry,
-        current_underlying=spot,
-        target_underlying=trigger_3m,
-        delta=option.delta,
-        gamma=option.gamma,
-        direction=direction,
-    )
-
-    target_2 = premium_target_from_underlying_move(
-        entry=entry,
-        current_underlying=spot,
-        target_underlying=target_15m,
-        delta=option.delta,
-        gamma=option.gamma,
-        direction=direction,
-    )
-
-    if target_2 <= target_1:
-        raise ScannerError(
-            "Target 2 must exceed Target 1."
-        )
-
-    stop_loss = round(
-        entry * ACTIVE_TRADE_SL_FACTOR,
-        2,
-    )
-
-    return (
-        target_1,
-        target_2,
-        stop_loss,
-    )
-
-
-# =============================================================================
-# ACTIVE TRADE / PERSISTENT STATE
-# =============================================================================
-
-def active_trade_from_state(state: dict[str, Any]) -> Optional[dict[str, Any]]:
-    trade = state.get("active_trade")
-    if not isinstance(trade, dict):
-        return None
-    if str(trade.get("status", "")).upper() != "ACTIVE":
-        return None
-    required = {
-        "instrument_key",
-        "trading_symbol",
-        "direction",
-        "option_type",
-        "strike",
-        "entry",
-        "target_1",
-        "target_2",
-        "stop_loss",
-    }
-    if not required.issubset(trade):
-        logger.warning("Ignoring incomplete active trade state.")
-        return None
-    return trade
-
-
-def market_logic_signature(
-    direction: str,
-    interpretation: str,
-    price_vs_vwap: str,
-    futures_state: str,
-    oi_direction: str,
-    oi_trend: str,
-    final_gate: bool,
-) -> str:
-    """Stable signature for the discrete market logic that owns an active strike."""
-    parts = [
-        str(direction).upper(),
-        str(interpretation).upper(),
-        str(price_vs_vwap).upper(),
-        str(futures_state).upper(),
-        str(oi_direction).upper(),
-        str(oi_trend).upper(),
-        "GATE_PASS" if final_gate else "GATE_FAIL",
-    ]
-    return "|".join(parts)
-
-
-def close_active_trade(
-    state: dict[str, Any],
-    trade: dict[str, Any],
-    outcome: str,
-    exit_ltp: Optional[float] = None,
-    reason: str = "",
-) -> None:
-    closed = dict(trade)
-    closed["status"] = "CLOSED"
-    closed["outcome"] = outcome
-    if exit_ltp is not None:
-        closed["exit_ltp"] = round(float(exit_ltp), 2)
-    closed["closed_at"] = now_ist().isoformat()
-    if reason:
-        closed["invalidation_reason"] = reason
-    state["active_trade"] = None
-    state["last_completed_trade"] = closed
-    save_state(state)
-
-
-def monitor_active_trade(
-    state: dict[str, Any],
-    current_direction: str,
-    current_interpretation: str,
-    current_confidence: float,
-    final_confirmed: bool,
-    selected_option: Optional[OptionCandidate],
-    current_logic_signature: str,
-) -> str:
-    """Monitor an active trade without treating normal market noise as an exit.
-
-    Exit hierarchy:
-      1. T2 / T1 / hard option SL.
-      2. Confirmed opposite market structure on two consecutive scans.
-      3. Neutral or temporary disagreement NEVER exits the trade.
-
-    The old implementation exited on any signature change, which caused a
-    bearish trade to be invalidated merely because Futures OI moved from
-    INCREASING to DECREASING on the next 3-minute scan.
+def get_option_chain() -> tuple[str, list[dict[str, Any]]]:
     """
-    trade = active_trade_from_state(state)
-    if trade is None:
-        return "NO_ACTIVE"
+    Use the relative current_week keyword directly supported by Upstox V2.
+    """
+    payload = api_get(
+        OPTION_CHAIN_URL,
+        {
+            "instrument_key": SENSEX_KEY,
+            "expiry_date": "current_week",
+        },
+        retries=4,
+    )
+    data = payload.get("data", [])
 
-    try:
-        ltp = extract_ltp(get_quote(str(trade["instrument_key"])))
-    except ScannerError as exc:
-        logger.info("ACTIVE TRADE MONITOR: quote unavailable: %s", exc)
-        return "ACTIVE"
+    if not isinstance(data, list) or not data:
+        raise ScannerError("Current-week SENSEX option chain is empty.")
 
-    entry = float(trade["entry"])
-    target_1 = float(trade["target_1"])
-    target_2 = float(trade["target_2"])
-    stop_loss = round(entry * ACTIVE_TRADE_SL_FACTOR, 2)
-    trade["stop_loss"] = stop_loss
-    trade["last_ltp"] = round(ltp, 2)
-    trade["last_monitored_at"] = now_ist().isoformat()
-
-    active_direction = str(trade.get("direction", "")).upper()
-    reversal_count = int(trade.get("reversal_confirmations", 0) or 0)
-
-    # Targets/SL are actual option-level exits and remain authoritative.
-    outcome = None
-    if ltp >= target_2:
-        outcome = "TARGET_2"
-    elif ltp >= target_1:
-        outcome = "TARGET_1"
-    elif ltp <= stop_loss:
-        outcome = "STOP_LOSS"
-
-    if outcome:
-        close_active_trade(state, trade, outcome, exit_ltp=ltp)
-        logger.info("ACTIVE TRADE CLOSED: %s | outcome=%s exit_ltp=%.2f", trade["trading_symbol"], outcome, ltp)
-        try:
-            send_email(
-                f"SENSEX TRADE {outcome} - {trade['trading_symbol']}",
-                f"SENSEX {trade['direction']} trade closed.<br>Option: {trade['trading_symbol']}<br>Entry: ₹{entry:.2f}<br>Exit: ₹{ltp:.2f}<br>Outcome: {outcome}<br>Exit was triggered by the option target/stop policy.",
-            )
-        except ScannerError as exc:
-            logger.warning("Trade outcome email failed: %s", exc)
-        return "CLOSED"
-
-    # Neutral is not an exit. Neither is a temporary VWAP/structure disagreement.
-    if current_direction == active_direction:
-        reversal_count = 0
-    elif current_direction in {"BULLISH", "BEARISH"}:
-        reversal_count += 1
-    else:
-        reversal_count = 0
-
-    trade["reversal_confirmations"] = reversal_count
-    trade["last_market_direction"] = current_direction
-    trade["last_market_interpretation"] = current_interpretation
-    trade["last_market_confidence"] = float(current_confidence)
+    expiries = sorted(
+        {
+            str(row.get("expiry", ""))[:10]
+            for row in data
+            if isinstance(row, dict) and row.get("expiry")
+        }
+    )
+    expiry = expiries[0] if expiries else "CURRENT_WEEK"
 
     logger.info(
-        "ACTIVE TRADE STRUCTURE MONITOR: %s | active=%s current=%s confidence=%.1f "
-        "reversal_confirmations=%d/%d | LTP=%.2f T1=%.2f T2=%.2f SL=%.2f",
-        trade["trading_symbol"], active_direction, current_direction, float(current_confidence),
-        reversal_count, REVERSAL_CONFIRMATIONS_REQUIRED, ltp, target_1, target_2, stop_loss,
+        "Loaded option chain: expiry=%s rows=%d",
+        expiry,
+        len(data),
+    )
+    return expiry, data
+
+
+def chain_rows(chain: list[dict[str, Any]]) -> dict[float, dict[str, Any]]:
+    out: dict[float, dict[str, Any]] = {}
+    for row in chain:
+        if not isinstance(row, dict):
+            continue
+        strike = safe_float(row.get("strike_price"), float("nan"))
+        if math.isfinite(strike):
+            out[strike] = row
+
+    if not out:
+        raise ScannerError("No valid strikes in option chain.")
+    return out
+
+
+def nearest_strike(spot: float, strikes: list[float]) -> float:
+    if not strikes:
+        raise ScannerError("No option strikes available.")
+    return min(strikes, key=lambda x: abs(x - spot))
+
+
+def strike_step(strikes: list[float]) -> float:
+    unique = sorted(set(float(x) for x in strikes))
+    diffs = [
+        unique[i + 1] - unique[i]
+        for i in range(len(unique) - 1)
+        if unique[i + 1] > unique[i]
+    ]
+    if not diffs:
+        raise ScannerError("Unable to determine strike interval.")
+    return min(diffs)
+
+
+def option_side_data(
+    row: dict[str, Any],
+    option_type: str,
+) -> dict[str, Any]:
+    key = "call_options" if option_type == "CE" else "put_options"
+    block = row.get(key) or {}
+    market = block.get("market_data") or {}
+    greeks = block.get("option_greeks") or {}
+
+    return {
+        "instrument_key": block.get("instrument_key"),
+        "ltp": safe_float(market.get("ltp")),
+        "oi": safe_float(market.get("oi")),
+        "prev_oi": safe_float(market.get("prev_oi")),
+        "volume": safe_float(market.get("volume")),
+        "bid": safe_float(market.get("bid_price")),
+        "ask": safe_float(market.get("ask_price")),
+        "bid_qty": safe_float(market.get("bid_qty")),
+        "ask_qty": safe_float(market.get("ask_qty")),
+        "delta": safe_float(greeks.get("delta"), float("nan")),
+        "gamma": safe_float(greeks.get("gamma"), 0.0),
+        "theta": safe_float(greeks.get("theta"), 0.0),
+        "iv": safe_float(greeks.get("iv"), 0.0),
+    }
+
+
+def chain_oi_support_resistance(
+    chain: list[dict[str, Any]],
+    spot: float,
+) -> dict[str, Any]:
+    """Derive dynamic option-chain walls and predictive OI migration.
+
+    Support = put-OI concentration below spot.
+    Resistance = call-OI concentration above spot.
+
+    The engine also measures how those walls are changing. A strong CE wall
+    that is building while PE support weakens is predictive bearish evidence;
+    the inverse is predictive bullish evidence.
+    """
+    rows = chain_rows(chain)
+    strikes = sorted(rows)
+    step = strike_step(strikes)
+    atm = nearest_strike(spot, strikes)
+
+    entries: list[dict[str, float]] = []
+    for strike, row in rows.items():
+        ce = option_side_data(row, "CE")
+        pe = option_side_data(row, "PE")
+        c_oi = max(safe_float(ce["oi"]), 0.0)
+        p_oi = max(safe_float(pe["oi"]), 0.0)
+        c_chg = safe_float(ce["oi"]) - safe_float(ce["prev_oi"])
+        p_chg = safe_float(pe["oi"]) - safe_float(pe["prev_oi"])
+        dist_steps = abs(strike - atm) / step if step > 0 else 0.0
+        proximity = 1.0 / (1.0 + dist_steps)
+        entries.append({
+            "strike": float(strike), "call_oi": c_oi, "put_oi": p_oi,
+            "call_change": c_chg, "put_change": p_chg,
+            "proximity": proximity,
+        })
+
+    max_call = max((x["call_oi"] for x in entries), default=1.0)
+    max_put = max((x["put_oi"] for x in entries), default=1.0)
+
+    support_rows = [x for x in entries if x["strike"] < spot and x["put_oi"] > 0]
+    resistance_rows = [x for x in entries if x["strike"] > spot and x["call_oi"] > 0]
+
+    def support_strength(x: dict[str, float]) -> float:
+        oi = x["put_oi"] / max(max_put, 1.0)
+        change = max(x["put_change"], 0.0) / max(max_put, 1.0)
+        opposite = max(-x["call_change"], 0.0) / max(max_call, 1.0)
+        return min(1.0, 0.55 * oi + 0.30 * change + 0.15 * opposite) * x["proximity"]
+
+    def resistance_strength(x: dict[str, float]) -> float:
+        oi = x["call_oi"] / max(max_call, 1.0)
+        change = max(x["call_change"], 0.0) / max(max_call, 1.0)
+        opposite = max(-x["put_change"], 0.0) / max(max_put, 1.0)
+        return min(1.0, 0.55 * oi + 0.30 * change + 0.15 * opposite) * x["proximity"]
+
+    supports_ranked = sorted(
+        [(x, support_strength(x)) for x in support_rows],
+        key=lambda z: (-z[1], abs(spot - z[0]["strike"])),
+    )
+    resistances_ranked = sorted(
+        [(x, resistance_strength(x)) for x in resistance_rows],
+        key=lambda z: (-z[1], abs(z[0]["strike"] - spot)),
     )
 
-    # Only a strong opposite direction confirmed on consecutive scans can force
-    # a structural exit. A NEUTRAL result is explicitly ignored.
-    if (
-        current_direction in {"BULLISH", "BEARISH"}
-        and current_direction != active_direction
-        and float(current_confidence) >= 70.0
-        and reversal_count >= REVERSAL_CONFIRMATIONS_REQUIRED
-    ):
-        reason = (
-            f"confirmed opposite market structure: active={active_direction}, "
-            f"current={current_direction}, confidence={float(current_confidence):.1f}, "
-            f"confirmations={reversal_count}"
-        )
-        close_active_trade(state, trade, "STRUCTURE_REVERSAL", exit_ltp=ltp, reason=reason)
-        try:
-            send_email(
-                f"SENSEX TRADE STRUCTURE REVERSAL - {trade['trading_symbol']}",
-                f"SENSEX {trade['direction']} trade exited on confirmed opposite market structure.<br>Option: {trade['trading_symbol']}<br>Entry: ₹{entry:.2f}<br>Exit: ₹{ltp:.2f}<br>Reason: {reason}",
-            )
-        except ScannerError as exc:
-            logger.warning("Structure reversal email failed: %s", exc)
-        return "CLOSED"
+    support_levels = sorted(x[0]["strike"] for x in supports_ranked[:8])
+    resistance_levels = sorted(x[0]["strike"] for x in resistances_ranked[:8])
 
-    state["active_trade"] = trade
-    save_state(state)
-    return "ACTIVE"
+    support_1 = min((x for x in support_levels if x < spot), key=lambda x: spot - x, default=spot)
+    support_2 = max((x for x in support_levels if x < support_1), default=support_1)
+    resistance_1 = min((x for x in resistance_levels if x > spot), key=lambda x: x - spot, default=spot)
+    resistance_2 = min((x for x in resistance_levels if x > resistance_1), default=resistance_1)
+
+    support1_row = next((x for x, _ in supports_ranked if abs(x["strike"] - support_1) < 0.01), None)
+    resistance1_row = next((x for x, _ in resistances_ranked if abs(x["strike"] - resistance_1) < 0.01), None)
+
+    support_strength_value = support_strength(support1_row) if support1_row else 0.0
+    resistance_strength_value = resistance_strength(resistance1_row) if resistance1_row else 0.0
+    support_change_strength = (
+        max(support1_row["put_change"], 0.0) / max(max_put, 1.0) if support1_row else 0.0
+    )
+    resistance_change_strength = (
+        max(resistance1_row["call_change"], 0.0) / max(max_call, 1.0) if resistance1_row else 0.0
+    )
+
+    # Local pressure around ATM, still useful but no longer the sole engine.
+    nearby = [x for x in entries if abs(x["strike"] - atm) <= step * 5]
+    bull_pressure = sum(x["proximity"] * (max(x["put_change"], 0.0) + max(-x["call_change"], 0.0)) for x in nearby)
+    bear_pressure = sum(x["proximity"] * (max(x["call_change"], 0.0) + max(-x["put_change"], 0.0)) for x in nearby)
+    pressure_den = bull_pressure + bear_pressure
+    pressure_score = (bull_pressure - bear_pressure) / pressure_den if pressure_den > 0 else 0.0
+
+    # Level/migration logic. This is intentionally predictive when a wall is
+    # close enough to matter for the current ATR, not merely when spot crosses it.
+    spot_ref_atr = max(
+        safe_float(rows[atm].get("_scanner_atr"), 0.0),
+        1.0,
+    )
+    res_dist = resistance_1 - spot if resistance_1 > spot else float("inf")
+    sup_dist = spot - support_1 if support_1 < spot else float("inf")
+
+    level_bias = 0
+    if resistance_1 > spot and resistance_strength_value >= support_strength_value + 0.10:
+        if res_dist <= CHAIN_WALL_PROXIMITY_ATR * max(spot_ref_atr, step):
+            level_bias = -1
+    if support_1 < spot and support_strength_value >= resistance_strength_value + 0.10:
+        if sup_dist <= CHAIN_WALL_PROXIMITY_ATR * max(spot_ref_atr, step):
+            level_bias = 1
+
+    migration_bias = (
+        -1 if resistance_change_strength - support_change_strength >= CHAIN_CHANGE_CONFIRM_THRESHOLD
+        else 1 if support_change_strength - resistance_change_strength >= CHAIN_CHANGE_CONFIRM_THRESHOLD
+        else 0
+    )
+
+    predictive_raw = 0.55 * pressure_score + 0.25 * (support_strength_value - resistance_strength_value) + 0.20 * migration_bias
+    predictive_bias = 1 if predictive_raw >= CHAIN_PREDICTIVE_STRENGTH_THRESHOLD else -1 if predictive_raw <= -CHAIN_PREDICTIVE_STRENGTH_THRESHOLD else 0
+
+    logger.info(
+        "CHAIN PREDICTIVE ENGINE: S1=%.0f(%.3f) S2=%.0f R1=%.0f(%.3f) R2=%.0f "
+        "support_chg=%.3f resistance_chg=%.3f pressure=%+.3f migration=%+d "
+        "level_bias=%+d predictive=%+d raw=%+.3f",
+        support_1, support_strength_value, support_2,
+        resistance_1, resistance_strength_value, resistance_2,
+        support_change_strength, resistance_change_strength,
+        pressure_score, migration_bias, level_bias, predictive_bias, predictive_raw,
+    )
+
+    return {
+        "support_1": float(support_1), "support_2": float(support_2),
+        "resistance_1": float(resistance_1), "resistance_2": float(resistance_2),
+        "pressure_score": float(pressure_score),
+        "normalized_diff": float(pressure_score),
+        "normalized_change": float(migration_bias),
+        "oi_bias": int(1 if pressure_score > 0.08 else -1 if pressure_score < -0.08 else 0),
+        "change_bias": int(migration_bias),
+        "predictive_bias": int(predictive_bias),
+        "predictive_strength": float(abs(predictive_raw)),
+        "level_bias": int(level_bias),
+        "support_strength": float(support_strength_value),
+        "resistance_strength": float(resistance_strength_value),
+        "support_change_strength": float(support_change_strength),
+        "resistance_change_strength": float(resistance_change_strength),
+    }
+
+
+def get_daily_oi_confirmation(
+    expiry: str,
+) -> tuple[int, float]:
+    """
+    Optional v2 market/OI endpoint.
+    The endpoint is date-based, so it is used as a secondary cross-check only.
+    """
+    today = now_ist().date().isoformat()
+
+    try:
+        payload = api_get(
+            MARKET_OI_URL,
+            {
+                "instrument_key": SENSEX_KEY,
+                "expiry": expiry,
+                "date": today,
+            },
+            retries=2,
+        )
+    except ScannerError as exc:
+        logger.info("Daily OI endpoint unavailable: %s", exc)
+        return 0, 0.0
+
+    data = payload.get("data", {})
+    if not isinstance(data, dict):
+        return 0, 0.0
+
+    total_put = safe_float(data.get("total_puts"))
+    total_call = safe_float(data.get("total_calls"))
+    denominator = total_put + total_call
+
+    if denominator <= 0:
+        return 0, 0.0
+
+    pcr = total_put / total_call if total_call > 0 else 999.0
+    score = (total_put - total_call) / denominator
+    bias = 1 if score > 0.05 else -1 if score < -0.05 else 0
+
+    logger.info(
+        "DAILY OI: puts=%.0f calls=%.0f PCR=%.3f score=%+.3f bias=%+d",
+        total_put, total_call, pcr, score, bias,
+    )
+    return bias, score
+
+
+def get_change_oi_confirmation(expiry: str) -> tuple[int, float]:
+    """
+    Upstox Change-in-OI is date-based, not an intraday timestamp API.
+    It is therefore a secondary positioning confirmation.
+    """
+    today = now_ist().date().isoformat()
+
+    try:
+        payload = api_get(
+            CHANGE_OI_URL,
+            {
+                "instrument_key": SENSEX_KEY,
+                "expiry": expiry,
+                "date": today,
+                "interval": 1,
+            },
+            retries=2,
+        )
+    except ScannerError as exc:
+        logger.info("Change-OI endpoint unavailable: %s", exc)
+        return 0, 0.0
+
+    data = payload.get("data", {})
+    if not isinstance(data, dict):
+        return 0, 0.0
+
+    put_change = safe_float(data.get("total_put_change_oi"))
+    call_change = safe_float(data.get("total_call_change_oi"))
+    den = abs(put_change) + abs(call_change)
+
+    if den <= 0:
+        return 0, 0.0
+
+    # Positive = PE buildup / CE unwinding => bullish.
+    score = (put_change - call_change) / den
+    bias = 1 if score > 0.10 else -1 if score < -0.10 else 0
+
+    logger.info(
+        "CHANGE-OI CONFIRMATION: put_change=%+.0f call_change=%+.0f "
+        "score=%+.3f bias=%+d",
+        put_change, call_change, score, bias,
+    )
+    return bias, score
+
+
+# =============================================================================
+# VWAP / TIMEFRAME STRUCTURE
+# =============================================================================
+
+def vwap_snapshot(
+    futures_session: pd.DataFrame,
+) -> tuple[float, float, int]:
+    if futures_session.empty:
+        raise ScannerError("Futures session candles unavailable for VWAP.")
+
+    vwap = calculate_vwap(futures_session).dropna()
+    if len(vwap) < 2:
+        raise ScannerError("Insufficient Futures VWAP values.")
+
+    current_vwap = float(vwap.iloc[-1])
+    prior_vwap = float(vwap.iloc[-2])
+    slope = current_vwap - prior_vwap
+
+    price = float(futures_session["close"].iloc[-1])
+    level_bias = 1 if price > current_vwap else -1 if price < current_vwap else 0
+
+    logger.info(
+        "VWAP: price=%.2f vwap=%.2f slope=%+.2f level_bias=%+d",
+        price, current_vwap, slope, level_bias,
+    )
+    return current_vwap, slope, level_bias
+
+
+def timeframe_snapshot(
+    spot_key: str,
+) -> tuple[dict[int, pd.DataFrame], dict[int, int]]:
+    frames: dict[int, pd.DataFrame] = {}
+    directions: dict[int, int] = {}
+
+    for tf in TIMEFRAMES:
+        bars = get_timeframe_candles(
+            spot_key,
+            tf,
+            min_bars=35 if tf <= 15 else 30,
+        )
+        completed = filter_completed_candles(bars, tf)
+
+        # At the very first scan of a session, higher TF completed candles may
+        # intentionally come from the prior session. That is preferable to
+        # manufacturing a Supertrend from 1-2 new candles.
+        if len(completed) < 25:
+            raise ScannerError(
+                f"Too few completed {tf}m candles for a stable Supertrend."
+            )
+
+        st = calculate_supertrend(
+            completed,
+            period=SUPERTREND_PERIOD,
+            factor=SUPERTREND_FACTOR,
+        )
+
+        frames[tf] = st
+
+        latest_dir = safe_float(st["direction"].iloc[-1], 0.0)
+        directions[tf] = 1 if latest_dir > 0 else -1 if latest_dir < 0 else 0
+
+        logger.info(
+            "TF %dm: Supertrend=%s level=%.2f structure=%s",
+            tf,
+            "BULLISH" if directions[tf] > 0 else "BEARISH" if directions[tf] < 0 else "NEUTRAL",
+            safe_float(st["supertrend"].iloc[-1]),
+            market_structure_state(st, 8),
+        )
+
+    return frames, directions
+
+
+# =============================================================================
+# MARKET STRUCTURE ENGINE
+# =============================================================================
+
+def build_market_structure(
+    spot: float,
+    futures_3m: pd.DataFrame,
+    futures_session: pd.DataFrame,
+    tf_frames: dict[int, pd.DataFrame],
+    tf_directions: dict[int, int],
+    chain_levels: dict[str, Any],
+    daily_oi_bias: int,
+    daily_oi_score: float,
+    change_oi_bias: int,
+    change_oi_score: float,
+    futures_live_quote: Optional[dict[str, Any]] = None,
+) -> StructureResult:
+    """Build the market regime with explicit Futures-OI and chain-S/R confirmation."""
+    vwap, vwap_slope, vwap_level_bias = vwap_snapshot(futures_session)
+    futures_info = futures_oi_structure(futures_3m, futures_live_quote)
+    futures_regime = str(futures_info["regime"])
+    futures_bias = int(futures_info["bias"])
+
+    structure_3 = market_structure_state(tf_frames[3], 8)
+    structure_15 = market_structure_state(tf_frames[15], 6)
+    structure_3_bias = 1 if structure_3 == "BULLISH" else -1 if structure_3 == "BEARISH" else 0
+    structure_15_bias = 1 if structure_15 == "BULLISH" else -1 if structure_15 == "BEARISH" else 0
+
+    components: dict[str, float] = {}
+    components["vwap_level"] = W_VWAP_LEVEL * vwap_level_bias
+
+    atr3 = max(safe_float(tf_frames[3]["atr"].iloc[-1]), 1.0)
+    slope_threshold = max(0.20, atr3 * 0.03)
+    vwap_slope_bias = 1 if vwap_slope > slope_threshold else -1 if vwap_slope < -slope_threshold else 0
+    components["vwap_slope"] = W_VWAP_SLOPE * vwap_slope_bias
+
+    # Futures OI remains one of the largest components.
+    components["futures"] = W_FUTURES * futures_bias * max(0.75, futures_info["oi_strength"])
+    components["futures_oi_strength"] = 1.25 * futures_info["oi_strength"] * futures_bias
+
+    components["structure_3m"] = W_PRICE_STRUCTURE_3 * structure_3_bias
+    components["structure_15m"] = W_PRICE_STRUCTURE_15 * structure_15_bias
+
+    tf_component = sum(TF_WEIGHTS[tf] * tf_directions.get(tf, 0) for tf in TIMEFRAMES)
+    components["multi_tf_supertrend"] = tf_component
+
+    chain_bias = int(chain_levels["oi_bias"])
+    chain_change_bias = int(chain_levels["change_bias"])
+    chain_predictive_bias = int(chain_levels.get("predictive_bias", 0))
+    chain_predictive_strength = float(chain_levels.get("predictive_strength", 0.0))
+    chain_level_bias = int(chain_levels.get("level_bias", 0))
+    components["option_oi"] = W_OPTION_OI * chain_bias
+    components["option_oi_change"] = W_OPTION_OI_CHANGE * chain_change_bias
+    components["chain_predictive"] = 2.20 * chain_predictive_bias * max(0.50, chain_predictive_strength)
+    components["chain_levels"] = W_CHAIN_LEVELS * chain_level_bias
+    components["chain_wall_imbalance"] = 1.30 * (
+        float(chain_levels.get("support_strength", 0.0)) -
+        float(chain_levels.get("resistance_strength", 0.0))
+    )
+
+    components["daily_oi"] = 0.60 * daily_oi_bias
+    components["change_oi_api"] = 0.75 * change_oi_bias
+
+    support_1 = float(chain_levels["support_1"])
+    support_2 = float(chain_levels["support_2"])
+    resistance_1 = float(chain_levels["resistance_1"])
+    resistance_2 = float(chain_levels["resistance_2"])
+
+    directional_groups = [
+        vwap_level_bias, vwap_slope_bias, futures_bias,
+        structure_3_bias, structure_15_bias,
+        *[tf_directions.get(tf, 0) for tf in TIMEFRAMES],
+        chain_bias, chain_change_bias, chain_predictive_bias,
+        chain_level_bias, daily_oi_bias, change_oi_bias,
+    ]
+    bullish_groups = sum(x > 0 for x in directional_groups)
+    bearish_groups = sum(x < 0 for x in directional_groups)
+    total_score = float(sum(components.values()))
+
+    # Explicit predictive confirmations: Futures OI + chain S/R must participate
+    # in the final direction instead of merely adding fractional score.
+    futures_bear_confirmed = (
+        futures_bias < 0
+        and futures_info["oi_strength"] >= FUTURES_OI_STRENGTH_THRESHOLD
+        and (
+            futures_regime == "SHORT_BUILDUP"
+            or futures_info["oi_persistence"] >= FUTURES_OI_MIN_PERSISTENCE
+        )
+    )
+    futures_bull_confirmed = (
+        futures_bias > 0
+        and futures_info["oi_strength"] >= FUTURES_OI_STRENGTH_THRESHOLD
+        and (
+            futures_regime == "LONG_BUILDUP"
+            or futures_info["oi_persistence"] >= FUTURES_OI_MIN_PERSISTENCE
+        )
+    )
+
+    chain_bear_confirmed = (
+        chain_predictive_bias < 0
+        and chain_predictive_strength >= CHAIN_PREDICTIVE_STRENGTH_THRESHOLD
+    ) or chain_level_bias < 0
+    chain_bull_confirmed = (
+        chain_predictive_bias > 0
+        and chain_predictive_strength >= CHAIN_PREDICTIVE_STRENGTH_THRESHOLD
+    ) or chain_level_bias > 0
+
+    short_term_bear = (
+        vwap_level_bias < 0
+        and futures_bias < 0
+        and (structure_3_bias < 0 or tf_directions.get(3, 0) < 0)
+    )
+    short_term_bull = (
+        vwap_level_bias > 0
+        and futures_bias > 0
+        and (structure_3_bias > 0 or tf_directions.get(3, 0) > 0)
+    )
+
+    bearish_evidence = bearish_groups >= MIN_DIRECTIONAL_COMPONENTS
+    bullish_evidence = bullish_groups >= MIN_DIRECTIONAL_COMPONENTS
+
+    # Chain is a confirmation, not an absolute veto when the walls themselves
+    # are neutral. A strong opposite chain signal, however, blocks entry.
+    chain_strong_opposite_to_bear = chain_predictive_bias > 0 and chain_predictive_strength >= 0.30 and chain_level_bias > 0
+    chain_strong_opposite_to_bull = chain_predictive_bias < 0 and chain_predictive_strength >= 0.30 and chain_level_bias < 0
+
+    if (
+        total_score <= -ENTRY_SCORE
+        and bearish_evidence
+        and short_term_bear
+        and futures_bear_confirmed
+        and (chain_bear_confirmed or chain_predictive_bias == 0)
+        and not chain_strong_opposite_to_bear
+    ):
+        direction = "BEARISH"
+    elif (
+        total_score >= ENTRY_SCORE
+        and bullish_evidence
+        and short_term_bull
+        and futures_bull_confirmed
+        and (chain_bull_confirmed or chain_predictive_bias == 0)
+        and not chain_strong_opposite_to_bull
+    ):
+        direction = "BULLISH"
+    else:
+        direction = "NEUTRAL"
+
+    max_groups = max(bullish_groups, bearish_groups, 1)
+    alignment = max_groups / len(directional_groups)
+    magnitude = min(abs(total_score) / 10.0, 1.0)
+    predictive_bonus = min(
+        0.15,
+        0.05 * int(futures_bear_confirmed or futures_bull_confirmed) +
+        0.05 * int(chain_bear_confirmed or chain_bull_confirmed),
+    )
+    confidence = (
+        50.0 + 28.0 * magnitude + 22.0 * alignment + 10.0 * predictive_bonus
+        if direction != "NEUTRAL"
+        else 20.0 + 30.0 * alignment * magnitude
+    )
+    confidence = min(99.0, max(0.0, confidence))
+
+    interpretation = (
+        "STRONG BEARISH MARKET STRUCTURE" if direction == "BEARISH" and confidence >= 80 else
+        "BEARISH MARKET STRUCTURE" if direction == "BEARISH" else
+        "STRONG BULLISH MARKET STRUCTURE" if direction == "BULLISH" and confidence >= 80 else
+        "BULLISH MARKET STRUCTURE" if direction == "BULLISH" else
+        "WAIT / MIXED MARKET STRUCTURE"
+    )
+
+    reasons: list[str] = [
+        f"Futures OI engine: regime={futures_regime}; price_delta={futures_info['price_delta']:+.2f}; OI_delta={futures_info['oi_delta']:+.0f}; persistence={futures_info['oi_persistence']:.2f}; strength={futures_info['oi_strength']:.3f}.",
+        f"Futures live OI change versus last completed candle={futures_info['live_oi_change']:+.0f}.",
+        f"Spot={spot:.2f}; Futures VWAP={vwap:.2f}; VWAP slope={vwap_slope:+.2f}.",
+        f"3m structure={structure_3}; 15m structure={structure_15}.",
+        "Multi-timeframe Supertrend=" + ", ".join(
+            f"{tf}m:{'BULL' if tf_directions.get(tf,0)>0 else 'BEAR' if tf_directions.get(tf,0)<0 else 'NEUTRAL'}"
+            for tf in TIMEFRAMES
+        ),
+        f"Option-chain walls: support={support_1:.0f}/{support_2:.0f}; resistance={resistance_1:.0f}/{resistance_2:.0f}.",
+        f"Chain wall strength: support={chain_levels.get('support_strength',0.0):.3f}; resistance={chain_levels.get('resistance_strength',0.0):.3f}.",
+        f"Chain wall change strength: support={chain_levels.get('support_change_strength',0.0):.3f}; resistance={chain_levels.get('resistance_change_strength',0.0):.3f}.",
+        f"Chain predictive bias={chain_predictive_bias:+d}; strength={chain_predictive_strength:.3f}; level_bias={chain_level_bias:+d}.",
+        f"Daily OI API bias={daily_oi_bias:+d} score={daily_oi_score:+.3f}; Change-OI API bias={change_oi_bias:+d} score={change_oi_score:+.3f}.",
+        f"Explicit confirmations: FuturesOI bear={futures_bear_confirmed}, bull={futures_bull_confirmed}; Chain bear={chain_bear_confirmed}, bull={chain_bull_confirmed}.",
+        f"Directional groups bullish={bullish_groups}, bearish={bearish_groups}; total score={total_score:+.2f}.",
+    ]
+
+    logger.info(
+        "MARKET STRUCTURE V2: score=%+.2f direction=%s confidence=%.1f | "
+        "Futures=%s OI_strength=%.3f | ChainPred=%+d/%0.3f | "
+        "VWAP=%s | TF=%s",
+        total_score, direction, confidence, futures_regime,
+        futures_info["oi_strength"], chain_predictive_bias,
+        chain_predictive_strength,
+        "ABOVE" if vwap_level_bias > 0 else "BELOW" if vwap_level_bias < 0 else "AT",
+        ",".join(f"{tf}:{'B' if tf_directions.get(tf,0)>0 else 'S' if tf_directions.get(tf,0)<0 else 'N'}" for tf in TIMEFRAMES),
+    )
+
+    return StructureResult(
+        direction=direction,
+        score=total_score,
+        confidence=confidence,
+        interpretation=interpretation,
+        components=components,
+        timeframe_directions={str(k): int(v) for k, v in tf_directions.items()},
+        vwap=vwap,
+        vwap_slope=vwap_slope,
+        futures_regime=futures_regime,
+        futures_bias=futures_bias,
+        futures_oi_strength=float(futures_info["oi_strength"]),
+        futures_oi_persistence=float(futures_info["oi_persistence"]),
+        futures_live_oi_change=float(futures_info["live_oi_change"]),
+        chain_predictive_bias=chain_predictive_bias,
+        chain_predictive_strength=chain_predictive_strength,
+        chain_level_bias=chain_level_bias,
+        support_strength=float(chain_levels.get("support_strength", 0.0)),
+        resistance_strength=float(chain_levels.get("resistance_strength", 0.0)),
+        support_change_strength=float(chain_levels.get("support_change_strength", 0.0)),
+        resistance_change_strength=float(chain_levels.get("resistance_change_strength", 0.0)),
+        support_1=support_1,
+        support_2=support_2,
+        resistance_1=resistance_1,
+        resistance_2=resistance_2,
+        reasons=reasons,
+    )
+
+
+# =============================================================================
+# OPTION SELECTION
+# =============================================================================
+
+def contract_lookup_from_chain(
+    chain: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for row in chain:
+        if not isinstance(row, dict):
+            continue
+        strike = safe_float(row.get("strike_price"), float("nan"))
+        if not math.isfinite(strike):
+            continue
+
+        for option_type in ("CE", "PE"):
+            data = option_side_data(row, option_type)
+            key = data.get("instrument_key")
+            if key:
+                out[str(key)] = {
+                    "strike": strike,
+                    "type": option_type,
+                    "data": data,
+                    "expiry": str(row.get("expiry", ""))[:10],
+                }
+    return out
+
+
+def build_option_candidate(
+    contract_meta: dict[str, Any],
+    chain_data: dict[str, Any],
+) -> OptionCandidate:
+    # Accept either the wrapped contract-lookup object or raw option-side data.
+    data = chain_data.get("data", chain_data)
+
+    ltp = safe_float(data["ltp"])
+    bid = safe_float(data["bid"])
+    ask = safe_float(data["ask"])
+
+    if ltp <= 0:
+        raise ScannerError("Option LTP is invalid.")
+
+    if bid > 0 and ask > 0 and ask >= bid:
+        mid = (bid + ask) / 2.0
+        spread_pct = (ask - bid) / mid if mid > 0 else 1.0
+    else:
+        spread_pct = 1.0
+
+    theta = safe_float(data["theta"])
+    theta_burden = abs(theta) / ltp if ltp > 0 else float("inf")
+
+    delta = safe_float(data["delta"], float("nan"))
+    if not math.isfinite(delta):
+        raise ScannerError("Option delta unavailable.")
+
+    return OptionCandidate(
+        instrument_key=str(data["instrument_key"]),
+        trading_symbol=str(
+            data.get("trading_symbol")
+            or contract_meta.get("trading_symbol")
+            or data["instrument_key"]
+        ),
+        option_type=str(contract_meta["type"]),
+        strike=float(contract_meta["strike"]),
+        expiry=str(contract_meta["expiry"]),
+        ltp=ltp,
+        oi=safe_float(data["oi"]),
+        prev_oi=safe_float(data["prev_oi"]),
+        volume=safe_float(data["volume"]),
+        bid=bid,
+        ask=ask,
+        bid_qty=safe_float(data["bid_qty"]),
+        ask_qty=safe_float(data["ask_qty"]),
+        delta=delta,
+        gamma=safe_float(data["gamma"]),
+        theta=theta,
+        iv=safe_float(data["iv"]),
+        spread_pct=spread_pct,
+        theta_burden_pct_day=theta_burden,
+    )
+
+
+def option_health_score(
+    option: OptionCandidate,
+    atm: float,
+    step: float,
+) -> float:
+    delta_abs = abs(option.delta)
+    delta_score = max(
+        0.0,
+        1.0 - abs(delta_abs - 0.55) / 0.30,
+    )
+
+    spread_score = max(0.0, 1.0 - option.spread_pct / MAX_SPREAD_PCT)
+    theta_score = max(
+        0.0,
+        1.0 - option.theta_burden_pct_day / MAX_THETA_BURDEN_PCT_PER_DAY,
+    )
+
+    liquidity_base = math.log1p(max(option.volume, 0.0))
+    oi_base = math.log1p(max(option.oi, 0.0))
+    liquidity_score = min(1.0, (liquidity_base + oi_base) / 20.0)
+
+    distance_steps = abs(option.strike - atm) / step if step > 0 else 0.0
+    distance_score = 1.0 if distance_steps <= 2.0 else 0.5
+
+    return (
+        0.30 * delta_score
+        + 0.30 * spread_score
+        + 0.20 * theta_score
+        + 0.15 * liquidity_score
+        + 0.05 * distance_score
+    )
+
+
+def select_directional_option(
+    chain: list[dict[str, Any]],
+    direction: str,
+    spot: float,
+) -> OptionCandidate:
+    if direction not in {"BULLISH", "BEARISH"}:
+        raise ScannerError("Option selection requires BULLISH or BEARISH.")
+
+    rows = chain_rows(chain)
+    strikes = sorted(rows)
+    step = strike_step(strikes)
+    atm = nearest_strike(spot, strikes)
+
+    candidate_strikes = (
+        [atm - step, atm - 2 * step]
+        if direction == "BULLISH"
+        else [atm + step, atm + 2 * step]
+    )
+    option_type = "CE" if direction == "BULLISH" else "PE"
+
+    candidates: list[OptionCandidate] = []
+    rejection_log: list[str] = []
+
+    for target in candidate_strikes:
+        target = round(float(target), 2)
+
+        # Never depend on exact float equality.
+        row_key = min(strikes, key=lambda s: abs(s - target))
+        if abs(row_key - target) > 0.01:
+            rejection_log.append(f"{option_type} {target:.0f} absent from chain")
+            continue
+
+        data = option_side_data(rows[row_key], option_type)
+
+        if not data["instrument_key"]:
+            rejection_log.append(f"{option_type} {row_key:.0f}: no instrument key")
+            continue
+
+        if data["ltp"] <= 0:
+            rejection_log.append(f"{option_type} {row_key:.0f}: invalid LTP")
+            continue
+
+        if data["oi"] < MIN_OI:
+            rejection_log.append(
+                f"{option_type} {row_key:.0f}: OI {data['oi']:.0f} below {MIN_OI:.0f}"
+            )
+            continue
+
+        if data["volume"] < MIN_VOLUME:
+            rejection_log.append(
+                f"{option_type} {row_key:.0f}: volume {data['volume']:.0f} below {MIN_VOLUME:.0f}"
+            )
+            continue
+
+        delta = safe_float(data["delta"], float("nan"))
+        if not math.isfinite(delta) or not (MIN_DELTA <= abs(delta) <= MAX_DELTA):
+            rejection_log.append(
+                f"{option_type} {row_key:.0f}: delta={delta!r} outside "
+                f"{MIN_DELTA:.2f}-{MAX_DELTA:.2f}"
+            )
+            continue
+
+        bid = safe_float(data["bid"])
+        ask = safe_float(data["ask"])
+        if bid <= 0 or ask <= 0 or ask < bid:
+            rejection_log.append(
+                f"{option_type} {row_key:.0f}: invalid bid/ask"
+            )
+            continue
+
+        mid = (bid + ask) / 2.0
+        spread_pct = (ask - bid) / mid if mid > 0 else 1.0
+        if spread_pct > MAX_SPREAD_PCT:
+            rejection_log.append(
+                f"{option_type} {row_key:.0f}: spread={spread_pct:.1%}"
+            )
+            continue
+
+        theta = safe_float(data["theta"])
+        theta_burden = abs(theta) / data["ltp"] if data["ltp"] > 0 else 999.0
+        if theta_burden > MAX_THETA_BURDEN_PCT_PER_DAY:
+            # Keep the candidate only when the alternative is much worse. For
+            # now this is a hard health rule because the user explicitly asked
+            # to avoid immediate theta decay.
+            rejection_log.append(
+                f"{option_type} {row_key:.0f}: theta burden={theta_burden:.1%}/day"
+            )
+            continue
+
+        meta = {
+            "strike": row_key,
+            "type": option_type,
+            "expiry": str(rows[row_key].get("expiry", ""))[:10],
+        }
+        candidate = build_option_candidate(meta, data)
+        candidates.append(candidate)
+
+    if not candidates:
+        detail = "; ".join(rejection_log[-8:]) or "no valid candidates"
+        raise ScannerError(
+            f"No healthy directional {option_type} option. {detail}"
+        )
+
+    selected = max(
+        candidates,
+        key=lambda x: option_health_score(x, atm, step),
+    )
+
+    logger.info(
+        "OPTION SELECT: direction=%s ATM=%.0f -> %s %.0f | "
+        "LTP=%.2f OI=%.0f volume=%.0f delta=%.3f spread=%.2f%% "
+        "theta=%.4f burden=%.2f%%/day",
+        direction, atm, selected.trading_symbol, selected.strike,
+        selected.ltp, selected.oi, selected.volume, selected.delta,
+        selected.spread_pct * 100.0, selected.theta,
+        selected.theta_burden_pct_day * 100.0,
+    )
+    return selected
+
+
+# =============================================================================
+# DYNAMIC LEVEL / GREEK TARGET ENGINE
+# =============================================================================
+
+def choose_underlying_levels(
+    structure: StructureResult,
+    spot: float,
+    tf_frames: dict[int, pd.DataFrame],
+) -> tuple[float, float, float]:
+    """
+    Returns:
+        underlying_target_1,
+        underlying_target_2,
+        underlying_stop
+    """
+    atr3 = safe_float(tf_frames[3]["atr"].iloc[-1], 0.0)
+    atr15 = safe_float(tf_frames[15]["atr"].iloc[-1], 0.0)
+
+    atr3 = max(atr3, 1.0)
+    atr15 = max(atr15, atr3)
+
+    # Use 15m ST for invalidation, but never place it unrealistically close.
+    st15 = safe_float(tf_frames[15]["supertrend"].iloc[-1], spot)
+
+    if structure.direction == "BEARISH":
+        support1 = structure.support_1
+        support2 = structure.support_2
+
+        # If the chain support is too close, project an ATR extension instead.
+        t1_floor = spot - 0.55 * atr3
+        t2_floor = spot - max(1.10 * atr15, 1.10 * atr3)
+
+        if support1 < spot and (spot - support1) >= 0.40 * atr3:
+            target1 = support1
+        else:
+            target1 = t1_floor
+
+        if support2 < target1 and (spot - support2) >= 0.90 * atr3:
+            target2 = support2
+        else:
+            target2 = min(t2_floor, target1 - 0.45 * atr15)
+
+        # Bearish invalidation must clear normal intraday noise and sit above
+        # VWAP/15m ST when those are on the wrong side.
+        resistance_buffer = 0.35 * atr3
+        stop_candidates = [
+            structure.vwap + 0.25 * atr3,
+            st15 + 0.20 * atr15,
+            spot + 0.80 * atr3,
+            structure.resistance_1 + resistance_buffer
+            if structure.resistance_1 > spot else spot + 0.80 * atr3,
+        ]
+        underlying_stop = max(stop_candidates)
+
+        if underlying_stop <= spot:
+            underlying_stop = spot + 0.80 * atr3
+
+    else:
+        resistance1 = structure.resistance_1
+        resistance2 = structure.resistance_2
+
+        t1_ceiling = spot + 0.55 * atr3
+        t2_ceiling = spot + max(1.10 * atr15, 1.10 * atr3)
+
+        if resistance1 > spot and (resistance1 - spot) >= 0.40 * atr3:
+            target1 = resistance1
+        else:
+            target1 = t1_ceiling
+
+        if resistance2 > target1 and (resistance2 - spot) >= 0.90 * atr3:
+            target2 = resistance2
+        else:
+            target2 = max(t2_ceiling, target1 + 0.45 * atr15)
+
+        support_buffer = 0.35 * atr3
+        stop_candidates = [
+            structure.vwap - 0.25 * atr3,
+            st15 - 0.20 * atr15,
+            spot - 0.80 * atr3,
+            structure.support_1 - support_buffer
+            if structure.support_1 < spot else spot - 0.80 * atr3,
+        ]
+        underlying_stop = min(stop_candidates)
+
+        if underlying_stop >= spot:
+            underlying_stop = spot - 0.80 * atr3
+
+    return float(target1), float(target2), float(underlying_stop)
+
+
+def project_option_premium(
+    entry: float,
+    underlying_move: float,
+    delta: float,
+    gamma: float,
+) -> float:
+    """
+    Second-order local Greek approximation:
+        Δpremium ≈ |delta| * |dS| + 0.5 * |gamma| * dS²
+
+    This is deliberately used only for target/stop estimation, not execution.
+    """
+    move = abs(float(underlying_move))
+    change = abs(delta) * move + 0.5 * abs(gamma) * move * move
+    return float(max(0.0, entry + change))
+
+
+def create_dynamic_targets(
+    option: OptionCandidate,
+    structure: StructureResult,
+    spot: float,
+    tf_frames: dict[int, pd.DataFrame],
+) -> tuple[float, float, float, float, float, float]:
+    target_u1, target_u2, stop_u = choose_underlying_levels(
+        structure,
+        spot,
+        tf_frames,
+    )
+
+    # Direction-aware underlying moves.
+    if structure.direction == "BEARISH":
+        move_t1 = spot - target_u1
+        move_t2 = spot - target_u2
+        adverse_move = stop_u - spot
+    else:
+        move_t1 = target_u1 - spot
+        move_t2 = target_u2 - spot
+        adverse_move = spot - stop_u
+
+    if move_t1 <= 0 or move_t2 <= move_t1:
+        raise ScannerError(
+            "Dynamic underlying targets are not ordered correctly."
+        )
+    if adverse_move <= 0:
+        raise ScannerError(
+            "Dynamic underlying stop is on the wrong side of spot."
+        )
+
+    target1 = project_option_premium(
+        option.ltp, move_t1, option.delta, option.gamma
+    )
+    target2 = project_option_premium(
+        option.ltp, move_t2, option.delta, option.gamma
+    )
+    adverse_premium = project_option_premium(
+        option.ltp, adverse_move, option.delta, option.gamma
+    )
+
+    # For a long option, adverse movement reduces premium. Use the structural
+    # loss estimate but bound it so normal volatility does not create a
+    # microscopic stop.
+    risk_distance = max(option.ltp - adverse_premium, 0.0)
+    structural_stop = option.ltp - risk_distance
+
+    hard_floor = option.ltp * (1.0 - OPTION_MAX_STOP_PCT)
+    soft_floor = option.ltp * (1.0 - OPTION_MIN_STOP_PCT)
+
+    # Dynamic structural SL, bounded by 15-30% below entry.
+    stop_loss = min(soft_floor, max(hard_floor, structural_stop))
+
+    # Ensure target distances are economically meaningful.
+    risk = option.ltp - stop_loss
+    if risk <= 0:
+        raise ScannerError("Dynamic option stop is not below entry.")
+
+    if target1 < option.ltp + MIN_T1_RISK_REWARD * risk:
+        target1 = option.ltp + MIN_T1_RISK_REWARD * risk
+
+    if target2 < option.ltp + MIN_T2_RISK_REWARD * risk:
+        target2 = option.ltp + MIN_T2_RISK_REWARD * risk
+
+    if target2 <= target1:
+        raise ScannerError("Target 2 must exceed Target 1.")
+
+    return (
+        round(target1, 2),
+        round(target2, 2),
+        round(stop_loss, 2),
+        round(stop_u, 2),
+        round(target_u1, 2),
+        round(target_u2, 2),
+    )
 
 
 # =============================================================================
@@ -3173,138 +2028,82 @@ def monitor_active_trade(
 
 def load_state() -> dict[str, Any]:
     if not STATE_FILE.exists():
-        logger.info("State file not found: %s", STATE_FILE)
         return {}
 
     try:
-        with STATE_FILE.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        if isinstance(data, dict):
-            snapshot = data.get("market_snapshot")
-            logger.info(
-                "Loaded state from %s | previous_snapshot=%s | active_trade=%s",
-                STATE_FILE,
-                "YES" if isinstance(snapshot, dict) else "NO",
-                "YES" if active_trade_from_state(data) is not None else "NO",
-            )
-            return data
-
-        logger.warning("State file contains invalid root data: %s", STATE_FILE)
-        return {}
-
+        with STATE_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
     except Exception as exc:
-        logger.warning("State read failed: %s", exc)
+        logger.warning("State load failed: %s", exc)
         return {}
 
 
-def save_state(
+def save_state(state: dict[str, Any]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, ensure_ascii=False)
+
+    tmp.replace(STATE_FILE)
+
+
+def active_trade_from_state(
     state: dict[str, Any],
-) -> None:
+) -> Optional[dict[str, Any]]:
+    trade = state.get("active_trade")
+    if not isinstance(trade, dict):
+        return None
 
-    STATE_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    if str(trade.get("status", "")).upper() != "ACTIVE":
+        return None
 
-    temp_file = STATE_FILE.with_suffix(
-        ".tmp"
-    )
-
-    with temp_file.open(
-        "w",
-        encoding="utf-8",
-    ) as file:
-
-        json.dump(
-            state,
-            file,
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    temp_file.replace(
-        STATE_FILE
-    )
-    logger.info("State saved: %s", STATE_FILE)
+    required = {
+        "instrument_key",
+        "trading_symbol",
+        "direction",
+        "entry",
+        "target_1",
+        "target_2",
+        "stop_loss",
+    }
+    return trade if required.issubset(trade) else None
 
 
-def signal_hash(
-    signal: Signal,
-) -> str:
-
+def signal_hash(signal: Signal) -> str:
     key = "|".join(
         [
             signal.direction,
             signal.instrument_key,
-            str(
-                signal.strike
-            ),
-            signal.regime,
+            str(signal.strike),
+            signal.timestamp[:10],
         ]
     )
-
-    return hashlib.sha256(
-        key.encode(
-            "utf-8"
-        )
-    ).hexdigest()
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
 # =============================================================================
 # EMAIL
 # =============================================================================
 
-def send_email(
-    subject: str,
-    body: str,
-) -> None:
+def send_email(subject: str, body: str) -> None:
+    if not all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER]):
+        logger.info("Email not configured; skipping email.")
+        return
 
-    required = {
-        "EMAIL_SENDER": EMAIL_SENDER,
-        "EMAIL_PASSWORD": EMAIL_PASSWORD,
-        "EMAIL_RECEIVER": EMAIL_RECEIVER,
-    }
-
-    missing = [
-        name
-        for name, value in required.items()
-        if not value
-    ]
-
-    if missing:
-        raise ScannerError(
-            "Missing email configuration: "
-            + ", ".join(missing)
-        )
-
-    message = MIMEMultipart(
-        "alternative"
-    )
-
+    message = MIMEMultipart("alternative")
     message["From"] = EMAIL_SENDER
     message["To"] = EMAIL_RECEIVER
     message["Subject"] = subject
-
-    message.attach(
-        MIMEText(
-            body,
-            "html",
-            "utf-8",
-        )
-    )
+    message.attach(MIMEText(body, "html", "utf-8"))
 
     with smtplib.SMTP_SSL(
         SMTP_HOST,
         SMTP_PORT,
         timeout=30,
     ) as server:
-
-        server.login(
-            EMAIL_SENDER,
-            EMAIL_PASSWORD,
-        )
-
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.sendmail(
             EMAIL_SENDER,
             [EMAIL_RECEIVER],
@@ -3312,400 +2111,613 @@ def send_email(
         )
 
 
-def email_body(
-    signal: Signal,
-) -> str:
-
-    reason_html = "".join(
-        f"<li>{reason}</li>"
+def signal_email_body(signal: Signal) -> str:
+    reasons = "".join(
+        f"<li>{html.escape(reason)}</li>"
         for reason in signal.reasons
     )
 
     return f"""
 <html>
 <body>
-
-<h2>
-SENSEX Predictive {signal.direction} Signal
-</h2>
-
-<table border="1"
-       cellpadding="7"
-       cellspacing="0">
-
-<tr>
-<td><b>Time</b></td>
-<td>{signal.timestamp}</td>
-</tr>
-
-<tr>
-<td><b>Regime</b></td>
-<td>{signal.regime}</td>
-</tr>
-
-<tr>
-<td><b>Confidence</b></td>
-<td>{signal.confidence:.1f}%</td>
-</tr>
-
-<tr>
-<td><b>SENSEX Spot</b></td>
-<td>{signal.spot:.2f}</td>
-</tr>
-
-<tr>
-<td><b>Futures Regime</b></td>
-<td>{signal.futures_state}</td>
-</tr>
-
-<tr>
-<td><b>Option</b></td>
-<td>{signal.trading_symbol}</td>
-</tr>
-
-<tr>
-<td><b>Option Type</b></td>
-<td>{signal.option_type}</td>
-</tr>
-
-<tr>
-<td><b>Strike</b></td>
-<td>{signal.strike:.0f}</td>
-</tr>
-
-<tr>
-<td><b>Entry</b></td>
-<td>₹{signal.entry:.2f}</td>
-</tr>
-
-<tr>
-<td><b>Target 1</b></td>
-<td>₹{signal.target_1:.2f}</td>
-</tr>
-
-<tr>
-<td><b>Target 2</b></td>
-<td>₹{signal.target_2:.2f}</td>
-</tr>
-
-<tr>
-<td><b>Stop Loss</b></td>
-<td>₹{signal.stop_loss:.2f}</td>
-</tr>
-
-<tr>
-<td><b>3m Breakout Trigger</b></td>
-<td>{signal.underlying_trigger_3m:.2f}</td>
-</tr>
-
-<tr>
-<td><b>15m Target Level</b></td>
-<td>{signal.underlying_target_15m:.2f}</td>
-</tr>
-
-<tr>
-<td><b>Delta</b></td>
-<td>{signal.delta:.4f}</td>
-</tr>
-
-<tr>
-<td><b>Gamma</b></td>
-<td>{signal.gamma:.6f}</td>
-</tr>
-
+<h2>SENSEX Predictive {html.escape(signal.direction)} Signal</h2>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><td><b>Time</b></td><td>{html.escape(signal.timestamp)}</td></tr>
+<tr><td><b>Regime</b></td><td>{html.escape(signal.regime)}</td></tr>
+<tr><td><b>Confidence</b></td><td>{signal.confidence:.1f}%</td></tr>
+<tr><td><b>Spot</b></td><td>{signal.spot:.2f}</td></tr>
+<tr><td><b>Futures Regime</b></td><td>{html.escape(signal.futures_state)}</td></tr>
+<tr><td><b>Option</b></td><td>{html.escape(signal.trading_symbol)}</td></tr>
+<tr><td><b>Strike</b></td><td>{signal.strike:.0f} {signal.option_type}</td></tr>
+<tr><td><b>Entry</b></td><td>₹{signal.entry:.2f}</td></tr>
+<tr><td><b>Target 1</b></td><td>₹{signal.target_1:.2f}</td></tr>
+<tr><td><b>Target 2</b></td><td>₹{signal.target_2:.2f}</td></tr>
+<tr><td><b>Stop Loss</b></td><td>₹{signal.stop_loss:.2f}</td></tr>
+<tr><td><b>Underlying T1</b></td><td>{signal.underlying_target_1:.2f}</td></tr>
+<tr><td><b>Underlying T2</b></td><td>{signal.underlying_target_2:.2f}</td></tr>
+<tr><td><b>Underlying SL</b></td><td>{signal.underlying_stop:.2f}</td></tr>
+<tr><td><b>Delta</b></td><td>{signal.delta:.4f}</td></tr>
+<tr><td><b>Gamma</b></td><td>{signal.gamma:.6f}</td></tr>
+<tr><td><b>Theta</b></td><td>{signal.theta:.4f}</td></tr>
+<tr><td><b>Support</b></td><td>{signal.support_1:.0f} / {signal.support_2:.0f}</td></tr>
+<tr><td><b>Resistance</b></td><td>{signal.resistance_1:.0f} / {signal.resistance_2:.0f}</td></tr>
 </table>
 
-<h3>Prediction Factors</h3>
+<h3>Decision factors</h3>
+<ul>{reasons}</ul>
 
-<ul>
-{reason_html}
-</ul>
-
-<p>
-This is a rule-based market signal. It does not guarantee
-future price movement or profitability.
-</p>
-
+<p>This is a rule-based market signal, not a guarantee of execution,
+profitability, or future price movement. No order is placed by this script.</p>
 </body>
 </html>
 """
 
 
 # =============================================================================
-# MAIN SCANNER — CLEAN EXECUTION PIPELINE
+# ACTIVE TRADE MONITOR
 # =============================================================================
 
-def execute_scan(state: Optional[dict[str, Any]] = None) -> Optional[Signal]:
-    """Run one complete SENSEX scan.
+def monitor_active_trade(
+    state: dict[str, Any],
+    structure: StructureResult,
+) -> str:
+    trade = active_trade_from_state(state)
+    if trade is None:
+        return "NO_ACTIVE"
 
-    Pipeline:
-        Market Structure -> Direction -> Confirmation -> Strike Selection
-        -> Entry -> Monitoring -> Exit
+    today = now_ist().date().isoformat()
+    trade_date = str(trade.get("trade_date", ""))[:10]
 
-    Existing active trades are monitored BEFORE any new strike is selected.
-    This prevents a valid active trade from being invalidated by a transient
-    option-chain/Greek/strike-selection condition on the same scan.
-    """
+    if trade_date and trade_date != today:
+        state["last_completed_trade"] = dict(
+            trade,
+            status="CLOSED",
+            outcome="SESSION_END_CLEANUP",
+            closed_at=now_ist().isoformat(),
+        )
+        state["active_trade"] = None
+        save_state(state)
+        return "CLOSED"
+
+    try:
+        ltp = extract_ltp(get_quote(str(trade["instrument_key"])))
+    except ScannerError as exc:
+        logger.info("Active trade quote unavailable: %s", exc)
+        return "ACTIVE"
+
+    entry = safe_float(trade.get("entry"))
+    target1 = safe_float(trade.get("target_1"))
+    target2 = safe_float(trade.get("target_2"))
+    stop = safe_float(trade.get("stop_loss"))
+
+    if ltp >= target2:
+        outcome = "TARGET_2"
+    elif ltp >= target1:
+        outcome = "TARGET_1"
+    elif ltp <= stop:
+        outcome = "STOP_LOSS"
+    else:
+        outcome = ""
+
+    if outcome:
+        closed = dict(trade)
+        closed.update(
+            {
+                "status": "CLOSED",
+                "outcome": outcome,
+                "exit_ltp": round(ltp, 2),
+                "closed_at": now_ist().isoformat(),
+            }
+        )
+        state["active_trade"] = None
+        state["last_completed_trade"] = closed
+        save_state(state)
+
+        send_email(
+            f"SENSEX TRADE {outcome} - {trade['trading_symbol']}",
+            (
+                f"<p>{html.escape(str(trade['direction']))} trade closed.</p>"
+                f"<p>Option: {html.escape(str(trade['trading_symbol']))}<br>"
+                f"Entry: ₹{entry:.2f}<br>"
+                f"Exit: ₹{ltp:.2f}<br>"
+                f"Outcome: {outcome}</p>"
+            ),
+        )
+        return "CLOSED"
+
+    active_direction = str(trade.get("direction", "")).upper()
+    last_opposite = int(trade.get("reversal_confirmations", 0) or 0)
+
+    if structure.direction == active_direction:
+        last_opposite = 0
+    elif structure.direction in {"BULLISH", "BEARISH"}:
+        last_opposite += 1
+    else:
+        last_opposite = 0
+
+    trade["reversal_confirmations"] = last_opposite
+    trade["last_ltp"] = round(ltp, 2)
+    trade["last_market_direction"] = structure.direction
+    trade["last_market_confidence"] = structure.confidence
+    trade["last_monitored_at"] = now_ist().isoformat()
+
+    if (
+        structure.direction in {"BULLISH", "BEARISH"}
+        and structure.direction != active_direction
+        and structure.confidence >= STRUCTURE_REVERSAL_CONFIDENCE
+        and last_opposite >= REVERSAL_CONFIRMATIONS_REQUIRED
+    ):
+        closed = dict(trade)
+        closed.update(
+            {
+                "status": "CLOSED",
+                "outcome": "STRUCTURE_REVERSAL",
+                "exit_ltp": round(ltp, 2),
+                "closed_at": now_ist().isoformat(),
+            }
+        )
+        state["active_trade"] = None
+        state["last_completed_trade"] = closed
+        save_state(state)
+
+        send_email(
+            f"SENSEX STRUCTURE REVERSAL - {trade['trading_symbol']}",
+            (
+                f"<p>Trade exited on confirmed opposite market structure.</p>"
+                f"<p>Active={active_direction}; current={structure.direction}; "
+                f"confidence={structure.confidence:.1f}%.</p>"
+            ),
+        )
+        return "CLOSED"
+
+    state["active_trade"] = trade
+    save_state(state)
+
+    logger.info(
+        "ACTIVE TRADE: %s LTP=%.2f T1=%.2f T2=%.2f SL=%.2f "
+        "market=%s reversal=%d/%d",
+        trade["trading_symbol"],
+        ltp,
+        target1,
+        target2,
+        stop,
+        structure.direction,
+        last_opposite,
+        REVERSAL_CONFIRMATIONS_REQUIRED,
+    )
+    return "ACTIVE"
+
+
+# =============================================================================
+# SCAN
+# =============================================================================
+
+def execute_scan(
+    state: Optional[dict[str, Any]] = None,
+) -> Optional[Signal]:
     if not market_window_open():
         logger.info("Outside BSE market hours.")
         return None
 
     status = get_market_status()
-    logger.info("BSE status: %s", status)
+    logger.info("BSE status=%s", status)
     if status != "OPEN":
-        logger.info("BSE is not OPEN. No signal generated.")
         return None
 
     state = state if isinstance(state, dict) else {}
-    previous_snapshot = state.get("market_snapshot")
-    if not isinstance(previous_snapshot, dict):
-        previous_snapshot = {}
 
-    try:
-        future = get_current_sensex_future()
-        futures_3m = get_intraday_candles(future.instrument_key, 3, max_candles=12, min_candles=3)
-        futures_vwap = get_session_candles_for_vwap(future.instrument_key, interval_minutes=3, min_candles=5)
+    future = get_current_sensex_future()
 
-        spot_3m = get_intraday_candles(SENSEX_KEY, 3, max_candles=80, min_candles=3)
-        spot_15m = get_intraday_candles(SENSEX_KEY, 15, max_candles=80, min_candles=2)
-        spot_3m = calculate_supertrend(spot_3m, SUPERTREND_PERIOD, SUPERTREND_FACTOR)
-        spot_15m = calculate_supertrend(spot_15m, SUPERTREND_PERIOD, SUPERTREND_FACTOR)
+    futures_3m = get_intraday_candles(
+        future.instrument_key,
+        3,
+    )
+    futures_session = get_intraday_candles(
+        future.instrument_key,
+        3,
+    )
+    futures_live_quote = get_quote(future.instrument_key)
 
-        spot = extract_ltp(get_quote(SENSEX_KEY))
-        chain = get_chain()
-        contracts = get_current_week_contracts()
+    spot = extract_ltp(get_quote(SENSEX_KEY))
 
-        chain_spot_value = chain_spot(chain)
-        if abs(chain_spot_value - spot) > 100:
-            raise ScannerError(
-                f"Option-chain spot mismatch: chain={chain_spot_value:.2f}, live={spot:.2f}."
-            )
+    tf_frames, tf_directions = timeframe_snapshot(SENSEX_KEY)
 
-        # Option OI difference is a confirmation input to market structure;
-        # it is not allowed to replace price/VWAP/Supertrend structure.
-        (
-            oi_diff,
-            oi_diff_change,
-            oi_diff_normalized,
-            oi_diff_direction,
-            oi_diff_trend,
-            ce_change_oi,
-            ce_change_oi_normalized,
-        ) = option_oi_difference(chain, spot)
+    expiry, chain = get_option_chain()
 
-        chain_bias, chain_bias_score, _ = oi_structure(chain, spot)
-        change_data = get_change_oi_from_chain(chain)
-        change_bias, change_bias_score = change_oi_bias(change_data)
+    chain_levels = chain_oi_support_resistance(chain, spot)
+    daily_oi_bias, daily_oi_score = get_daily_oi_confirmation(expiry)
+    change_oi_bias, change_oi_score = get_change_oi_confirmation(expiry)
 
-        direction, interpretation, confidence, reasons, market_score = predictive_direction(
-            spot_3m=spot_3m,
-            spot_15m=spot_15m,
-            chain_bias=chain_bias,
-            chain_bias_score=chain_bias_score,
-            change_oi_bias_value=change_bias,
-            change_oi_score=change_bias_score,
-            futures_state="STRUCTURE_ENGINE",
-            live_spot=spot,
-            futures_3m=futures_3m,
-            futures_vwap_candles=futures_vwap,
-            previous_snapshot=previous_snapshot,
-            option_oi_diff=oi_diff,
-            option_oi_diff_change=oi_diff_change,
-            option_oi_direction=oi_diff_direction,
-            option_oi_trend=oi_diff_trend,
-            ce_change_oi=ce_change_oi,
-            ce_change_oi_normalized=ce_change_oi_normalized,
-        )
+    structure = build_market_structure(
+        spot=spot,
+        futures_3m=futures_3m,
+        futures_session=futures_session,
+        tf_frames=tf_frames,
+        tf_directions=tf_directions,
+        chain_levels=chain_levels,
+        daily_oi_bias=daily_oi_bias,
+        daily_oi_score=daily_oi_score,
+        change_oi_bias=change_oi_bias,
+        change_oi_score=change_oi_score,
+        futures_live_quote=futures_live_quote,
+    )
 
-        snap = _market_structure_snapshot(
-            spot_3m, spot_15m, futures_3m, futures_vwap, spot,
-            float(oi_diff), float(oi_diff_change),
-        )
-        vwap = float(snap["vwap"])
-        price_vs_vwap = "ABOVE" if spot > vwap else "BELOW" if spot < vwap else "AT_VWAP"
+    state["market_snapshot"] = {
+        "timestamp": now_ist().isoformat(),
+        "spot": round(spot, 2),
+        "future": future.trading_symbol,
+        "future_expiry": future.expiry,
+        "futures_regime": structure.futures_regime,
+        "futures_bias": structure.futures_bias,
+        "futures_oi_strength": round(structure.futures_oi_strength, 4),
+        "futures_oi_persistence": round(structure.futures_oi_persistence, 4),
+        "futures_live_oi_change": round(structure.futures_live_oi_change, 2) if math.isfinite(structure.futures_live_oi_change) else None,
+        "chain_predictive_bias": structure.chain_predictive_bias,
+        "chain_predictive_strength": round(structure.chain_predictive_strength, 4),
+        "chain_level_bias": structure.chain_level_bias,
+        "support_strength": round(structure.support_strength, 4),
+        "resistance_strength": round(structure.resistance_strength, 4),
+        "support_change_strength": round(structure.support_change_strength, 4),
+        "resistance_change_strength": round(structure.resistance_change_strength, 4),
+        "vwap": round(structure.vwap, 2),
+        "vwap_slope": round(structure.vwap_slope, 4),
+        "direction": structure.direction,
+        "score": round(structure.score, 3),
+        "confidence": round(structure.confidence, 2),
+        "support_1": structure.support_1,
+        "support_2": structure.support_2,
+        "resistance_1": structure.resistance_1,
+        "resistance_2": structure.resistance_2,
+        "timeframes": structure.timeframe_directions,
+        "components": structure.components,
+    }
+    save_state(state)
 
-        state["market_snapshot"] = {
-            "timestamp": now_ist().isoformat(),
-            "sensex_spot": round(float(spot), 2),
-            "futures_price": round(float(futures_3m["close"].iloc[-1]), 2),
-            "futures_state": snap["futures_regime"],
-            "price_vs_vwap": price_vs_vwap,
-            "futures_vwap": round(vwap, 4),
-            "option_oi_difference": round(float(oi_diff), 2),
-            "option_oi_difference_change": round(float(oi_diff_change), 2),
-            "option_oi_difference_normalized": round(float(oi_diff_normalized), 6),
-            "option_oi_direction": oi_diff_direction,
-            "option_oi_trend": oi_diff_trend,
-            "prediction_direction": direction,
-            "prediction_regime": interpretation,
-            "prediction_confidence": round(float(confidence), 2),
-            "market_structure_score": round(float(market_score), 3),
-            "three_min_supertrend": "BULLISH" if snap["st3"] > 0 else "BEARISH" if snap["st3"] < 0 else "NEUTRAL",
-            "fifteen_min_supertrend": "BULLISH" if snap["st15"] > 0 else "BEARISH" if snap["st15"] < 0 else "NEUTRAL",
-            "futures_price_direction": int(snap["fut_price_dir"]),
-            "futures_oi_direction": int(snap["fut_oi_dir"]),
-        }
-        save_state(state)
+    logger.info(
+        "PREDICTION: %s | %s | confidence=%.1f score=%+.2f",
+        structure.direction,
+        structure.interpretation,
+        structure.confidence,
+        structure.score,
+    )
 
+    if active_trade_from_state(state) is not None:
+        monitor_active_trade(state, structure)
+        return None
+
+    if structure.direction == "NEUTRAL":
+        logger.info("No entry: market structure is neutral/mixed.")
+        return None
+
+    if structure.confidence < SIGNAL_THRESHOLD:
         logger.info(
-            "PREDICTION: direction=%s regime=%s confidence=%.1f score=%+.2f",
-            direction, interpretation, confidence, market_score,
+            "No entry: confidence %.1f < %.1f",
+            structure.confidence,
+            SIGNAL_THRESHOLD,
         )
+        return None
 
-        # ------------------------------------------------------------------
-        # ACTIVE TRADE: monitor first. Never re-select or invalidate it merely
-        # because current entry conditions are temporarily unavailable.
-        # ------------------------------------------------------------------
-        active = active_trade_from_state(state)
-        if active is not None:
-            trade_date = str(active.get("trade_date", ""))[:10]
-            today = now_ist().date().isoformat()
-            if trade_date and trade_date != today:
-                logger.info("Clearing stale previous-session active trade: %s", active.get("trading_symbol", ""))
-                state["last_completed_trade"] = dict(active, status="CLOSED", outcome="SESSION_END_CLEANUP")
-                state["active_trade"] = None
-                save_state(state)
-            else:
-                monitor_result = monitor_active_trade(
-                    state=state,
-                    current_direction=direction,
-                    current_interpretation=interpretation,
-                    current_confidence=confidence,
-                    final_confirmed=(direction != "NEUTRAL"),
-                    selected_option=None,
-                    current_logic_signature="",
-                )
-                # An existing trade owns this scan. Do not create a second trade.
-                return None
+    option = select_directional_option(
+        chain=chain,
+        direction=structure.direction,
+        spot=spot,
+    )
 
-        if direction == "NEUTRAL":
-            logger.info("No entry: market structure is neutral/mixed.")
-            return None
+    (
+        target1,
+        target2,
+        stop_loss,
+        underlying_stop,
+        underlying_target1,
+        underlying_target2,
+    ) = create_dynamic_targets(
+        option=option,
+        structure=structure,
+        spot=spot,
+        tf_frames=tf_frames,
+    )
 
-        if confidence < SIGNAL_THRESHOLD:
-            logger.info("No entry: confidence %.1f < %.1f.", confidence, SIGNAL_THRESHOLD)
-            return None
-
-        # Pre-breakout confirmation: direction must already be established,
-        # but the breakout itself must NOT have occurred.
-        confirmed, confirmation_reasons = final_entry_direction_confirmation(
-            direction, interpretation, spot_3m, futures_vwap
-        )
-        if not confirmed:
-            logger.info("No entry: pre-breakout VWAP confirmation failed.")
-            return None
-
-        option = select_directional_option(
-            contracts=contracts,
-            chain=chain,
-            direction=direction,
-            spot=spot,
-            preferred_strike=None,
-        )
-
-        valid, trigger_3m, target_15m, validation_reasons = validate_prebreakout(
-            spot_3m, spot_15m, direction, option
-        )
-        if not valid:
-            logger.info("No entry: pre-breakout structural validation failed.")
-            return None
-
-        target_1, target_2, stop_loss = create_targets(
-            option, spot, trigger_3m, target_15m, direction
-        )
-
-        all_reasons = list(reasons) + list(confirmation_reasons) + list(validation_reasons) + [
-            f"Market structure score={market_score:+.2f}.",
-            f"PE-CE OI difference={oi_diff:+.0f}; change={oi_diff_change:+.0f}.",
-            f"Futures regime={snap['futures_regime']}.",
-            f"Strike rule={'ATM-1 CE, fallback ATM-2 CE' if direction == 'BULLISH' else 'ATM+1 PE, fallback ATM+2 PE'}.",
-            "Entry is predictive and pre-breakout; no completed breakout candle is required.",
-            "Active trade exits only at T1/T2/SL or after two consecutive strong opposite-structure confirmations.",
+    reasons = list(structure.reasons)
+    reasons.extend(
+        [
+            (
+                f"Directional strike rule: "
+                f"{'ATM-1/ATM-2 CE' if structure.direction == 'BULLISH' else 'ATM+1/ATM+2 PE'}."
+            ),
+            (
+                f"Selected option health: spread={option.spread_pct:.2%}, "
+                f"theta burden={option.theta_burden_pct_day:.2%}/day, "
+                f"volume={option.volume:.0f}, OI={option.oi:.0f}, "
+                f"delta={option.delta:.3f}."
+            ),
+            (
+                f"Dynamic underlying targets: "
+                f"T1={underlying_target1:.2f}, "
+                f"T2={underlying_target2:.2f}, "
+                f"SL={underlying_stop:.2f}."
+            ),
+            (
+                f"Dynamic option targets: "
+                f"T1=₹{target1:.2f}, "
+                f"T2=₹{target2:.2f}, "
+                f"SL=₹{stop_loss:.2f}."
+            ),
+            "Market direction is established before option selection; option premium momentum is not the primary directional trigger.",
         ]
+    )
 
-        return Signal(
-            timestamp=now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
-            direction=direction,
-            regime=interpretation,
-            confidence=float(confidence),
-            spot=float(spot),
-            futures_state=str(snap["futures_regime"]),
-            option_type=option.option_type,
-            strike=float(option.strike),
-            trading_symbol=option.trading_symbol,
-            instrument_key=option.instrument_key,
-            entry=float(option.ltp),
-            target_1=float(target_1),
-            target_2=float(target_2),
-            stop_loss=float(stop_loss),
-            underlying_trigger_3m=float(trigger_3m),
-            underlying_target_15m=float(target_15m),
-            delta=float(option.delta),
-            gamma=float(option.gamma),
-            reasons=all_reasons,
-        )
+    signal = Signal(
+        timestamp=now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
+        direction=structure.direction,
+        regime=structure.interpretation,
+        confidence=structure.confidence,
+        spot=spot,
+        futures_state=structure.futures_regime,
+        option_type=option.option_type,
+        strike=option.strike,
+        trading_symbol=option.trading_symbol,
+        instrument_key=option.instrument_key,
+        entry=option.ltp,
+        target_1=target1,
+        target_2=target2,
+        stop_loss=stop_loss,
+        underlying_stop=underlying_stop,
+        underlying_target_1=underlying_target1,
+        underlying_target_2=underlying_target2,
+        delta=option.delta,
+        gamma=option.gamma,
+        theta=option.theta,
+        support_1=structure.support_1,
+        support_2=structure.support_2,
+        resistance_1=structure.resistance_1,
+        resistance_2=structure.resistance_2,
+        reasons=reasons,
+    )
 
-    except ScannerError as exc:
-        logger.info("Scanner cycle skipped safely: %s", exc)
-        return None
-    except Exception:
-        logger.error("Unexpected scan failure:\n%s", traceback.format_exc())
-        return None
+    return signal
+
+
+# =============================================================================
+# SELF TESTS
+# =============================================================================
+
+def _synthetic_candles(
+    values: list[float],
+    oi: Optional[list[float]] = None,
+    start: str = "2026-09-10 09:15",
+) -> pd.DataFrame:
+    index = pd.date_range(start, periods=len(values), freq="3min", tz="Asia/Kolkata")
+    df = pd.DataFrame(
+        {
+            "timestamp": index.tz_convert("UTC"),
+            "open": values,
+            "high": [x + 2 for x in values],
+            "low": [x - 2 for x in values],
+            "close": values,
+            "volume": [1000.0] * len(values),
+            "oi": oi if oi is not None else [np.nan] * len(values),
+        }
+    )
+    return df
 
 
 def self_test() -> None:
-    """Offline deterministic tests for core decision/state logic."""
-    def candles(values: list[float], oi: Optional[list[float]] = None) -> pd.DataFrame:
-        idx = pd.date_range("2026-09-09 09:15", periods=len(values), freq="3min")
-        df = pd.DataFrame({
-            "timestamp": idx,
-            "open": values,
-            "high": [v + 2 for v in values],
-            "low": [v - 2 for v in values],
-            "close": values,
-            "volume": [1000] * len(values),
-        }, index=idx)
-        if oi is not None:
-            df["oi"] = oi
-        return df
+    # Supertrend should be directional on clear monotonic series.
+    down = _synthetic_candles(
+        [100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85]
+    )
+    st_down = calculate_supertrend(down, 10, 3.0)
+    assert int(st_down["direction"].iloc[-1]) == -1
 
-    # Direction engine: strongly bearish and bullish synthetic structures.
-    bear3 = calculate_supertrend(candles([100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 89]), 10, 3.0)
-    bear15 = calculate_supertrend(candles([100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 89]), 10, 3.0)
-    fut_bear = candles([100, 99, 98, 97, 96, 95], [1000, 1020, 1040, 1060, 1080, 1100])
-    vwap_bear = fut_bear.copy()
-    bear = _market_structure_snapshot(bear3, bear15, fut_bear, vwap_bear, 89.0, -1000.0, -100.0)
-    assert bear["direction"] == "BEARISH", f"bearish test failed: {bear}"
+    up = _synthetic_candles(
+        [85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100]
+    )
+    st_up = calculate_supertrend(up, 10, 3.0)
+    assert int(st_up["direction"].iloc[-1]) == 1
 
-    bull3 = calculate_supertrend(candles([90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101]), 10, 3.0)
-    bull15 = calculate_supertrend(candles([90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101]), 10, 3.0)
-    fut_bull = candles([90, 91, 92, 93, 94, 95], [1000, 1020, 1040, 1060, 1080, 1100])
-    vwap_bull = fut_bull.copy()
-    bull = _market_structure_snapshot(bull3, bull15, fut_bull, vwap_bull, 101.0, 1000.0, 100.0)
-    assert bull["direction"] == "BULLISH", f"bullish test failed: {bull}"
+    # Futures short build-up must remain bearish even if the most recent OI move
+    # is small, because the regime is built from multiple candles.
+    fut = _synthetic_candles(
+        [100, 99, 98, 97, 96, 95, 94, 93],
+        [1000, 1020, 1050, 1080, 1100, 1120, 1130, 1131],
+    )
+    regime, bias, price_delta, oi_delta = futures_price_oi_regime(fut)
+    assert regime == "SHORT_BUILDUP"
+    assert bias == -1
+    assert price_delta < 0
+    assert oi_delta > 0
 
-    # Strike selection: deterministic ATM +/- one, fallback +/- two.
+    # The exact failure mode from the supplied logs:
+    # below VWAP + bearish futures + bearish 3m structure must not become neutral
+    # merely because the 15m ST is mixed.
+    frames = {
+        3: st_down,
+        15: calculate_supertrend(
+            _synthetic_candles(
+                [100, 99.8, 99.5, 99.2, 98.8, 98.5, 98.2, 97.8,
+                 97.5, 97.2, 96.8, 96.5, 96.2, 95.8, 95.5, 95.2]
+            ), 10, 3.0
+        ),
+        30: st_down,
+        60: st_down,
+        120: st_down,
+        180: st_down,
+    }
+    tf_dirs = {tf: -1 for tf in TIMEFRAMES}
+
+    chain_levels = {
+        "support_1": 74000.0,
+        "support_2": 73800.0,
+        "resistance_1": 74200.0,
+        "resistance_2": 74400.0,
+        "oi_bias": -1,
+        "change_bias": -1,
+    }
+
+    structure = build_market_structure(
+        spot=73900.0,
+        futures_3m=fut,
+        futures_session=fut,
+        tf_frames=frames,
+        tf_directions=tf_dirs,
+        chain_levels=chain_levels,
+        daily_oi_bias=-1,
+        daily_oi_score=-0.20,
+        change_oi_bias=-1,
+        change_oi_score=-0.25,
+    )
+    assert structure.direction == "BEARISH", structure
+    assert structure.score < -ENTRY_SCORE
+
+    # Strike selection test.
     chain = []
-    contracts = []
     for strike in [74000, 74050, 74100, 74150, 74200]:
-        chain.append({"strike_price": strike,
-                      "call_options": {"instrument_key": f"CE{strike}", "market_data": {"ltp": 100, "oi": 1000, "prev_oi": 900}, "option_greeks": {"delta": .5, "gamma": .01, "iv": 20}},
-                      "put_options": {"instrument_key": f"PE{strike}", "market_data": {"ltp": 100, "oi": 1000, "prev_oi": 900}, "option_greeks": {"delta": -.5, "gamma": .01, "iv": 20}}})
-        contracts.extend([
-            {"instrument_key": f"CE{strike}", "trading_symbol": f"SENSEX{strike}CE", "instrument_type": "CE", "strike_price": strike, "expiry": "2026-09-15"},
-            {"instrument_key": f"PE{strike}", "trading_symbol": f"SENSEX{strike}PE", "instrument_type": "PE", "strike_price": strike, "expiry": "2026-09-15"},
-        ])
-    selected_bull = select_directional_option(contracts, chain, "BULLISH", 74100)
-    selected_bear = select_directional_option(contracts, chain, "BEARISH", 74100)
-    assert selected_bull.strike == 74050 and selected_bull.option_type == "CE"
-    assert selected_bear.strike == 74150 and selected_bear.option_type == "PE"
+        chain.append(
+            {
+                "strike_price": strike,
+                "expiry": "2026-09-17",
+                "call_options": {
+                    "instrument_key": f"CE{strike}",
+                    "market_data": {
+                        "ltp": 100.0,
+                        "oi": 50000,
+                        "prev_oi": 49000,
+                        "volume": 10000,
+                        "bid_price": 99.5,
+                        "ask_price": 100.5,
+                        "bid_qty": 100,
+                        "ask_qty": 100,
+                    },
+                    "option_greeks": {
+                        "delta": 0.55,
+                        "gamma": 0.01,
+                        "theta": -2.0,
+                        "iv": 20,
+                    },
+                },
+                "put_options": {
+                    "instrument_key": f"PE{strike}",
+                    "market_data": {
+                        "ltp": 100.0,
+                        "oi": 50000,
+                        "prev_oi": 51000,
+                        "volume": 10000,
+                        "bid_price": 99.5,
+                        "ask_price": 100.5,
+                        "bid_qty": 100,
+                        "ask_qty": 100,
+                    },
+                    "option_greeks": {
+                        "delta": -0.55,
+                        "gamma": 0.01,
+                        "theta": -2.0,
+                        "iv": 20,
+                    },
+                },
+            }
+        )
 
-    # Target ordering and SL.
-    t1, t2, sl = create_targets(selected_bull, 74100, 74150, 74250, "BULLISH")
-    assert t2 > t1 > selected_bull.ltp and sl < selected_bull.ltp
+    # Chain S/R must independently recognize a nearby strengthening CE wall
+    # and weakening PE support as bearish predictive evidence.
+    chain_bear = []
+    for strike in [74000, 74050, 74100, 74150, 74200, 74250]:
+        chain_bear.append({
+            "strike_price": strike,
+            "expiry": "2026-09-17",
+            "call_options": {
+                "instrument_key": f"CEB{strike}",
+                "market_data": {
+                    "ltp": 100.0, "oi": 80000 if strike >= 74150 else 20000,
+                    "prev_oi": 70000 if strike >= 74150 else 21000,
+                    "volume": 10000, "bid_price": 99.5, "ask_price": 100.5,
+                    "bid_qty": 100, "ask_qty": 100,
+                },
+                "option_greeks": {"delta": 0.55, "gamma": 0.01, "theta": -2.0, "iv": 20.0},
+            },
+            "put_options": {
+                "instrument_key": f"PEB{strike}",
+                "market_data": {
+                    "ltp": 100.0, "oi": 15000 if strike <= 74050 else 20000,
+                    "prev_oi": 20000 if strike <= 74050 else 21000,
+                    "volume": 10000, "bid_price": 99.5, "ask_price": 100.5,
+                    "bid_qty": 100, "ask_qty": 100,
+                },
+                "option_greeks": {"delta": -0.55, "gamma": 0.01, "theta": -2.0, "iv": 20.0},
+            },
+        })
+    bear_chain_levels = chain_oi_support_resistance(chain_bear, 74100.0)
+    assert bear_chain_levels["resistance_1"] == 74150.0
+    assert bear_chain_levels["predictive_bias"] == -1
+    assert bear_chain_levels["predictive_strength"] >= CHAIN_PREDICTIVE_STRENGTH_THRESHOLD
 
-    logger.info("SELF-TEST PASSED: market direction, strike selection, and target engine.")
+    selected_bull = select_directional_option(chain, "BULLISH", 74100)
+    selected_bear = select_directional_option(chain, "BEARISH", 74100)
+    assert selected_bull.strike in {74050.0, 74000.0}
+    assert selected_bear.strike in {74150.0, 74200.0}
+    assert selected_bear.option_type == "PE"
 
+    # Target engine test.
+    fake_structure = StructureResult(
+        direction="BEARISH",
+        score=-7.0,
+        confidence=90.0,
+        interpretation="STRONG BEARISH MARKET STRUCTURE",
+        components={},
+        timeframe_directions={str(x): -1 for x in TIMEFRAMES},
+        vwap=74050.0,
+        vwap_slope=-12.0,
+        futures_regime="SHORT_BUILDUP",
+        futures_bias=-1,
+        futures_oi_strength=0.80,
+        futures_oi_persistence=0.75,
+        futures_live_oi_change=100.0,
+        chain_predictive_bias=-1,
+        chain_predictive_strength=0.70,
+        chain_level_bias=-1,
+        support_strength=0.50,
+        resistance_strength=0.80,
+        support_change_strength=0.10,
+        resistance_change_strength=0.30,
+        support_1=73850.0,
+        support_2=73650.0,
+        resistance_1=74200.0,
+        resistance_2=74400.0,
+        reasons=[],
+    )
+
+    target_frames = {
+        3: calculate_supertrend(
+            _synthetic_candles([74100, 74090, 74080, 74070, 74060, 74050, 74040, 74030]),
+            10,
+            3.0,
+        ),
+        15: calculate_supertrend(
+            _synthetic_candles([74200, 74180, 74160, 74140, 74120, 74100, 74080, 74060]),
+            10,
+            3.0,
+        ),
+    }
+
+    # Add required 15m/3m ATR fields via existing synthetic ST; only those two
+    # frames are consumed by the target engine.
+    t1, t2, sl, usl, ut1, ut2 = create_dynamic_targets(
+        option=selected_bear,
+        structure=fake_structure,
+        spot=74050.0,
+        tf_frames=target_frames,
+    )
+    assert t2 > t1 > selected_bear.ltp
+    assert sl < selected_bear.ltp
+    assert usl > 74050.0
+    assert ut1 < 74050.0
+    assert ut2 < ut1
+
+    logger.info("SELF-TEST PASSED.")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main() -> int:
     logger.info("SENSEX SCANNER VERSION: %s", SCANNER_VERSION)
@@ -3717,6 +2729,7 @@ def main() -> int:
     try:
         state = load_state()
         signal = execute_scan(state)
+
         if signal is None:
             logger.info("No actionable setup on this scan.")
             return 0
@@ -3736,26 +2749,37 @@ def main() -> int:
             "target_1": signal.target_1,
             "target_2": signal.target_2,
             "stop_loss": signal.stop_loss,
-            "underlying_trigger_3m": signal.underlying_trigger_3m,
-            "underlying_target_15m": signal.underlying_target_15m,
+            "underlying_stop": signal.underlying_stop,
+            "underlying_target_1": signal.underlying_target_1,
+            "underlying_target_2": signal.underlying_target_2,
             "delta": signal.delta,
             "gamma": signal.gamma,
-            "last_ltp": signal.entry,
+            "theta": signal.theta,
             "reversal_confirmations": 0,
             "last_market_direction": signal.direction,
             "last_market_confidence": signal.confidence,
+            "last_ltp": signal.entry,
         }
+
         state["active_trade"] = active_trade
         state["last_signal"] = asdict(signal)
-        state["last_signal_timestamp"] = signal.timestamp
         state["last_signal_hash"] = signal_hash(signal)
+        state["last_signal_timestamp"] = signal.timestamp
         save_state(state)
 
         send_email(
             f"SENSEX {signal.direction} {signal.trading_symbol}",
-            email_body(signal),
+            signal_email_body(signal),
         )
-        logger.info("NEW ACTIVE TRADE LOCKED: %s", signal.trading_symbol)
+
+        logger.info(
+            "NEW SIGNAL LOCKED: %s | entry=%.2f T1=%.2f T2=%.2f SL=%.2f",
+            signal.trading_symbol,
+            signal.entry,
+            signal.target_1,
+            signal.target_2,
+            signal.stop_loss,
+        )
         return 0
 
     except ScannerError as exc:
