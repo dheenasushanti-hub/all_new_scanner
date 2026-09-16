@@ -139,7 +139,11 @@ ENTRY_SCORE = 4.50
 MIN_DELTA = 0.35
 MAX_DELTA = 0.85
 MAX_SPREAD_PCT = 0.06
-MAX_THETA_BURDEN_PCT_PER_DAY = 0.10
+MAX_THETA_BURDEN_PCT_PER_DAY = 0.60
+# Evaluate theta over the planned intraday holding window instead of rejecting
+# near-expiry options because their full-day theta percentage is naturally high.
+EXPECTED_HOLDING_MINUTES = 60.0
+MAX_INTRADAY_THETA_BURDEN = 0.10
 MIN_OI = 100.0
 MIN_VOLUME = 1.0
 
@@ -1718,9 +1722,14 @@ def option_health_score(
     )
 
     spread_score = max(0.0, 1.0 - option.spread_pct / MAX_SPREAD_PCT)
+    intraday_theta_burden = (
+        option.theta_burden_pct_day
+        * EXPECTED_HOLDING_MINUTES
+        / 375.0
+    )
     theta_score = max(
         0.0,
-        1.0 - option.theta_burden_pct_day / MAX_THETA_BURDEN_PCT_PER_DAY,
+        1.0 - intraday_theta_burden / MAX_INTRADAY_THETA_BURDEN,
     )
 
     liquidity_base = math.log1p(max(option.volume, 0.0))
@@ -1819,12 +1828,19 @@ def select_directional_option(
 
         theta = safe_float(data["theta"])
         theta_burden = abs(theta) / data["ltp"] if data["ltp"] > 0 else 999.0
-        if theta_burden > MAX_THETA_BURDEN_PCT_PER_DAY:
-            # Keep the candidate only when the alternative is much worse. For
-            # now this is a hard health rule because the user explicitly asked
-            # to avoid immediate theta decay.
+
+        # Upstox theta is an absolute premium decay estimate per day. For an
+        # intraday BUY strategy, convert it to the expected holding window so
+        # final-day options are not rejected merely because daily theta is large.
+        trading_day_minutes = 375.0  # 09:15-15:30 IST
+        intraday_theta_burden = (
+            theta_burden * EXPECTED_HOLDING_MINUTES / trading_day_minutes
+        )
+        if intraday_theta_burden > MAX_INTRADAY_THETA_BURDEN:
             rejection_log.append(
-                f"{option_type} {row_key:.0f}: theta burden={theta_burden:.1%}/day"
+                f"{option_type} {row_key:.0f}: intraday theta burden="
+                f"{intraday_theta_burden:.1%} over "
+                f"{EXPECTED_HOLDING_MINUTES:.0f}m (daily={theta_burden:.1%})"
             )
             continue
 
