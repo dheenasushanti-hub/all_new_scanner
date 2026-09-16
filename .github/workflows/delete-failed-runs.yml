@@ -10,12 +10,12 @@ jobs:
       actions: write
       contents: read
     steps:
-      - name: Delete failed workflow runs
+      - name: Delete failed workflow runs (including today)
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
-          delete_run_by_conclusion: failure
+          delete_run_by_conclusion_pattern: failure
           keep_minimum_runs: 0
 
       - name: Delete workflow runs older than 1 day
