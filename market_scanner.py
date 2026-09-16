@@ -2693,6 +2693,38 @@ def self_test() -> None:
     assert selected_bear.strike in {74150.0, 74200.0}
     assert selected_bear.option_type == "PE"
 
+    # Regression test: a near-expiry PE with high DAILY theta must not be
+    # rejected when its burden over the planned 60-minute intraday holding
+    # window remains within the configured limit. This mirrors the 74500 PE
+    # failure seen in production (34.1%/day theta burden).
+    high_theta_chain = []
+    for strike in [74400, 74500]:
+        row = {
+            "strike_price": strike,
+            "expiry": "2026-09-17",
+            "call_options": {
+                "instrument_key": f"HTCE{strike}",
+                "market_data": {
+                    "ltp": 100.0, "oi": 50000, "prev_oi": 49000,
+                    "volume": 10000, "bid_price": 99.5, "ask_price": 100.5,
+                    "bid_qty": 100, "ask_qty": 100,
+                },
+                "option_greeks": {"delta": 0.55, "gamma": 0.01, "theta": -2.0, "iv": 20},
+            },
+            "put_options": {
+                "instrument_key": f"HTPE{strike}",
+                "market_data": {
+                    "ltp": 100.0, "oi": 50000, "prev_oi": 49000,
+                    "volume": 10000, "bid_price": 99.5, "ask_price": 100.5,
+                    "bid_qty": 100, "ask_qty": 100,
+                },
+                "option_greeks": {"delta": -0.55, "gamma": 0.01, "theta": -34.1 if strike == 74500 else -2.0, "iv": 20},
+            },
+        }
+        high_theta_chain.append(row)
+    selected_high_theta = select_directional_option(high_theta_chain, "BEARISH", 74431.0)
+    assert selected_high_theta.strike == 74500.0, selected_high_theta
+
     # Target engine test.
     fake_structure = StructureResult(
         direction="BEARISH",
