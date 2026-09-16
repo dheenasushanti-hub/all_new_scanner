@@ -1,27 +1,76 @@
-name: Delete Failed and Yesterday's Workflow Runs
+name: Delete Failed and Old Workflow Runs
 
 on:
-  workflow_dispatch: # Allows manual run from Actions tab
+  workflow_dispatch:
 
 jobs:
   del_runs:
     runs-on: ubuntu-latest
+
     permissions:
       actions: write
       contents: read
-    steps:
-      - name: Delete failed workflow runs (including today)
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-          delete_run_by_conclusion_pattern: failure
-          keep_minimum_runs: 0
 
-      - name: Delete workflow runs older than 1 day
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-          retain_days: 1
-          keep_minimum_runs: 0
+    steps:
+      - name: Delete failed runs and runs from before today
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+
+          echo "Repository: $REPO"
+          echo "Deleting:"
+          echo "  - ALL failed workflow runs"
+          echo "  - ALL workflow runs created before today"
+          echo "Keeping:"
+          echo "  - Today's successful/non-failed runs"
+
+          # Start of today in UTC.
+          TODAY=$(date -u +"%Y-%m-%dT00:00:00Z")
+
+          echo "Today (UTC): $TODAY"
+
+          # Get workflow runs, newest first.
+          gh api \
+            --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$REPO/actions/runs?per_page=100" \
+            --jq '.workflow_runs[] |
+              [
+                .id,
+                .created_at,
+                .conclusion,
+                .name
+              ] | @tsv' |
+          while IFS=$'\t' read -r RUN_ID CREATED_AT CONCLUSION NAME; do
+
+            SHOULD_DELETE=false
+            REASON=""
+
+            # Delete ALL failed runs, including today's failures.
+            if [ "$CONCLUSION" = "failure" ]; then
+              SHOULD_DELETE=true
+              REASON="failed"
+
+            # Delete anything created before today.
+            elif [[ "$CREATED_AT" < "$TODAY" ]]; then
+              SHOULD_DELETE=true
+              REASON="older than today"
+            fi
+
+            if [ "$SHOULD_DELETE" = true ]; then
+              echo "Deleting run $RUN_ID | $NAME | $CREATED_AT | $CONCLUSION | $REASON"
+
+              gh api \
+                --method DELETE \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/$REPO/actions/runs/$RUN_ID"
+
+            else
+              echo "Keeping run $RUN_ID | $NAME | $CREATED_AT | $CONCLUSION"
+            fi
+
+          done
+
+          echo "Cleanup completed."
