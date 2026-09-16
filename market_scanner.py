@@ -566,6 +566,19 @@ def get_intraday_candles(
     return df
 
 
+def _subtract_months(d: date, months: int) -> date:
+    """Subtract calendar months without exceeding the target month."""
+    year = d.year
+    month = d.month - months
+    while month <= 0:
+        month += 12
+        year -= 1
+
+    import calendar
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
 def get_historical_candles(
     instrument_key: str,
     interval_minutes: int,
@@ -573,7 +586,15 @@ def get_historical_candles(
 ) -> pd.DataFrame:
     encoded = urllib.parse.quote(instrument_key, safe="")
     end = now_ist().date()
-    start = end - timedelta(days=lookback_days)
+
+    # Upstox V3 historical-candle limits:
+    #   1..15 minute intervals -> max 1 calendar month/request
+    #   >15 minute minute intervals -> max 1 calendar quarter/request
+    # Use calendar-month subtraction instead of a fixed day count.
+    if interval_minutes <= 15:
+        start = _subtract_months(end, 1)
+    else:
+        start = _subtract_months(end, 3)
 
     url = (
         f"{HISTORICAL_V3_URL}/{encoded}/minutes/{interval_minutes}"
