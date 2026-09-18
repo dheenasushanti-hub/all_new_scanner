@@ -1,7 +1,7 @@
 {
   "market_snapshot": {
-    "timestamp": "2026-09-18T11:01:45.809502+05:30",
-    "spot": 74442.81,
+    "timestamp": "2026-09-18T11:04:26.470240+05:30",
+    "spot": 74440.95,
     "future": "SENSEX FUT 24 SEP 26",
     "future_expiry": "2026-09-24",
     "futures_regime": "LONG_BUILDUP",
@@ -10,17 +10,17 @@
     "futures_oi_persistence": 0.0909,
     "futures_live_oi_change": 20.0,
     "chain_predictive_bias": 0,
-    "chain_predictive_strength": 0.1259,
+    "chain_predictive_strength": 0.1212,
     "chain_level_bias": 0,
-    "support_strength": 0.4691,
-    "resistance_strength": 0.3797,
-    "support_change_strength": 0.4347,
-    "resistance_change_strength": 0.6979,
+    "support_strength": 0.4725,
+    "resistance_strength": 0.3793,
+    "support_change_strength": 0.4383,
+    "resistance_change_strength": 0.6954,
     "vwap": 74570.93,
-    "vwap_slope": -0.1873,
+    "vwap_slope": 0.0,
     "direction": "NEUTRAL",
-    "score": 1.525,
-    "confidence": 21.61,
+    "score": 1.53,
+    "confidence": 21.62,
     "support_1": 74400.0,
     "support_2": 74300.0,
     "resistance_1": 74500.0,
@@ -45,7 +45,7 @@
       "option_oi_change": -1.5,
       "chain_predictive": 0.0,
       "chain_levels": 0.0,
-      "chain_wall_imbalance": 0.11625252717810969,
+      "chain_wall_imbalance": 0.12119508207352482,
       "daily_oi": 0.0,
       "change_oi_api": 0.0
     }
@@ -73,9 +73,9 @@
     "theta": -34.497,
     "reversal_confirmations": 0,
     "last_market_direction": "NEUTRAL",
-    "last_market_confidence": 21.61434552706831,
-    "last_ltp": 500.6,
-    "last_monitored_at": "2026-09-18T11:01:46.140353+05:30"
+    "last_market_confidence": 21.619578820486982,
+    "last_ltp": 507.0,
+    "last_monitored_at": "2026-09-18T11:04:27.374889+05:30"
   },
   "last_signal": {
     "timestamp": "2026-09-18 10:16:24 IST",
