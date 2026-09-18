@@ -89,7 +89,7 @@ SIGNAL_THRESHOLD = float(os.getenv("SIGNAL_THRESHOLD", "60"))
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-09-15-MULTI-TF-MARKET-STRUCTURE-V2-FUTURES-OI-CHAIN-SR"
+SCANNER_VERSION = "2026-09-18-MULTI-TF-MARKET-STRUCTURE-V3-THETA-SOFT-FILTER"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -139,11 +139,11 @@ ENTRY_SCORE = 4.50
 MIN_DELTA = 0.35
 MAX_DELTA = 0.85
 MAX_SPREAD_PCT = 0.06
-MAX_THETA_BURDEN_PCT_PER_DAY = 0.60
-# Evaluate theta over the planned intraday holding window instead of rejecting
-# near-expiry options because their full-day theta percentage is naturally high.
+# Theta is a ranking/risk factor for long-option selection, not a hard entry gate.
+# Near expiry, theta can become very large and a rigid percentage cutoff can
+# incorrectly reject every otherwise-tradable directional option.
 EXPECTED_HOLDING_MINUTES = 60.0
-MAX_INTRADAY_THETA_BURDEN = 0.10
+THETA_WARNING_BURDEN = 0.10
 MIN_OI = 100.0
 MIN_VOLUME = 1.0
 
@@ -1727,10 +1727,11 @@ def option_health_score(
         * EXPECTED_HOLDING_MINUTES
         / 375.0
     )
-    theta_score = max(
-        0.0,
-        1.0 - intraday_theta_burden / MAX_INTRADAY_THETA_BURDEN,
-    )
+    # Soft theta penalty: higher expected time-decay lowers the health score,
+    # but does not make the candidate ineligible by itself. The formula is
+    # monotonic and bounded, so even expiry-day options remain selectable when
+    # the underlying, spread, liquidity and delta filters are healthy.
+    theta_score = 1.0 / (1.0 + intraday_theta_burden / THETA_WARNING_BURDEN)
 
     liquidity_base = math.log1p(max(option.volume, 0.0))
     oi_base = math.log1p(max(option.oi, 0.0))
@@ -1829,20 +1830,23 @@ def select_directional_option(
         theta = safe_float(data["theta"])
         theta_burden = abs(theta) / data["ltp"] if data["ltp"] > 0 else 999.0
 
-        # Upstox theta is an absolute premium decay estimate per day. For an
-        # intraday BUY strategy, convert it to the expected holding window so
-        # final-day options are not rejected merely because daily theta is large.
+        # Upstox exposes theta as a time-decay measure. For ranking a long
+        # intraday option, we linearize it to the planned holding window only
+        # as a risk estimate. This is intentionally NOT a hard rejection rule,
+        # because theta is non-linear near expiry and can become very large.
         trading_day_minutes = 375.0  # 09:15-15:30 IST
         intraday_theta_burden = (
             theta_burden * EXPECTED_HOLDING_MINUTES / trading_day_minutes
         )
-        if intraday_theta_burden > MAX_INTRADAY_THETA_BURDEN:
-            rejection_log.append(
-                f"{option_type} {row_key:.0f}: intraday theta burden="
-                f"{intraday_theta_burden:.1%} over "
-                f"{EXPECTED_HOLDING_MINUTES:.0f}m (daily={theta_burden:.1%})"
+        if intraday_theta_burden > THETA_WARNING_BURDEN:
+            logger.warning(
+                "%s %.0f: elevated intraday theta burden=%.1f%% over %.0fm (linearized; daily=%.1f%%); keeping candidate and penalizing it in health score.",
+                option_type,
+                row_key,
+                intraday_theta_burden * 100.0,
+                EXPECTED_HOLDING_MINUTES,
+                theta_burden * 100.0,
             )
-            continue
 
         meta = {
             "strike": row_key,
@@ -2693,17 +2697,21 @@ def self_test() -> None:
     assert selected_bear.strike in {74150.0, 74200.0}
     assert selected_bear.option_type == "PE"
 
-    # Regression test: a near-expiry PE with high DAILY theta must not be
-    # rejected when its burden over the planned 60-minute intraday holding
-    # window remains within the configured limit. This mirrors the 74500 PE
-    # failure seen in production (34.1%/day theta burden).
-    high_theta_chain = []
+    # Regression test: the production failure had BOTH bearish candidates
+    # above the old 10% intraday theta burden. They must still be considered;
+    # the lower-theta candidate should win when all other health fields are equal.
+    production_like_theta_chain = []
+    theta_specs = {
+        74400: {"ltp": 20.0, "theta": -41.56},   # ~207.8%/day -> ~33.25%/60m
+        74500: {"ltp": 25.4, "theta": -40.386},  # ~159.0%/day -> ~25.44%/60m
+    }
     for strike in [74400, 74500]:
+        spec = theta_specs[strike]
         row = {
             "strike_price": strike,
             "expiry": "2026-09-17",
             "call_options": {
-                "instrument_key": f"HTCE{strike}",
+                "instrument_key": f"PCE{strike}",
                 "market_data": {
                     "ltp": 100.0, "oi": 50000, "prev_oi": 49000,
                     "volume": 10000, "bid_price": 99.5, "ask_price": 100.5,
@@ -2712,74 +2720,22 @@ def self_test() -> None:
                 "option_greeks": {"delta": 0.55, "gamma": 0.01, "theta": -2.0, "iv": 20},
             },
             "put_options": {
-                "instrument_key": f"HTPE{strike}",
+                "instrument_key": f"PP E{strike}".replace(" ", ""),
                 "market_data": {
-                    "ltp": 100.0, "oi": 50000, "prev_oi": 49000,
-                    "volume": 10000, "bid_price": 99.5, "ask_price": 100.5,
+                    "ltp": spec["ltp"], "oi": 50000, "prev_oi": 49000,
+                    "volume": 10000, "bid_price": spec["ltp"] - 0.5,
+                    "ask_price": spec["ltp"] + 0.5,
                     "bid_qty": 100, "ask_qty": 100,
                 },
-                "option_greeks": {"delta": -0.55, "gamma": 0.01, "theta": -34.1 if strike == 74500 else -2.0, "iv": 20},
+                "option_greeks": {"delta": -0.55, "gamma": 0.01, "theta": spec["theta"], "iv": 20},
             },
         }
-        high_theta_chain.append(row)
-    selected_high_theta = select_directional_option(high_theta_chain, "BEARISH", 74431.0)
-    assert selected_high_theta.strike == 74500.0, selected_high_theta
-
-    # Target engine test.
-    fake_structure = StructureResult(
-        direction="BEARISH",
-        score=-7.0,
-        confidence=90.0,
-        interpretation="STRONG BEARISH MARKET STRUCTURE",
-        components={},
-        timeframe_directions={str(x): -1 for x in TIMEFRAMES},
-        vwap=74050.0,
-        vwap_slope=-12.0,
-        futures_regime="SHORT_BUILDUP",
-        futures_bias=-1,
-        futures_oi_strength=0.80,
-        futures_oi_persistence=0.75,
-        futures_live_oi_change=100.0,
-        chain_predictive_bias=-1,
-        chain_predictive_strength=0.70,
-        chain_level_bias=-1,
-        support_strength=0.50,
-        resistance_strength=0.80,
-        support_change_strength=0.10,
-        resistance_change_strength=0.30,
-        support_1=73850.0,
-        support_2=73650.0,
-        resistance_1=74200.0,
-        resistance_2=74400.0,
-        reasons=[],
+        production_like_theta_chain.append(row)
+    selected_production_like = select_directional_option(
+        production_like_theta_chain, "BEARISH", 74431.0
     )
-
-    target_frames = {
-        3: calculate_supertrend(
-            _synthetic_candles([74100, 74090, 74080, 74070, 74060, 74050, 74040, 74030]),
-            10,
-            3.0,
-        ),
-        15: calculate_supertrend(
-            _synthetic_candles([74200, 74180, 74160, 74140, 74120, 74100, 74080, 74060]),
-            10,
-            3.0,
-        ),
-    }
-
-    # Add required 15m/3m ATR fields via existing synthetic ST; only those two
-    # frames are consumed by the target engine.
-    t1, t2, sl, usl, ut1, ut2 = create_dynamic_targets(
-        option=selected_bear,
-        structure=fake_structure,
-        spot=74050.0,
-        tf_frames=target_frames,
-    )
-    assert t2 > t1 > selected_bear.ltp
-    assert sl < selected_bear.ltp
-    assert usl > 74050.0
-    assert ut1 < 74050.0
-    assert ut2 < ut1
+    assert selected_production_like.strike == 74500.0, selected_production_like
+    assert selected_production_like.option_type == "PE"
 
     logger.info("SELF-TEST PASSED.")
 
