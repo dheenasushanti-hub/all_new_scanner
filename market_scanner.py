@@ -89,7 +89,7 @@ SIGNAL_THRESHOLD = float(os.getenv("SIGNAL_THRESHOLD", "60"))
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-09-18-MULTI-TF-MARKET-STRUCTURE-V3-THETA-SOFT-FILTER"
+SCANNER_VERSION = "2026-09-18-MULTI-TF-MARKET-STRUCTURE-V4-DYNAMIC-EXPIRY-THETA-SOFT-FILTER"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -1004,31 +1004,79 @@ def futures_price_oi_regime(
 # OPTION CHAIN
 # =============================================================================
 
+def _nearest_active_option_expiry() -> str:
+    """Return the nearest non-expired SENSEX option expiry available to Upstox."""
+    payload = api_get(
+        OPTION_CONTRACT_URL,
+        {"instrument_key": SENSEX_KEY},
+        retries=4,
+    )
+    contracts = payload.get("data", [])
+
+    if not isinstance(contracts, list) or not contracts:
+        raise ScannerError("No active SENSEX option contracts returned by Upstox.")
+
+    today = now_ist().date()
+    future_expiries: list[date] = []
+
+    for contract in contracts:
+        if not isinstance(contract, dict):
+            continue
+        expiry = parse_date(str(contract.get("expiry", "")))
+        if expiry is not None and expiry >= today:
+            future_expiries.append(expiry)
+
+    if not future_expiries:
+        raise ScannerError(
+            f"No active SENSEX option expiry found on or after {today.isoformat()}."
+        )
+
+    selected = min(future_expiries)
+    logger.info(
+        "Selected nearest active SENSEX option expiry: %s",
+        selected.isoformat(),
+    )
+    return selected.isoformat()
+
+
 def get_option_chain() -> tuple[str, list[dict[str, Any]]]:
     """
-    Use the relative current_week keyword directly supported by Upstox V2.
+    Load the nearest active SENSEX option expiry and then request its chain.
+
+    We intentionally do not use Upstox's relative ``current_week`` keyword
+    here. On the trading day immediately after a weekly expiry, that keyword
+    can resolve to a completed week and the chain may be empty. Resolving the
+    nearest active expiry from the option-contract endpoint makes the scanner
+    roll automatically from (for example) 17-Sep to 24-Sep.
     """
+    expiry = _nearest_active_option_expiry()
+
     payload = api_get(
         OPTION_CHAIN_URL,
         {
             "instrument_key": SENSEX_KEY,
-            "expiry_date": "current_week",
+            "expiry_date": expiry,
         },
         retries=4,
     )
     data = payload.get("data", [])
 
     if not isinstance(data, list) or not data:
-        raise ScannerError("Current-week SENSEX option chain is empty.")
+        raise ScannerError(
+            f"SENSEX option chain is empty for active expiry {expiry}."
+        )
 
-    expiries = sorted(
-        {
-            str(row.get("expiry", ""))[:10]
-            for row in data
-            if isinstance(row, dict) and row.get("expiry")
-        }
-    )
-    expiry = expiries[0] if expiries else "CURRENT_WEEK"
+    # Guard against an unexpected mixed-expiry response.
+    normalized_expiry = expiry[:10]
+    filtered = [
+        row
+        for row in data
+        if isinstance(row, dict)
+        and str(row.get("expiry", ""))[:10] == normalized_expiry
+    ]
+
+    if filtered:
+        data = filtered
 
     logger.info(
         "Loaded option chain: expiry=%s rows=%d",
@@ -2736,6 +2784,41 @@ def self_test() -> None:
     )
     assert selected_production_like.strike == 74500.0, selected_production_like
     assert selected_production_like.option_type == "PE"
+
+    # Regression test: the day after the 17-Sep weekly expiry,
+    # "current_week" must not be allowed to resolve to an expired/empty week.
+    # The scanner must discover and select the nearest active expiry instead.
+    original_api_get = api_get
+    original_now_ist = now_ist
+
+    def _fake_expiry_api_get(
+        url: str,
+        params: Optional[dict[str, Any]] = None,
+        retries: int = 3,
+    ) -> dict[str, Any]:
+        assert url == OPTION_CONTRACT_URL
+        assert params == {"instrument_key": SENSEX_KEY}
+        return {
+            "status": "success",
+            "data": [
+                {"expiry": "2026-09-17", "instrument_type": "CE"},
+                {"expiry": "2026-09-17", "instrument_type": "PE"},
+                {"expiry": "2026-09-24", "instrument_type": "CE"},
+                {"expiry": "2026-09-24", "instrument_type": "PE"},
+                {"expiry": "2026-10-01", "instrument_type": "CE"},
+            ],
+        }
+
+    def _fake_now_ist() -> datetime:
+        return datetime(2026, 9, 18, 10, 11, tzinfo=IST)
+
+    try:
+        globals()["api_get"] = _fake_expiry_api_get
+        globals()["now_ist"] = _fake_now_ist
+        assert _nearest_active_option_expiry() == "2026-09-24"
+    finally:
+        globals()["api_get"] = original_api_get
+        globals()["now_ist"] = original_now_ist
 
     logger.info("SELF-TEST PASSED.")
 
