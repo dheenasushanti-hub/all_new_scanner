@@ -89,7 +89,7 @@ SIGNAL_THRESHOLD = float(os.getenv("SIGNAL_THRESHOLD", "60"))
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-09-18-MULTI-TF-MARKET-STRUCTURE-V4-DYNAMIC-EXPIRY-THETA-SOFT-FILTER"
+SCANNER_VERSION = "2026-09-21-MULTI-TF-MARKET-STRUCTURE-V5-TREND-FIRST-VWAP-ROBUST"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -134,6 +134,17 @@ FUTURES_LIVE_OI_WEIGHT = 0.35
 
 MIN_DIRECTIONAL_COMPONENTS = 4
 ENTRY_SCORE = 4.50
+
+# Trend-first decision engine.
+# The scanner must not let a slowly changing option-chain wall or a higher
+# timeframe Supertrend veto a clear intraday reversal.
+INTRADAY_LOOKBACK_BARS = 8
+INTRADAY_RECENT_BARS = 3
+INTRADAY_TREND_TRIGGER = 0.75
+CORE_BULL_TRIGGER = 2.50
+CORE_BEAR_TRIGGER = -2.50
+POSITIONING_HARD_OPPOSITE_STRENGTH = 0.65
+
 
 # Strike health.
 MIN_DELTA = 0.35
@@ -224,6 +235,9 @@ class StructureResult:
     futures_oi_strength: float
     futures_oi_persistence: float
     futures_live_oi_change: float
+    intraday_bias: int
+    intraday_strength: float
+    intraday_score: float
     chain_predictive_bias: int
     chain_predictive_strength: float
     chain_level_bias: int
@@ -1383,25 +1397,154 @@ def get_change_oi_confirmation(expiry: str) -> tuple[int, float]:
 def vwap_snapshot(
     futures_session: pd.DataFrame,
 ) -> tuple[float, float, int]:
-    if futures_session.empty:
+    """
+    Build the current-session futures VWAP.
+
+    Opening-minute robustness:
+      * one valid current-session candle is enough to produce a valid VWAP;
+      * the VWAP slope is 0.0 until a second value exists;
+      * no previous-session candle is mixed into the session VWAP.
+
+    This prevents the 09:15-09:18 startup window from failing simply because
+    only one live 3-minute candle is available.
+    """
+    if futures_session is None or futures_session.empty:
         raise ScannerError("Futures session candles unavailable for VWAP.")
 
-    vwap = calculate_vwap(futures_session).dropna()
-    if len(vwap) < 2:
-        raise ScannerError("Insufficient Futures VWAP values.")
+    work = futures_session.copy()
+    required = {"timestamp", "high", "low", "close", "volume"}
+    missing = required.difference(work.columns)
+    if missing:
+        raise ScannerError(
+            f"Futures session candles missing VWAP columns: {sorted(missing)}"
+        )
 
-    current_vwap = float(vwap.iloc[-1])
-    prior_vwap = float(vwap.iloc[-2])
-    slope = current_vwap - prior_vwap
+    for col in ("high", "low", "close", "volume"):
+        work[col] = pd.to_numeric(work[col], errors="coerce")
 
-    price = float(futures_session["close"].iloc[-1])
+    work = (
+        work.dropna(subset=["timestamp", "high", "low", "close"])
+        .sort_values("timestamp")
+        .drop_duplicates("timestamp", keep="last")
+        .reset_index(drop=True)
+    )
+    if work.empty:
+        raise ScannerError("No valid Futures session candles available for VWAP.")
+
+    vwap_series = calculate_vwap(work).replace([np.inf, -np.inf], np.nan).dropna()
+    if vwap_series.empty:
+        raise ScannerError("Unable to calculate Futures VWAP.")
+
+    current_vwap = float(vwap_series.iloc[-1])
+
+    # A single opening candle has a valid VWAP, but not a measurable slope.
+    if len(vwap_series) >= 2:
+        prior_vwap = float(vwap_series.iloc[-2])
+        slope = current_vwap - prior_vwap
+    else:
+        slope = 0.0
+
+    price = float(work["close"].iloc[-1])
     level_bias = 1 if price > current_vwap else -1 if price < current_vwap else 0
 
     logger.info(
-        "VWAP: price=%.2f vwap=%.2f slope=%+.2f level_bias=%+d",
-        price, current_vwap, slope, level_bias,
+        "VWAP: price=%.2f vwap=%.2f slope=%+.2f level_bias=%+d bars=%d",
+        price,
+        current_vwap,
+        slope,
+        level_bias,
+        len(vwap_series),
     )
     return current_vwap, slope, level_bias
+
+
+def intraday_trend_snapshot(
+    futures_session: pd.DataFrame,
+    vwap: float,
+) -> tuple[int, float, float]:
+    """
+    Measure fast intraday direction independently of slow option walls.
+
+    Inputs are current-session futures candles. The score combines:
+      - 8-bar net price movement normalized by ATR,
+      - very recent 3-bar movement,
+      - higher-high / higher-low or lower-high / lower-low structure,
+      - current price versus VWAP.
+
+    Returns (bias, strength, raw_score).
+    """
+    if futures_session is None or futures_session.empty:
+        return 0, 0.0, 0.0
+
+    work = futures_session.copy()
+    for col in ("high", "low", "close"):
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    work = work.dropna(subset=["high", "low", "close"]).sort_values("timestamp")
+    closes = work["close"].tail(INTRADAY_LOOKBACK_BARS)
+    if len(closes) < 3:
+        return 0, 0.0, 0.0
+
+    atr = calculate_atr(work).dropna()
+    atr_value = max(
+        float(atr.iloc[-1]) if not atr.empty and math.isfinite(float(atr.iloc[-1])) else 0.0,
+        1.0,
+    )
+
+    net_move = float(closes.iloc[-1] - closes.iloc[0])
+    recent_count = min(INTRADAY_RECENT_BARS + 1, len(closes))
+    recent_move = float(closes.iloc[-1] - closes.iloc[-recent_count])
+
+    recent = work.tail(min(INTRADAY_LOOKBACK_BARS, len(work)))
+    split = max(1, len(recent) // 2)
+    early = recent.iloc[:split]
+    late = recent.iloc[-split:]
+
+    higher_structure = (
+        float(late["high"].mean()) > float(early["high"].mean())
+        and float(late["low"].mean()) > float(early["low"].mean())
+    )
+    lower_structure = (
+        float(late["high"].mean()) < float(early["high"].mean())
+        and float(late["low"].mean()) < float(early["low"].mean())
+    )
+
+    price = float(closes.iloc[-1])
+    vwap_bias = 1 if price > vwap else -1 if price < vwap else 0
+
+    # Bounded contributions keep one abnormal move from dominating the engine.
+    net_component = math.tanh(net_move / (1.25 * atr_value))
+    recent_component = math.tanh(recent_move / (0.90 * atr_value))
+    structure_component = 1.0 if higher_structure else -1.0 if lower_structure else 0.0
+
+    raw_score = (
+        1.55 * net_component
+        + 1.25 * recent_component
+        + 0.75 * structure_component
+        + 0.60 * vwap_bias
+    )
+
+    bias = (
+        1 if raw_score >= INTRADAY_TREND_TRIGGER
+        else -1 if raw_score <= -INTRADAY_TREND_TRIGGER
+        else 0
+    )
+    strength = min(abs(raw_score) / 3.50, 1.0)
+
+    logger.info(
+        "INTRADAY TREND: bias=%+d strength=%.3f score=%+.2f "
+        "net_%dbars=%+.2f recent_%dbars=%+.2f structure=%s vwap_bias=%+d",
+        bias,
+        strength,
+        raw_score,
+        len(closes) - 1,
+        net_move,
+        recent_count - 1,
+        recent_move,
+        "HH_HL" if higher_structure else "LH_LL" if lower_structure else "MIXED",
+        vwap_bias,
+    )
+    return bias, float(strength), float(raw_score)
 
 
 def timeframe_snapshot(
@@ -1465,8 +1608,22 @@ def build_market_structure(
     change_oi_score: float,
     futures_live_quote: Optional[dict[str, Any]] = None,
 ) -> StructureResult:
-    """Build the market regime with explicit Futures-OI and chain-S/R confirmation."""
+    """
+    Trend-first market-structure engine.
+
+    Design:
+      1. Fast intraday price action + 3m/15m structure + VWAP establish the
+         directional core.
+      2. Futures OI, option-chain OI and daily/change-OI confirm or weaken it.
+      3. 60/120/180m Supertrends provide context but do not veto a clear
+         intraday reversal.
+      4. A strong opposite chain wall is a caution, not an automatic veto.
+    """
     vwap, vwap_slope, vwap_level_bias = vwap_snapshot(futures_session)
+    intraday_bias, intraday_strength, intraday_score = intraday_trend_snapshot(
+        futures_session,
+        vwap,
+    )
     futures_info = futures_oi_structure(futures_3m, futures_live_quote)
     futures_regime = str(futures_info["regime"])
     futures_bias = int(futures_info["bias"])
@@ -1476,138 +1633,235 @@ def build_market_structure(
     structure_3_bias = 1 if structure_3 == "BULLISH" else -1 if structure_3 == "BEARISH" else 0
     structure_15_bias = 1 if structure_15 == "BULLISH" else -1 if structure_15 == "BEARISH" else 0
 
-    components: dict[str, float] = {}
-    components["vwap_level"] = W_VWAP_LEVEL * vwap_level_bias
-
     atr3 = max(safe_float(tf_frames[3]["atr"].iloc[-1]), 1.0)
     slope_threshold = max(0.20, atr3 * 0.03)
-    vwap_slope_bias = 1 if vwap_slope > slope_threshold else -1 if vwap_slope < -slope_threshold else 0
-    components["vwap_slope"] = W_VWAP_SLOPE * vwap_slope_bias
+    vwap_slope_bias = (
+        1 if vwap_slope > slope_threshold
+        else -1 if vwap_slope < -slope_threshold
+        else 0
+    )
 
-    # Futures OI remains one of the largest components.
-    components["futures"] = W_FUTURES * futures_bias * max(0.75, futures_info["oi_strength"])
-    components["futures_oi_strength"] = 1.25 * futures_info["oi_strength"] * futures_bias
-
-    components["structure_3m"] = W_PRICE_STRUCTURE_3 * structure_3_bias
-    components["structure_15m"] = W_PRICE_STRUCTURE_15 * structure_15_bias
-
-    tf_component = sum(TF_WEIGHTS[tf] * tf_directions.get(tf, 0) for tf in TIMEFRAMES)
-    components["multi_tf_supertrend"] = tf_component
-
-    chain_bias = int(chain_levels["oi_bias"])
-    chain_change_bias = int(chain_levels["change_bias"])
+    chain_bias = int(chain_levels.get("oi_bias", 0))
+    chain_change_bias = int(chain_levels.get("change_bias", 0))
     chain_predictive_bias = int(chain_levels.get("predictive_bias", 0))
     chain_predictive_strength = float(chain_levels.get("predictive_strength", 0.0))
     chain_level_bias = int(chain_levels.get("level_bias", 0))
-    components["option_oi"] = W_OPTION_OI * chain_bias
-    components["option_oi_change"] = W_OPTION_OI_CHANGE * chain_change_bias
-    components["chain_predictive"] = 2.20 * chain_predictive_bias * max(0.50, chain_predictive_strength)
-    components["chain_levels"] = W_CHAIN_LEVELS * chain_level_bias
-    components["chain_wall_imbalance"] = 1.30 * (
-        float(chain_levels.get("support_strength", 0.0)) -
-        float(chain_levels.get("resistance_strength", 0.0))
+
+    # -------------------------------------------------------------------------
+    # Directional core: price/VWAP action is deliberately stronger than slow
+    # positioning inputs.
+    # -------------------------------------------------------------------------
+    structure_30_bias = tf_directions.get(30, 0)
+    core_components = {
+        "intraday_trend": 3.40 * intraday_bias * max(0.55, intraday_strength),
+        "vwap_level": 2.40 * vwap_level_bias,
+        "vwap_slope": 1.40 * vwap_slope_bias,
+        "structure_3m": 2.00 * structure_3_bias,
+        "structure_15m": 1.80 * structure_15_bias,
+        "structure_30m": 1.20 * structure_30_bias,
+    }
+    core_score = float(sum(core_components.values()))
+
+    # -------------------------------------------------------------------------
+    # Context/confirmation: useful, but cannot erase a strong intraday reversal
+    # merely because a slow OI wall has not caught up yet.
+    # -------------------------------------------------------------------------
+    tf_component = sum(
+        TF_WEIGHTS[tf] * tf_directions.get(tf, 0)
+        for tf in TIMEFRAMES
     )
+    futures_component = 2.00 * futures_bias * max(0.65, float(futures_info["oi_strength"]))
+    chain_component = 1.10 * chain_predictive_bias * max(
+        0.45, chain_predictive_strength
+    )
+    chain_level_component = 0.70 * chain_level_bias
+    option_oi_component = 0.65 * chain_bias
+    option_change_component = 0.65 * chain_change_bias
+    daily_oi_component = 0.45 * int(daily_oi_bias)
+    change_api_component = 0.45 * int(change_oi_bias)
 
-    components["daily_oi"] = 0.60 * daily_oi_bias
-    components["change_oi_api"] = 0.75 * change_oi_bias
+    context_components = {
+        "futures": futures_component,
+        "multi_tf_supertrend": 0.55 * tf_component,
+        "chain_predictive": chain_component,
+        "chain_levels": chain_level_component,
+        "option_oi": option_oi_component,
+        "option_oi_change": option_change_component,
+        "daily_oi": daily_oi_component,
+        "change_oi_api": change_api_component,
+        "chain_wall_imbalance": 0.75 * (
+            float(chain_levels.get("support_strength", 0.0))
+            - float(chain_levels.get("resistance_strength", 0.0))
+        ),
+    }
 
-    support_1 = float(chain_levels["support_1"])
-    support_2 = float(chain_levels["support_2"])
-    resistance_1 = float(chain_levels["resistance_1"])
-    resistance_2 = float(chain_levels["resistance_2"])
+    components: dict[str, float] = {}
+    components.update(core_components)
+    components.update(context_components)
+    components["futures_oi_strength"] = 0.80 * futures_info["oi_strength"] * futures_bias
+    total_score = float(sum(components.values()))
 
     directional_groups = [
-        vwap_level_bias, vwap_slope_bias, futures_bias,
-        structure_3_bias, structure_15_bias,
+        intraday_bias,
+        vwap_level_bias,
+        vwap_slope_bias,
+        structure_3_bias,
+        structure_15_bias,
+        futures_bias,
         *[tf_directions.get(tf, 0) for tf in TIMEFRAMES],
-        chain_bias, chain_change_bias, chain_predictive_bias,
-        chain_level_bias, daily_oi_bias, change_oi_bias,
+        chain_bias,
+        chain_change_bias,
+        chain_predictive_bias,
+        chain_level_bias,
+        daily_oi_bias,
+        change_oi_bias,
     ]
     bullish_groups = sum(x > 0 for x in directional_groups)
     bearish_groups = sum(x < 0 for x in directional_groups)
-    total_score = float(sum(components.values()))
 
-    # Explicit predictive confirmations: Futures OI + chain S/R must participate
-    # in the final direction instead of merely adding fractional score.
-    futures_bear_confirmed = (
-        futures_bias < 0
-        and futures_info["oi_strength"] >= FUTURES_OI_STRENGTH_THRESHOLD
+    # -------------------------------------------------------------------------
+    # Explicit core trigger.
+    # A direction is eligible when the fast trend is aligned with VWAP or
+    # VWAP slope and at least one of 3m/15m structure agrees.
+    # -------------------------------------------------------------------------
+    fast_bull_votes = sum(x > 0 for x in (structure_3_bias, structure_15_bias, structure_30_bias))
+    fast_bear_votes = sum(x < 0 for x in (structure_3_bias, structure_15_bias, structure_30_bias))
+
+    bull_price_core = (
+        intraday_bias > 0
+        and fast_bull_votes >= 2
         and (
-            futures_regime == "SHORT_BUILDUP"
-            or futures_info["oi_persistence"] >= FUTURES_OI_MIN_PERSISTENCE
+            vwap_level_bias > 0
+            or vwap_slope_bias > 0
+            or (fast_bull_votes == 3 and intraday_strength >= 0.60)
         )
     )
-    futures_bull_confirmed = (
+    bear_price_core = (
+        intraday_bias < 0
+        and fast_bear_votes >= 2
+        and (
+            vwap_level_bias < 0
+            or vwap_slope_bias < 0
+            or (fast_bear_votes == 3 and intraday_strength >= 0.60)
+        )
+    )
+
+    # Short-covering is explicitly bullish; long-unwinding is explicitly bearish.
+    bullish_futures_confirmation = (
         futures_bias > 0
         and futures_info["oi_strength"] >= FUTURES_OI_STRENGTH_THRESHOLD
         and (
-            futures_regime == "LONG_BUILDUP"
-            or futures_info["oi_persistence"] >= FUTURES_OI_MIN_PERSISTENCE
+            futures_regime in {"LONG_BUILDUP", "SHORT_COVERING"}
+            or futures_info["oi_persistence"] >= 0.35
+        )
+    )
+    bearish_futures_confirmation = (
+        futures_bias < 0
+        and futures_info["oi_strength"] >= FUTURES_OI_STRENGTH_THRESHOLD
+        and (
+            futures_regime in {"SHORT_BUILDUP", "LONG_UNWINDING"}
+            or futures_info["oi_persistence"] >= 0.35
         )
     )
 
-    chain_bear_confirmed = (
+    bullish_confirmation_count = sum(
+        [
+            bullish_futures_confirmation,
+            chain_predictive_bias > 0 and chain_predictive_strength >= 0.15,
+            chain_level_bias > 0,
+            daily_oi_bias > 0,
+            change_oi_bias > 0,
+        ]
+    )
+    bearish_confirmation_count = sum(
+        [
+            bearish_futures_confirmation,
+            chain_predictive_bias < 0 and chain_predictive_strength >= 0.15,
+            chain_level_bias < 0,
+            daily_oi_bias < 0,
+            change_oi_bias < 0,
+        ]
+    )
+
+    # A strong opposite positioning signal lowers confidence but does not veto
+    # an already-established intraday price trend. The exception is a very
+    # strong positioning conflict combined with weak price-core evidence.
+    strong_opposite_to_bull = (
         chain_predictive_bias < 0
-        and chain_predictive_strength >= CHAIN_PREDICTIVE_STRENGTH_THRESHOLD
-    ) or chain_level_bias < 0
-    chain_bull_confirmed = (
+        and chain_predictive_strength >= POSITIONING_HARD_OPPOSITE_STRENGTH
+        and intraday_strength < 0.70
+        and structure_3_bias <= 0
+    )
+    strong_opposite_to_bear = (
         chain_predictive_bias > 0
-        and chain_predictive_strength >= CHAIN_PREDICTIVE_STRENGTH_THRESHOLD
-    ) or chain_level_bias > 0
-
-    short_term_bear = (
-        vwap_level_bias < 0
-        and futures_bias < 0
-        and (structure_3_bias < 0 or tf_directions.get(3, 0) < 0)
-    )
-    short_term_bull = (
-        vwap_level_bias > 0
-        and futures_bias > 0
-        and (structure_3_bias > 0 or tf_directions.get(3, 0) > 0)
+        and chain_predictive_strength >= POSITIONING_HARD_OPPOSITE_STRENGTH
+        and intraday_strength < 0.70
+        and structure_3_bias >= 0
     )
 
-    bearish_evidence = bearish_groups >= MIN_DIRECTIONAL_COMPONENTS
-    bullish_evidence = bullish_groups >= MIN_DIRECTIONAL_COMPONENTS
+    bullish_trigger = (
+        bull_price_core
+        and core_score >= CORE_BULL_TRIGGER
+        and (
+            bullish_confirmation_count >= 1
+            or intraday_strength >= 0.75
+        )
+        and not strong_opposite_to_bull
+    )
+    bearish_trigger = (
+        bear_price_core
+        and core_score <= CORE_BEAR_TRIGGER
+        and (
+            bearish_confirmation_count >= 1
+            or intraday_strength >= 0.75
+        )
+        and not strong_opposite_to_bear
+    )
 
-    # Chain is a confirmation, not an absolute veto when the walls themselves
-    # are neutral. A strong opposite chain signal, however, blocks entry.
-    chain_strong_opposite_to_bear = chain_predictive_bias > 0 and chain_predictive_strength >= 0.30 and chain_level_bias > 0
-    chain_strong_opposite_to_bull = chain_predictive_bias < 0 and chain_predictive_strength >= 0.30 and chain_level_bias < 0
-
-    if (
-        total_score <= -ENTRY_SCORE
-        and bearish_evidence
-        and short_term_bear
-        and futures_bear_confirmed
-        and (chain_bear_confirmed or chain_predictive_bias == 0)
-        and not chain_strong_opposite_to_bear
-    ):
-        direction = "BEARISH"
-    elif (
-        total_score >= ENTRY_SCORE
-        and bullish_evidence
-        and short_term_bull
-        and futures_bull_confirmed
-        and (chain_bull_confirmed or chain_predictive_bias == 0)
-        and not chain_strong_opposite_to_bull
-    ):
+    # Fallback for decisive multi-factor moves even when one core input is
+    # temporarily stale/missing.
+    if bullish_trigger:
         direction = "BULLISH"
+    elif bearish_trigger:
+        direction = "BEARISH"
+    elif total_score >= ENTRY_SCORE and bullish_groups >= MIN_DIRECTIONAL_COMPONENTS and intraday_bias > 0:
+        direction = "BULLISH"
+    elif total_score <= -ENTRY_SCORE and bearish_groups >= MIN_DIRECTIONAL_COMPONENTS and intraday_bias < 0:
+        direction = "BEARISH"
     else:
         direction = "NEUTRAL"
 
-    max_groups = max(bullish_groups, bearish_groups, 1)
-    alignment = max_groups / len(directional_groups)
-    magnitude = min(abs(total_score) / 10.0, 1.0)
-    predictive_bonus = min(
-        0.15,
-        0.05 * int(futures_bear_confirmed or futures_bull_confirmed) +
-        0.05 * int(chain_bear_confirmed or chain_bull_confirmed),
+    # Confidence is based on evidence supporting the selected direction.
+    selected_groups = bullish_groups if direction == "BULLISH" else bearish_groups if direction == "BEARISH" else max(bullish_groups, bearish_groups)
+    alignment = selected_groups / max(len(directional_groups), 1)
+
+    core_magnitude = min(abs(core_score) / 8.0, 1.0)
+    total_magnitude = min(abs(total_score) / 12.0, 1.0)
+    confirmation_factor = min(
+        1.0,
+        (
+            bullish_confirmation_count if direction == "BULLISH"
+            else bearish_confirmation_count if direction == "BEARISH"
+            else 0
+        ) / 3.0,
     )
-    confidence = (
-        50.0 + 28.0 * magnitude + 22.0 * alignment + 10.0 * predictive_bonus
-        if direction != "NEUTRAL"
-        else 20.0 + 30.0 * alignment * magnitude
-    )
+
+    if direction != "NEUTRAL":
+        confidence = (
+            46.0
+            + 22.0 * core_magnitude
+            + 12.0 * intraday_strength
+            + 10.0 * alignment
+            + 10.0 * confirmation_factor
+        )
+    else:
+        confidence = (
+            15.0
+            + 24.0 * core_magnitude
+            + 16.0 * total_magnitude
+            + 15.0 * alignment
+        )
+
     confidence = min(99.0, max(0.0, confidence))
 
     interpretation = (
@@ -1618,33 +1872,51 @@ def build_market_structure(
         "WAIT / MIXED MARKET STRUCTURE"
     )
 
+    support_1 = float(chain_levels["support_1"])
+    support_2 = float(chain_levels["support_2"])
+    resistance_1 = float(chain_levels["resistance_1"])
+    resistance_2 = float(chain_levels["resistance_2"])
+
     reasons: list[str] = [
+        f"Intraday trend engine: bias={intraday_bias:+d}; strength={intraday_strength:.3f}; raw_score={intraday_score:+.2f}.",
+        f"Fast directional core score={core_score:+.2f}; total market score={total_score:+.2f}.",
         f"Futures OI engine: regime={futures_regime}; price_delta={futures_info['price_delta']:+.2f}; OI_delta={futures_info['oi_delta']:+.0f}; persistence={futures_info['oi_persistence']:.2f}; strength={futures_info['oi_strength']:.3f}.",
         f"Futures live OI change versus last completed candle={futures_info['live_oi_change']:+.0f}.",
         f"Spot={spot:.2f}; Futures VWAP={vwap:.2f}; VWAP slope={vwap_slope:+.2f}.",
-        f"3m structure={structure_3}; 15m structure={structure_15}.",
+        f"Fast structure: 3m={structure_3}; 15m={structure_15}; 30m={'BULLISH' if structure_30_bias > 0 else 'BEARISH' if structure_30_bias < 0 else 'NEUTRAL'}.",
         "Multi-timeframe Supertrend=" + ", ".join(
             f"{tf}m:{'BULL' if tf_directions.get(tf,0)>0 else 'BEAR' if tf_directions.get(tf,0)<0 else 'NEUTRAL'}"
             for tf in TIMEFRAMES
         ),
         f"Option-chain walls: support={support_1:.0f}/{support_2:.0f}; resistance={resistance_1:.0f}/{resistance_2:.0f}.",
-        f"Chain wall strength: support={chain_levels.get('support_strength',0.0):.3f}; resistance={chain_levels.get('resistance_strength',0.0):.3f}.",
-        f"Chain wall change strength: support={chain_levels.get('support_change_strength',0.0):.3f}; resistance={chain_levels.get('resistance_change_strength',0.0):.3f}.",
         f"Chain predictive bias={chain_predictive_bias:+d}; strength={chain_predictive_strength:.3f}; level_bias={chain_level_bias:+d}.",
         f"Daily OI API bias={daily_oi_bias:+d} score={daily_oi_score:+.3f}; Change-OI API bias={change_oi_bias:+d} score={change_oi_score:+.3f}.",
-        f"Explicit confirmations: FuturesOI bear={futures_bear_confirmed}, bull={futures_bull_confirmed}; Chain bear={chain_bear_confirmed}, bull={chain_bull_confirmed}.",
-        f"Directional groups bullish={bullish_groups}, bearish={bearish_groups}; total score={total_score:+.2f}.",
+        f"Bull confirmations={bullish_confirmation_count}; bear confirmations={bearish_confirmation_count}.",
+        f"Directional groups bullish={bullish_groups}, bearish={bearish_groups}.",
+        "Decision hierarchy: intraday price/VWAP core first; derivatives positioning confirms and does not veto a strong intraday reversal unless price-core evidence is weak.",
     ]
 
     logger.info(
-        "MARKET STRUCTURE V2: score=%+.2f direction=%s confidence=%.1f | "
-        "Futures=%s OI_strength=%.3f | ChainPred=%+d/%0.3f | "
-        "VWAP=%s | TF=%s",
-        total_score, direction, confidence, futures_regime,
-        futures_info["oi_strength"], chain_predictive_bias,
+        "MARKET STRUCTURE V3: score=%+.2f core=%+.2f direction=%s confidence=%.1f | "
+        "Intraday=%+d/%.3f Futures=%s/%.3f ChainPred=%+d/%.3f VWAP=%s | TF=%s | "
+        "BullConf=%d BearConf=%d",
+        total_score,
+        core_score,
+        direction,
+        confidence,
+        intraday_bias,
+        intraday_strength,
+        futures_regime,
+        futures_info["oi_strength"],
+        chain_predictive_bias,
         chain_predictive_strength,
         "ABOVE" if vwap_level_bias > 0 else "BELOW" if vwap_level_bias < 0 else "AT",
-        ",".join(f"{tf}:{'B' if tf_directions.get(tf,0)>0 else 'S' if tf_directions.get(tf,0)<0 else 'N'}" for tf in TIMEFRAMES),
+        ",".join(
+            f"{tf}:{'B' if tf_directions.get(tf,0)>0 else 'S' if tf_directions.get(tf,0)<0 else 'N'}"
+            for tf in TIMEFRAMES
+        ),
+        bullish_confirmation_count,
+        bearish_confirmation_count,
     )
 
     return StructureResult(
@@ -1661,6 +1933,9 @@ def build_market_structure(
         futures_oi_strength=float(futures_info["oi_strength"]),
         futures_oi_persistence=float(futures_info["oi_persistence"]),
         futures_live_oi_change=float(futures_info["live_oi_change"]),
+        intraday_bias=int(intraday_bias),
+        intraday_strength=float(intraday_strength),
+        intraday_score=float(intraday_score),
         chain_predictive_bias=chain_predictive_bias,
         chain_predictive_strength=chain_predictive_strength,
         chain_level_bias=chain_level_bias,
@@ -2441,6 +2716,9 @@ def execute_scan(
         "futures_oi_strength": round(structure.futures_oi_strength, 4),
         "futures_oi_persistence": round(structure.futures_oi_persistence, 4),
         "futures_live_oi_change": round(structure.futures_live_oi_change, 2) if math.isfinite(structure.futures_live_oi_change) else None,
+        "intraday_bias": structure.intraday_bias,
+        "intraday_strength": round(structure.intraday_strength, 4),
+        "intraday_score": round(structure.intraday_score, 4),
         "chain_predictive_bias": structure.chain_predictive_bias,
         "chain_predictive_strength": round(structure.chain_predictive_strength, 4),
         "chain_level_bias": structure.chain_level_bias,
@@ -2785,6 +3063,63 @@ def self_test() -> None:
     assert selected_production_like.strike == 74500.0, selected_production_like
     assert selected_production_like.option_type == "PE"
 
+    # Regression test: first opening candle must still produce VWAP.
+    opening_one_bar = _synthetic_candles([100.0])  # exactly one session value
+    opening_vwap, opening_slope, opening_bias = vwap_snapshot(opening_one_bar)
+    assert math.isfinite(opening_vwap)
+    assert opening_slope == 0.0
+    assert opening_bias == 0
+
+    # Regression test: a clear intraday bullish reversal must not be vetoed by
+    # slow bearish higher-timeframe context or a bearish option-chain wall.
+    bull_session = _synthetic_candles(
+        [100, 99.5, 99.8, 100.4, 101.2, 102.1, 103.0, 104.2, 105.0, 106.0, 106.8, 107.5],
+        [1200, 1195, 1190, 1185, 1180, 1175, 1170, 1165, 1160, 1155, 1150, 1145],
+    )
+    bull_frames = {
+        3: calculate_supertrend(_synthetic_candles([95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106]), 10, 3.0),
+        15: calculate_supertrend(_synthetic_candles([95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106]), 10, 3.0),
+        30: calculate_supertrend(_synthetic_candles([95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106]), 10, 3.0),
+        60: st_down,
+        120: st_down,
+        180: st_down,
+    }
+    bull_tf_dirs = {3: 1, 15: 1, 30: 1, 60: -1, 120: -1, 180: -1}
+    bull_chain_levels = {
+        "support_1": 104.0,
+        "support_2": 102.0,
+        "resistance_1": 108.0,
+        "resistance_2": 110.0,
+        "oi_bias": -1,
+        "change_bias": 0,
+        "predictive_bias": -1,
+        "predictive_strength": 0.36,
+        "level_bias": -1,
+        "support_strength": 0.20,
+        "resistance_strength": 0.48,
+        "support_change_strength": 0.10,
+        "resistance_change_strength": 0.30,
+    }
+    bull_structure = build_market_structure(
+        spot=107.5,
+        futures_3m=bull_session,
+        futures_session=bull_session,
+        tf_frames=bull_frames,
+        tf_directions=bull_tf_dirs,
+        chain_levels=bull_chain_levels,
+        daily_oi_bias=1,
+        daily_oi_score=0.10,
+        change_oi_bias=0,
+        change_oi_score=0.0,
+        futures_live_quote={"oi": 1140},
+    )
+    assert bull_structure.direction == "BULLISH", bull_structure
+    assert bull_structure.intraday_bias == 1
+    assert bull_structure.intraday_strength > 0.50
+
+    # The supplied production logs show a bullish short-covering/reversal state:
+    # 3m/15m/30m bullish + VWAP above + SHORT_COVERING. It must be eligible even
+    # when a bearish chain wall is still present.
     # Regression test: the day after the 17-Sep weekly expiry,
     # "current_week" must not be allowed to resolve to an expired/empty week.
     # The scanner must discover and select the nearest active expiry instead.
