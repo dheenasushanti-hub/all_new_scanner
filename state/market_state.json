@@ -1,29 +1,29 @@
 {
   "market_snapshot": {
-    "timestamp": "2026-09-22T09:55:24.367993+05:30",
-    "spot": 74973.6,
+    "timestamp": "2026-09-22T09:58:27.002163+05:30",
+    "spot": 74968.79,
     "future": "SENSEX FUT 24 SEP 26",
     "future_expiry": "2026-09-24",
     "futures_regime": "SHORT_COVERING",
     "futures_bias": 1,
-    "futures_oi_strength": 0.4,
+    "futures_oi_strength": 0.4001,
     "futures_oi_persistence": 0.0,
     "futures_live_oi_change": 0.0,
     "intraday_bias": 1,
-    "intraday_strength": 0.853,
-    "intraday_score": 2.9853,
+    "intraday_strength": 0.4258,
+    "intraday_score": 1.4903,
     "chain_predictive_bias": 0,
-    "chain_predictive_strength": 0.1303,
+    "chain_predictive_strength": 0.1213,
     "chain_level_bias": -1,
-    "support_strength": 0.2819,
-    "resistance_strength": 0.6692,
-    "support_change_strength": 0.4953,
-    "resistance_change_strength": 0.3973,
-    "vwap": 74961.47,
-    "vwap_slope": 0.3705,
+    "support_strength": 0.2839,
+    "resistance_strength": 0.6727,
+    "support_change_strength": 0.5009,
+    "resistance_change_strength": 0.409,
+    "vwap": 74963.94,
+    "vwap_slope": 0.7683,
     "direction": "BULLISH",
-    "score": 11.595,
-    "confidence": 90.46,
+    "score": 10.563,
+    "confidence": 83.87,
     "support_1": 74900.0,
     "support_2": 74800.0,
     "resistance_1": 75000.0,
@@ -37,7 +37,7 @@
       "180": -1
     },
     "components": {
-      "intraday_trend": 2.900037743626186,
+      "intraday_trend": 1.87,
       "vwap_level": 2.4,
       "vwap_slope": 0.0,
       "structure_3m": 2.0,
@@ -51,8 +51,8 @@
       "option_oi_change": 0.65,
       "daily_oi": 0.45,
       "change_oi_api": -0.45,
-      "chain_wall_imbalance": -0.29043679102642056,
-      "futures_oi_strength": 0.32000000000000006
+      "chain_wall_imbalance": -0.29161610106294616,
+      "futures_oi_strength": 0.32008188331627313
     }
   },
   "active_trade": {
@@ -78,9 +78,9 @@
     "theta": -61.9106,
     "reversal_confirmations": 0,
     "last_market_direction": "BULLISH",
-    "last_market_confidence": 90.45764955266759,
-    "last_ltp": 385.25,
-    "last_monitored_at": "2026-09-22T09:55:24.659307+05:30"
+    "last_market_confidence": 83.87428265066025,
+    "last_ltp": 388.85,
+    "last_monitored_at": "2026-09-22T09:58:27.286954+05:30"
   },
   "last_signal": {
     "timestamp": "2026-09-22 09:25:28 IST",
