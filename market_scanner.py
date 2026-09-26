@@ -806,8 +806,11 @@ def calculate_vwap(df: pd.DataFrame) -> pd.Series:
     cum_vol = volume.groupby(local_date).cumsum()
     cum_pv = (typical * volume).groupby(local_date).cumsum()
 
-    return cum_pv / cum_vol.replace(0, np.nan)
+    vwap = cum_pv / cum_vol.replace(0, np.nan)
 
+    if vwap.isna().all():
+      vwap = typical.groupby(local_date).cummean()
+    return vwap.ffill()
 
 def trend_direction(
     df: pd.DataFrame,
@@ -1195,8 +1198,8 @@ def chain_oi_support_resistance(
     max_call = max((x["call_oi"] for x in entries), default=1.0)
     max_put = max((x["put_oi"] for x in entries), default=1.0)
 
-    support_rows = [x for x in entries if x["strike"] < spot and x["put_oi"] > 0]
-    resistance_rows = [x for x in entries if x["strike"] > spot and x["call_oi"] > 0]
+    support_rows = [x for x in entries if x["strike"] <= atm and x["put_oi"] > 0]
+    resistance_rows = [x for x in entries if x["strike"] >= atm and x["call_oi"] > 0]
 
     def support_strength(x: dict[str, float]) -> float:
         oi = x["put_oi"] / max(max_put, 1.0)
