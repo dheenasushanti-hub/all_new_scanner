@@ -147,9 +147,9 @@ POSITIONING_HARD_OPPOSITE_STRENGTH = 0.65
 
 
 # Strike health.
-MIN_DELTA = 0.35
+MIN_DELTA = 0.25
 MAX_DELTA = 0.85
-MAX_SPREAD_PCT = 0.06
+MAX_SPREAD_PCT = 0.12
 # Theta is a ranking/risk factor for long-option selection, not a hard entry gate.
 # Near expiry, theta can become very large and a rigid percentage cutoff can
 # incorrectly reject every otherwise-tradable directional option.
@@ -2086,9 +2086,9 @@ def select_directional_option(
     atm = nearest_strike(spot, strikes)
 
     candidate_strikes = (
-        [atm - step, atm - 2 * step]
+        [atm, atm - step, atm - 2 * step, atm + step]
         if direction == "BULLISH"
-        else [atm + step, atm + 2 * step]
+        else [atm, atm + step, atm + 2 * step, atm - step]
     )
     option_type = "CE" if direction == "BULLISH" else "PE"
 
@@ -2127,11 +2127,12 @@ def select_directional_option(
             continue
 
         delta = safe_float(data["delta"], float("nan"))
-        if not math.isfinite(delta) or not (MIN_DELTA <= abs(delta) <= MAX_DELTA):
-            rejection_log.append(
-                f"{option_type} {row_key:.0f}: delta={delta!r} outside "
-                f"{MIN_DELTA:.2f}-{MAX_DELTA:.2f}"
-            )
+        if not math.isfinite(delta):
+            if option_type == "CE":
+               delta = 0.50 + ((spot - target) / (2 * step)) * 0.15
+            else:
+                delta = -0.50 - ((target - spot) / (2 * step)) * 0.15
+           delta = max(-0.95, min(0.95, delta))
             continue
 
         bid = safe_float(data["bid"])
