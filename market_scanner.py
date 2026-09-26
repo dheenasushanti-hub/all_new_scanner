@@ -2780,7 +2780,7 @@ def execute_scan(
             "No entry: Market is overextended (%.2f points from VWAP vs ATR %.2f). High risk of exhaustion/decay.", 
             vwap_distance, atr3_val
         )
-        return None
+      return None
       
     option = select_directional_option(
         chain=chain,
