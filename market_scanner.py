@@ -1795,22 +1795,32 @@ def build_market_structure(
         and structure_3_bias >= 0
     )
 
+    predictive_bull_surge = (
+        vwap_level_bias > 0 
+        and (
+            (futures_regime == "LONG_BUILDUP" and futures_info["oi_acceleration"] >= 1.50)
+            or (chain_predictive_bias > 0 and chain_predictive_strength >= 0.35)
+        )
+    )
+
+    predictive_bear_surge = (
+      vwap_level_bias < 0 
+        and (
+            (futures_regime == "SHORT_BUILDUP" and futures_info["oi_acceleration"] >= 1.50)
+            or (chain_predictive_bias < 0 and chain_predictive_strength >= 0.35)
+        )
+    )
+      
     bullish_trigger = (
         bull_price_core
-        and core_score >= CORE_BULL_TRIGGER
-        and (
-            bullish_confirmation_count >= 1
-            or intraday_strength >= 0.75
-        )
+        and (core_score >= CORE_BULL_TRIGGER or predictive_bull_surge)
+        and (bullish_confirmation_count >= 1 or intraday_strength >= 0.75 or predictive_bull_surge)
         and not strong_opposite_to_bull
     )
     bearish_trigger = (
         bear_price_core
-        and core_score <= CORE_BEAR_TRIGGER
-        and (
-            bearish_confirmation_count >= 1
-            or intraday_strength >= 0.75
-        )
+        and (core_score <= CORE_BEAR_TRIGGER or predictive_bear_surge)
+        and (bearish_confirmation_count >= 1 or intraday_strength >= 0.75 or predictive_bear_surge)
         and not strong_opposite_to_bear
     )
 
