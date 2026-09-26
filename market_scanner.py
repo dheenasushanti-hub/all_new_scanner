@@ -2159,15 +2159,10 @@ def select_directional_option(
             theta_burden * EXPECTED_HOLDING_MINUTES / trading_day_minutes
         )
         if intraday_theta_burden > THETA_WARNING_BURDEN:
-            logger.warning(
-                "%s %.0f: elevated intraday theta burden=%.1f%% over %.0fm (linearized; daily=%.1f%%); keeping candidate and penalizing it in health score.",
-                option_type,
-                row_key,
-                intraday_theta_burden * 100.0,
-                EXPECTED_HOLDING_MINUTES,
-                theta_burden * 100.0,
+            rejection_log.append(
+                f"{option_type} {row_key:.0f}: extreme intraday theta decay ({intraday_theta_burden * 100.0:.1f}%)"
             )
-
+            continue
         meta = {
             "strike": row_key,
             "type": option_type,
@@ -2364,8 +2359,8 @@ def create_dynamic_targets(
     if risk <= 0:
         raise ScannerError("Dynamic option stop is not below entry.")
 
-    if target1 < option.ltp + MIN_T1_RISK_REWARD * risk:
-        target1 = option.ltp + MIN_T1_RISK_REWARD * risk
+    if target1 < option.ltp + (1.0 * risk):
+        raise ScannerError(f"Target 1 (₹{target1:.2f}) offers poor risk/reward against ₹{risk:.2f} risk. Move exhausted.")
 
     if target2 < option.ltp + MIN_T2_RISK_REWARD * risk:
         target2 = option.ltp + MIN_T2_RISK_REWARD * risk
@@ -2767,7 +2762,16 @@ def execute_scan(
             SIGNAL_THRESHOLD,
         )
         return None
-
+      
+    atr3_val = safe_float(tf_frames[3]["atr"].iloc[-1], 50.0)
+    vwap_distance = abs(spot - structure.vwap)
+    if vwap_distance > (atr3_val * 2.5):
+      logger.info(
+            "No entry: Market is overextended (%.2f points from VWAP vs ATR %.2f). High risk of exhaustion/decay.", 
+            vwap_distance, atr3_val
+        )
+        return None
+      
     option = select_directional_option(
         chain=chain,
         direction=structure.direction,
