@@ -2132,7 +2132,7 @@ def select_directional_option(
                delta = 0.50 + ((spot - target) / (2 * step)) * 0.15
             else:
                 delta = -0.50 - ((target - spot) / (2 * step)) * 0.15
-           delta = max(-0.95, min(0.95, delta))
+                delta = max(-0.95, min(0.95, delta))
             continue
 
         bid = safe_float(data["bid"])
