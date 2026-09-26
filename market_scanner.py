@@ -95,7 +95,7 @@ MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
 
 SUPERTREND_PERIOD = 10
-SUPERTREND_FACTOR = 3.0
+SUPERTREND_FACTOR = 2.0
 TIMEFRAMES = (3, 15, 30, 60, 120, 180)
 
 ATR_PERIOD = 14
@@ -165,8 +165,8 @@ OPTION_MAX_STOP_PCT = 0.30
 OPTION_MIN_STOP_PCT = 0.15
 
 # Trade monitoring.
-REVERSAL_CONFIRMATIONS_REQUIRED = 2
-STRUCTURE_REVERSAL_CONFIDENCE = 75.0
+REVERSAL_CONFIRMATIONS_REQUIRED = 1
+STRUCTURE_REVERSAL_CONFIDENCE = 60.0
 
 # URLs.
 INSTRUMENT_SEARCH_URL = f"{BASE_URL}/v2/instruments/search"
@@ -1633,7 +1633,7 @@ def build_market_structure(
     futures_bias = int(futures_info["bias"])
 
     structure_3 = market_structure_state(tf_frames[3], 8)
-    structure_15 = market_structure_state(tf_frames[15], 6)
+    structure_15 = market_structure_state(tf_frames[15], 3)
     structure_3_bias = 1 if structure_3 == "BULLISH" else -1 if structure_3 == "BEARISH" else 0
     structure_15_bias = 1 if structure_15 == "BULLISH" else -1 if structure_15 == "BEARISH" else 0
 
@@ -1733,21 +1733,13 @@ def build_market_structure(
 
     bull_price_core = (
         intraday_bias > 0
-        and fast_bull_votes >= 2
-        and (
-            vwap_level_bias > 0
-            or vwap_slope_bias > 0
-            or (fast_bull_votes == 3 and intraday_strength >= 0.60)
-        )
+        and (fast_bull_votes >= 2 or (structure_3_bias > 0 and intraday_strength >= 0.50))
+        and (vwap_level_bias > 0 or vwap_slope_bias > 0)
     )
     bear_price_core = (
         intraday_bias < 0
-        and fast_bear_votes >= 2
-        and (
-            vwap_level_bias < 0
-            or vwap_slope_bias < 0
-            or (fast_bear_votes == 3 and intraday_strength >= 0.60)
-        )
+        and (fast_bear_votes >= 2 or (structure_3_bias < 0 and intraday_strength >= 0.50))
+        and (vwap_level_bias < 0 or vwap_slope_bias < 0)
     )
 
     # Short-covering is explicitly bullish; long-unwinding is explicitly bearish.
