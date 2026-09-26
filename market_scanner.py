@@ -1195,8 +1195,9 @@ def chain_oi_support_resistance(
             "proximity": proximity,
         })
 
-    max_call = max((x["call_oi"] for x in entries), default=1.0)
-    max_put = max((x["put_oi"] for x in entries), default=1.0)
+    near_entries = [x for x in entries if abs(x["strike"] - atm) <= step * 10]
+    max_call = max((x["call_oi"] for x in near_entries), default=1.0)
+    max_put = max((x["put_oi"] for x in near_entries), default=1.0)
 
     support_rows = [x for x in entries if x["strike"] <= atm and x["put_oi"] > 0]
     resistance_rows = [x for x in entries if x["strike"] >= atm and x["call_oi"] > 0]
@@ -2224,8 +2225,9 @@ def choose_underlying_levels(
     atr3 = safe_float(tf_frames[3]["atr"].iloc[-1], 0.0)
     atr15 = safe_float(tf_frames[15]["atr"].iloc[-1], 0.0)
 
-    atr3 = max(atr3, 1.0)
-    atr15 = max(atr15, atr3)
+    max_allowed_atr = spot * 0.0025
+    atr3 = min(max(atr3, 1.0), max_allowed_atr)
+    atr15 = min(max(atr15, atr3), max_allowed_atr * 1.5)
 
     # Use 15m ST for invalidation, but never place it unrealistically close.
     st15 = safe_float(tf_frames[15]["supertrend"].iloc[-1], spot)
@@ -2361,10 +2363,9 @@ def create_dynamic_targets(
     structural_stop = option.ltp - risk_distance
 
     hard_floor = option.ltp * (1.0 - OPTION_MAX_STOP_PCT)
-    soft_floor = option.ltp * (1.0 - OPTION_MIN_STOP_PCT)
 
     # Dynamic structural SL, bounded by 15-30% below entry.
-    stop_loss = min(soft_floor, max(hard_floor, structural_stop))
+    stop_loss = max(hard_floor, structural_stop)
 
     # Ensure target distances are economically meaningful.
     risk = option.ltp - stop_loss
