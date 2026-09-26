@@ -2663,7 +2663,8 @@ def execute_scan(
     if not market_window_open():
         logger.info("Outside BSE market hours.")
         return None
-
+    EARLIEST_ENTRY_TIME = time(9, 24)
+    now_time = now_ist().time()
     status = get_market_status()
     logger.info("BSE status=%s", status)
     if status != "OPEN":
@@ -2752,7 +2753,13 @@ def execute_scan(
     if active_trade_from_state(state) is not None:
         monitor_active_trade(state, structure)
         return None
-
+      
+    if len(futures_session) < 3:
+        logger.info("Skipping signal generation: waiting for at least 3 session candles (found %d).", len(futures_session))
+    
+    if now_time < EARLIEST_ENTRY_TIME:
+        logger.info("Skipping signal generation: opening cooldown active until 09:24 AM IST.")
+      
     if structure.direction == "NEUTRAL":
         logger.info("No entry: market structure is neutral/mixed.")
         return None
