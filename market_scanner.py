@@ -1,5 +1,5 @@
 """
-SENSEX Predictive Options Market Scanner — Market Structure Engine
+SENSEX Predictive Options Market Scanner â€” Market Structure Engine
 
 What this version fixes:
 - Uses completed/currently-available multi-timeframe SENSEX structure:
@@ -85,11 +85,14 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 MAX_HISTORY_DAYS = int(os.getenv("MAX_HISTORY_DAYS", "45"))
-SIGNAL_THRESHOLD = float(os.getenv("SIGNAL_THRESHOLD", "60"))
+SIGNAL_THRESHOLD = float(os.getenv("SIGNAL_THRESHOLD", "55"))
+MIN_ENTRY_TIME = time(9, 18)
+OPENING_RANGE_MINUTES = 3
+OVEREXTENSION_ATR = float(os.getenv("OVEREXTENSION_ATR", "3.25"))
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-09-21-MULTI-TF-MARKET-STRUCTURE-V5-TREND-FIRST-VWAP-ROBUST"
+SCANNER_VERSION = "2026-09-29-MULTI-TF-MARKET-STRUCTURE-V6-OPENING-RESILIENT-PRICE-FIRST"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -560,28 +563,71 @@ def _parse_candles(candles: Any) -> pd.DataFrame:
 def get_intraday_candles(
     instrument_key: str,
     interval_minutes: int,
+    *,
+    strict: bool = True,
 ) -> pd.DataFrame:
+    """Fetch today's intraday candles without turning normal opening-data lag into a fatal error."""
     encoded = urllib.parse.quote(instrument_key, safe="")
     url = f"{HISTORICAL_V3_URL}/intraday/{encoded}/minutes/{interval_minutes}"
 
-    payload = api_get(url, retries=3)
+    try:
+        payload = api_get(url, retries=3)
+    except ScannerError:
+        if strict:
+            raise
+        return pd.DataFrame()
+
     data = payload.get("data", {})
     df = _parse_candles(data.get("candles", []) if isinstance(data, dict) else [])
-
     if df.empty:
-        raise ScannerError(
-            f"No intraday {interval_minutes}m candles for {instrument_key}."
-        )
+        if strict:
+            raise ScannerError(f"No intraday {interval_minutes}m candles for {instrument_key}.")
+        return pd.DataFrame()
 
     session_date = now_ist().date()
     local_dates = df["timestamp"].dt.tz_convert(IST).dt.date
     df = df.loc[local_dates == session_date].reset_index(drop=True)
-
-    if df.empty:
-        raise ScannerError(
-            f"No current-session {interval_minutes}m candles for {instrument_key}."
-        )
+    if df.empty and strict:
+        raise ScannerError(f"No current-session {interval_minutes}m candles for {instrument_key}.")
     return df
+
+
+def _resample_one_minute_to_three(df: pd.DataFrame) -> pd.DataFrame:
+    """Build 3-minute bars from 1-minute data, preserving an incomplete opening bar."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    work = df.copy().sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
+    work = work.dropna(subset=["timestamp"]).set_index("timestamp")
+    for c in ("open", "high", "low", "close", "volume", "oi"):
+        if c in work.columns:
+            work[c] = pd.to_numeric(work[c], errors="coerce")
+    agg = work.resample("3min", origin="start_day", offset="9h15min", label="left", closed="left").agg(
+        open=("open", "first"), high=("high", "max"), low=("low", "min"),
+        close=("close", "last"), volume=("volume", "sum"), oi=("oi", "last"),
+    )
+    return agg.dropna(subset=["open", "high", "low", "close"]).reset_index()
+
+
+def get_current_session_futures_candles(instrument_key: str) -> pd.DataFrame:
+    """Prefer native 3m data; fall back to 1m aggregation during opening/API lag."""
+    native = get_intraday_candles(instrument_key, 3, strict=False)
+    if not native.empty:
+        logger.info("Current-session futures 3m candles: %d", len(native))
+        return native
+
+    one_min = get_intraday_candles(instrument_key, 1, strict=False)
+    if not one_min.empty:
+        rebuilt = _resample_one_minute_to_three(one_min)
+        if not rebuilt.empty:
+            logger.warning(
+                "Native 3m futures candles unavailable; rebuilt %d 3m bars from 1m data.",
+                len(rebuilt),
+            )
+            return rebuilt
+
+    logger.warning("Current-session futures 3m/1m candles unavailable; using quote/historical fallbacks.")
+    return pd.DataFrame()
 
 
 def _subtract_months(d: date, months: int) -> date:
@@ -1401,64 +1447,34 @@ def get_change_oi_confirmation(expiry: str) -> tuple[int, float]:
 def vwap_snapshot(
     futures_session: pd.DataFrame,
 ) -> tuple[float, float, int]:
-    """
-    Build the current-session futures VWAP.
+    """Calculate session VWAP from whatever current-session bars are available.
 
-    Opening-minute robustness:
-      * one valid current-session candle is enough to produce a valid VWAP;
-      * the VWAP slope is 0.0 until a second value exists;
-      * no previous-session candle is mixed into the session VWAP.
-
-    This prevents the 09:15-09:18 startup window from failing simply because
-    only one live 3-minute candle is available.
+    One opening bar is valid. A zero-volume opening feed falls back to a simple
+    typical-price average rather than failing the entire scan.
     """
     if futures_session is None or futures_session.empty:
         raise ScannerError("Futures session candles unavailable for VWAP.")
-
     work = futures_session.copy()
-    required = {"timestamp", "high", "low", "close", "volume"}
+    required = {"timestamp", "high", "low", "close"}
     missing = required.difference(work.columns)
     if missing:
-        raise ScannerError(
-            f"Futures session candles missing VWAP columns: {sorted(missing)}"
-        )
-
+        raise ScannerError(f"Futures session candles missing VWAP columns: {sorted(missing)}")
     for col in ("high", "low", "close", "volume"):
+        if col not in work.columns:
+            work[col] = 0.0
         work[col] = pd.to_numeric(work[col], errors="coerce")
-
-    work = (
-        work.dropna(subset=["timestamp", "high", "low", "close"])
-        .sort_values("timestamp")
-        .drop_duplicates("timestamp", keep="last")
-        .reset_index(drop=True)
-    )
+    work = work.dropna(subset=["timestamp", "high", "low", "close"]).sort_values("timestamp").drop_duplicates("timestamp", keep="last")
     if work.empty:
         raise ScannerError("No valid Futures session candles available for VWAP.")
-
     vwap_series = calculate_vwap(work).replace([np.inf, -np.inf], np.nan).dropna()
     if vwap_series.empty:
-        raise ScannerError("Unable to calculate Futures VWAP.")
-
+        typical = (work["high"] + work["low"] + work["close"]) / 3.0
+        vwap_series = typical.expanding().mean().dropna()
     current_vwap = float(vwap_series.iloc[-1])
-
-    # A single opening candle has a valid VWAP, but not a measurable slope.
-    if len(vwap_series) >= 2:
-        prior_vwap = float(vwap_series.iloc[-2])
-        slope = current_vwap - prior_vwap
-    else:
-        slope = 0.0
-
+    slope = float(vwap_series.iloc[-1] - vwap_series.iloc[-2]) if len(vwap_series) >= 2 else 0.0
     price = float(work["close"].iloc[-1])
     level_bias = 1 if price > current_vwap else -1 if price < current_vwap else 0
-
-    logger.info(
-        "VWAP: price=%.2f vwap=%.2f slope=%+.2f level_bias=%+d bars=%d",
-        price,
-        current_vwap,
-        slope,
-        level_bias,
-        len(vwap_series),
-    )
+    logger.info("VWAP: price=%.2f vwap=%.2f slope=%+.2f level_bias=%+d bars=%d", price, current_vwap, slope, level_bias, len(vwap_series))
     return current_vwap, slope, level_bias
 
 
@@ -1629,6 +1645,16 @@ def build_market_structure(
         vwap,
     )
     futures_info = futures_oi_structure(futures_3m, futures_live_quote)
+    if futures_3m is None or len(futures_3m) < 4:
+        live_price = safe_float((futures_live_quote or {}).get("last_price"), spot)
+        futures_info["regime"] = "OPENING_PRICE_ONLY"
+        futures_info["bias"] = 1 if live_price > vwap else -1 if live_price < vwap else 0
+        futures_info["oi_strength"] = 0.0
+        futures_info["oi_persistence"] = 0.0
+        futures_info["price_delta"] = 0.0
+        futures_info["oi_delta"] = 0.0
+        futures_info["live_oi_change"] = float("nan")
+        futures_info["oi_acceleration"] = 0.0
     futures_regime = str(futures_info["regime"])
     futures_bias = int(futures_info["bias"])
 
@@ -1814,13 +1840,13 @@ def build_market_structure(
     bullish_trigger = (
         bull_price_core
         and (core_score >= CORE_BULL_TRIGGER or predictive_bull_surge)
-        and (bullish_confirmation_count >= 1 or intraday_strength >= 0.75 or predictive_bull_surge)
+        and (bullish_confirmation_count >= 1 or intraday_strength >= 0.62 or abs(core_score) >= 4.25 or predictive_bull_surge)
         and not strong_opposite_to_bull
     )
     bearish_trigger = (
         bear_price_core
         and (core_score <= CORE_BEAR_TRIGGER or predictive_bear_surge)
-        and (bearish_confirmation_count >= 1 or intraday_strength >= 0.75 or predictive_bear_surge)
+        and (bearish_confirmation_count >= 1 or intraday_strength >= 0.62 or abs(core_score) >= 4.25 or predictive_bear_surge)
         and not strong_opposite_to_bear
     )
 
@@ -1854,11 +1880,11 @@ def build_market_structure(
 
     if direction != "NEUTRAL":
         confidence = (
-            46.0
-            + 22.0 * core_magnitude
-            + 12.0 * intraday_strength
-            + 10.0 * alignment
-            + 10.0 * confirmation_factor
+            50.0
+            + 25.0 * core_magnitude
+            + 14.0 * intraday_strength
+            + 7.0 * alignment
+            + 8.0 * confirmation_factor
         )
     else:
         confidence = (
@@ -2092,9 +2118,9 @@ def select_directional_option(
     atm = nearest_strike(spot, strikes)
 
     candidate_strikes = (
-        [atm, atm - step, atm - 2 * step, atm + step]
+        [atm - step, atm - 2 * step, atm]
         if direction == "BULLISH"
-        else [atm, atm + step, atm + 2 * step, atm - step]
+        else [atm + step, atm + 2 * step, atm]
     )
     option_type = "CE" if direction == "BULLISH" else "PE"
 
@@ -2139,7 +2165,7 @@ def select_directional_option(
             else:
                 delta = -0.50 - ((target - spot) / (2 * step)) * 0.15
                 delta = max(-0.95, min(0.95, delta))
-            continue
+            data["delta"] = delta
 
         bid = safe_float(data["bid"])
         ask = safe_float(data["ask"])
@@ -2169,10 +2195,10 @@ def select_directional_option(
             theta_burden * EXPECTED_HOLDING_MINUTES / trading_day_minutes
         )
         if intraday_theta_burden > THETA_WARNING_BURDEN:
-            rejection_log.append(
-                f"{option_type} {row_key:.0f}: extreme intraday theta decay ({intraday_theta_burden * 100.0:.1f}%)"
+            logger.info(
+                "OPTION HEALTH WARNING: %s %.0f has estimated %.1f%% theta burden for the planned holding window; ranking penalty only.",
+                option_type, row_key, intraday_theta_burden * 100.0,
             )
-            continue
         meta = {
             "strike": row_key,
             "type": option_type,
@@ -2303,7 +2329,7 @@ def project_option_premium(
 ) -> float:
     """
     Second-order local Greek approximation:
-        Δpremium ≈ |delta| * |dS| + 0.5 * |gamma| * dS²
+        Î”premium â‰ˆ |delta| * |dS| + 0.5 * |gamma| * dSÂ²
 
     This is deliberately used only for target/stop estimation, not execution.
     """
@@ -2370,7 +2396,7 @@ def create_dynamic_targets(
         raise ScannerError("Dynamic option stop is not below entry.")
 
     if target1 < option.ltp + (1.0 * risk):
-        raise ScannerError(f"Target 1 (₹{target1:.2f}) offers poor risk/reward against ₹{risk:.2f} risk. Move exhausted.")
+        raise ScannerError(f"Target 1 (â‚¹{target1:.2f}) offers poor risk/reward against â‚¹{risk:.2f} risk. Move exhausted.")
 
     if target2 < option.ltp + MIN_T2_RISK_REWARD * risk:
         target2 = option.ltp + MIN_T2_RISK_REWARD * risk
@@ -2495,10 +2521,10 @@ def signal_email_body(signal: Signal) -> str:
 <tr><td><b>Futures Regime</b></td><td>{html.escape(signal.futures_state)}</td></tr>
 <tr><td><b>Option</b></td><td>{html.escape(signal.trading_symbol)}</td></tr>
 <tr><td><b>Strike</b></td><td>{signal.strike:.0f} {signal.option_type}</td></tr>
-<tr><td><b>Entry</b></td><td>₹{signal.entry:.2f}</td></tr>
-<tr><td><b>Target 1</b></td><td>₹{signal.target_1:.2f}</td></tr>
-<tr><td><b>Target 2</b></td><td>₹{signal.target_2:.2f}</td></tr>
-<tr><td><b>Stop Loss</b></td><td>₹{signal.stop_loss:.2f}</td></tr>
+<tr><td><b>Entry</b></td><td>â‚¹{signal.entry:.2f}</td></tr>
+<tr><td><b>Target 1</b></td><td>â‚¹{signal.target_1:.2f}</td></tr>
+<tr><td><b>Target 2</b></td><td>â‚¹{signal.target_2:.2f}</td></tr>
+<tr><td><b>Stop Loss</b></td><td>â‚¹{signal.stop_loss:.2f}</td></tr>
 <tr><td><b>Underlying T1</b></td><td>{signal.underlying_target_1:.2f}</td></tr>
 <tr><td><b>Underlying T2</b></td><td>{signal.underlying_target_2:.2f}</td></tr>
 <tr><td><b>Underlying SL</b></td><td>{signal.underlying_stop:.2f}</td></tr>
@@ -2584,8 +2610,8 @@ def monitor_active_trade(
             (
                 f"<p>{html.escape(str(trade['direction']))} trade closed.</p>"
                 f"<p>Option: {html.escape(str(trade['trading_symbol']))}<br>"
-                f"Entry: ₹{entry:.2f}<br>"
-                f"Exit: ₹{ltp:.2f}<br>"
+                f"Entry: â‚¹{entry:.2f}<br>"
+                f"Exit: â‚¹{ltp:.2f}<br>"
                 f"Outcome: {outcome}</p>"
             ),
         )
@@ -2664,33 +2690,58 @@ def execute_scan(
     if not market_window_open():
         logger.info("Outside BSE market hours.")
         return None
-    EARLIEST_ENTRY_TIME = time(9, 24)
-    now_time = now_ist().time()
+
     status = get_market_status()
     logger.info("BSE status=%s", status)
     if status != "OPEN":
         return None
 
     state = state if isinstance(state, dict) else {}
-
+    now_time = now_ist().time()
     future = get_current_sensex_future()
 
-    futures_3m = get_intraday_candles(
-        future.instrument_key,
-        3,
-    )
-    futures_session = get_intraday_candles(
-        future.instrument_key,
-        3,
-    )
+    # Opening robustness: never require a completed 3m candle just to run the
+    # scanner. Native 3m -> 1m-resampled 3m -> historical/quote fallback.
+    futures_session = get_current_session_futures_candles(future.instrument_key)
     futures_live_quote = get_quote(future.instrument_key)
-
     spot = extract_ltp(get_quote(SENSEX_KEY))
 
+    # If the current session feed is late, use recent historical 3m candles for
+    # OI/ATR context and keep the live quote as the current price source.
+    try:
+        historical_futures = get_historical_candles(future.instrument_key, 3, lookback_days=10)
+        historical_completed = filter_completed_candles(historical_futures, 3)
+    except ScannerError as exc:
+        logger.warning("Historical futures 3m fallback unavailable: %s", exc)
+        historical_completed = pd.DataFrame()
+
+    if futures_session.empty:
+        futures_3m = historical_completed.tail(40).copy()
+    else:
+        completed_current = filter_completed_candles(futures_session, 3)
+        futures_3m = pd.concat([historical_completed.tail(35), completed_current], ignore_index=True)
+        futures_3m = futures_3m.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+
+    # VWAP/trend uses the live session feed. If Upstox has not published it yet,
+    # build a one-bar quote proxy so 09:15 does not crash the scanner.
+    if futures_session.empty:
+        q = futures_live_quote
+        ltp = extract_ltp(q)
+        opening_ts = pd.Timestamp(now_ist()).tz_convert("UTC")
+        proxy = pd.DataFrame([{
+            "timestamp": opening_ts,
+            "open": ltp,
+            "high": ltp,
+            "low": ltp,
+            "close": ltp,
+            "volume": safe_float(q.get("volume"), 0.0),
+            "oi": _extract_quote_oi(q),
+        }])
+        futures_session = proxy
+        logger.warning("OPENING MODE: using live futures quote proxy until intraday candles arrive.")
+
     tf_frames, tf_directions = timeframe_snapshot(SENSEX_KEY)
-
     expiry, chain = get_option_chain()
-
     chain_levels = chain_oi_support_resistance(chain, spot)
     daily_oi_bias, daily_oi_score = get_daily_oi_confirmation(expiry)
     change_oi_bias, change_oi_score = get_change_oi_confirmation(expiry)
@@ -2710,156 +2761,83 @@ def execute_scan(
     )
 
     state["market_snapshot"] = {
-        "timestamp": now_ist().isoformat(),
-        "spot": round(spot, 2),
-        "future": future.trading_symbol,
-        "future_expiry": future.expiry,
-        "futures_regime": structure.futures_regime,
-        "futures_bias": structure.futures_bias,
+        "timestamp": now_ist().isoformat(), "spot": round(spot, 2),
+        "future": future.trading_symbol, "future_expiry": future.expiry,
+        "futures_regime": structure.futures_regime, "futures_bias": structure.futures_bias,
         "futures_oi_strength": round(structure.futures_oi_strength, 4),
         "futures_oi_persistence": round(structure.futures_oi_persistence, 4),
         "futures_live_oi_change": round(structure.futures_live_oi_change, 2) if math.isfinite(structure.futures_live_oi_change) else None,
-        "intraday_bias": structure.intraday_bias,
-        "intraday_strength": round(structure.intraday_strength, 4),
-        "intraday_score": round(structure.intraday_score, 4),
-        "chain_predictive_bias": structure.chain_predictive_bias,
-        "chain_predictive_strength": round(structure.chain_predictive_strength, 4),
-        "chain_level_bias": structure.chain_level_bias,
-        "support_strength": round(structure.support_strength, 4),
-        "resistance_strength": round(structure.resistance_strength, 4),
-        "support_change_strength": round(structure.support_change_strength, 4),
-        "resistance_change_strength": round(structure.resistance_change_strength, 4),
-        "vwap": round(structure.vwap, 2),
-        "vwap_slope": round(structure.vwap_slope, 4),
-        "direction": structure.direction,
-        "score": round(structure.score, 3),
-        "confidence": round(structure.confidence, 2),
-        "support_1": structure.support_1,
-        "support_2": structure.support_2,
-        "resistance_1": structure.resistance_1,
-        "resistance_2": structure.resistance_2,
-        "timeframes": structure.timeframe_directions,
-        "components": structure.components,
+        "intraday_bias": structure.intraday_bias, "intraday_strength": round(structure.intraday_strength, 4),
+        "intraday_score": round(structure.intraday_score, 4), "chain_predictive_bias": structure.chain_predictive_bias,
+        "chain_predictive_strength": round(structure.chain_predictive_strength, 4), "chain_level_bias": structure.chain_level_bias,
+        "support_strength": round(structure.support_strength, 4), "resistance_strength": round(structure.resistance_strength, 4),
+        "support_change_strength": round(structure.support_change_strength, 4), "resistance_change_strength": round(structure.resistance_change_strength, 4),
+        "vwap": round(structure.vwap, 2), "vwap_slope": round(structure.vwap_slope, 4),
+        "direction": structure.direction, "score": round(structure.score, 3), "confidence": round(structure.confidence, 2),
+        "support_1": structure.support_1, "support_2": structure.support_2,
+        "resistance_1": structure.resistance_1, "resistance_2": structure.resistance_2,
+        "timeframes": structure.timeframe_directions, "components": structure.components,
     }
     save_state(state)
 
-    logger.info(
-        "PREDICTION: %s | %s | confidence=%.1f score=%+.2f",
-        structure.direction,
-        structure.interpretation,
-        structure.confidence,
-        structure.score,
-    )
+    logger.info("PREDICTION: %s | %s | confidence=%.1f score=%+.2f", structure.direction, structure.interpretation, structure.confidence, structure.score)
 
     if active_trade_from_state(state) is not None:
         monitor_active_trade(state, structure)
         return None
-      
-    if len(futures_session) < 3:
-        logger.info("Skipping signal generation: waiting for at least 3 session candles (found %d).", len(futures_session))
-    
-    if now_time < EARLIEST_ENTRY_TIME:
-        logger.info("Skipping signal generation: opening cooldown active until 09:24 AM IST.")
-      
+
+    # Do not suppress the market engine during the opening. We only gate actual
+    # option entry until the first 3-minute bar has completed, unless a decisive
+    # opening move is already visible in 1m/resampled data.
+    completed_session_bars = len(filter_completed_candles(futures_session, 3))
+    opening_mode = now_time < MIN_ENTRY_TIME or completed_session_bars < 1
+    if opening_mode:
+        logger.info("OPENING MODE: completed_3m_bars=%d time=%s; monitoring structure without forcing a trade.", completed_session_bars, now_time.strftime("%H:%M:%S"))
+        return None
+
     if structure.direction == "NEUTRAL":
         logger.info("No entry: market structure is neutral/mixed.")
         return None
-
     if structure.confidence < SIGNAL_THRESHOLD:
-        logger.info(
-            "No entry: confidence %.1f < %.1f",
-            structure.confidence,
-            SIGNAL_THRESHOLD,
-        )
+        logger.info("No entry: confidence %.1f < %.1f", structure.confidence, SIGNAL_THRESHOLD)
         return None
-      
-    atr3_val = safe_float(tf_frames[3]["atr"].iloc[-1], 50.0)
-    vwap_distance = abs(spot - structure.vwap)
-    if vwap_distance > (atr3_val * 2.5):
-      logger.info(
-            "No entry: Market is overextended (%.2f points from VWAP vs ATR %.2f). High risk of exhaustion/decay.", 
-            vwap_distance, atr3_val
-        )
-      return None
-      
-    option = select_directional_option(
-        chain=chain,
-        direction=structure.direction,
-        spot=spot,
-    )
 
-    (
-        target1,
-        target2,
-        stop_loss,
-        underlying_stop,
-        underlying_target1,
-        underlying_target2,
-    ) = create_dynamic_targets(
-        option=option,
-        structure=structure,
-        spot=spot,
-        tf_frames=tf_frames,
+    atr3_val = max(safe_float(tf_frames[3]["atr"].iloc[-1], 50.0), 1.0)
+    vwap_distance = abs(spot - structure.vwap)
+    overextended = vwap_distance > (atr3_val * OVEREXTENSION_ATR)
+    decisive_trend = structure.intraday_strength >= 0.78 and abs(structure.score) >= 5.5
+    if overextended and not decisive_trend:
+        logger.info("No entry: price is extended %.2f points from VWAP vs %.2f ATR; waiting for pullback.", vwap_distance, OVEREXTENSION_ATR)
+        return None
+    if overextended and decisive_trend:
+        logger.info("TREND-EXTENSION MODE: %.2f points from VWAP, but price trend is decisive; extension is not a veto.", vwap_distance)
+
+    option = select_directional_option(chain=chain, direction=structure.direction, spot=spot)
+    target1, target2, stop_loss, underlying_stop, underlying_target1, underlying_target2 = create_dynamic_targets(
+        option=option, structure=structure, spot=spot, tf_frames=tf_frames,
     )
 
     reasons = list(structure.reasons)
-    reasons.extend(
-        [
-            (
-                f"Directional strike rule: "
-                f"{'ATM-1/ATM-2 CE' if structure.direction == 'BULLISH' else 'ATM+1/ATM+2 PE'}."
-            ),
-            (
-                f"Selected option health: spread={option.spread_pct:.2%}, "
-                f"theta burden={option.theta_burden_pct_day:.2%}/day, "
-                f"volume={option.volume:.0f}, OI={option.oi:.0f}, "
-                f"delta={option.delta:.3f}."
-            ),
-            (
-                f"Dynamic underlying targets: "
-                f"T1={underlying_target1:.2f}, "
-                f"T2={underlying_target2:.2f}, "
-                f"SL={underlying_stop:.2f}."
-            ),
-            (
-                f"Dynamic option targets: "
-                f"T1=₹{target1:.2f}, "
-                f"T2=₹{target2:.2f}, "
-                f"SL=₹{stop_loss:.2f}."
-            ),
-            "Market direction is established before option selection; option premium momentum is not the primary directional trigger.",
-        ]
-    )
+    reasons.extend([
+        f"Entry mode: {'TREND-EXTENSION' if overextended else 'NORMAL'}; completed 3m bars={completed_session_bars}.",
+        f"Directional strike rule: {'ATM-1/ATM-2 CE' if structure.direction == 'BULLISH' else 'ATM+1/ATM+2 PE'}.",
+        f"Selected option health: spread={option.spread_pct:.2%}, theta burden={option.theta_burden_pct_day:.2%}/day, volume={option.volume:.0f}, OI={option.oi:.0f}, delta={option.delta:.3f}.",
+        f"Dynamic underlying targets: T1={underlying_target1:.2f}, T2={underlying_target2:.2f}, SL={underlying_stop:.2f}.",
+        f"Dynamic option targets: T1=â‚¹{target1:.2f}, T2=â‚¹{target2:.2f}, SL=â‚¹{stop_loss:.2f}.",
+        "Market direction is established before option selection; option premium momentum is not the primary directional trigger.",
+    ])
 
-    signal = Signal(
-        timestamp=now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
-        direction=structure.direction,
-        regime=structure.interpretation,
-        confidence=structure.confidence,
-        spot=spot,
-        futures_state=structure.futures_regime,
-        option_type=option.option_type,
-        strike=option.strike,
-        trading_symbol=option.trading_symbol,
-        instrument_key=option.instrument_key,
-        entry=option.ltp,
-        target_1=target1,
-        target_2=target2,
-        stop_loss=stop_loss,
-        underlying_stop=underlying_stop,
-        underlying_target_1=underlying_target1,
-        underlying_target_2=underlying_target2,
-        delta=option.delta,
-        gamma=option.gamma,
-        theta=option.theta,
-        support_1=structure.support_1,
-        support_2=structure.support_2,
-        resistance_1=structure.resistance_1,
-        resistance_2=structure.resistance_2,
-        reasons=reasons,
+    return Signal(
+        timestamp=now_ist().strftime("%Y-%m-%d %H:%M:%S IST"), direction=structure.direction,
+        regime=structure.interpretation, confidence=structure.confidence, spot=spot,
+        futures_state=structure.futures_regime, option_type=option.option_type, strike=option.strike,
+        trading_symbol=option.trading_symbol, instrument_key=option.instrument_key, entry=option.ltp,
+        target_1=target1, target_2=target2, stop_loss=stop_loss, underlying_stop=underlying_stop,
+        underlying_target_1=underlying_target1, underlying_target_2=underlying_target2,
+        delta=option.delta, gamma=option.gamma, theta=option.theta,
+        support_1=structure.support_1, support_2=structure.support_2,
+        resistance_1=structure.resistance_1, resistance_2=structure.resistance_2, reasons=reasons,
     )
-
-    return signal
 
 
 # =============================================================================
@@ -3172,6 +3150,22 @@ def self_test() -> None:
     finally:
         globals()["api_get"] = original_api_get
         globals()["now_ist"] = original_now_ist
+
+    # Opening-data regression: one current 3m bar is valid and must not raise.
+    one_bar = _synthetic_candles([100.0])
+    vv, ss, bb = vwap_snapshot(one_bar)
+    assert math.isfinite(vv) and ss == 0.0 and bb == 0
+
+    # Opening fallback regression: quote-only futures data must not make the
+    # structure engine crash when completed 3m OI data is unavailable.
+    quote_only = {"last_price": 101.0, "oi": 1000}
+    opening_structure = build_market_structure(
+        spot=101.0, futures_3m=pd.DataFrame(), futures_session=one_bar,
+        tf_frames=frames, tf_directions=tf_dirs, chain_levels=chain_levels,
+        daily_oi_bias=0, daily_oi_score=0.0, change_oi_bias=0, change_oi_score=0.0,
+        futures_live_quote=quote_only,
+    )
+    assert opening_structure.direction in {"BULLISH", "BEARISH", "NEUTRAL"}
 
     logger.info("SELF-TEST PASSED.")
 
