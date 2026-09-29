@@ -1,5 +1,5 @@
 """
-SENSEX Predictive Options Market Scanner â€” Market Structure Engine
+SENSEX Predictive Options Market Scanner — Market Structure Engine
 
 What this version fixes:
 - Uses completed/currently-available multi-timeframe SENSEX structure:
@@ -138,6 +138,14 @@ FUTURES_LIVE_OI_WEIGHT = 0.35
 MIN_DIRECTIONAL_COMPONENTS = 4
 ENTRY_SCORE = 4.50
 
+# Strict entry confirmation. A signal is emitted only when price structure
+# agrees with the live derivatives/positioning picture. Missing/neutral
+# confirmations are treated as WAIT rather than silently bypassed.
+STRICT_ENTRY_CONFIRMATIONS = True
+PCR_BULL_THRESHOLD = 1.05
+PCR_BEAR_THRESHOLD = 0.95
+MIN_ENTRY_CONFIRMATIONS = 4
+
 # Trend-first decision engine.
 # The scanner must not let a slowly changing option-chain wall or a higher
 # timeframe Supertrend veto a clear intraday reversal.
@@ -252,6 +260,10 @@ class StructureResult:
     support_2: float
     resistance_1: float
     resistance_2: float
+    market_phase: str
+    entry_confirmed: bool
+    pcr: float
+    pcr_bias: int
     reasons: list[str]
 
 
@@ -1296,6 +1308,15 @@ def chain_oi_support_resistance(
     pressure_den = bull_pressure + bear_pressure
     pressure_score = (bull_pressure - bear_pressure) / pressure_den if pressure_den > 0 else 0.0
 
+    total_put_oi = sum(x["put_oi"] for x in entries)
+    total_call_oi = sum(x["call_oi"] for x in entries)
+    pcr = total_put_oi / total_call_oi if total_call_oi > 0 else float("nan")
+    pcr_bias = (
+        1 if math.isfinite(pcr) and pcr >= PCR_BULL_THRESHOLD
+        else -1 if math.isfinite(pcr) and pcr <= PCR_BEAR_THRESHOLD
+        else 0
+    )
+
     # Level/migration logic. This is intentionally predictive when a wall is
     # close enough to matter for the current ATR, not merely when spot crosses it.
     spot_ref_atr = max(
@@ -1347,6 +1368,8 @@ def chain_oi_support_resistance(
         "resistance_strength": float(resistance_strength_value),
         "support_change_strength": float(support_change_strength),
         "resistance_change_strength": float(resistance_change_strength),
+        "pcr": float(pcr) if math.isfinite(pcr) else float("nan"),
+        "pcr_bias": int(pcr_bias),
     }
 
 
@@ -1627,6 +1650,7 @@ def build_market_structure(
     change_oi_bias: int,
     change_oi_score: float,
     futures_live_quote: Optional[dict[str, Any]] = None,
+    previous_direction: Optional[str] = None,
 ) -> StructureResult:
     """
     Trend-first market-structure engine.
@@ -1676,6 +1700,8 @@ def build_market_structure(
     chain_predictive_bias = int(chain_levels.get("predictive_bias", 0))
     chain_predictive_strength = float(chain_levels.get("predictive_strength", 0.0))
     chain_level_bias = int(chain_levels.get("level_bias", 0))
+    pcr = safe_float(chain_levels.get("pcr"), float("nan"))
+    pcr_bias = int(chain_levels.get("pcr_bias", 0))
 
     # -------------------------------------------------------------------------
     # Directional core: price/VWAP action is deliberately stronger than slow
@@ -1837,31 +1863,115 @@ def build_market_structure(
         )
     )
       
-    bullish_trigger = (
+    # -------------------------------------------------------------------------
+    # STRICT ENTRY CONFIRMATION GATE
+    # -------------------------------------------------------------------------
+    # Price action still determines whether the market is attempting a move,
+    # but an option-entry alert now requires independent confirmation from:
+    #   1) VWAP position,
+    #   2) Futures price/OI regime,
+    #   3) Change-in-OI, and
+    #   4) option-chain PCR/OI pressure.
+    # This deliberately blocks fake breakouts where price moves first but the
+    # derivatives picture has not confirmed.
+    bullish_confirmations = {
+        "VWAP": vwap_level_bias > 0,
+        "FUTURES_OI": bullish_futures_confirmation,
+        "CHANGE_OI": change_oi_bias > 0,
+        "PCR": pcr_bias > 0,
+        "CHAIN_OI": chain_predictive_bias > 0 and chain_predictive_strength >= CHAIN_PREDICTIVE_STRENGTH_THRESHOLD,
+    }
+    bearish_confirmations = {
+        "VWAP": vwap_level_bias < 0,
+        "FUTURES_OI": bearish_futures_confirmation,
+        "CHANGE_OI": change_oi_bias < 0,
+        "PCR": pcr_bias < 0,
+        "CHAIN_OI": chain_predictive_bias < 0 and chain_predictive_strength >= CHAIN_PREDICTIVE_STRENGTH_THRESHOLD,
+    }
+
+    bull_confirmed = sum(bullish_confirmations.values())
+    bear_confirmed = sum(bearish_confirmations.values())
+
+    # For a strict entry, all four requested core confirmations must agree.
+    # Chain-OI is an additional fifth confirmation and improves confidence.
+    bull_hard_gate = (
         bull_price_core
-        and (core_score >= CORE_BULL_TRIGGER or predictive_bull_surge)
-        and (bullish_confirmation_count >= 1 or intraday_strength >= 0.62 or abs(core_score) >= 4.25 or predictive_bull_surge)
-        and not strong_opposite_to_bull
+        and bullish_confirmations["VWAP"]
+        and bullish_confirmations["FUTURES_OI"]
+        and bullish_confirmations["CHANGE_OI"]
+        and bullish_confirmations["PCR"]
+        and bull_confirmed >= MIN_ENTRY_CONFIRMATIONS
     )
-    bearish_trigger = (
+    bear_hard_gate = (
         bear_price_core
-        and (core_score <= CORE_BEAR_TRIGGER or predictive_bear_surge)
-        and (bearish_confirmation_count >= 1 or intraday_strength >= 0.62 or abs(core_score) >= 4.25 or predictive_bear_surge)
-        and not strong_opposite_to_bear
+        and bearish_confirmations["VWAP"]
+        and bearish_confirmations["FUTURES_OI"]
+        and bearish_confirmations["CHANGE_OI"]
+        and bearish_confirmations["PCR"]
+        and bear_confirmed >= MIN_ENTRY_CONFIRMATIONS
     )
 
-    # Fallback for decisive multi-factor moves even when one core input is
-    # temporarily stale/missing.
+    # A strong opposite derivative picture blocks the entry even if the raw
+    # price score is large. This is the principal anti-fake-breakout control.
+    bull_blocked = bear_confirmed >= 2 and not bull_hard_gate
+    bear_blocked = bull_confirmed >= 2 and not bear_hard_gate
+
+    bullish_trigger = (
+        bull_hard_gate
+        and (core_score >= CORE_BULL_TRIGGER or predictive_bull_surge)
+        and not strong_opposite_to_bull
+        and not bull_blocked
+    )
+    bearish_trigger = (
+        bear_hard_gate
+        and (core_score <= CORE_BEAR_TRIGGER or predictive_bear_surge)
+        and not strong_opposite_to_bear
+        and not bear_blocked
+    )
+
     if bullish_trigger:
         direction = "BULLISH"
     elif bearish_trigger:
         direction = "BEARISH"
-    elif total_score >= ENTRY_SCORE and bullish_groups >= MIN_DIRECTIONAL_COMPONENTS and intraday_bias > 0:
-        direction = "BULLISH"
-    elif total_score <= -ENTRY_SCORE and bearish_groups >= MIN_DIRECTIONAL_COMPONENTS and intraday_bias < 0:
-        direction = "BEARISH"
     else:
-        direction = "NEUTRAL"
+        # IMPORTANT: keep the market-state classifier active even when the
+        # entry gate rejects a trade. This preserves detection of reversals,
+        # continuations and sideways markets without converting them into
+        # premature option alerts.
+        raw_price_direction = (
+            "BULLISH" if bull_price_core else
+            "BEARISH" if bear_price_core else
+            "NEUTRAL"
+        )
+        direction = raw_price_direction
+
+    # Classify the movement independently from the entry decision.
+    if direction == "NEUTRAL" or (
+        intraday_strength < 0.35
+        and abs(core_score) < 2.50
+    ):
+        market_phase = "SIDEWAYS"
+    elif previous_direction == "BEARISH" and direction == "BULLISH":
+        market_phase = "BEARISH_TO_BULLISH_REVERSAL"
+    elif previous_direction == "BULLISH" and direction == "BEARISH":
+        market_phase = "BULLISH_TO_BEARISH_REVERSAL"
+    elif direction == "BULLISH":
+        market_phase = "CONTINUOUS_BULLISH"
+    elif direction == "BEARISH":
+        market_phase = "CONTINUOUS_BEARISH"
+    else:
+        market_phase = "SIDEWAYS"
+
+    # A failed hard gate is explicitly represented as a WAIT state for trading
+    # purposes, while direction/phase remains available for monitoring.
+    if direction == "BULLISH" and not bullish_trigger:
+        entry_status = "WAIT_BULLISH_CONFIRMATION"
+    elif direction == "BEARISH" and not bearish_trigger:
+        entry_status = "WAIT_BEARISH_CONFIRMATION"
+    else:
+        entry_status = "ENTRY_CONFIRMED" if direction != "NEUTRAL" else "WAIT_SIDEWAYS"
+
+    entry_confirmed = bool(bullish_trigger or bearish_trigger)
 
     # Confidence is based on evidence supporting the selected direction.
     selected_groups = bullish_groups if direction == "BULLISH" else bearish_groups if direction == "BEARISH" else max(bullish_groups, bearish_groups)
@@ -1872,8 +1982,8 @@ def build_market_structure(
     confirmation_factor = min(
         1.0,
         (
-            bullish_confirmation_count if direction == "BULLISH"
-            else bearish_confirmation_count if direction == "BEARISH"
+            bull_confirmed if direction == "BULLISH"
+            else bear_confirmed if direction == "BEARISH"
             else 0
         ) / 3.0,
     )
@@ -1922,16 +2032,17 @@ def build_market_structure(
         ),
         f"Option-chain walls: support={support_1:.0f}/{support_2:.0f}; resistance={resistance_1:.0f}/{resistance_2:.0f}.",
         f"Chain predictive bias={chain_predictive_bias:+d}; strength={chain_predictive_strength:.3f}; level_bias={chain_level_bias:+d}.",
-        f"Daily OI API bias={daily_oi_bias:+d} score={daily_oi_score:+.3f}; Change-OI API bias={change_oi_bias:+d} score={change_oi_score:+.3f}.",
-        f"Bull confirmations={bullish_confirmation_count}; bear confirmations={bearish_confirmation_count}.",
+        f"PCR={pcr:.3f} bias={pcr_bias:+d}; Daily OI API bias={daily_oi_bias:+d} score={daily_oi_score:+.3f}; Change-OI API bias={change_oi_bias:+d} score={change_oi_score:+.3f}.",
+        f"Hard confirmations: bull={bull_confirmed}/5 {bullish_confirmations}; bear={bear_confirmed}/5 {bearish_confirmations}.",
+        f"Market phase={market_phase}; entry_status={entry_status}; previous_direction={previous_direction or 'NONE'}.",
         f"Directional groups bullish={bullish_groups}, bearish={bearish_groups}.",
-        "Decision hierarchy: intraday price/VWAP core first; derivatives positioning confirms and does not veto a strong intraday reversal unless price-core evidence is weak.",
+        "Decision hierarchy: price structure identifies the move; VWAP + Futures OI + Change-OI + PCR/chain OI must confirm before an option entry alert.",
     ]
 
     logger.info(
         "MARKET STRUCTURE V3: score=%+.2f core=%+.2f direction=%s confidence=%.1f | "
         "Intraday=%+d/%.3f Futures=%s/%.3f ChainPred=%+d/%.3f VWAP=%s | TF=%s | "
-        "BullConf=%d BearConf=%d",
+        "BullConf=%d BearConf=%d Phase=%s",
         total_score,
         core_score,
         direction,
@@ -1947,8 +2058,9 @@ def build_market_structure(
             f"{tf}:{'B' if tf_directions.get(tf,0)>0 else 'S' if tf_directions.get(tf,0)<0 else 'N'}"
             for tf in TIMEFRAMES
         ),
-        bullish_confirmation_count,
-        bearish_confirmation_count,
+        bull_confirmed,
+        bear_confirmed,
+        market_phase,
     )
 
     return StructureResult(
@@ -1979,6 +2091,10 @@ def build_market_structure(
         support_2=support_2,
         resistance_1=resistance_1,
         resistance_2=resistance_2,
+        market_phase=market_phase,
+        entry_confirmed=entry_confirmed,
+        pcr=float(pcr) if math.isfinite(pcr) else float("nan"),
+        pcr_bias=pcr_bias,
         reasons=reasons,
     )
 
@@ -2329,7 +2445,7 @@ def project_option_premium(
 ) -> float:
     """
     Second-order local Greek approximation:
-        Î”premium â‰ˆ |delta| * |dS| + 0.5 * |gamma| * dSÂ²
+        Δpremium ≈ |delta| * |dS| + 0.5 * |gamma| * dS²
 
     This is deliberately used only for target/stop estimation, not execution.
     """
@@ -2541,10 +2657,10 @@ def signal_email_body(signal: Signal) -> str:
 <tr><td><b>Futures Regime</b></td><td>{html.escape(signal.futures_state)}</td></tr>
 <tr><td><b>Option</b></td><td>{html.escape(signal.trading_symbol)}</td></tr>
 <tr><td><b>Strike</b></td><td>{signal.strike:.0f} {signal.option_type}</td></tr>
-<tr><td><b>Entry</b></td><td>â‚¹{signal.entry:.2f}</td></tr>
-<tr><td><b>Target 1</b></td><td>â‚¹{signal.target_1:.2f}</td></tr>
-<tr><td><b>Target 2</b></td><td>â‚¹{signal.target_2:.2f}</td></tr>
-<tr><td><b>Stop Loss</b></td><td>â‚¹{signal.stop_loss:.2f}</td></tr>
+<tr><td><b>Entry</b></td><td>₹{signal.entry:.2f}</td></tr>
+<tr><td><b>Target 1</b></td><td>₹{signal.target_1:.2f}</td></tr>
+<tr><td><b>Target 2</b></td><td>₹{signal.target_2:.2f}</td></tr>
+<tr><td><b>Stop Loss</b></td><td>₹{signal.stop_loss:.2f}</td></tr>
 <tr><td><b>Underlying T1</b></td><td>{signal.underlying_target_1:.2f}</td></tr>
 <tr><td><b>Underlying T2</b></td><td>{signal.underlying_target_2:.2f}</td></tr>
 <tr><td><b>Underlying SL</b></td><td>{signal.underlying_stop:.2f}</td></tr>
@@ -2630,8 +2746,8 @@ def monitor_active_trade(
             (
                 f"<p>{html.escape(str(trade['direction']))} trade closed.</p>"
                 f"<p>Option: {html.escape(str(trade['trading_symbol']))}<br>"
-                f"Entry: â‚¹{entry:.2f}<br>"
-                f"Exit: â‚¹{ltp:.2f}<br>"
+                f"Entry: ₹{entry:.2f}<br>"
+                f"Exit: ₹{ltp:.2f}<br>"
                 f"Outcome: {outcome}</p>"
             ),
         )
@@ -2766,6 +2882,9 @@ def execute_scan(
     daily_oi_bias, daily_oi_score = get_daily_oi_confirmation(expiry)
     change_oi_bias, change_oi_score = get_change_oi_confirmation(expiry)
 
+    previous_snapshot = state.get("market_snapshot") if isinstance(state.get("market_snapshot"), dict) else {}
+    previous_direction = str(previous_snapshot.get("direction", "")).upper() or None
+
     structure = build_market_structure(
         spot=spot,
         futures_3m=futures_3m,
@@ -2778,6 +2897,7 @@ def execute_scan(
         change_oi_bias=change_oi_bias,
         change_oi_score=change_oi_score,
         futures_live_quote=futures_live_quote,
+        previous_direction=previous_direction,
     )
 
     state["market_snapshot"] = {
@@ -2794,6 +2914,9 @@ def execute_scan(
         "support_change_strength": round(structure.support_change_strength, 4), "resistance_change_strength": round(structure.resistance_change_strength, 4),
         "vwap": round(structure.vwap, 2), "vwap_slope": round(structure.vwap_slope, 4),
         "direction": structure.direction, "score": round(structure.score, 3), "confidence": round(structure.confidence, 2),
+        "market_phase": structure.market_phase, "entry_confirmed": structure.entry_confirmed,
+        "pcr": structure.pcr if math.isfinite(structure.pcr) else None,
+        "pcr_bias": structure.pcr_bias,
         "support_1": structure.support_1, "support_2": structure.support_2,
         "resistance_1": structure.resistance_1, "resistance_2": structure.resistance_2,
         "timeframes": structure.timeframe_directions, "components": structure.components,
@@ -2816,8 +2939,19 @@ def execute_scan(
         return None
 
     if structure.direction == "NEUTRAL":
-        logger.info("No entry: market structure is neutral/mixed.")
+        logger.info("No entry: market structure is neutral/mixed; phase=%s.", structure.market_phase)
         return None
+
+    # The structure engine deliberately retains the direction for monitoring,
+    # but execute_scan only proceeds when the strict derivatives confirmation
+    # gate has passed.
+    if not structure.entry_confirmed:
+        logger.info(
+            "No entry: strict confirmation gate failed. direction=%s phase=%s PCR_bias=%+d",
+            structure.direction, structure.market_phase, structure.pcr_bias,
+        )
+        return None
+
     if structure.confidence < SIGNAL_THRESHOLD:
         logger.info("No entry: confidence %.1f < %.1f", structure.confidence, SIGNAL_THRESHOLD)
         return None
@@ -2843,7 +2977,7 @@ def execute_scan(
         f"Directional strike rule: {'ATM-1/ATM-2 CE' if structure.direction == 'BULLISH' else 'ATM+1/ATM+2 PE'}.",
         f"Selected option health: spread={option.spread_pct:.2%}, theta burden={option.theta_burden_pct_day:.2%}/day, volume={option.volume:.0f}, OI={option.oi:.0f}, delta={option.delta:.3f}.",
         f"Dynamic underlying targets: T1={underlying_target1:.2f}, T2={underlying_target2:.2f}, SL={underlying_stop:.2f}.",
-        f"Dynamic option targets: T1=â‚¹{target1:.2f}, T2=â‚¹{target2:.2f}, SL=â‚¹{stop_loss:.2f}.",
+        f"Dynamic option targets: T1=₹{target1:.2f}, T2=₹{target2:.2f}, SL=₹{stop_loss:.2f}.",
         "Market direction is established before option selection; option premium momentum is not the primary directional trigger.",
     ])
 
