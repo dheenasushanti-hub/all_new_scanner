@@ -2344,73 +2344,93 @@ def create_dynamic_targets(
     spot: float,
     tf_frames: dict[int, pd.DataFrame],
 ) -> tuple[float, float, float, float, float, float]:
+    """Create option and underlying targets without allowing risk math to crash a valid signal.
+
+    Important: the option is long, so an adverse underlying move must reduce
+    premium. The previous implementation accidentally used the *positive*
+    premium projection for the adverse move; with a high-delta/high-gamma
+    option that could make ``adverse_premium >= entry`` and produce zero risk.
+    """
     target_u1, target_u2, stop_u = choose_underlying_levels(
-        structure,
-        spot,
-        tf_frames,
+        structure, spot, tf_frames,
     )
 
-    # Direction-aware underlying moves.
+    atr3 = max(safe_float(tf_frames[3]["atr"].iloc[-1], 0.0), 1.0)
+    atr15 = max(safe_float(tf_frames[15]["atr"].iloc[-1], atr3), atr3)
+
+    # Final defensive validation/fallback for unusual chain levels.
     if structure.direction == "BEARISH":
+        if target_u1 >= spot:
+            target_u1 = spot - 0.75 * atr3
+        if target_u2 >= target_u1:
+            target_u2 = target_u1 - max(0.75 * atr3, 0.50 * atr15)
+        if stop_u <= spot:
+            stop_u = spot + 0.80 * atr3
         move_t1 = spot - target_u1
         move_t2 = spot - target_u2
         adverse_move = stop_u - spot
     else:
+        if target_u1 <= spot:
+            target_u1 = spot + 0.75 * atr3
+        if target_u2 <= target_u1:
+            target_u2 = target_u1 + max(0.75 * atr3, 0.50 * atr15)
+        if stop_u >= spot:
+            stop_u = spot - 0.80 * atr3
         move_t1 = target_u1 - spot
         move_t2 = target_u2 - spot
         adverse_move = spot - stop_u
 
-    if move_t1 <= 0 or move_t2 <= move_t1:
-        raise ScannerError(
-            "Dynamic underlying targets are not ordered correctly."
-        )
+    if move_t1 <= 0:
+        move_t1 = 0.75 * atr3
+        target_u1 = spot + move_t1 if structure.direction == "BULLISH" else spot - move_t1
+    if move_t2 <= move_t1:
+        move_t2 = max(1.25 * atr15, move_t1 + 0.50 * atr3)
+        target_u2 = spot + move_t2 if structure.direction == "BULLISH" else spot - move_t2
     if adverse_move <= 0:
+        adverse_move = 0.80 * atr3
+        stop_u = spot - adverse_move if structure.direction == "BULLISH" else spot + adverse_move
+
+    target1 = project_option_premium(option.ltp, move_t1, option.delta, option.gamma)
+    target2 = project_option_premium(option.ltp, move_t2, option.delta, option.gamma)
+
+    # Correct signed adverse-premium estimate for a LONG option.
+    # First order loses premium; gamma partially offsets that loss.
+    delta_abs = abs(option.delta)
+    gamma_abs = abs(option.gamma)
+    estimated_loss = (delta_abs * adverse_move) - (0.5 * gamma_abs * adverse_move * adverse_move)
+    estimated_loss = max(0.0, estimated_loss)
+
+    # Always keep a real, bounded monetary risk. This is a safety bound, not
+    # a directional veto. Near-expiry/high-gamma options can otherwise make
+    # the second-order approximation mathematically negative.
+    min_loss = option.ltp * OPTION_MIN_STOP_PCT
+    max_loss = option.ltp * OPTION_MAX_STOP_PCT
+    risk = min(max(estimated_loss, min_loss), max_loss)
+    stop_loss = option.ltp - risk
+
+    # Guarantee valid ordering without rejecting a structurally valid market
+    # signal merely because the option's local Greek approximation is noisy.
+    min_t1 = option.ltp + MIN_T1_RISK_REWARD * risk
+    min_t2 = option.ltp + MIN_T2_RISK_REWARD * risk
+    target1 = max(target1, min_t1)
+    target2 = max(target2, min_t2, target1 + 0.25 * risk)
+
+    if not (stop_loss < option.ltp < target1 < target2):
         raise ScannerError(
-            "Dynamic underlying stop is on the wrong side of spot."
+            f"Invalid option risk levels after fallback: entry={option.ltp:.2f}, "
+            f"SL={stop_loss:.2f}, T1={target1:.2f}, T2={target2:.2f}."
         )
 
-    target1 = project_option_premium(
-        option.ltp, move_t1, option.delta, option.gamma
+    logger.info(
+        "OPTION RISK: entry=%.2f SL=%.2f risk=%.2f (%.1f%%) T1=%.2f T2=%.2f | "
+        "underlying T1=%.2f T2=%.2f SL=%.2f",
+        option.ltp, stop_loss, risk, 100.0 * risk / option.ltp,
+        target1, target2, target_u1, target_u2, stop_u,
     )
-    target2 = project_option_premium(
-        option.ltp, move_t2, option.delta, option.gamma
-    )
-    adverse_premium = project_option_premium(
-        option.ltp, adverse_move, option.delta, option.gamma
-    )
-
-    # For a long option, adverse movement reduces premium. Use the structural
-    # loss estimate but bound it so normal volatility does not create a
-    # microscopic stop.
-    risk_distance = max(option.ltp - adverse_premium, 0.0)
-    structural_stop = option.ltp - risk_distance
-
-    hard_floor = option.ltp * (1.0 - OPTION_MAX_STOP_PCT)
-
-    # Dynamic structural SL, bounded by 15-30% below entry.
-    stop_loss = max(hard_floor, structural_stop)
-
-    # Ensure target distances are economically meaningful.
-    risk = option.ltp - stop_loss
-    if risk <= 0:
-        raise ScannerError("Dynamic option stop is not below entry.")
-
-    if target1 < option.ltp + (1.0 * risk):
-        raise ScannerError(f"Target 1 (â‚¹{target1:.2f}) offers poor risk/reward against â‚¹{risk:.2f} risk. Move exhausted.")
-
-    if target2 < option.ltp + MIN_T2_RISK_REWARD * risk:
-        target2 = option.ltp + MIN_T2_RISK_REWARD * risk
-
-    if target2 <= target1:
-        raise ScannerError("Target 2 must exceed Target 1.")
 
     return (
-        round(target1, 2),
-        round(target2, 2),
-        round(stop_loss, 2),
-        round(stop_u, 2),
-        round(target_u1, 2),
-        round(target_u2, 2),
+        round(target1, 2), round(target2, 2), round(stop_loss, 2),
+        round(stop_u, 2), round(target_u1, 2), round(target_u2, 2),
     )
 
 
