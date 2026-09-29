@@ -92,7 +92,7 @@ OVEREXTENSION_ATR = float(os.getenv("OVEREXTENSION_ATR", "3.25"))
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-09-29-MULTI-TF-MARKET-STRUCTURE-V6-OPENING-RESILIENT-PRICE-FIRST"
+SCANNER_VERSION = "2026-09-29-MULTI-TF-MARKET-STRUCTURE-V6_1-PHASE-AWARE-CONFIRMATION"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -176,8 +176,14 @@ OPTION_MAX_STOP_PCT = 0.30
 OPTION_MIN_STOP_PCT = 0.15
 
 # Trade monitoring.
-REVERSAL_CONFIRMATIONS_REQUIRED = 1
+REVERSAL_CONFIRMATIONS_REQUIRED = 2
 STRUCTURE_REVERSAL_CONFIDENCE = 60.0
+
+# Phase-aware state thresholds. These classify market movement separately from
+# entry readiness, so conflicting derivatives can mark a weakening trend
+# without falsely flipping the market direction.
+WEAKENING_MIN_OPPOSITE_CONFIRMATIONS = 1
+SIDEWAYS_CORE_THRESHOLD = 2.00
 
 # URLs.
 INSTRUMENT_SEARCH_URL = f"{BASE_URL}/v2/instruments/search"
@@ -262,6 +268,8 @@ class StructureResult:
     resistance_2: float
     market_phase: str
     entry_confirmed: bool
+    reversal_confirmations: int
+    confirmation_state: str
     pcr: float
     pcr_bias: int
     reasons: list[str]
@@ -1651,6 +1659,8 @@ def build_market_structure(
     change_oi_score: float,
     futures_live_quote: Optional[dict[str, Any]] = None,
     previous_direction: Optional[str] = None,
+    previous_phase: Optional[str] = None,
+    previous_reversal_confirmations: int = 0,
 ) -> StructureResult:
     """
     Trend-first market-structure engine.
@@ -1945,22 +1955,54 @@ def build_market_structure(
         )
         direction = raw_price_direction
 
-    # Classify the movement independently from the entry decision.
+    # -------------------------------------------------------------------------
+    # PHASE-AWARE MARKET STATE
+    # -------------------------------------------------------------------------
+    # Market direction and entry readiness are intentionally separate. A strong
+    # bearish price/VWAP/futures core with bullish Change-OI, for example, is
+    # still BEARISH but is classified as BEARISH_WEAKENING rather than being
+    # treated as a clean continuation. This preserves dynamic movement
+    # detection while preventing premature option entries.
+    opposite_confirmations = (
+        bull_confirmed if direction == "BEARISH" else
+        bear_confirmed if direction == "BULLISH" else 0
+    )
+    selected_confirmed = (
+        bear_confirmed if direction == "BEARISH" else
+        bull_confirmed if direction == "BULLISH" else 0
+    )
+
+    reversal_confirmations = 0
     if direction == "NEUTRAL" or (
-        intraday_strength < 0.35
-        and abs(core_score) < 2.50
+        intraday_strength < 0.35 and abs(core_score) < SIDEWAYS_CORE_THRESHOLD
     ):
         market_phase = "SIDEWAYS"
-    elif previous_direction == "BEARISH" and direction == "BULLISH":
-        market_phase = "BEARISH_TO_BULLISH_REVERSAL"
-    elif previous_direction == "BULLISH" and direction == "BEARISH":
-        market_phase = "BULLISH_TO_BEARISH_REVERSAL"
     elif direction == "BULLISH":
-        market_phase = "CONTINUOUS_BULLISH"
-    elif direction == "BEARISH":
-        market_phase = "CONTINUOUS_BEARISH"
-    else:
-        market_phase = "SIDEWAYS"
+        if previous_phase == "BEARISH_TO_BULLISH_REVERSAL" and previous_direction == "BULLISH":
+            reversal_confirmations = previous_reversal_confirmations + 1
+        elif previous_direction == "BEARISH":
+            reversal_confirmations = 1
+        if reversal_confirmations > 0 and reversal_confirmations < REVERSAL_CONFIRMATIONS_REQUIRED:
+            market_phase = "BEARISH_TO_BULLISH_REVERSAL"
+        elif reversal_confirmations >= REVERSAL_CONFIRMATIONS_REQUIRED:
+            market_phase = "BEARISH_TO_BULLISH_REVERSAL_CONFIRMED"
+        elif opposite_confirmations >= WEAKENING_MIN_OPPOSITE_CONFIRMATIONS:
+            market_phase = "BULLISH_WEAKENING"
+        else:
+            market_phase = "CONTINUOUS_BULLISH"
+    else:  # BEARISH
+        if previous_phase == "BULLISH_TO_BEARISH_REVERSAL" and previous_direction == "BEARISH":
+            reversal_confirmations = previous_reversal_confirmations + 1
+        elif previous_direction == "BULLISH":
+            reversal_confirmations = 1
+        if reversal_confirmations > 0 and reversal_confirmations < REVERSAL_CONFIRMATIONS_REQUIRED:
+            market_phase = "BULLISH_TO_BEARISH_REVERSAL"
+        elif reversal_confirmations >= REVERSAL_CONFIRMATIONS_REQUIRED:
+            market_phase = "BULLISH_TO_BEARISH_REVERSAL_CONFIRMED"
+        elif opposite_confirmations >= WEAKENING_MIN_OPPOSITE_CONFIRMATIONS:
+            market_phase = "BEARISH_WEAKENING"
+        else:
+            market_phase = "CONTINUOUS_BEARISH"
 
     # A failed hard gate is explicitly represented as a WAIT state for trading
     # purposes, while direction/phase remains available for monitoring.
@@ -1971,7 +2013,27 @@ def build_market_structure(
     else:
         entry_status = "ENTRY_CONFIRMED" if direction != "NEUTRAL" else "WAIT_SIDEWAYS"
 
-    entry_confirmed = bool(bullish_trigger or bearish_trigger)
+    # Reversal entries require persistence across scans. The market can be
+    # labelled as a reversal immediately for monitoring, but an option alert
+    # is not allowed until the reversal has survived the required confirmations.
+    if market_phase in {"BEARISH_TO_BULLISH_REVERSAL", "BULLISH_TO_BEARISH_REVERSAL"}:
+        entry_confirmed = False
+    else:
+        entry_confirmed = bool(bullish_trigger or bearish_trigger)
+
+    if not entry_confirmed and direction != "NEUTRAL":
+        entry_status = "WAIT_REVERSAL_CONFIRMATION" if "_TO_" in market_phase else (
+            "WAIT_BULLISH_CONFIRMATION" if direction == "BULLISH" else "WAIT_BEARISH_CONFIRMATION"
+        )
+
+    if direction == "NEUTRAL":
+        confirmation_state = "NEUTRAL"
+    elif selected_confirmed >= 4 and opposite_confirmations == 0:
+        confirmation_state = "CONFIRMED"
+    elif opposite_confirmations > 0:
+        confirmation_state = "CONFLICT"
+    else:
+        confirmation_state = "PARTIAL"
 
     # Confidence is based on evidence supporting the selected direction.
     selected_groups = bullish_groups if direction == "BULLISH" else bearish_groups if direction == "BEARISH" else max(bullish_groups, bearish_groups)
@@ -2034,7 +2096,8 @@ def build_market_structure(
         f"Chain predictive bias={chain_predictive_bias:+d}; strength={chain_predictive_strength:.3f}; level_bias={chain_level_bias:+d}.",
         f"PCR={pcr:.3f} bias={pcr_bias:+d}; Daily OI API bias={daily_oi_bias:+d} score={daily_oi_score:+.3f}; Change-OI API bias={change_oi_bias:+d} score={change_oi_score:+.3f}.",
         f"Hard confirmations: bull={bull_confirmed}/5 {bullish_confirmations}; bear={bear_confirmed}/5 {bearish_confirmations}.",
-        f"Market phase={market_phase}; entry_status={entry_status}; previous_direction={previous_direction or 'NONE'}.",
+        f"Confirmation state={confirmation_state}; selected={selected_confirmed}; opposite={opposite_confirmations}.",
+        f"Market phase={market_phase}; reversal_confirmations={reversal_confirmations}/{REVERSAL_CONFIRMATIONS_REQUIRED}; entry_status={entry_status}; previous_direction={previous_direction or 'NONE'}.",
         f"Directional groups bullish={bullish_groups}, bearish={bearish_groups}.",
         "Decision hierarchy: price structure identifies the move; VWAP + Futures OI + Change-OI + PCR/chain OI must confirm before an option entry alert.",
     ]
@@ -2093,6 +2156,8 @@ def build_market_structure(
         resistance_2=resistance_2,
         market_phase=market_phase,
         entry_confirmed=entry_confirmed,
+        reversal_confirmations=reversal_confirmations,
+        confirmation_state=confirmation_state,
         pcr=float(pcr) if math.isfinite(pcr) else float("nan"),
         pcr_bias=pcr_bias,
         reasons=reasons,
@@ -2884,6 +2949,8 @@ def execute_scan(
 
     previous_snapshot = state.get("market_snapshot") if isinstance(state.get("market_snapshot"), dict) else {}
     previous_direction = str(previous_snapshot.get("direction", "")).upper() or None
+    previous_phase = str(previous_snapshot.get("market_phase", "")).upper() or None
+    previous_reversal_confirmations = int(previous_snapshot.get("reversal_confirmations", 0) or 0)
 
     structure = build_market_structure(
         spot=spot,
@@ -2898,6 +2965,8 @@ def execute_scan(
         change_oi_score=change_oi_score,
         futures_live_quote=futures_live_quote,
         previous_direction=previous_direction,
+        previous_phase=previous_phase,
+        previous_reversal_confirmations=previous_reversal_confirmations,
     )
 
     state["market_snapshot"] = {
@@ -2915,6 +2984,8 @@ def execute_scan(
         "vwap": round(structure.vwap, 2), "vwap_slope": round(structure.vwap_slope, 4),
         "direction": structure.direction, "score": round(structure.score, 3), "confidence": round(structure.confidence, 2),
         "market_phase": structure.market_phase, "entry_confirmed": structure.entry_confirmed,
+        "reversal_confirmations": structure.reversal_confirmations,
+        "confirmation_state": structure.confirmation_state,
         "pcr": structure.pcr if math.isfinite(structure.pcr) else None,
         "pcr_bias": structure.pcr_bias,
         "support_1": structure.support_1, "support_2": structure.support_2,
@@ -2947,8 +3018,9 @@ def execute_scan(
     # gate has passed.
     if not structure.entry_confirmed:
         logger.info(
-            "No entry: strict confirmation gate failed. direction=%s phase=%s PCR_bias=%+d",
-            structure.direction, structure.market_phase, structure.pcr_bias,
+            "No entry: confirmation gate failed. direction=%s phase=%s state=%s reversal=%d/%d PCR_bias=%+d",
+            structure.direction, structure.market_phase, structure.confirmation_state,
+            structure.reversal_confirmations, REVERSAL_CONFIRMATIONS_REQUIRED, structure.pcr_bias,
         )
         return None
 
@@ -3266,6 +3338,90 @@ def self_test() -> None:
     assert bull_structure.direction == "BULLISH", bull_structure
     assert bull_structure.intraday_bias == 1
     assert bull_structure.intraday_strength > 0.50
+    assert bull_structure.market_phase == "BULLISH_WEAKENING", bull_structure
+    assert not bull_structure.entry_confirmed, bull_structure
+    assert bull_structure.confirmation_state == "CONFLICT", bull_structure
+
+    # Phase-aware regression: a strong bearish core with bullish Change-OI/PCR
+    # conflict remains BEARISH, but is explicitly marked as weakening. It must
+    # not flip bullish and must not produce an option-entry confirmation.
+    weakening_chain = dict(chain_levels)
+    weakening_chain.update({
+        "pcr": 1.08,
+        "pcr_bias": 1,
+        "predictive_bias": 0,
+        "predictive_strength": 0.10,
+        "level_bias": 0,
+        "change_bias": 0,
+    })
+    weakening = build_market_structure(
+        spot=93.0,
+        futures_3m=fut,
+        futures_session=fut,
+        tf_frames=frames,
+        tf_directions=tf_dirs,
+        chain_levels=weakening_chain,
+        daily_oi_bias=-1,
+        daily_oi_score=-0.20,
+        change_oi_bias=1,
+        change_oi_score=0.24,
+    )
+    assert weakening.direction == "BEARISH", weakening
+    assert weakening.market_phase == "BEARISH_WEAKENING", weakening
+    assert weakening.confirmation_state == "CONFLICT", weakening
+    assert not weakening.entry_confirmed, weakening
+
+    # Strict-entry regression: all four mandatory confirmations aligned with
+    # the price core must allow an entry; chain OI is an additional confirmation.
+    confirmed_chain = dict(bull_chain_levels)
+    confirmed_chain.update({
+        "oi_bias": 1, "change_bias": 1, "predictive_bias": 1,
+        "predictive_strength": 0.30, "level_bias": 1,
+        "pcr": 1.10, "pcr_bias": 1,
+    })
+    confirmed = build_market_structure(
+        spot=107.5,
+        futures_3m=bull_session,
+        futures_session=bull_session,
+        tf_frames=bull_frames,
+        tf_directions=bull_tf_dirs,
+        chain_levels=confirmed_chain,
+        daily_oi_bias=1,
+        daily_oi_score=0.20,
+        change_oi_bias=1,
+        change_oi_score=0.25,
+        futures_live_quote={"oi": 1140},
+    )
+    assert confirmed.direction == "BULLISH", confirmed
+    assert confirmed.entry_confirmed, confirmed
+    assert confirmed.confirmation_state == "CONFIRMED", confirmed
+
+    # Reversal persistence regression: the first bullish scan after a bearish
+    # regime is labelled as a reversal but cannot trigger an option entry. The
+    # second consecutive confirming scan is required before entry is allowed.
+    reversal_1 = build_market_structure(
+        spot=107.5, futures_3m=bull_session, futures_session=bull_session,
+        tf_frames=bull_frames, tf_directions=bull_tf_dirs,
+        chain_levels=confirmed_chain, daily_oi_bias=1, daily_oi_score=0.20,
+        change_oi_bias=1, change_oi_score=0.25, futures_live_quote={"oi": 1140},
+        previous_direction="BEARISH", previous_phase="CONTINUOUS_BEARISH",
+        previous_reversal_confirmations=0,
+    )
+    assert reversal_1.market_phase == "BEARISH_TO_BULLISH_REVERSAL", reversal_1
+    assert reversal_1.reversal_confirmations == 1, reversal_1
+    assert not reversal_1.entry_confirmed, reversal_1
+
+    reversal_2 = build_market_structure(
+        spot=107.5, futures_3m=bull_session, futures_session=bull_session,
+        tf_frames=bull_frames, tf_directions=bull_tf_dirs,
+        chain_levels=confirmed_chain, daily_oi_bias=1, daily_oi_score=0.20,
+        change_oi_bias=1, change_oi_score=0.25, futures_live_quote={"oi": 1140},
+        previous_direction="BULLISH", previous_phase="BEARISH_TO_BULLISH_REVERSAL",
+        previous_reversal_confirmations=1,
+    )
+    assert reversal_2.market_phase == "BEARISH_TO_BULLISH_REVERSAL_CONFIRMED", reversal_2
+    assert reversal_2.reversal_confirmations == 2, reversal_2
+    assert reversal_2.entry_confirmed, reversal_2
 
     # The supplied production logs show a bullish short-covering/reversal state:
     # 3m/15m/30m bullish + VWAP above + SHORT_COVERING. It must be eligible even
