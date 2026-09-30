@@ -88,11 +88,30 @@ MAX_HISTORY_DAYS = int(os.getenv("MAX_HISTORY_DAYS", "45"))
 SIGNAL_THRESHOLD = float(os.getenv("SIGNAL_THRESHOLD", "55"))
 MIN_ENTRY_TIME = time(9, 18)
 OPENING_RANGE_MINUTES = 3
-OVEREXTENSION_ATR = float(os.getenv("OVEREXTENSION_ATR", "3.25"))
+OVEREXTENSION_ATR = float(os.getenv("OVEREXTENSION_ATR", "2.25"))
+# Entry timing controls: confirmation is necessary but not sufficient. These
+# prevent chasing a move that is already materially displaced from VWAP.
+ENTRY_FUTURES_MIN_PERSISTENCE = float(os.getenv("ENTRY_FUTURES_MIN_PERSISTENCE", "0.50"))
+ENTRY_FUTURES_MIN_STRENGTH = float(os.getenv("ENTRY_FUTURES_MIN_STRENGTH", "0.35"))
+ENTRY_PCR_BULL_THRESHOLD = float(os.getenv("ENTRY_PCR_BULL_THRESHOLD", "1.10"))
+ENTRY_PCR_BEAR_THRESHOLD = float(os.getenv("ENTRY_PCR_BEAR_THRESHOLD", "0.90"))
+ENTRY_CHANGE_OI_MIN_SCORE = float(os.getenv("ENTRY_CHANGE_OI_MIN_SCORE", "0.15"))
+ENTRY_MAX_3M_MOVE_ATR = float(os.getenv("ENTRY_MAX_3M_MOVE_ATR", "1.35"))
+ENTRY_BREAKOUT_LOOKBACK_BARS = int(os.getenv("ENTRY_BREAKOUT_LOOKBACK_BARS", "6"))
+ENTRY_BREAKOUT_BUFFER_ATR = float(os.getenv("ENTRY_BREAKOUT_BUFFER_ATR", "0.10"))
+
+# Reversal detection is independent from option-entry confirmation. It uses
+# completed 3m price history so a bullish/bearish turn can still be recognized
+# when the immediately previous scan was NEUTRAL or there was a long scan gap.
+REVERSAL_LOOKBACK_BARS = int(os.getenv("REVERSAL_LOOKBACK_BARS", "9"))
+REVERSAL_RECENT_BARS = int(os.getenv("REVERSAL_RECENT_BARS", "3"))
+REVERSAL_ENTRY_CONFIRMATIONS_REQUIRED = int(os.getenv("REVERSAL_ENTRY_CONFIRMATIONS_REQUIRED", "2"))
+REVERSAL_STRIKE_MAX_DISTANCE_STEPS = float(os.getenv("REVERSAL_STRIKE_MAX_DISTANCE_STEPS", "1.25"))
+REVERSAL_STRIKE_PREFERRED_DISTANCE_STEPS = float(os.getenv("REVERSAL_STRIKE_PREFERRED_DISTANCE_STEPS", "0.0"))
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-09-29-MULTI-TF-MARKET-STRUCTURE-V6_1-PHASE-AWARE-CONFIRMATION"
+SCANNER_VERSION = "2026-09-30-MULTI-TF-MARKET-STRUCTURE-V6_3-REVERSAL-PERSISTENCE-STRIKE-SAFE"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -1198,7 +1217,11 @@ def strike_step(strikes: list[float]) -> float:
     ]
     if not diffs:
         raise ScannerError("Unable to determine strike interval.")
-    return min(diffs)
+
+    # Median is robust against one-off gaps/anomalous strikes. Using the raw
+    # minimum can accidentally turn a 100-point chain into a 50-point chain and
+    # corrupt ATM/adjacent-strike selection.
+    return float(np.median(np.asarray(diffs, dtype=float)))
 
 
 def option_side_data(
@@ -1598,6 +1621,116 @@ def intraday_trend_snapshot(
     return bias, float(strength), float(raw_score)
 
 
+def entry_timing_filter(
+    futures_session: pd.DataFrame,
+    direction: str,
+    vwap: float,
+    atr3: float,
+) -> tuple[bool, str, float, float]:
+    """Reject late/chased entries even when the directional gate is bullish/bearish.
+
+    Returns (allowed, state, vwap_distance_atr, latest_3m_move_atr).
+    A valid directional confirmation is still required separately.
+    """
+    if futures_session is None or futures_session.empty or direction not in {"BULLISH", "BEARISH"}:
+        return False, "INSUFFICIENT_DATA", float("inf"), float("inf")
+
+    work = futures_session.copy().sort_values("timestamp")
+    work = filter_completed_candles(work, 3)
+    if len(work) < max(ENTRY_BREAKOUT_LOOKBACK_BARS + 1, 7):
+        return False, "INSUFFICIENT_COMPLETED_3M_BARS", float("inf"), float("inf")
+
+    atr = max(float(atr3), 1.0)
+    price = float(work["close"].iloc[-1])
+    vwap_distance_atr = abs(price - vwap) / atr
+    latest_move_atr = abs(float(work["close"].iloc[-1] - work["close"].iloc[-2])) / atr
+
+    # Hard anti-chase rule. A decisive trend does NOT override this anymore.
+    if vwap_distance_atr > OVEREXTENSION_ATR:
+        return False, "VWAP_EXTENDED", vwap_distance_atr, latest_move_atr
+
+    if latest_move_atr > ENTRY_MAX_3M_MOVE_ATR:
+        return False, "LATEST_3M_BLOWOFF", vwap_distance_atr, latest_move_atr
+
+    prior = work.iloc[-(ENTRY_BREAKOUT_LOOKBACK_BARS + 1):-1]
+    last = work.iloc[-1]
+    buffer = ENTRY_BREAKOUT_BUFFER_ATR * atr
+
+    if direction == "BULLISH":
+        prior_level = float(prior["high"].max())
+        fresh_breakout = float(last["close"]) > prior_level + buffer
+        reclaim = (
+            float(last["close"]) > float(work["close"].iloc[-2])
+            and float(last["low"]) <= float(work["low"].tail(4).min())
+        )
+    else:
+        prior_level = float(prior["low"].min())
+        fresh_breakout = float(last["close"]) < prior_level - buffer
+        reclaim = (
+            float(last["close"]) < float(work["close"].iloc[-2])
+            and float(last["high"]) >= float(work["high"].tail(4).max())
+        )
+
+    # A fresh breakout or a pullback/reclaim is required. This prevents a
+    # signal merely because the last several candles have already trended.
+    if fresh_breakout:
+        return True, "FRESH_BREAKOUT", vwap_distance_atr, latest_move_atr
+    if reclaim:
+        return True, "PULLBACK_RECLAIM", vwap_distance_atr, latest_move_atr
+
+    return False, "NO_FRESH_ENTRY_SETUP", vwap_distance_atr, latest_move_atr
+
+
+def infer_prior_session_direction(
+    futures_session: pd.DataFrame,
+    current_direction: Optional[str] = None,
+) -> tuple[Optional[str], str]:
+    """Infer the recent prior directional regime from completed 3m history.
+
+    Returns (prior_direction, transition_hint). This is deliberately price-first
+    and independent from option OI/PCR, so the scanner can recognize a genuine
+    bearish->bullish or bullish->bearish turn even when the previous persisted
+    market snapshot was NEUTRAL or absent.
+    """
+    if futures_session is None or futures_session.empty:
+        return None, "NO_DATA"
+
+    work = filter_completed_candles(futures_session, 3)
+    minimum = max(REVERSAL_LOOKBACK_BARS, REVERSAL_RECENT_BARS + 3)
+    if len(work) < minimum:
+        return None, "INSUFFICIENT_HISTORY"
+
+    recent_count = min(REVERSAL_RECENT_BARS, len(work) - 3)
+    recent = work.tail(recent_count)
+    prior_end = len(work) - recent_count
+    prior_start = max(0, prior_end - REVERSAL_LOOKBACK_BARS)
+    prior = work.iloc[prior_start:prior_end]
+
+    if len(prior) < 3 or len(recent) < 2:
+        return None, "INSUFFICIENT_WINDOWS"
+
+    prior_structure = market_structure_state(prior, min(8, len(prior)))
+    recent_structure = market_structure_state(recent, min(8, len(recent)))
+
+    prior_net = float(prior["close"].iloc[-1] - prior["close"].iloc[0])
+    recent_net = float(recent["close"].iloc[-1] - recent["close"].iloc[0])
+
+    if prior_structure == "BEARISH" or prior_net < 0:
+        prior_direction = "BEARISH"
+    elif prior_structure == "BULLISH" or prior_net > 0:
+        prior_direction = "BULLISH"
+    else:
+        prior_direction = None
+
+    current = (current_direction or "").upper()
+    if current == "BULLISH" and prior_direction == "BEARISH" and recent_net > 0:
+        return prior_direction, "BEARISH_TO_BULLISH"
+    if current == "BEARISH" and prior_direction == "BULLISH" and recent_net < 0:
+        return prior_direction, "BULLISH_TO_BEARISH"
+
+    return prior_direction, "NO_CONFIRMED_TRANSITION"
+
+
 def timeframe_snapshot(
     spot_key: str,
 ) -> tuple[dict[int, pd.DataFrame], dict[int, int]]:
@@ -1884,18 +2017,46 @@ def build_market_structure(
     #   4) option-chain PCR/OI pressure.
     # This deliberately blocks fake breakouts where price moves first but the
     # derivatives picture has not confirmed.
+    # Confirmation strength matters. PCR/Change-OI are date/cumulative positioning
+    # measures, so merely crossing the old bias thresholds is too weak to justify
+    # an immediate option entry. Futures build-up also requires persistence.
+    bullish_futures_entry = (
+        futures_bias > 0
+        and futures_info["oi_strength"] >= ENTRY_FUTURES_MIN_STRENGTH
+        and (
+            (futures_regime == "LONG_BUILDUP"
+             and futures_info["oi_persistence"] >= ENTRY_FUTURES_MIN_PERSISTENCE)
+            or
+            (futures_regime == "SHORT_COVERING"
+             and futures_info["oi_delta"] < 0
+             and futures_info["oi_acceleration"] < 0)
+        )
+    )
+    bearish_futures_entry = (
+        futures_bias < 0
+        and futures_info["oi_strength"] >= ENTRY_FUTURES_MIN_STRENGTH
+        and (
+            (futures_regime == "SHORT_BUILDUP"
+             and futures_info["oi_persistence"] >= ENTRY_FUTURES_MIN_PERSISTENCE)
+            or
+            (futures_regime == "LONG_UNWINDING"
+             and futures_info["oi_delta"] < 0
+             and futures_info["oi_acceleration"] > 0)
+        )
+    )
+
     bullish_confirmations = {
         "VWAP": vwap_level_bias > 0,
-        "FUTURES_OI": bullish_futures_confirmation,
-        "CHANGE_OI": change_oi_bias > 0,
-        "PCR": pcr_bias > 0,
+        "FUTURES_OI": bullish_futures_entry,
+        "CHANGE_OI": change_oi_score >= ENTRY_CHANGE_OI_MIN_SCORE and change_oi_bias > 0,
+        "PCR": math.isfinite(pcr) and pcr >= ENTRY_PCR_BULL_THRESHOLD,
         "CHAIN_OI": chain_predictive_bias > 0 and chain_predictive_strength >= CHAIN_PREDICTIVE_STRENGTH_THRESHOLD,
     }
     bearish_confirmations = {
         "VWAP": vwap_level_bias < 0,
-        "FUTURES_OI": bearish_futures_confirmation,
-        "CHANGE_OI": change_oi_bias < 0,
-        "PCR": pcr_bias < 0,
+        "FUTURES_OI": bearish_futures_entry,
+        "CHANGE_OI": change_oi_score <= -ENTRY_CHANGE_OI_MIN_SCORE and change_oi_bias < 0,
+        "PCR": math.isfinite(pcr) and pcr <= ENTRY_PCR_BEAR_THRESHOLD,
         "CHAIN_OI": chain_predictive_bias < 0 and chain_predictive_strength >= CHAIN_PREDICTIVE_STRENGTH_THRESHOLD,
     }
 
@@ -2289,6 +2450,7 @@ def select_directional_option(
     chain: list[dict[str, Any]],
     direction: str,
     spot: float,
+    market_phase: Optional[str] = None,
 ) -> OptionCandidate:
     if direction not in {"BULLISH", "BEARISH"}:
         raise ScannerError("Option selection requires BULLISH or BEARISH.")
@@ -2297,12 +2459,39 @@ def select_directional_option(
     strikes = sorted(rows)
     step = strike_step(strikes)
     atm = nearest_strike(spot, strikes)
+    atm_distance_steps = abs(atm - spot) / max(step, 1.0)
 
-    candidate_strikes = (
-        [atm - step, atm - 2 * step, atm]
-        if direction == "BULLISH"
-        else [atm + step, atm + 2 * step, atm]
-    )
+    # Fail safe rather than silently selecting a materially displaced strike.
+    # This catches malformed/incomplete chains and prevents a stale chain from
+    # converting an otherwise correct reversal into an obviously wrong option.
+    if atm_distance_steps > 1.25:
+        raise ScannerError(
+            f"ATM strike sanity check failed: index spot={spot:.2f}, "
+            f"nearest strike={atm:.0f}, step={step:.0f} "
+            f"({atm_distance_steps:.2f} steps away)."
+        )
+
+    is_reversal = str(market_phase or "").upper() in {
+        "BEARISH_TO_BULLISH_REVERSAL",
+        "BEARISH_TO_BULLISH_REVERSAL_CONFIRMED",
+        "BULLISH_TO_BEARISH_REVERSAL",
+        "BULLISH_TO_BEARISH_REVERSAL_CONFIRMED",
+    }
+
+    if is_reversal:
+        # Reversal entries use ATM first and only one step ITM as backup. Do not
+        # reach two strikes away after the underlying has already turned.
+        candidate_strikes = (
+            [atm, atm - step]
+            if direction == "BULLISH"
+            else [atm, atm + step]
+        )
+    else:
+        candidate_strikes = (
+            [atm - step, atm - 2 * step, atm]
+            if direction == "BULLISH"
+            else [atm + step, atm + 2 * step, atm]
+        )
     option_type = "CE" if direction == "BULLISH" else "PE"
 
     candidates: list[OptionCandidate] = []
@@ -2394,9 +2583,22 @@ def select_directional_option(
             f"No healthy directional {option_type} option. {detail}"
         )
 
+    if is_reversal:
+        candidates = [
+            x for x in candidates
+            if abs(x.strike - spot) / max(step, 1.0) <= REVERSAL_STRIKE_MAX_DISTANCE_STEPS
+        ]
+        if not candidates:
+            raise ScannerError(
+                f"No reversal option within {REVERSAL_STRIKE_MAX_DISTANCE_STEPS:.2f} strike steps of index spot={spot:.2f}."
+            )
+
     selected = max(
         candidates,
-        key=lambda x: option_health_score(x, atm, step),
+        key=lambda x: (
+            option_health_score(x, atm, step)
+            - (0.08 * abs(x.strike - atm) / max(step, 1.0) if is_reversal else 0.0)
+        ),
     )
 
     logger.info(
@@ -2906,6 +3108,11 @@ def execute_scan(
     futures_session = get_current_session_futures_candles(future.instrument_key)
     futures_live_quote = get_quote(future.instrument_key)
     spot = extract_ltp(get_quote(SENSEX_KEY))
+    futures_ltp_now = extract_ltp(futures_live_quote)
+    logger.info(
+        "UNDERLYING PRICES: index_spot=%.2f futures_ltp=%.2f basis=%+.2f",
+        spot, futures_ltp_now, futures_ltp_now - spot,
+    )
 
     # If the current session feed is late, use recent historical 3m candles for
     # OI/ATR context and keep the live quote as the current price source.
@@ -2949,8 +3156,35 @@ def execute_scan(
 
     previous_snapshot = state.get("market_snapshot") if isinstance(state.get("market_snapshot"), dict) else {}
     previous_direction = str(previous_snapshot.get("direction", "")).upper() or None
+    persistent_direction = str(
+        state.get("persistent_direction")
+        or previous_snapshot.get("persistent_direction", "")
+    ).upper() or None
     previous_phase = str(previous_snapshot.get("market_phase", "")).upper() or None
     previous_reversal_confirmations = int(previous_snapshot.get("reversal_confirmations", 0) or 0)
+
+    # The immediately previous snapshot can be NEUTRAL during a transition.
+    # Preserve the last directional state and also infer an older regime from
+    # today's completed 3m history when necessary. This recovers a missing
+    # bearish->bullish transition without inventing a reversal from derivatives.
+    seed_direction = persistent_direction or previous_direction
+    vwap_seed, _, _ = vwap_snapshot(futures_session)
+    provisional_intraday_bias, _, _ = intraday_trend_snapshot(futures_session, vwap_seed)
+    provisional_current_direction = (
+        "BULLISH" if provisional_intraday_bias > 0 else
+        "BEARISH" if provisional_intraday_bias < 0 else
+        (seed_direction or "NEUTRAL")
+    )
+    inferred_prior_direction, transition_hint = infer_prior_session_direction(
+        futures_session, provisional_current_direction
+    )
+    # When today's completed 3m history explicitly identifies a transition,
+    # it is more relevant than an older persisted direction. Otherwise keep the
+    # persisted state through neutral scans.
+    if transition_hint in {"BEARISH_TO_BULLISH", "BULLISH_TO_BEARISH"} and inferred_prior_direction:
+        seed_direction = inferred_prior_direction
+    elif not seed_direction and inferred_prior_direction:
+        seed_direction = inferred_prior_direction
 
     structure = build_market_structure(
         spot=spot,
@@ -2964,7 +3198,7 @@ def execute_scan(
         change_oi_bias=change_oi_bias,
         change_oi_score=change_oi_score,
         futures_live_quote=futures_live_quote,
-        previous_direction=previous_direction,
+        previous_direction=seed_direction,
         previous_phase=previous_phase,
         previous_reversal_confirmations=previous_reversal_confirmations,
     )
@@ -2982,7 +3216,13 @@ def execute_scan(
         "support_strength": round(structure.support_strength, 4), "resistance_strength": round(structure.resistance_strength, 4),
         "support_change_strength": round(structure.support_change_strength, 4), "resistance_change_strength": round(structure.resistance_change_strength, 4),
         "vwap": round(structure.vwap, 2), "vwap_slope": round(structure.vwap_slope, 4),
-        "direction": structure.direction, "score": round(structure.score, 3), "confidence": round(structure.confidence, 2),
+        "direction": structure.direction, "persistent_direction": (
+            structure.direction if structure.direction in {"BULLISH", "BEARISH"}
+            else (seed_direction or "")
+        ),
+        "inferred_prior_direction": inferred_prior_direction or "",
+        "transition_hint": transition_hint,
+        "score": round(structure.score, 3), "confidence": round(structure.confidence, 2),
         "market_phase": structure.market_phase, "entry_confirmed": structure.entry_confirmed,
         "reversal_confirmations": structure.reversal_confirmations,
         "confirmation_state": structure.confirmation_state,
@@ -2992,8 +3232,19 @@ def execute_scan(
         "resistance_1": structure.resistance_1, "resistance_2": structure.resistance_2,
         "timeframes": structure.timeframe_directions, "components": structure.components,
     }
+    state["persistent_direction"] = (
+        structure.direction if structure.direction in {"BULLISH", "BEARISH"}
+        else (seed_direction or "")
+    ) or None
     save_state(state)
 
+    logger.info(
+        "REVERSAL CONTEXT: persisted=%s inferred_prior=%s hint=%s immediate_previous=%s",
+        state.get("persistent_direction") or "NONE",
+        inferred_prior_direction or "NONE",
+        transition_hint,
+        previous_direction or "NONE",
+    )
     logger.info("PREDICTION: %s | %s | confidence=%.1f score=%+.2f", structure.direction, structure.interpretation, structure.confidence, structure.score)
 
     if active_trade_from_state(state) is not None:
@@ -3029,24 +3280,39 @@ def execute_scan(
         return None
 
     atr3_val = max(safe_float(tf_frames[3]["atr"].iloc[-1], 50.0), 1.0)
-    vwap_distance = abs(spot - structure.vwap)
-    overextended = vwap_distance > (atr3_val * OVEREXTENSION_ATR)
-    decisive_trend = structure.intraday_strength >= 0.78 and abs(structure.score) >= 5.5
-    if overextended and not decisive_trend:
-        logger.info("No entry: price is extended %.2f points from VWAP vs %.2f ATR; waiting for pullback.", vwap_distance, OVEREXTENSION_ATR)
+    timing_ok, timing_state, vwap_distance_atr, latest_3m_move_atr = entry_timing_filter(
+        futures_session=futures_session,
+        direction=structure.direction,
+        vwap=structure.vwap,
+        atr3=atr3_val,
+    )
+    logger.info(
+        "ENTRY TIMING: state=%s vwap_distance=%.2f ATR latest_3m_move=%.2f ATR",
+        timing_state, vwap_distance_atr, latest_3m_move_atr,
+    )
+    if not timing_ok:
+        logger.info(
+            "No entry: directional confirmation exists but timing filter rejected the setup: %s. "
+            "Waiting for a fresh breakout or pullback/reclaim.",
+            timing_state,
+        )
         return None
-    if overextended and decisive_trend:
-        logger.info("TREND-EXTENSION MODE: %.2f points from VWAP, but price trend is decisive; extension is not a veto.", vwap_distance)
 
-    option = select_directional_option(chain=chain, direction=structure.direction, spot=spot)
+    option = select_directional_option(
+        chain=chain,
+        direction=structure.direction,
+        spot=spot,
+        market_phase=structure.market_phase,
+    )
     target1, target2, stop_loss, underlying_stop, underlying_target1, underlying_target2 = create_dynamic_targets(
         option=option, structure=structure, spot=spot, tf_frames=tf_frames,
     )
 
     reasons = list(structure.reasons)
     reasons.extend([
-        f"Entry mode: {'TREND-EXTENSION' if overextended else 'NORMAL'}; completed 3m bars={completed_session_bars}.",
-        f"Directional strike rule: {'ATM-1/ATM-2 CE' if structure.direction == 'BULLISH' else 'ATM+1/ATM+2 PE'}.",
+        f"Entry timing: {timing_state}; VWAP distance={vwap_distance_atr:.2f} ATR; latest 3m move={latest_3m_move_atr:.2f} ATR; completed 3m bars={completed_session_bars}.",
+        f"Strike rule: {'REVERSAL ATM/ATM-1 CE' if structure.market_phase.startswith('BEARISH_TO_BULLISH') else 'REVERSAL ATM/ATM+1 PE' if structure.market_phase.startswith('BULLISH_TO_BEARISH') else 'ATM-1/ATM-2 CE' if structure.direction == 'BULLISH' else 'ATM+1/ATM+2 PE'}.",
+        f"Index spot used for option ATM selection={spot:.2f}; futures VWAP reference={structure.vwap:.2f}.",
         f"Selected option health: spread={option.spread_pct:.2%}, theta burden={option.theta_burden_pct_day:.2%}/day, volume={option.volume:.0f}, OI={option.oi:.0f}, delta={option.delta:.3f}.",
         f"Dynamic underlying targets: T1={underlying_target1:.2f}, T2={underlying_target2:.2f}, SL={underlying_stop:.2f}.",
         f"Dynamic option targets: T1=₹{target1:.2f}, T2=₹{target2:.2f}, SL=₹{stop_loss:.2f}.",
@@ -3158,6 +3424,14 @@ def self_test() -> None:
     assert structure.direction == "BEARISH", structure
     assert structure.score < -ENTRY_SCORE
 
+    # Reversal-history regression: a current bullish move following a prior
+    # bearish completed 3m window must be detected even without prior state.
+    reversal_values = [110, 109, 108, 107, 106, 105, 104, 103, 104, 106, 108, 110]
+    reversal_df = _synthetic_candles(reversal_values)
+    prior_dir, hint = infer_prior_session_direction(reversal_df, "BULLISH")
+    assert prior_dir == "BEARISH", (prior_dir, hint)
+    assert hint == "BEARISH_TO_BULLISH", (prior_dir, hint)
+
     # Strike selection test.
     chain = []
     for strike in [74000, 74050, 74100, 74150, 74200]:
@@ -3238,6 +3512,11 @@ def self_test() -> None:
     assert bear_chain_levels["resistance_1"] == 74150.0
     assert bear_chain_levels["predictive_bias"] == -1
     assert bear_chain_levels["predictive_strength"] >= CHAIN_PREDICTIVE_STRENGTH_THRESHOLD
+
+    selected_reversal = select_directional_option(
+        chain, "BULLISH", 74100, market_phase="BEARISH_TO_BULLISH_REVERSAL"
+    )
+    assert selected_reversal.strike in {74050.0, 74100.0}
 
     selected_bull = select_directional_option(chain, "BULLISH", 74100)
     selected_bear = select_directional_option(chain, "BEARISH", 74100)
@@ -3476,6 +3755,27 @@ def self_test() -> None:
         futures_live_quote=quote_only,
     )
     assert opening_structure.direction in {"BULLISH", "BEARISH", "NEUTRAL"}
+
+    # Entry-timing regression: an already-displaced trend must be rejected even
+    # when directional structure is strong. A fresh breakout within the VWAP
+    # distance limit remains eligible.
+    extended = _synthetic_candles(
+        [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111]
+    )
+    ok, state, dist_atr, move_atr = entry_timing_filter(
+        extended, "BULLISH", vwap=100.0, atr3=2.0
+    )
+    assert not ok, (ok, state, dist_atr, move_atr)
+    assert state == "VWAP_EXTENDED", state
+
+    breakout = _synthetic_candles(
+        [100, 100.2, 100.1, 100.3, 100.2, 100.4, 100.3, 100.5, 100.7, 100.6, 100.8, 103.3]
+    )
+    ok, state, _, _ = entry_timing_filter(
+        breakout, "BULLISH", vwap=100.2, atr3=3.0
+    )
+    assert ok, (ok, state)
+    assert state in {"FRESH_BREAKOUT", "PULLBACK_RECLAIM"}, state
 
     logger.info("SELF-TEST PASSED.")
 
