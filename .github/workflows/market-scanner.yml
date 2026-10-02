@@ -27,7 +27,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run SENSEX predictive scanner
+      - name: Run Nifty predictive scanner
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
