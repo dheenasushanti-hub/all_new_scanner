@@ -132,7 +132,7 @@ REVERSAL_STRIKE_PREFERRED_DISTANCE_STEPS = float(os.getenv("REVERSAL_STRIKE_PREF
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-10-05-FOUR-FACTOR-MARKET-STRUCTURE-V10"
+SCANNER_VERSION = "2026-10-05-FOUR-FACTOR-MARKET-STRUCTURE-V10-STRICT-STRIKE"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -2577,10 +2577,15 @@ def select_directional_option(
                 else [atm, atm + step]
             )
     else:
+        # Continuous directional entries have a HARD strike rule:
+        #   BULLISH -> ATM-1 / ATM-2 CE only
+        #   BEARISH -> ATM+1 / ATM+2 PE only
+        # ATM is intentionally forbidden for continuous-trend entries.
+        # Strike health ranks only between these two permitted strikes.
         candidate_strikes = (
-            [atm - step, atm - 2 * step, atm]
+            [atm - step, atm - 2 * step]
             if direction == "BULLISH"
-            else [atm + step, atm + 2 * step, atm]
+            else [atm + step, atm + 2 * step]
         )
     option_type = "CE" if direction == "BULLISH" else "PE"
 
@@ -2691,6 +2696,26 @@ def select_directional_option(
         ),
     )
 
+    # Final hard invariant for continuous entries. This is deliberately checked
+    # after candidate filtering/ranking so an invalid strike can NEVER propagate
+    # into Signal -> state -> email.
+    if not is_reversal:
+        permitted = (
+            {round(atm - step, 2), round(atm - 2.0 * step, 2)}
+            if direction == "BULLISH"
+            else {round(atm + step, 2), round(atm + 2.0 * step, 2)}
+        )
+        if round(selected.strike, 2) not in permitted:
+            raise ScannerError(
+                f"STRICT STRIKE VALIDATION FAILED: direction={direction} "
+                f"ATM={atm:.2f} step={step:.2f} selected={selected.strike:.2f} "
+                f"permitted={sorted(permitted)}"
+            )
+        if direction == "BULLISH" and selected.option_type != "CE":
+            raise ScannerError("STRICT STRIKE VALIDATION FAILED: bullish entry must use CE.")
+        if direction == "BEARISH" and selected.option_type != "PE":
+            raise ScannerError("STRICT STRIKE VALIDATION FAILED: bearish entry must use PE.")
+
     logger.info(
         "OPTION SELECT: direction=%s ATM=%.0f -> %s %.0f | "
         "LTP=%.2f OI=%.0f volume=%.0f delta=%.3f spread=%.2f%% "
@@ -2701,6 +2726,68 @@ def select_directional_option(
         selected.theta_burden_pct_day * 100.0,
     )
     return selected
+
+
+def validate_continuous_option_entry(
+    option: OptionCandidate,
+    chain: list[dict[str, Any]],
+    direction: str,
+    market_phase: str,
+    spot: float,
+) -> None:
+    """Final pre-signal/pre-email invariant check for continuous trend trades."""
+    phase = str(market_phase or "").upper()
+    if phase not in {"CONTINUOUS_BULLISH", "CONTINUOUS_BEARISH"}:
+        return
+
+    rows = chain_rows(chain)
+    strikes = sorted(rows)
+    step = strike_step(strikes)
+    atm = nearest_strike(spot, strikes)
+    permitted = (
+        {round(atm - step, 2), round(atm - 2.0 * step, 2)}
+        if direction == "BULLISH"
+        else {round(atm + step, 2), round(atm + 2.0 * step, 2)}
+    )
+    selected_strike = round(float(option.strike), 2)
+
+    if selected_strike not in permitted:
+        raise ScannerError(
+            f"PRE-EMAIL STRIKE VALIDATION FAILED: {direction} continuous entry "
+            f"requires {sorted(permitted)} but selected {selected_strike:.2f}."
+        )
+
+    expected_type = "CE" if direction == "BULLISH" else "PE"
+    if option.option_type != expected_type:
+        raise ScannerError(
+            f"PRE-EMAIL OPTION TYPE VALIDATION FAILED: {direction} "
+            f"requires {expected_type}, got {option.option_type}."
+        )
+
+    exact_row = rows.get(selected_strike)
+    if exact_row is None:
+        raise ScannerError(
+            f"PRE-EMAIL CHAIN VALIDATION FAILED: strike {selected_strike:.2f} "
+            "is not present in the live option chain."
+        )
+
+    side = option_side_data(exact_row, expected_type)
+    live_key = str(side.get("instrument_key") or "")
+    if not live_key or live_key != option.instrument_key:
+        raise ScannerError(
+            "PRE-EMAIL INSTRUMENT VALIDATION FAILED: selected instrument does not "
+            "match the live chain contract at the selected strike."
+        )
+
+    if safe_float(side.get("ltp"), 0.0) <= 0:
+        raise ScannerError(
+            f"PRE-EMAIL LTP VALIDATION FAILED: {expected_type} {selected_strike:.2f} has invalid LTP."
+        )
+
+    logger.info(
+        "STRICT STRIKE VALIDATION PASSED: direction=%s phase=%s ATM=%.0f step=%.0f selected=%s %.0f permitted=%s",
+        direction, phase, atm, step, expected_type, selected_strike, sorted(permitted),
+    )
 
 
 # =============================================================================
@@ -3642,6 +3729,13 @@ def execute_scan(
         spot=spot,
         market_phase=structure.market_phase,
     )
+    validate_continuous_option_entry(
+        option=option,
+        chain=chain,
+        direction=structure.direction,
+        market_phase=structure.market_phase,
+        spot=spot,
+    )
     target1, target2, stop_loss, underlying_stop, underlying_target1, underlying_target2 = create_dynamic_targets(
         option=option,
         structure=structure,
@@ -3856,8 +3950,27 @@ def self_test() -> None:
     pe = select_directional_option(chain, "BEARISH", 74100.0)
     assert ce.option_type == "CE"
     assert pe.option_type == "PE"
-    assert ce.strike in {74000.0, 74050.0, 74100.0}
-    assert pe.strike in {74100.0, 74150.0, 74200.0}
+    assert ce.strike in {74000.0, 74050.0}
+    assert pe.strike in {74150.0, 74200.0}
+    assert ce.strike != 74100.0
+    assert pe.strike != 74100.0
+
+    # Strict pre-email invariant must reject an ATM option for a continuous trend.
+    try:
+        validate_continuous_option_entry(
+            option=OptionCandidate(
+                instrument_key="PE74100", trading_symbol="PE74100", option_type="PE",
+                strike=74100.0, expiry="2026-10-06", ltp=100.0, oi=50000.0,
+                prev_oi=49000.0, volume=10000.0, bid=99.5, ask=100.5,
+                bid_qty=100.0, ask_qty=100.0, delta=-0.55, gamma=0.01,
+                theta=-2.0, iv=20.0, spread_pct=0.01, theta_burden_pct_day=0.02,
+            ),
+            chain=chain, direction="BEARISH", market_phase="CONTINUOUS_BEARISH", spot=74100.0,
+        )
+    except ScannerError:
+        pass
+    else:
+        raise AssertionError("ATM continuous bearish strike was not rejected")
 
     # Active expiry discovery regression.
     original_api_get = api_get
