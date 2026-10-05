@@ -1,37 +1,37 @@
 {
   "market_snapshot": {
-    "timestamp": "2026-10-05T12:16:12.202520+05:30",
-    "spot": 22429.35,
-    "futures_ltp": 22540.9,
-    "basis": 111.55,
+    "timestamp": "2026-10-05T12:19:18.085348+05:30",
+    "spot": 22432.45,
+    "futures_ltp": 22551.5,
+    "basis": 119.05,
     "future": "NIFTY FUT 27 OCT 26",
     "future_expiry": "2026-10-27",
     "futures_regime": "SHORT_BUILDUP",
     "futures_bias": -1,
-    "futures_oi_strength": 0.4327,
-    "futures_oi_persistence": 0.3636,
-    "futures_live_oi_change": 1170.0,
+    "futures_oi_strength": 0.3868,
+    "futures_oi_persistence": 0.2727,
+    "futures_live_oi_change": -25480.0,
     "intraday_bias": -1,
-    "intraday_strength": 0.966,
-    "intraday_score": -3.8641,
+    "intraday_strength": 0.427,
+    "intraday_score": -1.7081,
     "chain_predictive_bias": 1,
-    "chain_predictive_strength": 0.2115,
+    "chain_predictive_strength": 0.198,
     "chain_level_bias": 1,
-    "support_strength": 0.3868,
-    "resistance_strength": 0.2703,
-    "support_change_strength": 0.7452,
-    "resistance_change_strength": 0.2549,
-    "vwap": 22512.01,
-    "vwap_slope": -1.5316,
+    "support_strength": 0.386,
+    "resistance_strength": 0.2809,
+    "support_change_strength": 0.7401,
+    "resistance_change_strength": 0.2685,
+    "vwap": 22510.6,
+    "vwap_slope": -1.407,
     "direction": "BEARISH",
     "persistent_direction": "BEARISH",
     "inferred_prior_direction": "BEARISH",
     "transition_hint": "NO_CONFIRMED_TRANSITION",
-    "score": -22.413,
-    "confidence": 91.79,
+    "score": -14.627,
+    "confidence": 81.01,
     "market_phase": "BULLISH_TO_BEARISH_REVERSAL_CONFIRMED",
     "entry_confirmed": false,
-    "reversal_confirmations": 11,
+    "reversal_confirmations": 12,
     "confirmation_state": "CONFLICT",
     "pcr": 0.7164898197324202,
     "pcr_bias": -1,
@@ -55,7 +55,7 @@
       "180": -1
     },
     "components": {
-      "intraday_trend": -13.910581152824514,
+      "intraday_trend": -6.149101395753423,
       "vwap_level": -2.6,
       "vwap_slope": -1.5,
       "structure_3m": -2.2,
@@ -69,8 +69,8 @@
       "option_oi_change": 0.55,
       "daily_oi": -0.4,
       "change_oi_api": -0.4,
-      "chain_wall_imbalance": 0.07571737030702183,
-      "futures_oi_strength": -0.3029000839515367
+      "chain_wall_imbalance": 0.06829665783177828,
+      "futures_oi_strength": -0.2707714390872273
     }
   },
   "active_trade": null,
@@ -162,17 +162,6 @@
   },
   "persistent_direction": "BEARISH",
   "market_history": [
-    {
-      "timestamp": "2026-10-05T09:19:14.525933+05:30",
-      "spot": 22554.8,
-      "direction": "BULLISH",
-      "phase": "BULLISH_WEAKENING",
-      "score": 9.565,
-      "core": 2.6,
-      "confidence": 63.81,
-      "confirmation_state": "CONFLICT",
-      "reversal_confirmations": 0
-    },
     {
       "timestamp": "2026-10-05T09:22:14.359515+05:30",
       "spot": 22513.3,
@@ -821,6 +810,17 @@
       "confidence": 91.79,
       "confirmation_state": "CONFLICT",
       "reversal_confirmations": 11
+    },
+    {
+      "timestamp": "2026-10-05T12:19:18.085319+05:30",
+      "spot": 22432.45,
+      "direction": "BEARISH",
+      "phase": "BULLISH_TO_BEARISH_REVERSAL_CONFIRMED",
+      "score": -14.627,
+      "core": -8.749,
+      "confidence": 81.01,
+      "confirmation_state": "CONFLICT",
+      "reversal_confirmations": 12
     }
   ]
 }
