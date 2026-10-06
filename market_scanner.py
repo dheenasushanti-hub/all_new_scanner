@@ -69,6 +69,8 @@ import numpy as np
 import pandas as pd
 import requests
 
+HTTP_SESSION = requests.Session()
+
 
 # =============================================================================
 # CONFIG
@@ -86,7 +88,8 @@ EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", "").strip()
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
+API_RETRIES = int(os.getenv("API_RETRIES", "2"))
 MAX_HISTORY_DAYS = int(os.getenv("MAX_HISTORY_DAYS", "45"))
 SIGNAL_THRESHOLD = float(os.getenv("SIGNAL_THRESHOLD", "55"))
 MIN_ENTRY_TIME = time(9, 18)
@@ -132,7 +135,7 @@ REVERSAL_STRIKE_PREFERRED_DISTANCE_STEPS = float(os.getenv("REVERSAL_STRIKE_PREF
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-10-05-OVERALL-MARKET-MOVEMENT-V11"
+SCANNER_VERSION = "2026-10-06-STRUCTURE-SAFE-V12"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -260,9 +263,30 @@ OPTION_CONFIRMATION_REQUIRE_LATEST_BAR = os.getenv(
 ACTIVE_TRADE_INTRABAR_MONITOR = os.getenv(
     "ACTIVE_TRADE_INTRABAR_MONITOR", "1"
 ).strip().lower() not in {"0", "false", "no"}
+# A 1m option stop is only allowed to close a trade when the NIFTY index itself
+# has breached the structural stop. This keeps the option SL subordinate to the
+# underlying market structure instead of allowing IV/theta/option noise to
+# terminate a structurally-valid NIFTY trend.
+ACTIVE_TRADE_REQUIRE_UNDERLYING_CONFIRMATION = os.getenv(
+    "ACTIVE_TRADE_REQUIRE_UNDERLYING_CONFIRMATION", "1"
+).strip().lower() not in {"0", "false", "no"}
+# Number of recent 1m bars inspected on each scan. The monitor additionally
+# filters these bars to the period after the trade was opened / last checked.
+ACTIVE_TRADE_INTRABAR_LOOKBACK = int(
+    os.getenv("ACTIVE_TRADE_INTRABAR_LOOKBACK", "15")
+)
 MARKET_INVALIDATION_CONFIRMATIONS_REQUIRED = int(
     os.getenv("MARKET_INVALIDATION_CONFIRMATIONS_REQUIRED", "2")
 )
+
+# Do not immediately re-enter the same direction after a completed trade.
+# A fresh completed 3m bar is required, and the short cooldown prevents
+# stop -> new strike -> stop churn when ATM moves between two strikes.
+REENTRY_COOLDOWN_MINUTES = int(os.getenv("REENTRY_COOLDOWN_MINUTES", "6"))
+REENTRY_REQUIRE_NEW_3M_BAR = os.getenv("REENTRY_REQUIRE_NEW_3M_BAR", "1").strip().lower() not in {"0", "false", "no"}
+STRUCTURAL_STOP_CONFIRM_BARS = int(os.getenv("STRUCTURAL_STOP_CONFIRM_BARS", "1"))
+STRUCTURAL_STOP_BUFFER_ATR = float(os.getenv("STRUCTURAL_STOP_BUFFER_ATR", "0.15"))
+TRAIL_MIN_DISTANCE_ATR = float(os.getenv("TRAIL_MIN_DISTANCE_ATR", "0.25"))
 
 
 
@@ -453,12 +477,10 @@ def parse_date(raw: str) -> Optional[date]:
 
 
 def market_window_open() -> bool:
+    # NSE status is checked immediately afterwards and is the authoritative
+    # open/closed gate. Avoid a separate holiday API call on every 5-minute run.
     now = now_ist()
-    if now.weekday() >= 5:
-        return False
-    if is_bse_holiday(now):
-        return False
-    return MARKET_START <= now.time() <= MARKET_END
+    return now.weekday() < 5 and MARKET_START <= now.time() <= MARKET_END
 
 
 # =============================================================================
@@ -486,7 +508,7 @@ def api_get(
 
     for attempt in range(1, retries + 1):
         try:
-            response = requests.get(
+            response = HTTP_SESSION.get(
                 url,
                 params=params,
                 headers=api_headers(),
@@ -600,7 +622,19 @@ def extract_ltp(quote: dict[str, Any]) -> float:
 # INSTRUMENT DISCOVERY
 # =============================================================================
 
-def get_current_nifty_future() -> FuturesContract:
+def get_current_nifty_future(state: Optional[dict[str, Any]] = None) -> FuturesContract:
+    # The nearest NIFTY future normally remains unchanged throughout the session.
+    # Persisting it avoids two instrument-search requests on every scan.
+    today = now_ist().date()
+    if isinstance(state, dict):
+        cached = state.get("nifty_future")
+        if isinstance(cached, dict):
+            expiry = parse_date(str(cached.get("expiry", "")))
+            key = str(cached.get("instrument_key", "")).strip()
+            symbol = str(cached.get("trading_symbol", "")).strip()
+            if key and symbol and expiry and expiry >= today:
+                return FuturesContract(key, symbol, expiry.isoformat())
+
     candidates: list[dict[str, Any]] = []
 
     for expiry_filter in ("current_month", "next_month"):
@@ -651,11 +685,14 @@ def get_current_nifty_future() -> FuturesContract:
         selected["instrument_key"],
     )
 
-    return FuturesContract(
+    contract = FuturesContract(
         instrument_key=str(selected["instrument_key"]),
         trading_symbol=str(selected["trading_symbol"]),
         expiry=str(selected["expiry"])[:10],
     )
+    if isinstance(state, dict):
+        state["nifty_future"] = asdict(contract)
+    return contract
 
 
 # =============================================================================
@@ -834,6 +871,93 @@ def merge_current_into_history(
         .drop_duplicates("timestamp", keep="last")
         .reset_index(drop=True)
     )
+
+
+def _resample_intraday_bars(df: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
+    """Resample 3m bars locally into higher NIFTY timeframes without crossing sessions."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if interval_minutes == 3:
+        return df.copy().sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+
+    work = df.copy().sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
+    work = work.dropna(subset=["timestamp"])
+    work["local_date"] = work["timestamp"].dt.tz_convert(IST).dt.date
+    rows: list[pd.DataFrame] = []
+
+    for _, day in work.groupby("local_date", sort=True):
+        local = day.copy()
+        local["timestamp"] = local["timestamp"].dt.tz_convert(IST)
+        local = local.set_index("timestamp").sort_index()
+        local = local.between_time("09:15", "15:30", inclusive="both")
+        if local.empty:
+            continue
+        agg = local.resample(
+            f"{interval_minutes}min",
+            origin="start_day",
+            offset="9h15min",
+            label="left",
+            closed="left",
+        ).agg(
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+            volume=("volume", "sum"),
+            oi=("oi", "last"),
+        )
+        agg = agg.dropna(subset=["open", "high", "low", "close"]).reset_index()
+        if not agg.empty:
+            agg["timestamp"] = agg["timestamp"].dt.tz_convert("UTC")
+            rows.append(agg)
+
+    if not rows:
+        return pd.DataFrame()
+    return (
+        pd.concat(rows, ignore_index=True)
+        .sort_values("timestamp")
+        .drop_duplicates("timestamp", keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def timeframe_snapshot(
+    spot_key: str,
+    base_3m: Optional[pd.DataFrame] = None,
+) -> tuple[dict[int, pd.DataFrame], dict[int, int]]:
+    """Build all NIFTY timeframe structures from one 3m history + current-session feed.
+
+    The previous implementation made a historical + intraday API request for every
+    timeframe (3/15/30/60/120/180), creating 12+ candle requests per scan. This
+    version fetches the 3m series once and resamples locally, preserving indicator
+    warm-up while materially reducing scan latency and API exposure.
+    """
+    current = base_3m if base_3m is not None and not base_3m.empty else get_intraday_candles(spot_key, 3, strict=False)
+    historical = get_historical_candles(spot_key, 3, lookback_days=MAX_HISTORY_DAYS)
+    merged = merge_current_into_history(historical, current)
+    if merged.empty:
+        raise ScannerError("Unable to build NIFTY timeframe data from 3m candles.")
+
+    frames: dict[int, pd.DataFrame] = {}
+    directions: dict[int, int] = {}
+    for tf in TIMEFRAMES:
+        bars = _resample_intraday_bars(merged, tf)
+        completed = filter_completed_candles(bars, tf)
+        if len(completed) < 25:
+            raise ScannerError(f"Too few completed {tf}m candles for a stable Supertrend: {len(completed)} < 25.")
+        st = calculate_supertrend(completed, period=SUPERTREND_PERIOD, factor=SUPERTREND_FACTOR)
+        frames[tf] = st
+        latest_dir = safe_float(st["direction"].iloc[-1], 0.0)
+        directions[tf] = 1 if latest_dir > 0 else -1 if latest_dir < 0 else 0
+        logger.info(
+            "TF %dm: Supertrend=%s level=%.2f structure=%s",
+            tf,
+            "BULLISH" if directions[tf] > 0 else "BEARISH" if directions[tf] < 0 else "NEUTRAL",
+            safe_float(st["supertrend"].iloc[-1]),
+            market_structure_state(st, 8),
+        )
+    return frames, directions
 
 
 def get_timeframe_candles(
@@ -1250,7 +1374,7 @@ def _nearest_active_option_expiry() -> str:
     return selected.isoformat()
 
 
-def get_option_chain() -> tuple[str, list[dict[str, Any]]]:
+def get_option_chain(state: Optional[dict[str, Any]] = None) -> tuple[str, list[dict[str, Any]]]:
     """
     Load the nearest active NIFTY option expiry and then request its chain.
 
@@ -1260,7 +1384,16 @@ def get_option_chain() -> tuple[str, list[dict[str, Any]]]:
     nearest active expiry from the option-contract endpoint makes the scanner
     roll automatically from (for example) 17-Sep to 24-Sep.
     """
-    expiry = _nearest_active_option_expiry()
+    expiry = None
+    today = now_ist().date()
+    if isinstance(state, dict):
+        cached_expiry = parse_date(str(state.get("option_expiry", "")))
+        if cached_expiry and cached_expiry >= today:
+            expiry = cached_expiry.isoformat()
+    if not expiry:
+        expiry = _nearest_active_option_expiry()
+        if isinstance(state, dict):
+            state["option_expiry"] = expiry
 
     payload = api_get(
         OPTION_CHAIN_URL,
@@ -2283,50 +2416,6 @@ def detect_false_breakout_trap(
     return result
 
 
-def timeframe_snapshot(
-    spot_key: str,
-) -> tuple[dict[int, pd.DataFrame], dict[int, int]]:
-    frames: dict[int, pd.DataFrame] = {}
-    directions: dict[int, int] = {}
-
-    for tf in TIMEFRAMES:
-        bars = get_timeframe_candles(
-            spot_key,
-            tf,
-            min_bars=35 if tf <= 15 else 30,
-        )
-        completed = filter_completed_candles(bars, tf)
-
-        # At the very first scan of a session, higher TF completed candles may
-        # intentionally come from the prior session. That is preferable to
-        # manufacturing a Supertrend from 1-2 new candles.
-        if len(completed) < 25:
-            raise ScannerError(
-                f"Too few completed {tf}m candles for a stable Supertrend."
-            )
-
-        st = calculate_supertrend(
-            completed,
-            period=SUPERTREND_PERIOD,
-            factor=SUPERTREND_FACTOR,
-        )
-
-        frames[tf] = st
-
-        latest_dir = safe_float(st["direction"].iloc[-1], 0.0)
-        directions[tf] = 1 if latest_dir > 0 else -1 if latest_dir < 0 else 0
-
-        logger.info(
-            "TF %dm: Supertrend=%s level=%.2f structure=%s",
-            tf,
-            "BULLISH" if directions[tf] > 0 else "BEARISH" if directions[tf] < 0 else "NEUTRAL",
-            safe_float(st["supertrend"].iloc[-1]),
-            market_structure_state(st, 8),
-        )
-
-    return frames, directions
-
-
 def overall_market_movement(
     price_session: pd.DataFrame,
     atr3: float,
@@ -2892,10 +2981,12 @@ def select_directional_option(
     }
     expiry_day = now_ist().date() in expiry_dates
 
-    # All directional entries use the nearest OTM strike first.
+    # Preserve the scanner's directional ITM strike convention.
     # BULLISH -> ATM-1 CE, then ATM-2 CE as fallback.
     # BEARISH -> ATM+1 PE, then ATM+2 PE as fallback.
-    # ATM is never the preferred directional strike.
+    # ATM is never the preferred directional strike. This convention is kept
+    # unchanged here; the Oct-6 strike hopping was caused by false trade exits,
+    # not by nondeterministic strike ranking.
     candidate_strikes = (
         [atm - step, atm - 2 * step]
         if direction == "BULLISH"
@@ -3183,10 +3274,12 @@ def choose_underlying_levels(
         else:
             target2 = spot - 3.00 * atr3
 
+        recent_swing_high = safe_float(tf_frames[3]["high"].tail(6).max(), spot)
         stop_candidates = [
             structure.vwap + 0.25 * atr3,
             st3 + 0.20 * atr3,
             st15 + 0.20 * atr15,
+            recent_swing_high + STRUCTURAL_STOP_BUFFER_ATR * atr3,
         ]
         if structure.resistance_1 > spot:
             stop_candidates.append(structure.resistance_1 + 0.25 * atr3)
@@ -3208,10 +3301,12 @@ def choose_underlying_levels(
     else:
         target2 = spot + 3.00 * atr3
 
+    recent_swing_low = safe_float(tf_frames[3]["low"].tail(6).min(), spot)
     stop_candidates = [
         structure.vwap - 0.25 * atr3,
         st3 - 0.20 * atr3,
         st15 - 0.20 * atr15,
+        recent_swing_low - STRUCTURAL_STOP_BUFFER_ATR * atr3,
     ]
     if structure.support_1 < spot:
         stop_candidates.append(structure.support_1 - 0.25 * atr3)
@@ -3502,6 +3597,77 @@ profitability, or future price movement. No order is placed by this script.</p>
 # ACTIVE TRADE MONITOR
 # =============================================================================
 
+def _trade_entry_bar_utc(trade: dict[str, Any]) -> Optional[pd.Timestamp]:
+    """Return the first safe 1m bar boundary after the actual option entry.
+
+    The entry timestamp can fall inside a 1m candle. That candle contains price
+    action that happened before the option was purchased, so it must never be
+    allowed to trigger a post-entry stop.
+    """
+    raw = str(trade.get("opened_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        ts = pd.Timestamp(raw)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(IST)
+        else:
+            ts = ts.tz_convert(IST)
+        return ts.tz_convert("UTC").floor("min") + pd.Timedelta(minutes=1)
+    except Exception:
+        return None
+
+
+def _prepare_active_trade_1m_window(
+    trade: dict[str, Any],
+    option_1m: Optional[pd.DataFrame],
+) -> Optional[pd.DataFrame]:
+    """Keep only post-entry/new 1m bars and never replay old candles.
+
+    The latest bar is retained on every scan because its OHLC can still evolve.
+    Older bars are evaluated only once via ``intrabar_last_checked_at``.
+    """
+    if option_1m is None or option_1m.empty:
+        return None
+
+    work = option_1m.copy().sort_values("timestamp")
+    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
+    for column in ("high", "low"):
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    work = work.dropna(subset=["timestamp", "high", "low"])
+    if work.empty:
+        return None
+
+    entry_bar = _trade_entry_bar_utc(trade)
+    if entry_bar is not None:
+        work = work[work["timestamp"] >= entry_bar]
+
+    last_checked_raw = str(trade.get("intrabar_last_checked_at") or "").strip()
+    if last_checked_raw:
+        try:
+            last_checked = pd.Timestamp(last_checked_raw)
+            if last_checked.tzinfo is None:
+                last_checked = last_checked.tz_localize("UTC")
+            else:
+                last_checked = last_checked.tz_convert("UTC")
+            current_bar_ts = (
+                pd.Timestamp(now_ist()).tz_convert("UTC").floor("min")
+            )
+            # Re-evaluate only the currently-forming 1m bar. A completed bar
+            # must never be replayed after the stop has been ratcheted upward,
+            # otherwise an old low can falsely trigger the new stop.
+            work = work[
+                (work["timestamp"] > last_checked)
+                | (work["timestamp"] >= current_bar_ts)
+            ]
+        except Exception:
+            pass
+
+    if work.empty:
+        return None
+    return work.tail(max(ACTIVE_TRADE_INTRABAR_LOOKBACK, 1)).copy()
+
+
 def monitor_active_trade(
     state: dict[str, Any],
     structure: StructureResult,
@@ -3542,20 +3708,53 @@ def monitor_active_trade(
 
     if ACTIVE_TRADE_INTRABAR_MONITOR:
         try:
-            intraday_1m = get_intraday_candles(
+            option_1m_raw = get_intraday_candles(
                 str(trade["instrument_key"]), 1, strict=False
             )
+            option_1m = _prepare_active_trade_1m_window(trade, option_1m_raw)
+
+            # A stop on the option is subordinate to the NIFTY structural stop.
+            # Fetch the underlying 1m bars separately so an option IV/theta spike
+            # cannot close a trade while NIFTY is still respecting its structure.
+            underlying_1m = None
+            if ACTIVE_TRADE_REQUIRE_UNDERLYING_CONFIRMATION:
+                underlying_1m_raw = get_intraday_candles(
+                    NIFTY_KEY, 1, strict=False
+                )
+                underlying_1m = _prepare_active_trade_1m_window(
+                    trade, underlying_1m_raw
+                )
+
             (
                 intrabar_outcome,
                 intrabar_exit_reference,
                 intrabar_reason,
-            ) = _active_trade_intrabar_exit(trade, intraday_1m)
+            ) = _active_trade_intrabar_exit(
+                trade,
+                option_1m,
+                underlying_1m=underlying_1m,
+                underlying_3m=(tf_frames or {}).get(3),
+            )
+
+            # Record the newest bar examined, but the helper always rechecks the
+            # latest bar because that candle may still be forming.
+            if option_1m is not None and not option_1m.empty:
+                trade["intrabar_last_checked_at"] = (
+                    option_1m["timestamp"].max().isoformat()
+                )
+
             if intrabar_outcome:
                 logger.info(
                     "ACTIVE TRADE INTRABAR: %s outcome=%s reference=%.2f reason=%s",
                     trade["trading_symbol"],
                     intrabar_outcome,
                     float(intrabar_exit_reference or 0.0),
+                    intrabar_reason,
+                )
+            else:
+                logger.info(
+                    "ACTIVE TRADE INTRABAR: %s no exit | structure=%s",
+                    trade["trading_symbol"],
                     intrabar_reason,
                 )
         except Exception as exc:
@@ -3568,6 +3767,39 @@ def monitor_active_trade(
     if intrabar_outcome == "T1_HIT":
         t1_hit = True
 
+    # A quote-only option stop is not allowed to override the underlying
+    # structure when structural confirmation is enabled. The current NIFTY
+    # snapshot is a second line of defence; the 1m structural breach is the
+    # preferred intrabar path above.
+    snapshot_for_stop = (
+        state.get("market_snapshot")
+        if isinstance(state.get("market_snapshot"), dict)
+        else {}
+    )
+    spot_for_stop = safe_float(snapshot_for_stop.get("spot"), float("nan"))
+    underlying_stop_for_quote = safe_float(
+        trade.get("underlying_stop"), float("nan")
+    )
+    direction_for_quote = str(trade.get("direction", "")).upper()
+    latest_3m_close = float("nan")
+    latest_3m_bar = ""
+    if tf_frames and 3 in tf_frames and not tf_frames[3].empty:
+        latest_3m_close = safe_float(tf_frames[3]["close"].iloc[-1], float("nan"))
+        latest_3m_bar = str(tf_frames[3]["timestamp"].iloc[-1])
+    armed_bar = str(trade.get("underlying_stop_armed_bar") or "")
+    quote_stop_structure_confirmed = not ACTIVE_TRADE_REQUIRE_UNDERLYING_CONFIRMATION
+    if not quote_stop_structure_confirmed and math.isfinite(underlying_stop_for_quote) and math.isfinite(latest_3m_close):
+        newer_bar = True
+        if armed_bar and latest_3m_bar:
+            try:
+                newer_bar = pd.Timestamp(latest_3m_bar) > pd.Timestamp(armed_bar)
+            except Exception:
+                newer_bar = True
+        quote_stop_structure_confirmed = newer_bar and (
+            (direction_for_quote == "BULLISH" and latest_3m_close <= underlying_stop_for_quote)
+            or (direction_for_quote == "BEARISH" and latest_3m_close >= underlying_stop_for_quote)
+        )
+
     # T1 is a milestone, not a full exit. Once reached, the stop ratchets to
     # cost and then trails until T2 or a protective stop is reached.
     if intrabar_outcome == "STOP_LOSS":
@@ -3579,7 +3811,7 @@ def monitor_active_trade(
     elif ltp >= target2:
         outcome = "TARGET_2"
         exit_ltp = ltp
-    elif ltp <= stop:
+    elif ltp <= stop and quote_stop_structure_confirmed:
         outcome = "STOP_LOSS"
         exit_ltp = ltp
     else:
@@ -3595,6 +3827,7 @@ def monitor_active_trade(
                 "exit_ltp": round(exit_ltp, 2),
                 "closed_at": now_ist().isoformat(),
                 "exit_reason": intrabar_reason if intrabar_outcome else "QUOTE_LTP",
+                "exit_3m_bar": str((state.get("market_snapshot") or {}).get("latest_completed_3m_bar", "")),
             }
         )
         state["active_trade"] = None
@@ -3632,11 +3865,38 @@ def monitor_active_trade(
                 base_spot = safe_float(trade.get("entry_underlying"), spot_now)
                 direction = str(trade.get("direction", "")).upper()
                 if spot_now > 0 and base_spot > 0 and st3 > 0:
-                    trail_underlying = (
-                        max(st3, spot_now - atr3)
-                        if direction == "BULLISH"
-                        else min(st3, spot_now + atr3)
-                    )
+                    recent_low = safe_float(tf_frames[3]["low"].tail(6).min(), spot_now)
+                    recent_high = safe_float(tf_frames[3]["high"].tail(6).max(), spot_now)
+                    if direction == "BULLISH":
+                        structural_trail = max(
+                            st3 - STRUCTURAL_STOP_BUFFER_ATR * atr3,
+                            recent_low - STRUCTURAL_STOP_BUFFER_ATR * atr3,
+                        )
+                        trail_underlying = min(
+                            structural_trail,
+                            spot_now - TRAIL_MIN_DISTANCE_ATR * atr3,
+                        )
+                        previous_underlying_stop = safe_float(trade.get("underlying_stop"), -float("inf"))
+                        trail_underlying = max(previous_underlying_stop, trail_underlying)
+                    else:
+                        structural_trail = min(
+                            st3 + STRUCTURAL_STOP_BUFFER_ATR * atr3,
+                            recent_high + STRUCTURAL_STOP_BUFFER_ATR * atr3,
+                        )
+                        trail_underlying = max(
+                            structural_trail,
+                            spot_now + TRAIL_MIN_DISTANCE_ATR * atr3,
+                        )
+                        previous_underlying_stop = safe_float(trade.get("underlying_stop"), float("inf"))
+                        trail_underlying = min(previous_underlying_stop, trail_underlying)
+
+                    old_underlying_stop = safe_float(trade.get("underlying_stop"), float("nan"))
+                    trade["underlying_stop"] = round(trail_underlying, 2)
+                    latest_bar = str(tf_frames[3]["timestamp"].iloc[-1])
+                    if not math.isfinite(old_underlying_stop) or abs(trail_underlying - old_underlying_stop) >= 0.01:
+                        # The new stop is armed only from this completed 3m bar onward;
+                        # never use the same bar retroactively against a newly raised stop.
+                        trade["underlying_stop_armed_bar"] = latest_bar
                     signed_move = trail_underlying - base_spot
                     # Do not tighten beyond the entry-side direction: for a
                     # long CE, trail must remain above entry underlying; for a
@@ -3721,6 +3981,7 @@ def monitor_active_trade(
                 "exit_reason": (
                     "four-factor continuous phase lost and/or NIFTY reclaimed VWAP"
                 ),
+                "exit_3m_bar": str((state.get("market_snapshot") or {}).get("latest_completed_3m_bar", "")),
             }
         )
         state["active_trade"] = None
@@ -3771,6 +4032,7 @@ def monitor_active_trade(
                 "outcome": "STRUCTURE_REVERSAL",
                 "exit_ltp": round(ltp, 2),
                 "closed_at": now_ist().isoformat(),
+                "exit_3m_bar": str((state.get("market_snapshot") or {}).get("latest_completed_3m_bar", "")),
             }
         )
         state["active_trade"] = None
@@ -3864,8 +4126,20 @@ def update_continuation_persistence(
 def _active_trade_intrabar_exit(
     trade: dict[str, Any],
     df_1m: Optional[pd.DataFrame],
+    *,
+    underlying_1m: Optional[pd.DataFrame] = None,
+    underlying_3m: Optional[pd.DataFrame] = None,
 ) -> tuple[Optional[str], Optional[float], str]:
-    """Return (outcome, exit_reference, reason) from 1m OHLC.
+    """Return (outcome, exit_reference, reason) from post-entry 1m OHLC.
+
+    Two protections are important here:
+
+    1. Only candles after the actual option entry are eligible. A 1m candle can
+       contain movement that occurred before the trade was opened.
+    2. A structural stop on the option is confirmed by the NIFTY index. This
+       prevents a later trailing option stop from being compared with an old
+       option candle and prevents option-only IV/theta noise from overriding a
+       still-valid NIFTY trend.
 
     For a single OHLC bar that touches both a protective stop and a target, the
     stop is treated as first for conservative, non-look-ahead accounting.
@@ -3874,29 +4148,98 @@ def _active_trade_intrabar_exit(
         return None, None, "NO_1M_DATA"
 
     work = df_1m.copy().sort_values("timestamp")
+    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
     for column in ("high", "low"):
         work[column] = pd.to_numeric(work[column], errors="coerce")
-    work = work.dropna(subset=["high", "low"])
+    work = work.dropna(subset=["timestamp", "high", "low"])
     if work.empty:
         return None, None, "INVALID_1M_DATA"
 
     stop = safe_float(trade.get("stop_loss"), float("nan"))
     target1 = safe_float(trade.get("target_1"), float("nan"))
     target2 = safe_float(trade.get("target_2"), float("nan"))
+    direction = str(trade.get("direction", "")).upper()
+    underlying_stop = safe_float(trade.get("underlying_stop"), float("nan"))
 
-    for _, bar in work.tail(10).iterrows():
+    underlying = None
+    if underlying_1m is not None and not underlying_1m.empty:
+        underlying = underlying_1m.copy().sort_values("timestamp")
+        underlying["timestamp"] = pd.to_datetime(
+            underlying["timestamp"], utc=True, errors="coerce"
+        )
+        for column in ("high", "low"):
+            underlying[column] = pd.to_numeric(underlying[column], errors="coerce")
+        underlying = underlying.dropna(subset=["timestamp", "high", "low"])
+
+    for _, bar in work.tail(max(ACTIVE_TRADE_INTRABAR_LOOKBACK, 1)).iterrows():
         low = float(bar["low"])
         high = float(bar["high"])
-        ts = str(bar.get("timestamp", ""))
+        ts_value = pd.Timestamp(bar["timestamp"])
+        ts = ts_value.isoformat()
+
+        # Match the same underlying 1m candle. Exact timestamp matching is
+        # preferable to nearest-neighbour matching because the stop is a
+        # structural confirmation, not an approximate quote proxy.
+        # Structural confirmation is based on completed 3m closes, not a single
+        # 1m wick. This aligns the stop with the market structure and prevents
+        # option IV/noise or a transient index spike from closing the trade.
+        underlying_breach = False
+        underlying_close = float("nan")
+        underlying_3m_ts = ""
+        if underlying_3m is not None and not underlying_3m.empty and math.isfinite(underlying_stop):
+            u3 = underlying_3m.copy().sort_values("timestamp")
+            u3["timestamp"] = pd.to_datetime(u3["timestamp"], utc=True, errors="coerce")
+            u3["close"] = pd.to_numeric(u3["close"], errors="coerce")
+            u3 = u3.dropna(subset=["timestamp", "close"])
+            if not u3.empty:
+                required = max(STRUCTURAL_STOP_CONFIRM_BARS, 1)
+                recent = u3.tail(required)
+                armed_raw = str(trade.get("underlying_stop_armed_bar") or "").strip()
+                armed_ts = None
+                if armed_raw:
+                    try:
+                        armed_ts = pd.Timestamp(armed_raw)
+                        if armed_ts.tzinfo is None:
+                            armed_ts = armed_ts.tz_localize("UTC")
+                        else:
+                            armed_ts = armed_ts.tz_convert("UTC")
+                    except Exception:
+                        armed_ts = None
+                if armed_ts is not None:
+                    recent = recent[recent["timestamp"] > armed_ts]
+                if len(recent) >= required:
+                    closes = recent["close"].to_numpy(dtype=float)
+                    underlying_breach = (
+                        bool(np.all(closes <= underlying_stop)) if direction == "BULLISH"
+                        else bool(np.all(closes >= underlying_stop))
+                    )
+                    if underlying_breach:
+                        underlying_close = float(closes[-1])
+                        underlying_3m_ts = pd.Timestamp(recent["timestamp"].iloc[-1]).isoformat()
 
         if math.isfinite(stop) and low <= stop:
-            return "STOP_LOSS", stop, f"1M_LOW={low:.2f}@{ts}"
+            if ACTIVE_TRADE_REQUIRE_UNDERLYING_CONFIRMATION:
+                if underlying_breach:
+                    return (
+                        "STOP_LOSS",
+                        stop,
+                        f"OPTION_1M_LOW={low:.2f}@{ts}; "
+                        f"NIFTY_3M_CLOSE_BREACH={underlying_close:.2f}@{underlying_3m_ts}; "
+                        f"underlying_stop={underlying_stop:.2f}",
+                    )
+                # Do not let the option alone invalidate the trade. T1/target
+                # checks below remain valid because they are favourable events.
+            else:
+                return "STOP_LOSS", stop, f"1M_LOW={low:.2f}@{ts}"
+
         if math.isfinite(target2) and high >= target2:
             return "TARGET_2", target2, f"1M_HIGH={high:.2f}@{ts}"
         if math.isfinite(target1) and high >= target1:
             # T1 is handled as a milestone below; do not fully close here.
             return "T1_HIT", target1, f"1M_HIGH={high:.2f}@{ts}"
 
+    if ACTIVE_TRADE_REQUIRE_UNDERLYING_CONFIRMATION:
+        return None, None, "NO_INTRABAR_EXIT_OR_NIFTY_STRUCTURE_STOP_NOT_BREACHED"
     return None, None, "NO_INTRABAR_EXIT"
 
 
@@ -3938,7 +4281,7 @@ def execute_scan(
         state["scanner_version"] = SCANNER_VERSION
 
     now_time = now_ist().time()
-    future = get_current_nifty_future()
+    future = get_current_nifty_future(state)
 
     # -------------------------------------------------------------------------
     # PRIMARY MARKET PRICE FEED = NIFTY INDEX
@@ -4024,8 +4367,8 @@ def execute_scan(
             )
 
     # Multi-timeframe structures are already computed from the NIFTY index.
-    tf_frames, tf_directions = timeframe_snapshot(NIFTY_KEY)
-    expiry, chain = get_option_chain()
+    tf_frames, tf_directions = timeframe_snapshot(NIFTY_KEY, base_3m=index_session)
+    expiry, chain = get_option_chain(state)
     daily_oi_bias, daily_oi_score = get_daily_oi_confirmation(expiry)
     change_oi_bias, change_oi_score, change_oi_by_strike = get_change_oi_confirmation(expiry)
     pcr_value, pcr_rate_15m, pcr_trend, pcr_higher_low, pcr_lower_high = get_intraday_pcr(expiry)
@@ -4167,6 +4510,10 @@ def execute_scan(
         "resistance_1": structure.resistance_1,
         "resistance_2": structure.resistance_2,
         "timeframes": structure.timeframe_directions,
+        "latest_completed_3m_bar": (
+            str(filter_completed_candles(index_session, 3)["timestamp"].iloc[-1])
+            if not filter_completed_candles(index_session, 3).empty else ""
+        ),
         "components": structure.components,
     }
     state["persistent_direction"] = (
@@ -4194,7 +4541,48 @@ def execute_scan(
         monitor_active_trade(state, structure, tf_frames)
         return None
 
+    # Defensive duplicate guard: the same direction/strike/session signal should
+    # never email twice merely because state persistence was delayed.
+    last_hash = str(state.get("last_signal_hash", ""))
+    last_signal = state.get("last_signal")
+    if isinstance(last_signal, dict):
+        same_day = str(last_signal.get("timestamp", ""))[:10] == today_iso
+        if same_day and last_hash:
+            logger.info("DUPLICATE SIGNAL GUARD: prior signal exists for this session; waiting for a new trade state.")
+            # Do not block after a completed trade; the re-entry gate below decides when a new setup is valid.
+
+    # Prevent stop/exit -> immediate re-entry churn. A fresh 3m candle and a
+    # short cooldown are required before another trade can be opened. This is
+    # especially important on expiry day when ATM can move by one strike quickly.
+    last_completed = state.get("last_completed_trade")
+    if isinstance(last_completed, dict):
+        closed_at_raw = str(last_completed.get("closed_at", ""))
+        try:
+            closed_at = pd.Timestamp(closed_at_raw)
+            if closed_at.tzinfo is None:
+                closed_at = closed_at.tz_localize(IST)
+            else:
+                closed_at = closed_at.tz_convert(IST)
+            elapsed = (pd.Timestamp(now_ist()) - closed_at).total_seconds() / 60.0
+            if elapsed < max(REENTRY_COOLDOWN_MINUTES, 0):
+                logger.info(
+                    "RE-ENTRY COOLDOWN: %.1f/%.1f minutes elapsed after %s; no new trade.",
+                    elapsed, max(REENTRY_COOLDOWN_MINUTES, 0), last_completed.get("outcome", "EXIT"),
+                )
+                return None
+        except Exception:
+            pass
+
     completed_session_bars = len(filter_completed_candles(index_session, 3))
+    if REENTRY_REQUIRE_NEW_3M_BAR:
+        last_exit_bar = str(last_completed.get("exit_3m_bar", "")) if isinstance(last_completed, dict) else ""
+        current_completed_bar = (
+            str(filter_completed_candles(index_session, 3)["timestamp"].iloc[-1])
+            if completed_session_bars else ""
+        )
+        if last_exit_bar and current_completed_bar and last_exit_bar == current_completed_bar:
+            logger.info("RE-ENTRY WAIT: no new completed 3m bar since the previous exit.")
+            return None
     opening_mode = now_time < MIN_ENTRY_TIME or completed_session_bars < 1
     if opening_mode:
         logger.info(
@@ -4900,14 +5288,59 @@ def self_test() -> None:
         "stop_loss": 85.0,
         "target_1": 120.0,
         "target_2": 140.0,
+        "direction": "BULLISH",
+        "underlying_stop": 90.0,
     }
     test_1m = _synthetic_candles([100, 99, 98])
     test_1m.loc[test_1m.index[-1], "low"] = 84.0
+    test_underlying_1m = _synthetic_candles([100, 99, 88])
+    test_underlying_3m = _synthetic_candles([100, 99, 88])
+    test_trade["underlying_stop_armed_bar"] = str(test_underlying_3m["timestamp"].iloc[0])
     exit_outcome, exit_reference, _ = _active_trade_intrabar_exit(
-        test_trade, test_1m
+        test_trade, test_1m, underlying_1m=test_underlying_1m, underlying_3m=test_underlying_3m
     )
     assert exit_outcome == "STOP_LOSS"
     assert exit_reference == 85.0
+
+    # Regression: an option-only stop must not close a bullish trade while NIFTY
+    # remains above its structural stop.
+    no_structure_breach_trade = dict(test_trade)
+    no_structure_breach_trade["stop_loss"] = 95.0
+    no_structure_breach_trade["underlying_stop"] = 90.0
+    option_drop = _synthetic_candles([100, 99, 94])
+    underlying_hold = _synthetic_candles([100, 99, 95])
+    underlying_hold_3m = _synthetic_candles([100, 99, 95])
+    no_structure_breach_trade["underlying_stop_armed_bar"] = str(underlying_hold_3m["timestamp"].iloc[0])
+    no_exit, _, no_exit_reason = _active_trade_intrabar_exit(
+        no_structure_breach_trade,
+        option_drop,
+        underlying_1m=underlying_hold,
+        underlying_3m=underlying_hold_3m,
+    )
+    assert no_exit is None
+    assert "NOT_BREACHED" in no_exit_reason
+
+    # Regression: once a completed bar has been checked, its old low must not be
+    # replayed against a newly-raised trailing stop.
+    replay_trade = {
+        "stop_loss": 76.29,
+        "target_1": 88.58,
+        "target_2": 122.88,
+        "direction": "BULLISH",
+        "underlying_stop": 22600.0,
+        "intrabar_last_checked_at": "2026-10-06T10:25:00+00:00",
+    }
+    replay_option = _synthetic_candles([80, 75, 90])
+    replay_underlying = _synthetic_candles([22620, 22610, 22630])
+    replay_underlying_3m = _synthetic_candles([22620, 22610, 22630])
+    replay_trade["underlying_stop_armed_bar"] = str(replay_underlying_3m["timestamp"].iloc[1])
+    replay_outcome, _, _ = _active_trade_intrabar_exit(
+        replay_trade,
+        replay_option,
+        underlying_1m=replay_underlying,
+        underlying_3m=replay_underlying_3m,
+    )
+    assert replay_outcome != "STOP_LOSS"
 
     # Active expiry discovery regression.
     original_api_get = api_get
@@ -5011,6 +5444,9 @@ def main() -> int:
             "last_market_direction": signal.direction,
             "last_market_confidence": signal.confidence,
             "last_ltp": signal.entry,
+            "entry_3m_bar": str((state.get("market_snapshot") or {}).get("latest_completed_3m_bar", "")),
+            "underlying_stop_armed_bar": str((state.get("market_snapshot") or {}).get("latest_completed_3m_bar", "")),
+            "intrabar_last_checked_at": signal.timestamp,
         }
 
         state["active_trade"] = active_trade
