@@ -43,7 +43,7 @@ jobs:
           EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           STATE_FILE: state/market_state.json
-        run: python market_scanner_oct6_optimized.py
+        run: python market_scanner.py
 
       - name: Persist scanner state
         if: always()
