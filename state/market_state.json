@@ -462,52 +462,63 @@
       "confidence": 70.49,
       "confirmation_state": "FLOW_WAIT",
       "reversal_confirmations": 0
+    },
+    {
+      "timestamp": "2026-10-08T14:49:12.979905+05:30",
+      "spot": 22215.25,
+      "direction": "BEARISH",
+      "phase": "CONTINUOUS_BEARISH",
+      "score": -8.0,
+      "core": -0.899,
+      "confidence": 95.0,
+      "confirmation_state": "STRUCTURAL_CONTINUATION",
+      "reversal_confirmations": 0
     }
   ],
   "market_snapshot": {
-    "timestamp": "2026-10-08T14:46:21.432668+05:30",
-    "spot": 22223.5,
-    "futures_ltp": 22300.0,
-    "basis": 76.5,
+    "timestamp": "2026-10-08T14:49:12.979951+05:30",
+    "spot": 22215.25,
+    "futures_ltp": 22286.9,
+    "basis": 71.65,
     "future": "NIFTY FUT 27 OCT 26",
     "future_expiry": "2026-10-27",
-    "futures_regime": "LONG_BUILDUP",
-    "futures_bias": 1,
-    "futures_oi_strength": 0.4869,
-    "futures_oi_persistence": 0.4545,
-    "futures_live_oi_change": 2925.0,
-    "intraday_bias": -1,
-    "intraday_strength": 1.0,
-    "intraday_score": -1.0705,
-    "chain_predictive_bias": 0,
-    "chain_predictive_strength": 0.0737,
+    "futures_regime": "SHORT_BUILDUP",
+    "futures_bias": -1,
+    "futures_oi_strength": 0.7362,
+    "futures_oi_persistence": 0.5455,
+    "futures_live_oi_change": 6695.0,
+    "intraday_bias": 1,
+    "intraday_strength": 0.1011,
+    "intraday_score": 0.1011,
+    "chain_predictive_bias": -1,
+    "chain_predictive_strength": 0.324,
     "chain_level_bias": 0,
-    "support_strength": 0.7732,
+    "support_strength": 0.83,
     "resistance_strength": 0.81,
-    "support_change_strength": 0.0086,
-    "resistance_change_strength": 0.0026,
-    "vwap": 22358.87,
-    "vwap_slope": -0.8929,
+    "support_change_strength": 0.011,
+    "resistance_change_strength": 0.0074,
+    "vwap": 22357.75,
+    "vwap_slope": -0.3488,
     "direction": "BEARISH",
     "persistent_direction": "BEARISH",
     "inferred_prior_direction": "",
     "transition_hint": "NO_CONFIRMED_TRANSITION",
-    "score": -2.0,
-    "confidence": 70.49,
-    "market_phase": "BEARISH",
-    "entry_confirmed": false,
+    "score": -8.0,
+    "confidence": 95.0,
+    "market_phase": "CONTINUOUS_BEARISH",
+    "entry_confirmed": true,
     "reversal_confirmations": 0,
-    "confirmation_state": "FLOW_WAIT",
-    "pcr": 0.6137883209635785,
+    "confirmation_state": "STRUCTURAL_CONTINUATION",
+    "pcr": 0.6292334551339279,
     "pcr_bias": -1,
-    "pcr_rate_15m": 0.0016,
+    "pcr_rate_15m": 0.0154,
     "pcr_higher_low": true,
     "pcr_lower_high": true,
     "false_breakout": false,
     "trap_level": 0.0,
-    "entry_trigger": "Maintain bearish price watch; wait for bearish Change-OI confirmation. Support=22200.00.",
-    "invalidation_rule": "Bearish bias weakens on sustained VWAP reclaim and bullish price structure.",
-    "support_1": 22200.0,
+    "entry_trigger": "NIFTY remains below VWAP with bearish Change-OI and sustained bearish price structure; support=22000.00 is a strengthening breakdown trigger, not a prerequisite for the bearish regime.",
+    "invalidation_rule": "Invalidate bearish structure on sustained VWAP reclaim with opposing Change-OI and/or decisive HH/HL transition. A temporary 3m bounce alone does not invalidate the regime.",
+    "support_1": 22000.0,
     "support_2": 22000.0,
     "resistance_1": 22500.0,
     "resistance_2": 22600.0,
@@ -519,48 +530,80 @@
       "120": -1,
       "180": -1
     },
-    "latest_completed_3m_bar": "2026-10-08 09:12:00+00:00",
+    "latest_completed_3m_bar": "2026-10-08 09:15:00+00:00",
     "components": {
-      "structure_change_oi": 0.11313866994309138,
-      "structure_change_oi_intraday_raw": 0.11313866994309138,
-      "structure_change_oi_day_raw": -0.49291619373346524,
+      "structure_change_oi": -0.46710544748766547,
+      "structure_change_oi_intraday_raw": -0.46710544748766547,
+      "structure_change_oi_day_raw": -0.5081553856201351,
       "structure_change_oi_conflict": 0.0,
       "structure_change_oi_source": "INTRADAY_PRIMARY",
       "structure_vwap": -1.0,
       "structure_price_break": 0.0,
-      "structure_support": 22200.0,
+      "structure_support": 22000.0,
       "structure_resistance": 22500.0,
-      "structure_score": -2.0,
-      "change_oi_api_score": -0.49291619373346524,
+      "structure_score": -8.0,
+      "change_oi_api_score": -0.5081553856201351,
       "change_oi_bias": -1.0,
       "support_break_strength": 0.0,
       "resistance_break_strength": 0.0,
       "below_support_bars": 0.0,
       "above_resistance_bars": 0.0,
-      "intraday_trend": -1.0704718561413225,
+      "intraday_trend": 0.10111866878646444,
       "vwap_level": -1.0,
-      "recent3_movement_atr": -1.0704718561413225,
-      "price_session_atr": -15.356230797292282,
-      "price_recent7_atr": 0.7800523615379846,
-      "price_recent3_atr": -0.8784589671473569,
-      "price_recent12_atr": 0.42242835578686366,
-      "price_directional_down_ratio": 0.5,
-      "price_directional_up_ratio": 0.5,
-      "price_trend_efficiency": 0.05612244897961196,
+      "recent3_movement_atr": 0.10111866878646444,
+      "price_session_atr": -16.072812403608413,
+      "price_recent7_atr": 1.36510202861727,
+      "price_recent3_atr": -1.2488155595126886,
+      "price_recent12_atr": 1.054162122099002,
+      "price_directional_down_ratio": 0.4166666666666667,
+      "price_directional_up_ratio": 0.5833333333333334,
+      "price_trend_efficiency": 0.14016806722690886,
       "price_structure": 1.0,
-      "vwap_distance_atr": 6.498140846151022,
+      "vwap_distance_atr": 7.204466623949163,
       "bull_votes": 0.0,
-      "bear_votes": 2.0,
-      "chain_context": 0.11313866994309138,
+      "bear_votes": 4.0,
+      "chain_context": -0.46710544748766547,
       "daily_oi_context": -1.0,
-      "active_structure_level": 22200.0
+      "active_structure_level": 22000.0
     }
   },
   "persistent_direction": "BEARISH",
   "continuation_phase": "CONTINUOUS_BEARISH",
-  "continuation_count": 1,
-  "continuation_last_bar": "2026-10-08 08:12:00+00:00",
-  "active_trade": null,
+  "continuation_count": 2,
+  "continuation_last_bar": "2026-10-08 09:15:00+00:00",
+  "active_trade": {
+    "status": "ACTIVE",
+    "trade_date": "2026-10-08",
+    "opened_at": "2026-10-08 14:49:12 IST",
+    "direction": "BEARISH",
+    "regime": "CONTINUOUS BEARISH — BELOW VWAP + SUSTAINED DOWNWARD STRUCTURE + CHANGE-OI CONFIRMED",
+    "confidence": 95.0,
+    "instrument_key": "NSE_FO|44597",
+    "trading_symbol": "NSE_FO|44597",
+    "option_type": "PE",
+    "strike": 22250.0,
+    "entry": 145.3,
+    "entry_underlying": 22215.25,
+    "t1_hit": false,
+    "target_1": 267.17,
+    "target_2": 272.77,
+    "stop_loss": 123.51,
+    "underlying_stop": 22258.97,
+    "underlying_target_1": 22000.0,
+    "underlying_target_2": 21990.11,
+    "delta": -0.5147,
+    "gamma": 0.0012,
+    "theta": -13.6864,
+    "target_engine_version": "V21_DELTA_FIRST_GAMMA_CAPPED_10PCT",
+    "reversal_confirmations": 0,
+    "market_alignment_failures": 0,
+    "last_market_direction": "BEARISH",
+    "last_market_confidence": 95.0,
+    "last_ltp": 145.3,
+    "entry_3m_bar": "2026-10-08 09:15:00+00:00",
+    "underlying_stop_armed_bar": "2026-10-08 09:15:00+00:00",
+    "intrabar_last_checked_at": "2026-10-08 14:49:12 IST"
+  },
   "last_completed_trade": {
     "status": "CLOSED",
     "trade_date": "2026-10-08",
@@ -609,559 +652,559 @@
   "option_oi_snapshot": {
     "date": "2026-10-08",
     "expiry": "2026-10-13",
-    "timestamp": "2026-10-08T14:46:21.433957+05:30",
+    "timestamp": "2026-10-08T14:49:12.981539+05:30",
     "strikes": {
       "20050.0": {
         "call_oi": 0.0,
-        "put_oi": 4463940.0,
+        "put_oi": 4457375.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.2
+        "put_ltp": 1.15
       },
       "20100.0": {
         "call_oi": 0.0,
-        "put_oi": 3631550.0,
+        "put_oi": 3632785.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.25
+        "put_ltp": 1.15
       },
       "20150.0": {
         "call_oi": 0.0,
-        "put_oi": 90935.0,
+        "put_oi": 92105.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.3
+        "put_ltp": 1.2
       },
       "20200.0": {
         "call_oi": 0.0,
-        "put_oi": 555035.0,
+        "put_oi": 555230.0,
         "call_ltp": 0.0,
         "put_ltp": 1.3
       },
       "20250.0": {
         "call_oi": 0.0,
-        "put_oi": 195455.0,
+        "put_oi": 191555.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.35
+        "put_ltp": 1.25
       },
       "20300.0": {
         "call_oi": 0.0,
-        "put_oi": 254085.0,
+        "put_oi": 254020.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.45
+        "put_ltp": 1.35
       },
       "20350.0": {
         "call_oi": 0.0,
-        "put_oi": 68185.0,
+        "put_oi": 70525.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.45
+        "put_ltp": 1.35
       },
       "20400.0": {
         "call_oi": 0.0,
-        "put_oi": 308035.0,
+        "put_oi": 306800.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.6
+        "put_ltp": 1.45
       },
       "20450.0": {
         "call_oi": 0.0,
-        "put_oi": 85085.0,
+        "put_oi": 85800.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.7
+        "put_ltp": 1.55
       },
       "20500.0": {
         "call_oi": 260.0,
-        "put_oi": 3760640.0,
+        "put_oi": 3819205.0,
         "call_ltp": 1739.0,
-        "put_ltp": 1.85
+        "put_ltp": 1.7
       },
       "20550.0": {
         "call_oi": 0.0,
-        "put_oi": 155415.0,
+        "put_oi": 147355.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.9
+        "put_ltp": 1.75
       },
       "20600.0": {
         "call_oi": 0.0,
-        "put_oi": 994435.0,
+        "put_oi": 927875.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.9
+        "put_ltp": 1.8
       },
       "20650.0": {
         "call_oi": 0.0,
-        "put_oi": 202800.0,
+        "put_oi": 197535.0,
         "call_ltp": 0.0,
-        "put_ltp": 2.1
+        "put_ltp": 2.0
       },
       "20700.0": {
         "call_oi": 0.0,
-        "put_oi": 915070.0,
+        "put_oi": 923325.0,
         "call_ltp": 0.0,
-        "put_ltp": 2.15
+        "put_ltp": 2.1
       },
       "20750.0": {
         "call_oi": 0.0,
-        "put_oi": 310765.0,
+        "put_oi": 310960.0,
         "call_ltp": 0.0,
-        "put_ltp": 2.3
+        "put_ltp": 2.25
       },
       "20800.0": {
         "call_oi": 0.0,
-        "put_oi": 1810705.0,
+        "put_oi": 1790815.0,
         "call_ltp": 0.0,
-        "put_ltp": 2.5
+        "put_ltp": 2.45
       },
       "20850.0": {
         "call_oi": 0.0,
-        "put_oi": 205205.0,
+        "put_oi": 207740.0,
         "call_ltp": 0.0,
-        "put_ltp": 2.8
+        "put_ltp": 2.75
       },
       "20900.0": {
         "call_oi": 0.0,
-        "put_oi": 821795.0,
+        "put_oi": 858065.0,
         "call_ltp": 0.0,
-        "put_ltp": 3.05
+        "put_ltp": 2.95
       },
       "20950.0": {
         "call_oi": 0.0,
-        "put_oi": 217620.0,
+        "put_oi": 220610.0,
         "call_ltp": 0.0,
-        "put_ltp": 3.3
+        "put_ltp": 3.2
       },
       "21000.0": {
         "call_oi": 8515.0,
-        "put_oi": 7578740.0,
+        "put_oi": 7618650.0,
         "call_ltp": 1270.0,
-        "put_ltp": 3.65
+        "put_ltp": 3.5
       },
       "21050.0": {
         "call_oi": 0.0,
-        "put_oi": 317525.0,
+        "put_oi": 312650.0,
         "call_ltp": 0.0,
-        "put_ltp": 3.8
+        "put_ltp": 3.75
       },
       "21100.0": {
         "call_oi": 0.0,
-        "put_oi": 1228045.0,
+        "put_oi": 1221025.0,
         "call_ltp": 0.0,
-        "put_ltp": 4.2
+        "put_ltp": 4.05
       },
       "21150.0": {
         "call_oi": 0.0,
-        "put_oi": 397475.0,
+        "put_oi": 398450.0,
         "call_ltp": 0.0,
-        "put_ltp": 4.55
+        "put_ltp": 4.45
       },
       "21200.0": {
         "call_oi": 0.0,
-        "put_oi": 4914585.0,
+        "put_oi": 4891575.0,
         "call_ltp": 0.0,
-        "put_ltp": 5.1
+        "put_ltp": 4.95
       },
       "21250.0": {
         "call_oi": 0.0,
-        "put_oi": 615615.0,
+        "put_oi": 611585.0,
         "call_ltp": 0.0,
-        "put_ltp": 5.45
+        "put_ltp": 5.3
       },
       "21300.0": {
         "call_oi": 2145.0,
-        "put_oi": 2754635.0,
+        "put_oi": 2743130.0,
         "call_ltp": 985.0,
-        "put_ltp": 5.9
+        "put_ltp": 5.7
       },
       "21350.0": {
         "call_oi": 65.0,
-        "put_oi": 543530.0,
+        "put_oi": 532415.0,
         "call_ltp": 1148.6,
-        "put_ltp": 6.75
+        "put_ltp": 6.5
       },
       "21400.0": {
         "call_oi": 1885.0,
-        "put_oi": 2979210.0,
+        "put_oi": 2970630.0,
         "call_ltp": 890.0,
-        "put_ltp": 7.55
+        "put_ltp": 7.25
       },
       "21450.0": {
         "call_oi": 130.0,
-        "put_oi": 930995.0,
+        "put_oi": 920010.0,
         "call_ltp": 823.65,
-        "put_ltp": 8.8
+        "put_ltp": 8.45
       },
       "21500.0": {
-        "call_oi": 65195.0,
-        "put_oi": 9058790.0,
-        "call_ltp": 760.0,
-        "put_ltp": 10.3
+        "call_oi": 65325.0,
+        "put_oi": 9085115.0,
+        "call_ltp": 749.0,
+        "put_ltp": 9.95
       },
       "21550.0": {
         "call_oi": 325.0,
-        "put_oi": 1320150.0,
+        "put_oi": 1311245.0,
         "call_ltp": 739.1,
-        "put_ltp": 11.7
+        "put_ltp": 11.3
       },
       "21600.0": {
         "call_oi": 5135.0,
-        "put_oi": 3583320.0,
+        "put_oi": 3581240.0,
         "call_ltp": 670.0,
-        "put_ltp": 13.55
+        "put_ltp": 13.0
       },
       "21650.0": {
         "call_oi": 1625.0,
-        "put_oi": 2734030.0,
+        "put_oi": 2714010.0,
         "call_ltp": 616.45,
-        "put_ltp": 15.75
+        "put_ltp": 15.15
       },
       "21700.0": {
-        "call_oi": 16120.0,
-        "put_oi": 5724810.0,
-        "call_ltp": 572.5,
-        "put_ltp": 19.2
+        "call_oi": 16575.0,
+        "put_oi": 5681845.0,
+        "call_ltp": 562.0,
+        "put_ltp": 18.55
       },
       "21750.0": {
         "call_oi": 5915.0,
-        "put_oi": 1473745.0,
+        "put_oi": 1446185.0,
         "call_ltp": 526.35,
-        "put_ltp": 23.2
+        "put_ltp": 22.35
       },
       "21800.0": {
-        "call_oi": 70135.0,
-        "put_oi": 6871995.0,
-        "call_ltp": 478.4,
-        "put_ltp": 28.0
+        "call_oi": 72930.0,
+        "put_oi": 6724055.0,
+        "call_ltp": 470.0,
+        "put_ltp": 26.85
       },
       "21850.0": {
-        "call_oi": 11700.0,
-        "put_oi": 2526290.0,
-        "call_ltp": 436.65,
-        "put_ltp": 33.75
+        "call_oi": 11765.0,
+        "put_oi": 2457065.0,
+        "call_ltp": 428.75,
+        "put_ltp": 32.75
       },
       "21900.0": {
-        "call_oi": 76830.0,
-        "put_oi": 4298580.0,
-        "call_ltp": 394.05,
-        "put_ltp": 41.55
+        "call_oi": 77220.0,
+        "put_oi": 4269720.0,
+        "call_ltp": 383.0,
+        "put_ltp": 40.15
       },
       "21950.0": {
-        "call_oi": 46215.0,
-        "put_oi": 1983995.0,
-        "call_ltp": 352.2,
-        "put_ltp": 50.0
+        "call_oi": 45760.0,
+        "put_oi": 1950975.0,
+        "call_ltp": 341.9,
+        "put_ltp": 48.8
       },
       "22000.0": {
-        "call_oi": 903500.0,
-        "put_oi": 10399025.0,
-        "call_ltp": 312.0,
-        "put_ltp": 60.8
+        "call_oi": 917345.0,
+        "put_oi": 10285795.0,
+        "call_ltp": 303.3,
+        "put_ltp": 59.55
       },
       "22050.0": {
-        "call_oi": 138710.0,
-        "put_oi": 1859650.0,
-        "call_ltp": 274.3,
-        "put_ltp": 73.5
+        "call_oi": 138190.0,
+        "put_oi": 1807000.0,
+        "call_ltp": 265.7,
+        "put_ltp": 71.6
       },
       "22100.0": {
-        "call_oi": 842335.0,
-        "put_oi": 4923295.0,
-        "call_ltp": 238.75,
-        "put_ltp": 88.0
+        "call_oi": 763685.0,
+        "put_oi": 4746495.0,
+        "call_ltp": 230.4,
+        "put_ltp": 86.15
       },
       "22150.0": {
-        "call_oi": 520780.0,
-        "put_oi": 2145325.0,
-        "call_ltp": 205.8,
-        "put_ltp": 104.9
+        "call_oi": 508495.0,
+        "put_oi": 2092935.0,
+        "call_ltp": 196.9,
+        "put_ltp": 103.4
       },
       "22200.0": {
-        "call_oi": 3833245.0,
-        "put_oi": 7680790.0,
-        "call_ltp": 175.65,
-        "put_ltp": 124.0
+        "call_oi": 3811275.0,
+        "put_oi": 7594730.0,
+        "call_ltp": 167.75,
+        "put_ltp": 123.1
       },
       "22250.0": {
-        "call_oi": 3448510.0,
-        "put_oi": 3097900.0,
-        "call_ltp": 147.4,
-        "put_ltp": 147.4
+        "call_oi": 3432650.0,
+        "put_oi": 2979665.0,
+        "call_ltp": 140.05,
+        "put_ltp": 145.3
       },
       "22300.0": {
-        "call_oi": 7735195.0,
-        "put_oi": 6406790.0,
-        "call_ltp": 122.95,
-        "put_ltp": 171.95
+        "call_oi": 7768085.0,
+        "put_oi": 6446245.0,
+        "call_ltp": 115.75,
+        "put_ltp": 171.2
       },
       "22350.0": {
-        "call_oi": 4192500.0,
-        "put_oi": 1638455.0,
-        "call_ltp": 101.3,
-        "put_ltp": 200.45
+        "call_oi": 4114630.0,
+        "put_oi": 1589120.0,
+        "call_ltp": 95.1,
+        "put_ltp": 200.5
       },
       "22400.0": {
-        "call_oi": 10228335.0,
-        "put_oi": 3677115.0,
-        "call_ltp": 82.75,
-        "put_ltp": 231.4
+        "call_oi": 10175750.0,
+        "put_oi": 3626740.0,
+        "call_ltp": 77.1,
+        "put_ltp": 233.0
       },
       "22450.0": {
-        "call_oi": 5320965.0,
-        "put_oi": 1657760.0,
-        "call_ltp": 67.4,
-        "put_ltp": 266.35
+        "call_oi": 5274620.0,
+        "put_oi": 1632345.0,
+        "call_ltp": 62.4,
+        "put_ltp": 268.05
       },
       "22500.0": {
-        "call_oi": 14328015.0,
-        "put_oi": 3539705.0,
-        "call_ltp": 54.6,
-        "put_ltp": 303.9
+        "call_oi": 14222975.0,
+        "put_oi": 3540225.0,
+        "call_ltp": 50.15,
+        "put_ltp": 306.0
       },
       "22550.0": {
-        "call_oi": 6570590.0,
-        "put_oi": 1259440.0,
-        "call_ltp": 43.9,
-        "put_ltp": 342.8
+        "call_oi": 6542900.0,
+        "put_oi": 1242865.0,
+        "call_ltp": 40.15,
+        "put_ltp": 344.7
       },
       "22600.0": {
-        "call_oi": 12350975.0,
-        "put_oi": 3231215.0,
-        "call_ltp": 35.7,
-        "put_ltp": 384.6
+        "call_oi": 12265955.0,
+        "put_oi": 3220035.0,
+        "call_ltp": 32.75,
+        "put_ltp": 388.3
       },
       "22650.0": {
-        "call_oi": 5771480.0,
-        "put_oi": 859170.0,
-        "call_ltp": 28.6,
-        "put_ltp": 427.0
+        "call_oi": 5734755.0,
+        "put_oi": 856375.0,
+        "call_ltp": 26.35,
+        "put_ltp": 430.0
       },
       "22700.0": {
-        "call_oi": 12373205.0,
-        "put_oi": 3162380.0,
-        "call_ltp": 22.8,
-        "put_ltp": 471.95
+        "call_oi": 12439375.0,
+        "put_oi": 3159910.0,
+        "call_ltp": 21.05,
+        "put_ltp": 476.5
       },
       "22750.0": {
-        "call_oi": 5411705.0,
-        "put_oi": 499655.0,
-        "call_ltp": 18.45,
-        "put_ltp": 513.1
+        "call_oi": 5407415.0,
+        "put_oi": 496730.0,
+        "call_ltp": 17.05,
+        "put_ltp": 525.0
       },
       "22800.0": {
-        "call_oi": 10349625.0,
-        "put_oi": 1230190.0,
-        "call_ltp": 14.65,
-        "put_ltp": 563.7
+        "call_oi": 10395190.0,
+        "put_oi": 1230775.0,
+        "call_ltp": 13.7,
+        "put_ltp": 567.55
       },
       "22850.0": {
-        "call_oi": 4265170.0,
-        "put_oi": 198380.0,
-        "call_ltp": 11.85,
-        "put_ltp": 609.5
+        "call_oi": 4292145.0,
+        "put_oi": 196690.0,
+        "call_ltp": 11.0,
+        "put_ltp": 615.8
       },
       "22900.0": {
-        "call_oi": 7208240.0,
-        "put_oi": 684385.0,
-        "call_ltp": 9.7,
-        "put_ltp": 655.4
+        "call_oi": 7252115.0,
+        "put_oi": 684190.0,
+        "call_ltp": 9.15,
+        "put_ltp": 665.0
       },
       "22950.0": {
-        "call_oi": 3594695.0,
+        "call_oi": 3513445.0,
         "put_oi": 275535.0,
-        "call_ltp": 8.05,
-        "put_ltp": 702.85
+        "call_ltp": 7.75,
+        "put_ltp": 712.05
       },
       "23000.0": {
-        "call_oi": 12970035.0,
-        "put_oi": 1057290.0,
-        "call_ltp": 7.05,
-        "put_ltp": 750.9
+        "call_oi": 12931945.0,
+        "put_oi": 1053715.0,
+        "call_ltp": 6.75,
+        "put_ltp": 762.05
       },
       "23050.0": {
-        "call_oi": 2587975.0,
-        "put_oi": 80145.0,
-        "call_ltp": 5.85,
-        "put_ltp": 784.4
+        "call_oi": 2598830.0,
+        "put_oi": 80275.0,
+        "call_ltp": 5.7,
+        "put_ltp": 800.7
       },
       "23100.0": {
-        "call_oi": 5938920.0,
-        "put_oi": 327990.0,
-        "call_ltp": 5.05,
-        "put_ltp": 847.0
+        "call_oi": 5944250.0,
+        "put_oi": 328055.0,
+        "call_ltp": 4.85,
+        "put_ltp": 846.55
       },
       "23150.0": {
-        "call_oi": 2531815.0,
+        "call_oi": 2530190.0,
         "put_oi": 34515.0,
-        "call_ltp": 4.35,
+        "call_ltp": 4.2,
         "put_ltp": 889.0
       },
       "23200.0": {
-        "call_oi": 8194030.0,
+        "call_oi": 8314995.0,
         "put_oi": 263120.0,
-        "call_ltp": 3.95,
+        "call_ltp": 3.85,
         "put_ltp": 945.0
       },
       "23250.0": {
-        "call_oi": 2988895.0,
+        "call_oi": 2977520.0,
         "put_oi": 171340.0,
-        "call_ltp": 3.55,
-        "put_ltp": 970.8
+        "call_ltp": 3.45,
+        "put_ltp": 995.05
       },
       "23300.0": {
-        "call_oi": 7046845.0,
-        "put_oi": 224380.0,
-        "call_ltp": 3.1,
-        "put_ltp": 1040.75
+        "call_oi": 7041905.0,
+        "put_oi": 224445.0,
+        "call_ltp": 3.0,
+        "put_ltp": 1050.75
       },
       "23350.0": {
-        "call_oi": 2556970.0,
+        "call_oi": 2553330.0,
         "put_oi": 13195.0,
-        "call_ltp": 2.85,
+        "call_ltp": 2.75,
         "put_ltp": 1050.0
       },
       "23400.0": {
-        "call_oi": 6686745.0,
+        "call_oi": 6686940.0,
         "put_oi": 219310.0,
         "call_ltp": 2.5,
         "put_ltp": 1120.0
       },
       "23450.0": {
-        "call_oi": 2448160.0,
+        "call_oi": 2470455.0,
         "put_oi": 10270.0,
-        "call_ltp": 2.35,
+        "call_ltp": 2.25,
         "put_ltp": 1205.0
       },
       "23500.0": {
-        "call_oi": 9594390.0,
+        "call_oi": 9725365.0,
         "put_oi": 340990.0,
-        "call_ltp": 2.15,
-        "put_ltp": 1240.2
+        "call_ltp": 2.1,
+        "put_ltp": 1245.2
       },
       "23550.0": {
-        "call_oi": 907855.0,
+        "call_oi": 900640.0,
         "put_oi": 43550.0,
-        "call_ltp": 1.85,
+        "call_ltp": 1.95,
         "put_ltp": 1313.6
       },
       "23600.0": {
-        "call_oi": 4467580.0,
+        "call_oi": 4479735.0,
         "put_oi": 66690.0,
         "call_ltp": 1.7,
         "put_ltp": 1334.35
       },
       "23650.0": {
-        "call_oi": 640185.0,
+        "call_oi": 637715.0,
         "put_oi": 9685.0,
-        "call_ltp": 1.6,
+        "call_ltp": 1.65,
         "put_ltp": 1384.0
       },
       "23700.0": {
-        "call_oi": 3895905.0,
+        "call_oi": 3884985.0,
         "put_oi": 37960.0,
-        "call_ltp": 1.4,
+        "call_ltp": 1.5,
         "put_ltp": 1469.4
       },
       "23750.0": {
-        "call_oi": 483990.0,
+        "call_oi": 485225.0,
         "put_oi": 3900.0,
         "call_ltp": 1.4,
         "put_ltp": 1477.05
       },
       "23800.0": {
-        "call_oi": 4185155.0,
+        "call_oi": 4174755.0,
         "put_oi": 33735.0,
-        "call_ltp": 1.3,
+        "call_ltp": 1.4,
         "put_ltp": 1521.0
       },
       "23850.0": {
-        "call_oi": 1229865.0,
+        "call_oi": 1235000.0,
         "put_oi": 2275.0,
         "call_ltp": 1.25,
         "put_ltp": 1594.0
       },
       "23900.0": {
-        "call_oi": 2597140.0,
+        "call_oi": 2653950.0,
         "put_oi": 95290.0,
-        "call_ltp": 1.2,
+        "call_ltp": 1.25,
         "put_ltp": 1661.4
       },
       "23950.0": {
-        "call_oi": 901160.0,
+        "call_oi": 878930.0,
         "put_oi": 11050.0,
-        "call_ltp": 1.1,
+        "call_ltp": 1.2,
         "put_ltp": 1465.0
       },
       "24000.0": {
-        "call_oi": 11871340.0,
+        "call_oi": 11859900.0,
         "put_oi": 314405.0,
         "call_ltp": 1.15,
         "put_ltp": 1739.85
       },
       "24050.0": {
-        "call_oi": 838695.0,
+        "call_oi": 831155.0,
         "put_oi": 455.0,
         "call_ltp": 1.0,
         "put_ltp": 1458.2
       },
       "24100.0": {
-        "call_oi": 2510040.0,
+        "call_oi": 2527720.0,
         "put_oi": 61035.0,
         "call_ltp": 0.95,
         "put_ltp": 1817.0
       },
       "24150.0": {
-        "call_oi": 320905.0,
+        "call_oi": 320580.0,
         "put_oi": 1625.0,
         "call_ltp": 1.0,
         "put_ltp": 1952.25
       },
       "24200.0": {
-        "call_oi": 1377610.0,
+        "call_oi": 1325740.0,
         "put_oi": 60905.0,
         "call_ltp": 0.9,
         "put_ltp": 1932.0
       },
       "24250.0": {
-        "call_oi": 176280.0,
+        "call_oi": 175110.0,
         "put_oi": 1625.0,
-        "call_ltp": 0.85,
+        "call_ltp": 0.9,
         "put_ltp": 1777.65
       },
       "24300.0": {
-        "call_oi": 512525.0,
+        "call_oi": 504335.0,
         "put_oi": 43940.0,
-        "call_ltp": 0.75,
+        "call_ltp": 0.85,
         "put_ltp": 2015.0
       },
       "24350.0": {
-        "call_oi": 125840.0,
+        "call_oi": 124605.0,
         "put_oi": 715.0,
         "call_ltp": 0.85,
         "put_ltp": 1700.0
       },
       "24400.0": {
-        "call_oi": 427700.0,
+        "call_oi": 422825.0,
         "put_oi": 10140.0,
-        "call_ltp": 0.75,
+        "call_ltp": 0.85,
         "put_ltp": 2151.0
       },
       "24450.0": {
-        "call_oi": 152815.0,
+        "call_oi": 152100.0,
         "put_oi": 195.0,
-        "call_ltp": 0.8,
+        "call_ltp": 0.85,
         "put_ltp": 1690.0
       },
       "24500.0": {
-        "call_oi": 2898675.0,
-        "put_oi": 114270.0,
-        "call_ltp": 0.8,
-        "put_ltp": 2220.0
+        "call_oi": 2890680.0,
+        "put_oi": 114205.0,
+        "call_ltp": 0.85,
+        "put_ltp": 2239.0
       },
       "24550.0": {
         "call_oi": 68250.0,
         "put_oi": 0.0,
-        "call_ltp": 0.8,
+        "call_ltp": 0.75,
         "put_ltp": 0.0
       },
       "24600.0": {
-        "call_oi": 315575.0,
-        "put_oi": 14235.0,
-        "call_ltp": 0.8,
-        "put_ltp": 2320.0
+        "call_oi": 295945.0,
+        "put_oi": 13845.0,
+        "call_ltp": 0.75,
+        "put_ltp": 2340.0
       },
       "24650.0": {
         "call_oi": 107770.0,
@@ -1176,7 +1219,7 @@
         "put_ltp": 1990.0
       },
       "24750.0": {
-        "call_oi": 32370.0,
+        "call_oi": 31785.0,
         "put_oi": 0.0,
         "call_ltp": 0.7,
         "put_ltp": 0.0
@@ -1190,7 +1233,7 @@
       "24850.0": {
         "call_oi": 25610.0,
         "put_oi": 195.0,
-        "call_ltp": 0.6,
+        "call_ltp": 0.65,
         "put_ltp": 2405.15
       },
       "24900.0": {
@@ -1202,7 +1245,7 @@
       "24950.0": {
         "call_oi": 47385.0,
         "put_oi": 585.0,
-        "call_ltp": 0.65,
+        "call_ltp": 0.6,
         "put_ltp": 2338.35
       },
       "25000.0": {
@@ -1212,7 +1255,7 @@
         "put_ltp": 2720.0
       },
       "25050.0": {
-        "call_oi": 24570.0,
+        "call_oi": 24830.0,
         "put_oi": 585.0,
         "call_ltp": 0.65,
         "put_ltp": 2424.75
@@ -1224,7 +1267,7 @@
         "put_ltp": 2820.0
       },
       "25150.0": {
-        "call_oi": 29120.0,
+        "call_oi": 28340.0,
         "put_oi": 1105.0,
         "call_ltp": 0.6,
         "put_ltp": 2528.6
@@ -1242,27 +1285,27 @@
         "put_ltp": 2904.15
       },
       "25300.0": {
-        "call_oi": 157625.0,
+        "call_oi": 157300.0,
         "put_oi": 0.0,
-        "call_ltp": 0.55,
+        "call_ltp": 0.5,
         "put_ltp": 0.0
       },
       "25350.0": {
-        "call_oi": 109200.0,
+        "call_oi": 110045.0,
         "put_oi": 520.0,
-        "call_ltp": 0.6,
+        "call_ltp": 0.55,
         "put_ltp": 2725.0
       },
       "25400.0": {
-        "call_oi": 730275.0,
+        "call_oi": 725530.0,
         "put_oi": 13065.0,
-        "call_ltp": 0.55,
+        "call_ltp": 0.5,
         "put_ltp": 2915.0
       }
     }
   },
   "last_signal": {
-    "timestamp": "2026-10-08 13:46:16 IST",
+    "timestamp": "2026-10-08 14:49:12 IST",
     "direction": "BEARISH",
     "regime": "CONTINUOUS BEARISH — BELOW VWAP + SUSTAINED DOWNWARD STRUCTURE + CHANGE-OI CONFIRMED",
     "market_state": "CONTINUOUS_BEARISH",
@@ -1270,47 +1313,47 @@
     "entry_trigger": "NIFTY remains below VWAP with bearish Change-OI and sustained bearish price structure; support=22000.00 is a strengthening breakdown trigger, not a prerequisite for the bearish regime.",
     "invalidation_rule": "Invalidate bearish structure on sustained VWAP reclaim with opposing Change-OI and/or decisive HH/HL transition. A temporary 3m bounce alone does not invalidate the regime.",
     "confidence": 95.0,
-    "spot": 22241.1,
+    "spot": 22215.25,
     "futures_state": "SHORT_BUILDUP",
     "option_type": "PE",
-    "strike": 22300.0,
-    "trading_symbol": "NSE_FO|44599",
-    "instrument_key": "NSE_FO|44599",
-    "entry": 164.9,
-    "target_1": 307.45,
-    "target_2": 314.31,
-    "stop_loss": 137.73,
-    "underlying_stop": 22294.58,
+    "strike": 22250.0,
+    "trading_symbol": "NSE_FO|44597",
+    "instrument_key": "NSE_FO|44597",
+    "entry": 145.3,
+    "target_1": 267.17,
+    "target_2": 272.77,
+    "stop_loss": 123.51,
+    "underlying_stop": 22258.97,
     "underlying_target_1": 22000.0,
-    "underlying_target_2": 21988.4,
-    "delta": -0.5375,
-    "gamma": 0.0011,
-    "theta": -14.2757,
+    "underlying_target_2": 21990.11,
+    "delta": -0.5147,
+    "gamma": 0.0012,
+    "theta": -13.6864,
     "support_1": 22000.0,
     "support_2": 22000.0,
     "resistance_1": 22500.0,
     "resistance_2": 22600.0,
     "reasons": [
-      "PRIMARY STRUCTURE: direction=BEARISH; phase=CONTINUOUS_BEARISH; NIFTY=22250.85; VWAP=22398.59; distance=6.79ATR.",
-      "STRUCTURAL LEVELS: support=22000.00/22000.00; resistance=22500.00/22600.00; break_buffer=1.86; hold_bars=2.",
+      "PRIMARY STRUCTURE: direction=BEARISH; phase=CONTINUOUS_BEARISH; NIFTY=22228.15; VWAP=22357.75; distance=7.20ATR.",
+      "STRUCTURAL LEVELS: support=22000.00/22000.00; resistance=22500.00/22600.00; break_buffer=1.58; hold_bars=2.",
       "BREAK TEST: below_support_bars=0; above_resistance_bars=0; breakdown=False; breakout=False.",
-      "CHANGE-OI PRIMARY: effective=-0.454; bias=-1; source=INTRADAY_PRIMARY; raw_intraday=-0.454; API_day_change=-0.574; mode=INTRADAY_SNAPSHOT; conflict=False.",
-      "PRICE ACTION CONTEXT: structure=MIXED; session=-12.72ATR; recent7=-0.58ATR; recent12=-1.51ATR; recent3=-0.87ATR; down_ratio=0.58; up_ratio=0.42; efficiency=0.18; recent 3-bar movement is context only.",
-      "FUTURES CONFIRMATION: regime=SHORT_BUILDUP; bias=-1; strength=0.452.",
-      "PCR CONFIRMATION: value=0.614; bias=-1; 15m_rate=+0.026.",
+      "CHANGE-OI PRIMARY: effective=-0.467; bias=-1; source=INTRADAY_PRIMARY; raw_intraday=-0.467; API_day_change=-0.508; mode=INTRADAY_SNAPSHOT; conflict=False.",
+      "PRICE ACTION CONTEXT: structure=HH_HL; session=-16.07ATR; recent7=+1.37ATR; recent12=+1.05ATR; recent3=-1.25ATR; down_ratio=0.42; up_ratio=0.58; efficiency=0.14; recent 3-bar movement is context only.",
+      "FUTURES CONFIRMATION: regime=SHORT_BUILDUP; bias=-1; strength=0.736.",
+      "PCR CONFIRMATION: value=0.629; bias=-1; 15m_rate=+0.015.",
       "HIGHER-TF CONTEXT: 3m=+1, 15m=-1, 30m=-1, 60m=-1, 120m=-1, 180m=-1.",
       "SECONDARY CONFIRMATIONS: 4/5 align with BEARISH; not used as primary directional voters.",
       "Setup type: STRUCTURAL CONTINUATION ENTRY.",
-      "Entry timing: STRUCTURAL_CONTINUATION; index VWAP distance=6.79 ATR; latest 3m move=0.88 ATR; completed index 3m bars=90.",
+      "Entry timing: STRUCTURAL_CONTINUATION; index VWAP distance=7.20 ATR; latest 3m move=0.10 ATR; completed index 3m bars=111.",
       "Strike rule: ATM+1/ATM+2 PE.",
-      "Index spot used for option ATM selection=22241.10; futures LTP=22311.00; futures/index basis=+69.90.",
-      "Selected option health: spread=0.24%, theta burden=8.66%/day, volume=130866125, OI=5617690, delta=-0.537.",
-      "Dynamic underlying targets: T1=22000.00, T2=21988.40, SL=22294.58.",
-      "Dynamic option targets: T1=₹307.45, T2=₹314.31, SL=₹137.73.",
+      "Index spot used for option ATM selection=22215.25; futures LTP=22286.90; futures/index basis=+71.65.",
+      "Selected option health: spread=0.24%, theta burden=9.42%/day, volume=96966935, OI=2979665, delta=-0.515.",
+      "Dynamic underlying targets: T1=22000.00, T2=21990.11, SL=22258.97.",
+      "Dynamic option targets: T1=₹267.17, T2=₹272.77, SL=₹123.51.",
       "Primary entry alignment: NIFTY price vs VWAP + structural support/resistance + confirming Change-OI.",
       "Futures price/OI, PCR and higher-timeframe Supertrend are confirmation/context only; they do not override a confirmed structural breakout or breakdown."
     ]
   },
-  "last_signal_hash": "8108bfc9227be26c488523efb88c9bed51a020de133bebaa343f64bc68fed18a",
-  "last_signal_timestamp": "2026-10-08 13:46:16 IST"
+  "last_signal_hash": "516488d66e26b0fe02e720c4514e635a32f1ba22c009da18812a5e5f372d2db7",
+  "last_signal_timestamp": "2026-10-08 14:49:12 IST"
 }
