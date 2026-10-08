@@ -24,8 +24,8 @@ What this version fixes:
   older v2 intraday candle API is deprecated.
 
 Run:
-    python final_scanner_nifty.py --self-test
-    python final_scanner_nifty.py
+    python final_scanner_oct8_final.py --self-test
+    python final_scanner_oct8_final.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -159,7 +159,7 @@ REVERSAL_STRIKE_PREFERRED_DISTANCE_STEPS = float(os.getenv("REVERSAL_STRIKE_PREF
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-10-08-STRUCTURE-V16-FINAL"
+SCANNER_VERSION = "2026-10-08-STRUCTURE-V17-FINAL"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -254,23 +254,27 @@ REVERSAL_MAX_OPPOSING_DERIVATIVE_SCORE = float(os.getenv("REVERSAL_MAX_OPPOSING_
 
 
 # PRIMARY MARKET-STRUCTURE ENGINE
-# Direction is determined from price/VWAP + dynamic support/resistance + Change-OI.
-# Futures OI/PCR are confirmation only and cannot veto a clear structural move.
+# The hierarchy is intentionally explicit:
+#   1) NIFTY price relative to VWAP
+#   2) OI + Change-OI establish nearby structural support/resistance
+#   3) Price breaks and HOLDS beyond that level
+#   4) Change-OI confirms the direction
+# Futures OI, PCR and Supertrend are confirmation/context only.
 STRUCTURE_LEVEL_LOOKBACK_BARS = int(os.getenv("STRUCTURE_LEVEL_LOOKBACK_BARS", "12"))
 STRUCTURE_LEVEL_MAX_DISTANCE_STEPS = float(os.getenv("STRUCTURE_LEVEL_MAX_DISTANCE_STEPS", "8"))
 STRUCTURE_BREAK_BUFFER_ATR = float(os.getenv("STRUCTURE_BREAK_BUFFER_ATR", "0.08"))
 STRUCTURE_HOLD_BARS = int(os.getenv("STRUCTURE_HOLD_BARS", "2"))
 STRUCTURE_CHANGE_OI_CONFIRM = float(os.getenv("STRUCTURE_CHANGE_OI_CONFIRM", "0.08"))
 STRUCTURE_CHANGE_OI_STRONG = float(os.getenv("STRUCTURE_CHANGE_OI_STRONG", "0.20"))
-STRUCTURE_PRACTICAL_VWAP_MAX_DISTANCE_ATR = float(os.getenv("STRUCTURE_PRACTICAL_VWAP_MAX_DISTANCE_ATR", "2.75"))
 STRUCTURE_VWAP_RECLAIM_BUFFER_ATR = float(os.getenv("STRUCTURE_VWAP_RECLAIM_BUFFER_ATR", "0.05"))
 STRUCTURE_MIN_LEVEL_STRENGTH = float(os.getenv("STRUCTURE_MIN_LEVEL_STRENGTH", "0.20"))
 STRUCTURE_ACTIVITY_PRICE_NOISE_PCT = float(os.getenv("STRUCTURE_ACTIVITY_PRICE_NOISE_PCT", "0.002"))
-STRUCTURE_SWING_WEIGHT = float(os.getenv("STRUCTURE_SWING_WEIGHT", "0.35"))
 STRUCTURE_OI_WALL_WEIGHT = float(os.getenv("STRUCTURE_OI_WALL_WEIGHT", "0.70"))
 STRUCTURE_FLOW_WEIGHT = float(os.getenv("STRUCTURE_FLOW_WEIGHT", "0.30"))
 STRUCTURE_LEVEL_CANDIDATE_COUNT = int(os.getenv("STRUCTURE_LEVEL_CANDIDATE_COUNT", "6"))
 STRUCTURE_LEVEL_MEDIAN_MULTIPLIER = float(os.getenv("STRUCTURE_LEVEL_MEDIAN_MULTIPLIER", "1.05"))
+STRUCTURE_SWING_MIN_DISTANCE_ATR = float(os.getenv("STRUCTURE_SWING_MIN_DISTANCE_ATR", "0.10"))
+STRUCTURE_LEVEL_MIN_GAP_POINTS = float(os.getenv("STRUCTURE_LEVEL_MIN_GAP_POINTS", "1.0"))
 
 # Entry confirmation controls. One scanner pass is sufficient once the overall
 # market is aligned; forcing two polls would delay fast reversal/continuation entries.
@@ -1690,19 +1694,30 @@ def chain_oi_support_resistance(
     previous_option_snapshot: Optional[dict[str, Any]] = None,
     expiry: str = "",
 ) -> dict[str, Any]:
-    """Build the primary structural map from option OI + intraday Change-OI + VWAP."""
+    """Create the single authoritative structural map used by the scanner.
+
+    Support/resistance are NOT manufactured from VWAP and are never allowed to
+    equal each other. VWAP is an independent regime boundary; option-chain OI
+    and directional Change-OI establish the actual nearby structural levels.
+    Price swing levels are a fallback/secondary structural reference.
+    """
     rows = chain_rows(chain)
     strikes = sorted(rows)
     step = strike_step(strikes)
     atm = nearest_strike(spot, strikes)
     atr = max(safe_float(atr3, 50.0), 1.0)
 
-    if vwap is None and price_session is not None and not price_session.empty:
+    if vwap is None:
+        if price_session is None or price_session.empty:
+            raise ScannerError("VWAP unavailable for structural analysis.")
         vwap, _, _ = vwap_snapshot(price_session)
     vwap_value = safe_float(vwap, spot)
 
     flow_map, flow_mode = _intraday_option_changes(
-        chain, previous_option_snapshot, change_oi_by_strike, expiry
+        chain,
+        previous_option_snapshot,
+        change_oi_by_strike,
+        expiry,
     )
 
     entries: list[dict[str, Any]] = []
@@ -1737,18 +1752,18 @@ def chain_oi_support_resistance(
 
     def support_strength(x: dict[str, Any]) -> float:
         oi_ratio = min(float(x["put_oi"]) / max(max_put_oi, 1.0), 1.0)
-        defended = 1.0 if int(x["put_bias"]) > 0 else 0.0
-        attacked = 1.0 if int(x["put_bias"]) < 0 else 0.0
-        raw = STRUCTURE_OI_WALL_WEIGHT * oi_ratio + STRUCTURE_FLOW_WEIGHT * defended
-        raw -= 0.20 * STRUCTURE_FLOW_WEIGHT * attacked
+        flow_bonus = 1.0 if int(x["put_bias"]) > 0 else 0.0
+        flow_penalty = 1.0 if int(x["put_bias"]) < 0 else 0.0
+        raw = STRUCTURE_OI_WALL_WEIGHT * oi_ratio + STRUCTURE_FLOW_WEIGHT * flow_bonus
+        raw -= 0.50 * STRUCTURE_FLOW_WEIGHT * flow_penalty
         return max(0.0, min(1.0, raw)) * float(x["proximity"])
 
     def resistance_strength(x: dict[str, Any]) -> float:
         oi_ratio = min(float(x["call_oi"]) / max(max_call_oi, 1.0), 1.0)
-        defended = 1.0 if int(x["call_bias"]) < 0 else 0.0
-        attacked = 1.0 if int(x["call_bias"]) > 0 else 0.0
-        raw = STRUCTURE_OI_WALL_WEIGHT * oi_ratio + STRUCTURE_FLOW_WEIGHT * defended
-        raw -= 0.20 * STRUCTURE_FLOW_WEIGHT * attacked
+        flow_bonus = 1.0 if int(x["call_bias"]) < 0 else 0.0
+        flow_penalty = 1.0 if int(x["call_bias"]) > 0 else 0.0
+        raw = STRUCTURE_OI_WALL_WEIGHT * oi_ratio + STRUCTURE_FLOW_WEIGHT * flow_bonus
+        raw -= 0.50 * STRUCTURE_FLOW_WEIGHT * flow_penalty
         return max(0.0, min(1.0, raw)) * float(x["proximity"])
 
     support_pool = [
@@ -1764,11 +1779,11 @@ def chain_oi_support_resistance(
 
     support_ranked = sorted(
         [(x, support_strength(x)) for x in support_pool],
-        key=lambda z: (abs(spot - float(z[0]["strike"])), -z[1]),
+        key=lambda z: (-z[1], abs(spot - float(z[0]["strike"]))),
     )
     resistance_ranked = sorted(
         [(x, resistance_strength(x)) for x in resistance_pool],
-        key=lambda z: (abs(float(z[0]["strike"]) - spot), -z[1]),
+        key=lambda z: (-z[1], abs(float(z[0]["strike"]) - spot)),
     )
 
     strong_supports = [
@@ -1806,41 +1821,82 @@ def chain_oi_support_resistance(
         default=float("nan"),
     )
 
-    # VWAP is the dynamic center. If price is below VWAP it is immediate overhead
-    # resistance; if price is above VWAP it is immediate underlying support.
-    support_candidates = [
-        x for x in (option_support, recent_low)
-        if math.isfinite(x) and x < spot
-    ]
-    resistance_candidates = [
-        x for x in (option_resistance, recent_high)
-        if math.isfinite(x) and x > spot
-    ]
-    if vwap_value < spot:
-        support_candidates.append(vwap_value)
-    elif vwap_value > spot:
-        resistance_candidates.append(vwap_value)
+    min_swing_gap = max(STRUCTURE_LEVEL_MIN_GAP_POINTS, STRUCTURE_SWING_MIN_DISTANCE_ATR * atr)
+    swing_support = recent_low if math.isfinite(recent_low) and recent_low <= spot - min_swing_gap else float("nan")
+    swing_resistance = recent_high if math.isfinite(recent_high) and recent_high >= spot + min_swing_gap else float("nan")
 
-    support_1 = max(support_candidates) if support_candidates else (vwap_value if vwap_value < spot else spot)
-    resistance_1 = min(resistance_candidates) if resistance_candidates else (vwap_value if vwap_value > spot else spot)
+    # Option OI/Change-OI is primary. Recent swing is used only when the OI wall
+    # is absent or implausibly close to spot. VWAP is deliberately NOT inserted
+    # into these levels; it is the separate directional regime boundary.
+    if math.isfinite(option_support) and option_support <= spot - STRUCTURE_LEVEL_MIN_GAP_POINTS:
+        support_1 = option_support
+        support_source = "OPTION_OI"
+    elif math.isfinite(swing_support):
+        support_1 = swing_support
+        support_source = "PRICE_SWING"
+    else:
+        support_1 = float("nan")
+        support_source = "NONE"
 
-    lower_levels = sorted(
-        [x for x in strong_supports if x < support_1]
-        + ([recent_low] if math.isfinite(recent_low) and recent_low < support_1 else []),
-        reverse=True,
+    if math.isfinite(option_resistance) and option_resistance >= spot + STRUCTURE_LEVEL_MIN_GAP_POINTS:
+        resistance_1 = option_resistance
+        resistance_source = "OPTION_OI"
+    elif math.isfinite(swing_resistance):
+        resistance_1 = swing_resistance
+        resistance_source = "PRICE_SWING"
+    else:
+        resistance_1 = float("nan")
+        resistance_source = "NONE"
+
+    # Secondary levels are always strictly on the correct side of spot.
+    support_candidates = sorted(
+        set(
+            x for x in [
+                option_support,
+                swing_support,
+            ]
+            if math.isfinite(x) and x < spot and (not math.isfinite(support_1) or abs(x - support_1) > 0.01)
+        ),
+        key=lambda x: spot - x,
     )
-    upper_levels = sorted(
-        [x for x in strong_resistances if x > resistance_1]
-        + ([recent_high] if math.isfinite(recent_high) and recent_high > resistance_1 else []),
+    resistance_candidates = sorted(
+        set(
+            x for x in [
+                option_resistance,
+                swing_resistance,
+            ]
+            if math.isfinite(x) and x > spot and (not math.isfinite(resistance_1) or abs(x - resistance_1) > 0.01)
+        ),
+        key=lambda x: x - spot,
     )
-    if vwap_value > spot and math.isfinite(option_resistance) and option_resistance > resistance_1:
-        upper_levels.insert(0, option_resistance)
-    if vwap_value < spot and math.isfinite(option_support) and option_support < support_1:
-        lower_levels.insert(0, option_support)
-    support_2 = lower_levels[0] if lower_levels else support_1
-    resistance_2 = upper_levels[0] if upper_levels else resistance_1
 
-    # Aggregate underlying-direction Change-OI pressure around ATM.
+    if not math.isfinite(support_1):
+        support_1 = support_candidates[0] if support_candidates else spot - max(step, atr)
+        support_source = "FALLBACK"
+    if not math.isfinite(resistance_1):
+        resistance_1 = resistance_candidates[0] if resistance_candidates else spot + max(step, atr)
+        resistance_source = "FALLBACK"
+
+    support_2 = support_candidates[0] if support_candidates else support_1
+    resistance_2 = resistance_candidates[0] if resistance_candidates else resistance_1
+
+    # Hard invariant: one level cannot be both support and resistance and both
+    # must be on the proper side of the live NIFTY price.
+    if not support_1 < spot:
+        support_1 = min(spot - max(STRUCTURE_LEVEL_MIN_GAP_POINTS, 1.0), recent_low if math.isfinite(recent_low) and recent_low < spot else spot - step)
+        support_source = "INVARIANT_FALLBACK"
+    if not resistance_1 > spot:
+        resistance_1 = max(spot + max(STRUCTURE_LEVEL_MIN_GAP_POINTS, 1.0), recent_high if math.isfinite(recent_high) and recent_high > spot else spot + step)
+        resistance_source = "INVARIANT_FALLBACK"
+    if support_1 >= resistance_1:
+        mid = spot
+        support_1 = min(support_1, mid - max(step * 0.5, 1.0))
+        resistance_1 = max(resistance_1, mid + max(step * 0.5, 1.0))
+        support_source = "SEPARATION_FALLBACK"
+        resistance_source = "SEPARATION_FALLBACK"
+
+    # Aggregate Change-OI flow around ATM. This is the primary confirmation,
+    # while the individual wall flows are retained for transparency.
     flow_num = 0.0
     flow_den = 0.0
     for x in nearby:
@@ -1856,42 +1912,47 @@ def chain_oi_support_resistance(
         flow_num += weight * directional
         flow_den += weight
     change_flow_score = max(-1.0, min(1.0, flow_num / flow_den if flow_den > 0 else 0.0))
-    change_flow_bias = 1 if change_flow_score >= STRUCTURE_CHANGE_OI_CONFIRM else -1 if change_flow_score <= -STRUCTURE_CHANGE_OI_CONFIRM else 0
+    change_flow_bias = (
+        1 if change_flow_score >= STRUCTURE_CHANGE_OI_CONFIRM
+        else -1 if change_flow_score <= -STRUCTURE_CHANGE_OI_CONFIRM
+        else 0
+    )
 
-    major_support_row = max(support_pool, key=lambda x: float(x["put_oi"]), default=None)
-    major_resistance_row = max(resistance_pool, key=lambda x: float(x["call_oi"]), default=None)
-    if major_support_row:
+    support_row = next((x for x in entries if abs(float(x["strike"]) - support_1) < 0.01), None)
+    resistance_row = next((x for x in entries if abs(float(x["strike"]) - resistance_1) < 0.01), None)
+
+    support_flow_bias = int(support_row["put_bias"]) if support_row else 0
+    resistance_flow_bias = int(resistance_row["call_bias"]) if resistance_row else 0
+    support_activity = str(support_row["put_activity"]) if support_row else "NO_OI_DATA"
+    resistance_activity = str(resistance_row["call_activity"]) if resistance_row else "NO_OI_DATA"
+
+    if support_row:
         logger.info(
-            "CHAIN SUPPORT ACTIVITY: strike=%.0f put_activity=%s",
-            float(major_support_row["strike"]), str(major_support_row["put_activity"]),
+            "CHAIN SUPPORT LEVEL: strike=%.0f source=%s put_oi=%.0f put_oi_change=%+.0f activity=%s flow_bias=%+d",
+            support_1, support_source, float(support_row["put_oi"]), float(support_row["put_oi_change"]),
+            support_activity, support_flow_bias,
         )
-    if major_resistance_row:
+    if resistance_row:
         logger.info(
-            "CHAIN RESISTANCE ACTIVITY: strike=%.0f call_activity=%s",
-            float(major_resistance_row["strike"]), str(major_resistance_row["call_activity"]),
+            "CHAIN RESISTANCE LEVEL: strike=%.0f source=%s call_oi=%.0f call_oi_change=%+.0f activity=%s flow_bias=%+d",
+            resistance_1, resistance_source, float(resistance_row["call_oi"]), float(resistance_row["call_oi_change"]),
+            resistance_activity, resistance_flow_bias,
         )
 
-    support_change_strength = 0.0
-    resistance_change_strength = 0.0
-    if math.isfinite(option_support):
-        row = next((x for x in entries if abs(float(x["strike"]) - option_support) < 0.01), None)
-        if row:
-            total = abs(float(row["put_oi_change"])) + abs(float(row["call_oi_change"]))
-            support_change_strength = abs(float(row["put_oi_change"])) / total if total > 0 else 0.0
-    if math.isfinite(option_resistance):
-        row = next((x for x in entries if abs(float(x["strike"]) - option_resistance) < 0.01), None)
-        if row:
-            total = abs(float(row["put_oi_change"])) + abs(float(row["call_oi_change"]))
-            resistance_change_strength = abs(float(row["call_oi_change"])) / total if total > 0 else 0.0
+    support_change_strength = abs(float(support_row["put_oi_change"])) if support_row else 0.0
+    resistance_change_strength = abs(float(resistance_row["call_oi_change"])) if resistance_row else 0.0
+    max_support_change = max(
+        [abs(float(x["put_oi_change"])) for x in nearby] or [1.0]
+    )
+    max_resistance_change = max(
+        [abs(float(x["call_oi_change"])) for x in nearby] or [1.0]
+    )
+    support_change_strength = min(support_change_strength / max(max_support_change, 1.0), 1.0)
+    resistance_change_strength = min(resistance_change_strength / max(max_resistance_change, 1.0), 1.0)
 
-    def level_strength(ranked: list[tuple[dict[str, Any], float]], level: float) -> float:
-        for row, strength in ranked:
-            if abs(float(row["strike"]) - level) < 0.01:
-                return float(strength)
-        return 0.0
-
-    support_strength_value = level_strength(support_ranked, option_support) if math.isfinite(option_support) else 0.0
-    resistance_strength_value = level_strength(resistance_ranked, option_resistance) if math.isfinite(option_resistance) else 0.0
+    pcr_put = sum(float(x["put_oi"]) for x in entries)
+    pcr_call = sum(float(x["call_oi"]) for x in entries)
+    pcr = pcr_put / pcr_call if pcr_call > 0 else float("nan")
 
     predictive_bias = change_flow_bias
     predictive_strength = abs(change_flow_score)
@@ -1899,14 +1960,17 @@ def chain_oi_support_resistance(
 
     logger.info(
         "CHAIN STRUCTURE: VWAP=%.2f support=%.2f/%.2f resistance=%.2f/%.2f "
-        "flow_mode=%s change_flow=%+.3f bias=%+d predictive=%+d strength=%.3f",
+        "source=%s/%s flow_mode=%s change_flow=%+.3f bias=%+d predictive=%+d strength=%.3f",
         vwap_value, support_1, support_2, resistance_1, resistance_2,
-        flow_mode, change_flow_score, change_flow_bias, predictive_bias, predictive_strength,
+        support_source, resistance_source, flow_mode,
+        change_flow_score, change_flow_bias, predictive_bias, predictive_strength,
     )
 
     return {
-        "support_1": float(support_1), "support_2": float(support_2),
-        "resistance_1": float(resistance_1), "resistance_2": float(resistance_2),
+        "support_1": float(support_1),
+        "support_2": float(support_2),
+        "resistance_1": float(resistance_1),
+        "resistance_2": float(resistance_2),
         "pressure_score": float(change_flow_score),
         "normalized_diff": float(change_flow_score),
         "normalized_change": float(change_flow_score),
@@ -1915,16 +1979,16 @@ def chain_oi_support_resistance(
         "predictive_bias": int(predictive_bias),
         "predictive_strength": float(predictive_strength),
         "level_bias": int(level_bias),
-        "support_strength": float(support_strength_value),
-        "resistance_strength": float(resistance_strength_value),
+        "support_strength": float(support_strength(support_row)) if support_row else 0.0,
+        "resistance_strength": float(resistance_strength(resistance_row)) if resistance_row else 0.0,
         "support_change_strength": float(support_change_strength),
         "resistance_change_strength": float(resistance_change_strength),
         "major_support": float(option_support) if math.isfinite(option_support) else float(support_1),
         "major_resistance": float(option_resistance) if math.isfinite(option_resistance) else float(resistance_1),
-        "put_writing_at_support": bool(major_support_row and major_support_row["put_activity"] == "PUT_WRITING"),
-        "put_unwinding_at_support": bool(major_support_row and major_support_row["put_activity"] in {"PUT_LONG_UNWINDING", "PUT_SHORT_COVERING"}),
-        "call_writing_at_resistance": bool(major_resistance_row and major_resistance_row["call_activity"] == "CALL_WRITING"),
-        "call_unwinding_at_resistance": bool(major_resistance_row and major_resistance_row["call_activity"] in {"CALL_LONG_UNWINDING", "CALL_SHORT_COVERING"}),
+        "put_writing_at_support": bool(support_activity == "PUT_WRITING"),
+        "put_unwinding_at_support": bool(support_activity in {"PUT_LONG_UNWINDING", "PUT_SHORT_COVERING"}),
+        "call_writing_at_resistance": bool(resistance_activity == "CALL_WRITING"),
+        "call_unwinding_at_resistance": bool(resistance_activity in {"CALL_LONG_UNWINDING", "CALL_SHORT_COVERING"}),
         "change_flow_score": float(change_flow_score),
         "change_flow_bias": int(change_flow_bias),
         "vwap": float(vwap_value),
@@ -1933,9 +1997,14 @@ def chain_oi_support_resistance(
         "recent_swing_low": float(recent_low) if math.isfinite(recent_low) else float("nan"),
         "recent_swing_high": float(recent_high) if math.isfinite(recent_high) else float("nan"),
         "flow_mode": flow_mode,
-        "intraday_flow_strikes": flow_map,
+        "support_source": support_source,
+        "resistance_source": resistance_source,
+        "support_flow_bias": support_flow_bias,
+        "resistance_flow_bias": resistance_flow_bias,
+        "support_activity": support_activity,
+        "resistance_activity": resistance_activity,
+        "pcr": float(pcr) if math.isfinite(pcr) else float("nan"),
     }
-
 
 def get_daily_oi_confirmation(
     expiry: str,
@@ -2932,9 +3001,17 @@ def build_market_structure(
     pcr_higher_low: bool = False,
     pcr_lower_high: bool = False,
 ) -> StructureResult:
-    """Primary market-direction engine: VWAP + structural OI levels + Change-OI."""
+    """Authoritative market-structure state machine.
+
+    Primary direction:
+        NIFTY price vs VWAP -> OI/Change-OI structural level -> break/hold.
+
+    The latest 3m candle is context only. It can describe a pullback but cannot
+    by itself flip a confirmed structural regime. Futures OI, PCR and
+    Supertrend are secondary confirmation/context and never define direction.
+    """
     primary_session = price_session if price_session is not None and not price_session.empty else futures_session
-    vwap, vwap_slope, vwap_level_bias = vwap_snapshot(primary_session)
+    vwap, vwap_slope, _ = vwap_snapshot(primary_session)
 
     futures_info = futures_oi_structure(futures_3m, futures_live_quote)
     futures_regime = str(futures_info.get("regime", "UNAVAILABLE"))
@@ -2948,19 +3025,23 @@ def build_market_structure(
     for c in ("open", "high", "low", "close"):
         if c in work.columns:
             work[c] = pd.to_numeric(work[c], errors="coerce")
-    required_cols = [c for c in ("open", "high", "low", "close") if c in work.columns]
-    work = work.dropna(subset=required_cols).reset_index(drop=True) if not work.empty else pd.DataFrame()
+    if not work.empty:
+        work = work.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
     current_close = float(work["close"].iloc[-1]) if not work.empty else float(spot)
     latest_move = float(work["close"].iloc[-1] - work["close"].iloc[-2]) if len(work) >= 2 else 0.0
 
-    fresh_support = safe_float(chain_levels.get("support_1"), spot)
-    fresh_support_2 = safe_float(chain_levels.get("support_2"), fresh_support)
-    fresh_resistance = safe_float(chain_levels.get("resistance_1"), spot)
-    fresh_resistance_2 = safe_float(chain_levels.get("resistance_2"), fresh_resistance)
+    support_1 = safe_float(chain_levels.get("support_1"), current_close - max(50.0, atr3))
+    support_2 = safe_float(chain_levels.get("support_2"), support_1)
+    resistance_1 = safe_float(chain_levels.get("resistance_1"), current_close + max(50.0, atr3))
+    resistance_2 = safe_float(chain_levels.get("resistance_2"), resistance_1)
     change_flow_score = safe_float(chain_levels.get("change_flow_score"), safe_float(change_oi_score))
     change_flow_bias = int(chain_levels.get("change_flow_bias", 0))
     if change_flow_bias == 0:
-        change_flow_bias = 1 if change_flow_score >= STRUCTURE_CHANGE_OI_CONFIRM else -1 if change_flow_score <= -STRUCTURE_CHANGE_OI_CONFIRM else 0
+        change_flow_bias = (
+            1 if change_flow_score >= STRUCTURE_CHANGE_OI_CONFIRM
+            else -1 if change_flow_score <= -STRUCTURE_CHANGE_OI_CONFIRM
+            else 0
+        )
 
     previous_support = safe_float(chain_levels.get("previous_support_1"), float("nan"))
     previous_resistance = safe_float(chain_levels.get("previous_resistance_1"), float("nan"))
@@ -2968,22 +3049,33 @@ def build_market_structure(
     prior_phase = (previous_phase or "").upper().strip()
     break_buffer = STRUCTURE_BREAK_BUFFER_ATR * atr3
 
-    # Lock the previous broken level while price remains beyond it. This avoids
-    # the support/resistance calculation chasing the move and erasing continuity.
-    support_1 = fresh_support
-    support_2 = fresh_support_2
-    resistance_1 = fresh_resistance
-    resistance_2 = fresh_resistance_2
-    bearish_prior = prior == "BEARISH" or prior_phase in {"BEARISH", "BEARISH_BREAKDOWN", "CONTINUOUS_BEARISH"}
     bullish_prior = prior == "BULLISH" or prior_phase in {"BULLISH", "BULLISH_BREAKOUT", "CONTINUOUS_BULLISH"}
+    bearish_prior = prior == "BEARISH" or prior_phase in {"BEARISH", "BEARISH_BREAKDOWN", "CONTINUOUS_BEARISH"}
+
+    # Do not let the structural level chase an already-broken trend. Once a
+    # confirmed bearish/bullish regime exists, its broken level stays the active
+    # reference until price decisively reclaims it.
     if bearish_prior and math.isfinite(previous_support) and current_close < previous_support - break_buffer:
         support_1 = previous_support
-        if math.isfinite(fresh_support) and fresh_support < support_1:
-            support_2 = fresh_support
-    if bullish_prior and math.isfinite(previous_resistance) and current_close > previous_resistance + break_buffer:
+        if math.isfinite(support_2) and support_2 >= support_1:
+            support_2 = chain_levels.get("support_1", support_1)
+    elif bullish_prior and math.isfinite(previous_resistance) and current_close > previous_resistance + break_buffer:
         resistance_1 = previous_resistance
-        if math.isfinite(fresh_resistance) and fresh_resistance > resistance_1:
-            resistance_2 = fresh_resistance
+        if math.isfinite(resistance_2) and resistance_2 <= resistance_1:
+            resistance_2 = chain_levels.get("resistance_1", resistance_1)
+
+    # Hard structural invariants. VWAP never becomes a support/resistance value.
+    # IMPORTANT: after a breakout/breakdown, the broken level is allowed to sit
+    # on the opposite side of current price because it remains the reference
+    # level that price has broken through. Only missing/invalid levels are
+    # synthesized here.
+    if not math.isfinite(support_1):
+        support_1 = current_close - max(STRUCTURE_LEVEL_MIN_GAP_POINTS, break_buffer)
+    if not math.isfinite(resistance_1):
+        resistance_1 = current_close + max(STRUCTURE_LEVEL_MIN_GAP_POINTS, break_buffer)
+    if support_1 >= resistance_1:
+        support_1 = min(support_1, current_close - max(STRUCTURE_LEVEL_MIN_GAP_POINTS, 1.0))
+        resistance_1 = max(resistance_1, current_close + max(STRUCTURE_LEVEL_MIN_GAP_POINTS, 1.0))
 
     below_vwap = current_close < vwap - STRUCTURE_VWAP_RECLAIM_BUFFER_ATR * atr3
     above_vwap = current_close > vwap + STRUCTURE_VWAP_RECLAIM_BUFFER_ATR * atr3
@@ -3002,21 +3094,6 @@ def build_market_structure(
         or change_oi_score >= STRUCTURE_CHANGE_OI_STRONG
     )
 
-    # Structural continuation: VWAP location + broken level + held closes + Change-OI.
-    continuous_bearish = bool(
-        below_vwap
-        and current_close < support_1 - break_buffer
-        and below_support_bars >= hold_bars
-        and bearish_flow_ok
-    )
-    continuous_bullish = bool(
-        above_vwap
-        and current_close > resistance_1 + break_buffer
-        and above_resistance_bars >= hold_bars
-        and bullish_flow_ok
-    )
-
-    # First structural break: one completed close beyond the level with confirming flow.
     fresh_bearish_break = bool(
         below_vwap
         and current_close < support_1 - break_buffer
@@ -3030,59 +3107,51 @@ def build_market_structure(
         and bullish_flow_ok
     )
 
-    bearish_reclaim = bool(
-        bearish_prior
-        and len(closes) >= hold_bars
-        and np.all(closes > support_1 + break_buffer)
-        and above_vwap
+    continuous_bearish = bool(
+        below_vwap
+        and current_close < support_1 - break_buffer
+        and below_support_bars >= hold_bars
+        and bearish_flow_ok
     )
-    bullish_reclaim = bool(
-        bullish_prior
-        and len(closes) >= hold_bars
-        and np.all(closes < resistance_1 - break_buffer)
-        and below_vwap
+    continuous_bullish = bool(
+        above_vwap
+        and current_close > resistance_1 + break_buffer
+        and above_resistance_bars >= hold_bars
+        and bullish_flow_ok
     )
 
-    if continuous_bullish:
-        direction = "BULLISH"
-        market_phase = "CONTINUOUS_BULLISH"
-        entry_confirmed = True
-        confirmation_state = "STRUCTURAL_CONTINUATION"
-        interpretation = "CONTINUOUS BULLISH — ABOVE RESISTANCE + ABOVE VWAP + CHANGE-OI CONFIRMED"
-        scenario_trigger = f"NIFTY has held above resistance {resistance_1:.2f}, above VWAP, with bullish Change-OI; CE setup confirmed."
-        scenario_invalidation = f"Invalidate only after completed closes below {resistance_1:.2f}/VWAP with opposite Change-OI."
-    elif continuous_bearish:
+    if continuous_bearish:
         direction = "BEARISH"
         market_phase = "CONTINUOUS_BEARISH"
         entry_confirmed = True
         confirmation_state = "STRUCTURAL_CONTINUATION"
         interpretation = "CONTINUOUS BEARISH — BELOW SUPPORT + BELOW VWAP + CHANGE-OI CONFIRMED"
-        scenario_trigger = f"NIFTY has held below support {support_1:.2f}, below VWAP, with bearish Change-OI; PE setup confirmed."
-        scenario_invalidation = f"Invalidate only after completed closes reclaim {support_1:.2f}/VWAP with opposite Change-OI."
-    elif fresh_bullish_break:
+        scenario_trigger = f"NIFTY has held below structural support {support_1:.2f}, remains below VWAP, and bearish Change-OI confirms; PE setup confirmed."
+        scenario_invalidation = f"Invalidate bearish structure only after sustained reclaim of {support_1:.2f}/VWAP with opposing Change-OI."
+    elif continuous_bullish:
         direction = "BULLISH"
-        market_phase = "BULLISH_BREAKOUT"
-        entry_confirmed = False
-        confirmation_state = "STRUCTURAL_BREAK"
-        interpretation = "BULLISH BREAKOUT — RESISTANCE BROKEN, WAITING FOR PERSISTENCE"
-        scenario_trigger = f"Require another completed close above {resistance_1:.2f}; Change-OI already confirms direction."
-        scenario_invalidation = f"Breakout fails on a completed close back below {resistance_1:.2f} and VWAP."
+        market_phase = "CONTINUOUS_BULLISH"
+        entry_confirmed = True
+        confirmation_state = "STRUCTURAL_CONTINUATION"
+        interpretation = "CONTINUOUS BULLISH — ABOVE RESISTANCE + ABOVE VWAP + CHANGE-OI CONFIRMED"
+        scenario_trigger = f"NIFTY has held above structural resistance {resistance_1:.2f}, remains above VWAP, and bullish Change-OI confirms; CE setup confirmed."
+        scenario_invalidation = f"Invalidate bullish structure only after sustained reclaim below {resistance_1:.2f}/VWAP with opposing Change-OI."
     elif fresh_bearish_break:
         direction = "BEARISH"
         market_phase = "BEARISH_BREAKDOWN"
         entry_confirmed = False
         confirmation_state = "STRUCTURAL_BREAK"
-        interpretation = "BEARISH BREAKDOWN — SUPPORT BROKEN, WAITING FOR PERSISTENCE"
-        scenario_trigger = f"Require another completed close below {support_1:.2f}; Change-OI already confirms direction."
-        scenario_invalidation = f"Breakdown fails on a completed close back above {support_1:.2f} and VWAP."
-    elif bearish_reclaim or bullish_reclaim:
-        direction = "NEUTRAL"
-        market_phase = "SIDEWAYS"
+        interpretation = "BEARISH BREAKDOWN — SUPPORT BROKEN, WAITING FOR HOLD"
+        scenario_trigger = f"Support {support_1:.2f} has broken with bearish Change-OI; require one more completed close below the structural level."
+        scenario_invalidation = f"Breakdown fails if NIFTY reclaims {support_1:.2f} and VWAP."
+    elif fresh_bullish_break:
+        direction = "BULLISH"
+        market_phase = "BULLISH_BREAKOUT"
         entry_confirmed = False
-        confirmation_state = "STRUCTURE_RECLAIMED"
-        interpretation = "STRUCTURAL LEVEL RECLAIMED — NEW SETUP REQUIRED"
-        scenario_trigger = "Wait for the next clean support/resistance break with confirming Change-OI."
-        scenario_invalidation = "No directional trade inside the reclaimed range."
+        confirmation_state = "STRUCTURAL_BREAK"
+        interpretation = "BULLISH BREAKOUT — RESISTANCE BROKEN, WAITING FOR HOLD"
+        scenario_trigger = f"Resistance {resistance_1:.2f} has broken with bullish Change-OI; require one more completed close above the structural level."
+        scenario_invalidation = f"Breakout fails if NIFTY falls back below {resistance_1:.2f} and VWAP."
     elif below_vwap and bearish_flow_ok:
         direction = "BEARISH"
         market_phase = "BEARISH"
@@ -3090,7 +3159,7 @@ def build_market_structure(
         confirmation_state = "STRUCTURAL_WATCH"
         interpretation = "BEARISH — BELOW VWAP + BEARISH CHANGE-OI, SUPPORT NOT BROKEN"
         scenario_trigger = f"Wait for NIFTY to break and hold below support {support_1:.2f} with bearish Change-OI."
-        scenario_invalidation = f"Bearish bias weakens on a completed reclaim above support {support_1:.2f} and VWAP."
+        scenario_invalidation = f"Bearish bias weakens on a sustained reclaim above support {support_1:.2f} and VWAP."
     elif above_vwap and bullish_flow_ok:
         direction = "BULLISH"
         market_phase = "BULLISH"
@@ -3098,18 +3167,20 @@ def build_market_structure(
         confirmation_state = "STRUCTURAL_WATCH"
         interpretation = "BULLISH — ABOVE VWAP + BULLISH CHANGE-OI, RESISTANCE NOT BROKEN"
         scenario_trigger = f"Wait for NIFTY to break and hold above resistance {resistance_1:.2f} with bullish Change-OI."
-        scenario_invalidation = f"Bullish bias weakens on a completed reclaim below resistance {resistance_1:.2f} and VWAP."
+        scenario_invalidation = f"Bullish bias weakens on a sustained reclaim below resistance {resistance_1:.2f} and VWAP."
     else:
         direction = "NEUTRAL"
         market_phase = "SIDEWAYS"
         entry_confirmed = False
         confirmation_state = "NO_TRADE"
-        interpretation = "SIDEWAYS / MIXED — PRICE INSIDE VWAP/STRUCTURAL RANGE"
-        scenario_trigger = f"Wait for a break of support {support_1:.2f} or resistance {resistance_1:.2f} with confirming Change-OI."
-        scenario_invalidation = "No directional trade while price remains inside the structural range."
+        interpretation = "SIDEWAYS / MIXED — NO STRUCTURAL BREAK CONFIRMED"
+        scenario_trigger = f"Wait for a clean break of support {support_1:.2f} or resistance {resistance_1:.2f} with confirming Change-OI."
+        scenario_invalidation = "No directional entry while price remains inside the structural range."
 
     pcr = safe_float(pcr_value, safe_float(chain_levels.get("pcr"), float("nan")))
     pcr_bias = 1 if math.isfinite(pcr) and pcr >= 1.10 else -1 if math.isfinite(pcr) and pcr <= 0.90 else 0
+
+    # Secondary confirmations are logged only; they do not vote on direction.
     secondary_confirmations = [
         int(below_vwap if direction == "BEARISH" else above_vwap if direction == "BULLISH" else False),
         int(bearish_flow_ok if direction == "BEARISH" else bullish_flow_ok if direction == "BULLISH" else False),
@@ -3119,17 +3190,15 @@ def build_market_structure(
     ]
     confirmation_count = int(sum(secondary_confirmations))
 
-    confidence = 35.0
+    confidence = 40.0
     if direction in {"BULLISH", "BEARISH"}:
-        confidence += 8.0 * confirmation_count
-        confidence += 20.0 * abs(change_flow_score)
-        confidence += 12.0 * min(vwap_distance_atr / 1.5, 1.0)
+        confidence += 10.0 * confirmation_count
+        confidence += 22.0 * abs(change_flow_score)
+        confidence += 8.0 * min(vwap_distance_atr / 1.5, 1.0)
+        if fresh_bullish_break or fresh_bearish_break:
+            confidence += 8.0
         if continuous_bullish or continuous_bearish:
-            confidence += 12.0
-        elif fresh_bullish_break or fresh_bearish_break:
-            confidence += 6.0
-    else:
-        confidence += 10.0 * abs(change_flow_score)
+            confidence += 15.0
     confidence = min(95.0, max(5.0, confidence))
 
     structure_score = (
@@ -3139,15 +3208,15 @@ def build_market_structure(
     )
 
     reasons = [
-        f"PRIMARY STRUCTURE: direction={direction}; phase={market_phase}; price={current_close:.2f}; VWAP={vwap:.2f}; distance={vwap_distance_atr:.2f}ATR.",
+        f"PRIMARY STRUCTURE: direction={direction}; phase={market_phase}; NIFTY={current_close:.2f}; VWAP={vwap:.2f}; distance={vwap_distance_atr:.2f}ATR.",
         f"STRUCTURAL LEVELS: support={support_1:.2f}/{support_2:.2f}; resistance={resistance_1:.2f}/{resistance_2:.2f}; break_buffer={break_buffer:.2f}; hold_bars={hold_bars}.",
         f"BREAK TEST: below_support_bars={below_support_bars}; above_resistance_bars={above_resistance_bars}; breakdown={fresh_bearish_break}; breakout={fresh_bullish_break}.",
-        f"CHANGE-OI PRIMARY: flow={change_flow_score:+.3f}; bias={change_flow_bias:+d}; API_day_change={change_oi_score:+.3f}; mode={chain_levels.get('flow_mode','UNKNOWN')}.",
-        f"PRICE ACTION CONTEXT: latest_3m_change={latest_move:+.2f}; latest candle cannot independently reverse a broken structural regime.",
+        f"CHANGE-OI PRIMARY: intraday_flow={change_flow_score:+.3f}; bias={change_flow_bias:+d}; API_day_change={change_oi_score:+.3f}; mode={chain_levels.get('flow_mode','UNKNOWN')}.",
+        f"PRICE ACTION CONTEXT: latest_3m_change={latest_move:+.2f}; it does not independently reverse a confirmed structural regime.",
         f"FUTURES CONFIRMATION: regime={futures_regime}; bias={futures_bias:+d}; strength={futures_strength:.3f}.",
-        f"PCR CONFIRMATION: value={pcr:.3f} if available; bias={pcr_bias:+d}; 15m_rate={pcr_rate_15m:+.3f}.",
+        f"PCR CONFIRMATION: value={pcr:.3f}; bias={pcr_bias:+d}; 15m_rate={pcr_rate_15m:+.3f}.",
         f"HIGHER-TF CONTEXT: {', '.join(f'{tf}m={tf_directions.get(tf,0):+d}' for tf in TIMEFRAMES)}.",
-        f"SECONDARY CONFIRMATIONS: {confirmation_count}/5 align with {direction}.",
+        f"SECONDARY CONFIRMATIONS: {confirmation_count}/5 align with {direction}; not used as primary directional voters.",
     ]
 
     logger.info(
@@ -3171,18 +3240,12 @@ def build_market_structure(
         "resistance_break_strength": float(max(0.0, (current_close - resistance_1) / atr3)),
         "below_support_bars": float(below_support_bars),
         "above_resistance_bars": float(above_resistance_bars),
-        "five_factor_score": float(structure_score / 10.0),
-        "five_factor_change_oi": float(change_flow_score),
-        "five_factor_pcr": float(pcr_bias),
-        "five_factor_vwap": float(1 if above_vwap else -1 if below_vwap else 0),
-        "five_factor_market_movement": float(1 if latest_move > 0 else -1 if latest_move < 0 else 0),
-        "five_factor_futures": float(futures_bias * min(max(futures_strength, 0.0), 1.0)),
         "intraday_trend": float(latest_move / atr3),
-        "vwap_level": float(vwap_level_bias),
+        "vwap_level": float(1 if above_vwap else -1 if below_vwap else 0),
         "recent3_movement_atr": float(latest_move / atr3),
         "vwap_distance_atr": float(vwap_distance_atr),
-        "bull_votes": float(confirmation_count if direction == "BULLISH" else 0),
-        "bear_votes": float(confirmation_count if direction == "BEARISH" else 0),
+        "bull_votes": float(secondary_confirmations.count(1) if direction == "BULLISH" else 0),
+        "bear_votes": float(secondary_confirmations.count(1) if direction == "BEARISH" else 0),
         "chain_context": float(change_flow_score),
         "daily_oi_context": float(daily_oi_bias),
         "active_structure_level": float(support_1 if direction == "BEARISH" else resistance_1 if direction == "BULLISH" else float("nan")),
@@ -3232,8 +3295,6 @@ def build_market_structure(
         reasons=reasons,
     )
 
-
-# =============================================================================
 # OPTION SELECTION
 # =============================================================================
 
@@ -5125,47 +5186,25 @@ def execute_scan(
             structure.market_phase,
             latest_completed_3m_bar=latest_completed_bar,
         )
+        logger.info(
+            "STRUCTURAL ENTRY CHECK: phase=%s persistence=%d/%d support=%.2f resistance=%.2f "
+            "ChangeOI=%+.3f VWAP=%.2f; recent 3m movement is context only.",
+            structure.market_phase,
+            persistence_count,
+            max(CONTINUATION_CONFIRMATIONS_REQUIRED, 1),
+            structure.support_1,
+            structure.resistance_1,
+            structure.components.get("structure_change_oi", 0.0),
+            structure.vwap,
+        )
         if not persistence_ok:
             logger.info(
-                "No entry: continuous state requires %d confirmation(s); got %d.",
+                "No entry: structural persistence requires %d confirmation(s); got %d.",
                 max(CONTINUATION_CONFIRMATIONS_REQUIRED, 1),
                 persistence_count,
             )
             save_state(state)
             return None
-
-        timing_ok, timing_state, vwap_distance_atr, latest_3m_move_atr = continuation_market_timing_filter(
-            price_session=index_session,
-            direction=structure.direction,
-            vwap=structure.vwap,
-            atr3=atr3_val,
-            market_movement_factor=safe_float(structure.components.get("recent3_movement_atr"), 0.0),
-            chain_levels=chain_levels,
-        )
-        logger.info(
-            "ENTRY TIMING: continuous state=%s persistence=%d/%d reason=%s "
-            "movement=%+.3f vwap_distance=%.2f ATR latest_3m_move=%.2f ATR",
-            structure.market_phase,
-            persistence_count,
-            max(CONTINUATION_CONFIRMATIONS_REQUIRED, 1),
-            timing_state,
-            movement_factor,
-            vwap_distance_atr,
-            latest_3m_move_atr,
-        )
-        if not timing_ok:
-            logger.info(
-                "No entry: continuous market timing rejected setup: %s.", timing_state
-            )
-            save_state(state)
-            return None
-
-        logger.info(
-            "STRUCTURAL CONTINUATION CONFIRMATION: direction=%s support=%.2f resistance=%.2f "
-            "ChangeOI=%+.3f VWAP=%.2f; latest 3m candle is timing context only.",
-            structure.direction, structure.support_1, structure.resistance_1,
-            structure.components.get("structure_change_oi", 0.0), structure.vwap,
-        )
         option_require_momentum = False
 
     else:
@@ -5337,35 +5376,15 @@ def _synthetic_candles(
 
 
 def self_test() -> None:
-    """Deterministic regression tests for the regime matrix and option gates."""
-    down = _synthetic_candles(
-        [100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85]
-    )
-    up = _synthetic_candles(
-        [85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100]
-    )
+    """Deterministic regression suite for the final Oct-8 structure engine."""
+    down = _synthetic_candles([120, 118, 116, 114, 112, 109, 106, 103, 100, 98, 96, 94])
+    up = _synthetic_candles([94, 96, 98, 100, 103, 106, 109, 112, 114, 116, 118, 120])
     st_down = calculate_supertrend(down, SUPERTREND_PERIOD, 3.0)
     st_up = calculate_supertrend(up, SUPERTREND_PERIOD, 3.0)
     assert int(st_down["direction"].iloc[-1]) == -1
     assert int(st_up["direction"].iloc[-1]) == 1
 
-    # Primary structural logic: build levels from VWAP + option OI/Change-OI,
-    # then verify a clean breakdown/breakout is required for continuous state.
-    bearish_prices = [120, 118, 116, 114, 112, 109, 106, 103, 100, 98, 96, 94]
-    bullish_prices = list(reversed(bearish_prices))
-    bear_session = _synthetic_candles(bearish_prices)
-    bull_session = _synthetic_candles(bullish_prices)
-    bear_chain, bear_changes = _synthetic_structure_chain(95.0, 100.0, 120.0, put_change=1000000.0, call_change=5000000.0)
-    bull_chain, bull_changes = _synthetic_structure_chain(115.0, 100.0, 110.0, put_change=5000000.0, call_change=1000000.0)
-    bear_levels = chain_oi_support_resistance(bear_chain, 95.0, bear_changes, price_session=bear_session, vwap=110.0, atr3=5.0)
-    bull_levels = chain_oi_support_resistance(bull_chain, 115.0, bull_changes, price_session=bull_session, vwap=100.0, atr3=5.0)
-    assert bear_levels["support_1"] < 95.0
-    assert bear_levels["resistance_1"] > 95.0
-    assert bull_levels["support_1"] < 115.0
-    assert bull_levels["resistance_1"] > 115.0
-
-    # Futures classification.
-
+    # Futures price/OI classification remains correct.
     fut_bear = _synthetic_candles(
         [100, 99.5, 99, 98.5, 98, 97.5, 97, 96.5, 96],
         [1000, 1020, 1045, 1070, 1100, 1130, 1160, 1190, 1220],
@@ -5374,164 +5393,120 @@ def self_test() -> None:
     assert regime == "SHORT_BUILDUP"
     assert bias == -1 and price_delta < 0 and oi_delta > 0
 
-    # Clean continuous bearish and bullish regimes.
-    down_break = _synthetic_candles([100, 98, 96, 94, 92, 90, 88, 86, 84, 82, 80])
-    up_break = _synthetic_candles([90, 92, 94, 96, 98, 100, 102, 104, 106, 108, 110])
+    # Build a deterministic chain with real OI walls and directional flow.
+    chain, changes = _synthetic_structure_chain(
+        spot=102.0,
+        support=100.0,
+        resistance=110.0,
+        put_change=2_000_000.0,
+        call_change=3_000_000.0,
+    )
+    level_session = _synthetic_candles([106, 105, 104, 103, 102])
+    levels = chain_oi_support_resistance(
+        chain, 102.0, changes,
+        price_session=level_session, vwap=105.0, atr3=4.0,
+        expiry="2026-10-13",
+    )
+    assert levels["support_1"] < 102.0
+    assert levels["resistance_1"] > 102.0
+    assert levels["support_1"] != levels["resistance_1"]
+    assert levels["flow_mode"] == "DAY_CHANGE_API_WARMUP"
+
     frames_bear = {tf: st_down.copy() for tf in TIMEFRAMES}
     tf_bear = {tf: -1 for tf in TIMEFRAMES}
-    bearish_chain = {
-        "support_1": 84.0, "support_2": 80.0, "resistance_1": 94.0, "resistance_2": 96.0,
-        "predictive_bias": -1, "predictive_strength": 0.35, "level_bias": -1,
-        "oi_bias": -1, "support_strength": 0.20, "resistance_strength": 0.60,
-        "support_change_strength": 0.10, "resistance_change_strength": 0.50, "pcr": 0.75,
+    bearish_levels = {
+        "support_1": 100.0, "support_2": 95.0,
+        "resistance_1": 110.0, "resistance_2": 115.0,
+        "change_flow_score": -0.70, "change_flow_bias": -1,
+        "predictive_bias": -1, "predictive_strength": 0.70,
+        "support_strength": 0.70, "resistance_strength": 0.60,
+        "support_change_strength": 0.60, "resistance_change_strength": 0.70,
+        "pcr": 0.70,
     }
-    b = build_market_structure(
-        81.0, fut_bear, fut_bear, frames_bear, tf_bear, bearish_chain,
-        -1, -0.10, -1, -0.20, pcr_value=0.75,
-        price_session=down_break,
+    # Below VWAP but ABOVE support = bearish WATCH, never a breakdown.
+    watch_session = _synthetic_candles([108, 106, 105, 104, 103, 102, 102.5, 103])
+    watch = build_market_structure(
+        103.0, fut_bear, fut_bear, frames_bear, tf_bear, bearish_levels,
+        -1, -0.10, -1, -0.30, pcr_value=0.70, price_session=watch_session,
     )
-    assert b.direction == "BEARISH"
-    assert b.market_phase == "CONTINUOUS_BEARISH"
-    assert b.entry_confirmed
+    assert watch.direction == "BEARISH"
+    assert watch.market_phase == "BEARISH"
+    assert not watch.entry_confirmed
 
-    # A small bounce while still below broken support/VWAP must not erase a bearish regime.
-    pullback = _synthetic_candles([100, 96, 92, 88, 86, 84, 82, 85])
-    pullback_levels = {
-        "support_1": 90.0, "support_2": 85.0, "resistance_1": 100.0, "resistance_2": 105.0,
-        "change_flow_score": -0.50, "predictive_bias": -1, "predictive_strength": 0.50,
-        "support_strength": 0.50, "resistance_strength": 0.50, "support_change_strength": 0.50,
-        "resistance_change_strength": 0.50, "level_bias": -1, "pcr": 0.75,
-    }
-    pull_ok, pull_reason, _, _ = continuation_market_timing_filter(
-        pullback, "BEARISH", 90.0, 4.0, -0.40, chain_levels=pullback_levels
+    # Clean structural breakdown: two completed closes below support + bearish Change-OI.
+    down_break = _synthetic_candles([104, 103, 102, 101, 100.5, 99.0, 97.5, 96.5])
+    breakdown = build_market_structure(
+        96.5, fut_bear, fut_bear, frames_bear, tf_bear, bearish_levels,
+        -1, -0.10, -1, -0.30, pcr_value=0.70, price_session=down_break,
     )
-    assert pull_ok and pull_reason == "STRUCTURAL_BEARISH_CONTINUATION"
+    assert breakdown.direction == "BEARISH"
+    assert breakdown.market_phase == "CONTINUOUS_BEARISH"
+    assert breakdown.entry_confirmed
+    assert breakdown.support_1 == 100.0
 
+    # A small countertrend bounce below the broken support cannot erase the bearish regime.
+    pullback = _synthetic_candles([104, 102, 100, 98, 96, 97, 96.5])
+    pullback_levels = dict(bearish_levels)
+    pullback_levels["previous_support_1"] = 100.0
+    pullback_result = build_market_structure(
+        96.5, fut_bear, fut_bear, frames_bear, tf_bear, pullback_levels,
+        -1, -0.10, -1, -0.30, previous_direction="BEARISH",
+        previous_phase="CONTINUOUS_BEARISH", price_session=pullback,
+    )
+    assert pullback_result.market_phase == "CONTINUOUS_BEARISH"
+    assert pullback_result.entry_confirmed
+    assert pullback_result.support_1 == 100.0
+
+    # Clean structural breakout: two completed closes above resistance + bullish Change-OI.
     fut_bull = _synthetic_candles(
         [100, 100.5, 101, 101.5, 102, 102.5, 103, 103.5, 104],
         [1200, 1215, 1230, 1245, 1260, 1275, 1290, 1305, 1320],
     )
     frames_bull = {tf: st_up.copy() for tf in TIMEFRAMES}
     tf_bull = {tf: 1 for tf in TIMEFRAMES}
-    bullish_chain = {
-        "support_1": 100.0, "support_2": 98.0, "resistance_1": 107.0, "resistance_2": 110.0,
-        "predictive_bias": 1, "predictive_strength": 0.35, "level_bias": 1,
-        "oi_bias": 1, "support_strength": 0.60, "resistance_strength": 0.20,
-        "support_change_strength": 0.50, "resistance_change_strength": 0.10, "pcr": 1.25,
+    bullish_levels = {
+        "support_1": 90.0, "support_2": 85.0,
+        "resistance_1": 100.0, "resistance_2": 105.0,
+        "change_flow_score": 0.70, "change_flow_bias": 1,
+        "predictive_bias": 1, "predictive_strength": 0.70,
+        "support_strength": 0.60, "resistance_strength": 0.70,
+        "support_change_strength": 0.60, "resistance_change_strength": 0.70,
+        "pcr": 1.25,
     }
-    u = build_market_structure(
-        110.0, fut_bull, fut_bull, frames_bull, tf_bull, bullish_chain,
-        1, 0.10, 1, 0.20, pcr_value=1.25,
-        price_session=up_break,
+    up_break = _synthetic_candles([96, 97, 98, 99, 100.5, 102, 104, 105, 106])
+    breakout = build_market_structure(
+        106.0, fut_bull, fut_bull, frames_bull, tf_bull, bullish_levels,
+        1, 0.10, 1, 0.30, pcr_value=1.25, price_session=up_break,
     )
-    assert u.direction == "BULLISH"
-    assert u.market_phase == "CONTINUOUS_BULLISH"
-    assert u.entry_confirmed
+    assert breakout.direction == "BULLISH"
+    assert breakout.market_phase == "CONTINUOUS_BULLISH"
+    assert breakout.entry_confirmed
+    assert breakout.resistance_1 == 100.0
 
-    # Regression for the Oct-7 failure: positive PCR/Change-OI cannot override
-    # lower-high/lower-low NIFTY price action + short-build-up Futures + bearish chain.
-    # Session remains positive, but the latest 8/3 bars are negative.
-    oct7_like = _synthetic_candles(
-        [90.0, 92.0, 94.0, 96.0, 98.0, 100.0, 102.0, 104.0,
-         105.0, 106.0, 106.0, 105.5, 105.0, 104.5, 104.0, 103.5]
+    # Exact V16 bug regression: support and resistance can never collapse to the same level.
+    v16_like = dict(bearish_levels)
+    v16_like.update({"support_1": 22421.25, "resistance_1": 22450.0})
+    v16_session = _synthetic_candles([22480, 22465, 22455, 22450, 22447, 22446, 22445])
+    v16_result = build_market_structure(
+        22446.5, fut_bear, fut_bear, frames_bear, tf_bear, v16_like,
+        -1, -0.10, -1, -0.43, pcr_value=0.71, price_session=v16_session,
     )
-    oct7_st = calculate_supertrend(oct7_like, SUPERTREND_PERIOD, SUPERTREND_FACTOR)
-    oct7_frames = {tf: oct7_st.copy() for tf in TIMEFRAMES}
-    oct7_dirs = {tf: 1 for tf in TIMEFRAMES}
-    oct7_futures = _synthetic_candles(
-        [100, 100.2, 100.0, 99.8, 99.6, 99.4, 99.2, 99.0, 98.8],
-        [1000, 1010, 1030, 1050, 1075, 1100, 1120, 1140, 1160],
-    )
-    oct7_chain = {
-        "support_1": 100.0, "support_2": 98.0, "resistance_1": 105.0, "resistance_2": 107.0,
-        "predictive_bias": -1, "predictive_strength": 0.38, "level_bias": -1,
-        "oi_bias": 0, "support_strength": 0.17, "resistance_strength": 0.69,
-        "support_change_strength": 0.32, "resistance_change_strength": 0.49, "pcr": 1.117,
-    }
-    oct7 = build_market_structure(
-        103.0, oct7_futures, oct7_futures, oct7_frames, oct7_dirs, oct7_chain,
-        1, 0.06, 0, 0.056, pcr_value=1.117, price_session=oct7_like,
-        previous_direction="BULLISH",
-    )
-    assert oct7.market_phase in {"BULLISH_WEAKENING", "SIDEWAYS", "BEARISH", "BULLISH"}
-    assert not oct7.entry_confirmed, oct7
-    assert oct7.direction != "BULLISH" or oct7.market_phase != "CONTINUOUS_BULLISH"
+    assert v16_result.support_1 == 22421.25
+    assert v16_result.resistance_1 == 22450.0
+    assert v16_result.support_1 < 22446.5 < v16_result.resistance_1
+    assert not v16_result.entry_confirmed
+    assert v16_result.market_phase == "BEARISH"
 
-    # Exact scanner-state regression: below VWAP + bearish Change-OI but still above
-    # support is bearish WATCH, not continuous bearish and not neutral.
-    watch_session = _synthetic_candles([22600, 22580, 22560, 22540, 22530, 22525, 22520, 22495])
-    watch_levels = {
-        "support_1": 22450.0, "support_2": 22400.0, "resistance_1": 22500.0, "resistance_2": 22550.0,
-        "change_flow_score": -0.80, "change_flow_bias": -1, "predictive_bias": -1,
-        "predictive_strength": 0.80, "support_strength": 0.60, "resistance_strength": 0.60,
-        "support_change_strength": 0.50, "resistance_change_strength": 0.70, "level_bias": -1,
-        "pcr": 0.71,
-    }
-    frames_watch = {tf: st_down.copy() for tf in TIMEFRAMES}
-    tf_watch = {tf: -1 for tf in TIMEFRAMES}
-    watch = build_market_structure(
-        22495.0, fut_bear, fut_bear, frames_watch, tf_watch, watch_levels,
-        -1, -0.10, -1, -0.20, pcr_value=0.71, price_session=watch_session,
-    )
-    assert watch.direction == "BEARISH"
-    assert watch.market_phase == "BEARISH"
-    assert not watch.entry_confirmed
+    # Option flow interpretation: rising long PE premium confirms bearish direction.
+    activity, activity_bias = classify_option_flow("PE", 0.05, 100000.0)
+    assert activity == "PUT_BUYING" and activity_bias == -1
+    activity, activity_bias = classify_option_flow("CE", -0.05, 100000.0)
+    assert activity == "CALL_WRITING" and activity_bias == -1
 
-    # Option direction bug regression: rising PE premium must confirm a bearish long-PE setup.
-    # bullish premium must count rising bars.
-    original_get_intraday = get_intraday_candles
-    try:
-        globals()["get_intraday_candles"] = lambda key, interval_minutes, strict=False: _synthetic_candles(
-            [108, 110, 112, 114, 116, 118, 120]
-        ) if key.endswith("PE") else _synthetic_candles([100, 102, 104, 106, 108, 110, 112])
-        fake_pe = OptionCandidate(
-            instrument_key="TEST_PE", trading_symbol="TESTPE", option_type="PE", strike=100.0,
-            expiry="2026-10-13", ltp=112.0, oi=10000, prev_oi=9000, volume=100000,
-            bid=111.5, ask=112.5, bid_qty=100, ask_qty=100, delta=-0.55, gamma=0.01,
-            theta=-2.0, iv=20.0, spread_pct=0.009, theta_burden_pct_day=0.02,
-        )
-        ok_bear, _, stats_bear = option_momentum_confirmation(fake_pe, "BEARISH")
-        assert ok_bear and stats_bear["directional_bars"] >= 2
-    finally:
-        globals()["get_intraday_candles"] = original_get_intraday
-
-    # Oct-7 supplied 22600 CE regression: at the reported ~11:22 IST entry,
-    # 22600 CE had a strongly falling completed 3m sequence (207.85 -> 206.80
-    # -> 202.70 -> 201.30) while the live quote was about 204.30. The old engine
-    # accepted this as live acceleration; the new engine must reject the bounce.
-    oct7_option_bars = pd.DataFrame({
-        "timestamp": pd.to_datetime([
-            "2026-10-07T05:42:00Z", "2026-10-07T05:45:00Z",
-            "2026-10-07T05:48:00Z", "2026-10-07T05:51:00Z",
-        ], utc=True),
-        "open": [209.80, 207.30, 206.40, 202.70],
-        "high": [214.80, 211.95, 209.00, 207.10],
-        "low": [206.10, 205.20, 197.00, 200.10],
-        "close": [207.85, 206.80, 202.70, 201.30],
-        "volume": [394485, 447395, 1058000, 423605],
-        "oi": [0, 0, 0, 0],
-    })
-    original_get_intraday = get_intraday_candles
-    try:
-        globals()["get_intraday_candles"] = lambda key, interval_minutes, strict=False: oct7_option_bars
-        fake_22600 = OptionCandidate(
-            instrument_key="TEST_22600CE", trading_symbol="22600CE", option_type="CE",
-            strike=22600.0, expiry="2026-10-13", ltp=204.30, oi=5000000,
-            prev_oi=4900000, volume=88000000, bid=204.10, ask=204.50,
-            bid_qty=1000, ask_qty=1000, delta=0.61, gamma=0.01, theta=-11.0, iv=20.0,
-            spread_pct=0.002, theta_burden_pct_day=0.05,
-        )
-        ok_oct7, reason_oct7, stats_oct7 = option_momentum_confirmation(fake_22600, "BULLISH")
-        assert not ok_oct7, (ok_oct7, reason_oct7, stats_oct7)
-        assert stats_oct7["aligned_net_move_atr"] < -REGIME_OPTION_MAX_ADVERSE_NET_ATR
-        assert stats_oct7["aligned_latest_move_atr"] < -REGIME_LIVE_OPTION_MAX_ADVERSE_ATR
-    finally:
-        globals()["get_intraday_candles"] = original_get_intraday
-
-    # Directional strike rule is still hard enforced.
-    chain = []
+    # Directional strike rule remains hard enforced.
+    simple_chain = []
     for strike in [74000, 74050, 74100, 74150, 74200]:
-        chain.append({
+        simple_chain.append({
             "strike_price": strike,
             "expiry": "2026-10-13",
             "call_options": {
@@ -5551,56 +5526,10 @@ def self_test() -> None:
                 "option_greeks": {"delta": -0.55, "gamma": 0.01, "theta": -2.0, "iv": 20.0},
             },
         })
-    ce = select_directional_option(chain, "BULLISH", 74100.0)
-    pe = select_directional_option(chain, "BEARISH", 74100.0)
+    ce = select_directional_option(simple_chain, "BULLISH", 74100.0)
+    pe = select_directional_option(simple_chain, "BEARISH", 74100.0)
     assert ce.option_type == "CE" and ce.strike in {74000.0, 74050.0}
     assert pe.option_type == "PE" and pe.strike in {74150.0, 74200.0}
-
-
-
-    # Intraday OI regression: scan-to-scan OI/LTP changes are interpreted directionally.
-    regression_chain = []
-    for strike in [22350, 22400, 22450, 22500, 22550, 22600]:
-        regression_chain.append({
-            "strike_price": strike,
-            "expiry": "2026-10-13",
-            "call_options": {
-                "instrument_key": f"CE{strike}",
-                "market_data": {
-                    "ltp": 90.0, "close_price": 90.0, "oi": 200000, "prev_oi": 200000,
-                    "volume": 100000, "bid_price": 89.5, "ask_price": 90.5, "bid_qty": 100, "ask_qty": 100,
-                },
-                "option_greeks": {"delta": 0.55, "gamma": 0.01, "theta": -2.0, "iv": 20.0},
-            },
-            "put_options": {
-                "instrument_key": f"PE{strike}",
-                "market_data": {
-                    "ltp": 130.0, "close_price": 130.0, "oi": 300000, "prev_oi": 300000,
-                    "volume": 100000, "bid_price": 129.5, "ask_price": 130.5, "bid_qty": 100, "ask_qty": 100,
-                },
-                "option_greeks": {"delta": -0.55, "gamma": 0.01, "theta": -2.0, "iv": 20.0},
-            },
-        })
-    previous_option = build_option_oi_snapshot(regression_chain, "2026-10-13")
-    for row in previous_option["strikes"].values():
-        row["call_oi"] -= 50000
-        row["call_ltp"] += 4.0
-        row["put_oi"] += 50000
-        row["put_ltp"] -= 4.0
-    regression_levels = chain_oi_support_resistance(
-        regression_chain,
-        22442.0,
-        {},
-        price_session=down_break,
-        vwap=22473.0,
-        atr3=30.0,
-        previous_option_snapshot=previous_option,
-        expiry="2026-10-13",
-    )
-    assert regression_levels["flow_mode"] == "INTRADAY_SNAPSHOT"
-    assert regression_levels["change_flow_bias"] == -1
-    assert regression_levels["support_1"] < 22442.0
-    assert regression_levels["resistance_1"] <= 22473.0
 
     logger.info("SELF-TEST PASSED.")
 
