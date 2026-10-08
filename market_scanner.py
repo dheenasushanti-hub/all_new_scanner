@@ -159,7 +159,8 @@ REVERSAL_STRIKE_PREFERRED_DISTANCE_STEPS = float(os.getenv("REVERSAL_STRIKE_PREF
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-10-08-STRUCTURE-V21-FINAL"
+SCANNER_VERSION = "2026-10-08-STRUCTURE-V22-FINAL"
+OPTION_TARGET_ENGINE_VERSION = "V21_DELTA_FIRST_GAMMA_CAPPED_10PCT"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -3991,6 +3992,112 @@ def project_option_premium(
     return float(max(0.0, entry + change))
 
 
+def migrate_active_trade_targets(
+    trade: dict[str, Any],
+) -> bool:
+    """Migrate one legacy active trade to the V21 target engine exactly once.
+
+    The migration deliberately uses the trade's stored entry-underlying and
+    underlying target/stop levels. It does not recompute structural levels from
+    the current market, and it never runs again after the engine version is saved.
+    If T1 has already been hit, the live monetary levels are preserved because
+    changing a milestone retrospectively would alter an in-flight trade.
+    """
+    current_engine = str(trade.get("target_engine_version", "")).strip()
+    if current_engine == OPTION_TARGET_ENGINE_VERSION:
+        return False
+
+    if bool(trade.get("t1_hit", False)):
+        logger.warning(
+            "TARGET ENGINE MIGRATION: preserving legacy levels because T1 is already hit | %s",
+            trade.get("trading_symbol", ""),
+        )
+        trade["target_engine_version"] = OPTION_TARGET_ENGINE_VERSION
+        return True
+
+    entry = safe_float(trade.get("entry"), float("nan"))
+    entry_underlying = safe_float(trade.get("entry_underlying"), float("nan"))
+    underlying_t1 = safe_float(trade.get("underlying_target_1"), float("nan"))
+    underlying_t2 = safe_float(trade.get("underlying_target_2"), float("nan"))
+    underlying_stop = safe_float(trade.get("underlying_stop"), float("nan"))
+    delta = safe_float(trade.get("delta"), float("nan"))
+    gamma = safe_float(trade.get("gamma"), 0.0)
+    direction = str(trade.get("direction", "")).upper()
+
+    values = (entry, entry_underlying, underlying_t1, underlying_t2, underlying_stop, delta)
+    if not all(math.isfinite(v) for v in values):
+        logger.warning(
+            "TARGET ENGINE MIGRATION: insufficient stored levels/Greeks; preserving legacy levels | %s",
+            trade.get("trading_symbol", ""),
+        )
+        return False
+
+    if direction == "BEARISH":
+        move_t1 = entry_underlying - underlying_t1
+        move_t2 = entry_underlying - underlying_t2
+        adverse_move = underlying_stop - entry_underlying
+    elif direction == "BULLISH":
+        move_t1 = underlying_t1 - entry_underlying
+        move_t2 = underlying_t2 - entry_underlying
+        adverse_move = entry_underlying - underlying_stop
+    else:
+        logger.warning(
+            "TARGET ENGINE MIGRATION: unknown direction=%s; preserving legacy levels | %s",
+            direction, trade.get("trading_symbol", ""),
+        )
+        return False
+
+    if move_t1 <= 0 or move_t2 <= move_t1 or adverse_move <= 0 or entry <= 0:
+        logger.warning(
+            "TARGET ENGINE MIGRATION: stored underlying levels invalid; preserving legacy levels | %s "
+            "entry_u=%.2f T1u=%.2f T2u=%.2f SLu=%.2f",
+            trade.get("trading_symbol", ""), entry_underlying, underlying_t1, underlying_t2, underlying_stop,
+        )
+        return False
+
+    target1 = project_option_premium(entry, move_t1, delta, gamma)
+    target2 = project_option_premium(entry, move_t2, delta, gamma)
+
+    delta_abs = abs(delta)
+    gamma_abs = abs(gamma)
+    estimated_loss = (delta_abs * adverse_move) - (0.5 * gamma_abs * adverse_move * adverse_move)
+    estimated_loss = max(0.0, estimated_loss)
+    min_loss = entry * OPTION_MIN_STOP_PCT
+    max_loss = entry * OPTION_MAX_STOP_PCT
+    risk = min(max(estimated_loss, min_loss), max_loss)
+    stop_loss = entry - risk
+
+    min_t1 = entry + MIN_T1_RISK_REWARD * risk
+    min_t2 = entry + MIN_T2_RISK_REWARD * risk
+    target1 = max(target1, min_t1)
+    target2 = max(target2, min_t2, target1 + 0.25 * risk)
+
+    if not (stop_loss < entry < target1 < target2):
+        logger.warning(
+            "TARGET ENGINE MIGRATION: generated levels invalid; preserving legacy levels | %s",
+            trade.get("trading_symbol", ""),
+        )
+        return False
+
+    old = (
+        safe_float(trade.get("target_1"), float("nan")),
+        safe_float(trade.get("target_2"), float("nan")),
+        safe_float(trade.get("stop_loss"), float("nan")),
+    )
+    trade["target_1"] = round(target1, 2)
+    trade["target_2"] = round(target2, 2)
+    trade["stop_loss"] = round(stop_loss, 2)
+    trade["target_engine_version"] = OPTION_TARGET_ENGINE_VERSION
+
+    logger.info(
+        "TARGET ENGINE MIGRATED: %s | old T1=%.2f T2=%.2f SL=%.2f -> "
+        "V21 T1=%.2f T2=%.2f SL=%.2f | entry_u=%.2f T1u=%.2f T2u=%.2f SLu=%.2f",
+        trade.get("trading_symbol", ""), old[0], old[1], old[2],
+        target1, target2, stop_loss, entry_underlying, underlying_t1, underlying_t2, underlying_stop,
+    )
+    return True
+
+
 def project_option_premium_signed(
     entry: float,
     underlying_move: float,
@@ -5231,7 +5338,12 @@ def execute_scan(
         structure.score,
     )
 
-    if active_trade_from_state(state) is not None:
+    active_trade = active_trade_from_state(state)
+    if active_trade is not None:
+        migrated = migrate_active_trade_targets(active_trade)
+        if migrated:
+            state["active_trade"] = active_trade
+            save_state(state)
         monitor_active_trade(state, structure, tf_frames)
         return None
 
@@ -5896,6 +6008,32 @@ def self_test() -> None:
     assert conflict_result.market_phase == "BEARISH"
     assert not conflict_result.entry_confirmed
 
+    # V22 regression: a legacy active trade must be migrated exactly once using
+    # its stored entry/underlying levels and the V21 target engine.
+    legacy_trade = {
+        "status": "ACTIVE",
+        "trading_symbol": "NIFTY25OCT22500PE",
+        "direction": "BEARISH",
+        "entry": 192.65,
+        "entry_underlying": 22316.25,
+        "underlying_target_1": 22200.0,
+        "underlying_target_2": 22000.0,
+        "underlying_stop": 22400.0,
+        "delta": -0.60,
+        "gamma": 0.01,
+        "target_1": 261.76,
+        "target_2": 423.71,
+        "stop_loss": 143.06,
+        "t1_hit": False,
+    }
+    assert migrate_active_trade_targets(legacy_trade)
+    assert legacy_trade["target_engine_version"] == OPTION_TARGET_ENGINE_VERSION
+    assert legacy_trade["target_1"] < 300.0
+    assert legacy_trade["target_2"] < 410.0
+    migrated_values = (legacy_trade["target_1"], legacy_trade["target_2"], legacy_trade["stop_loss"])
+    assert not migrate_active_trade_targets(legacy_trade)
+    assert migrated_values == (legacy_trade["target_1"], legacy_trade["target_2"], legacy_trade["stop_loss"])
+
     logger.info("SELF-TEST PASSED.")
 
 
@@ -5941,6 +6079,7 @@ def main() -> int:
             "delta": signal.delta,
             "gamma": signal.gamma,
             "theta": signal.theta,
+            "target_engine_version": OPTION_TARGET_ENGINE_VERSION,
             "reversal_confirmations": 0,
             "market_alignment_failures": 0,
             "last_market_direction": signal.direction,
