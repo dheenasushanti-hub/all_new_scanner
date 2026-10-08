@@ -159,8 +159,8 @@ REVERSAL_STRIKE_PREFERRED_DISTANCE_STEPS = float(os.getenv("REVERSAL_STRIKE_PREF
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-10-08-STRUCTURE-V22-FINAL"
-OPTION_TARGET_ENGINE_VERSION = "V21_DELTA_FIRST_GAMMA_CAPPED_10PCT"
+SCANNER_VERSION = "2026-10-08-STRUCTURE-V23-PA-OI-DYNAMIC"
+OPTION_TARGET_ENGINE_VERSION = "V23_PRICE_ACTION_OI_DYNAMIC"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -369,18 +369,17 @@ THETA_WARNING_BURDEN = 0.10
 MIN_OI = 100.0
 MIN_VOLUME = 1.0
 
-# Dynamic target and stop constraints.
-MIN_T1_RISK_REWARD = 1.10
-MIN_T2_RISK_REWARD = 1.60
-OPTION_MAX_STOP_PCT = 0.30
-OPTION_MIN_STOP_PCT = 0.15
-# Option targets use the underlying structural targets, but the option-price
-# projection is deliberately conservative.  The linear delta term is primary;
-# the quadratic gamma term is capped so large underlying moves cannot create
-# unrealistic premium targets.
-OPTION_TARGET_GAMMA_MAX_FRACTION = float(
-    os.getenv("OPTION_TARGET_GAMMA_MAX_FRACTION", "0.10")
-)
+# Price-action + OI structural trade levels. These levels are authoritative;
+# option Greeks are not used to manufacture T1/T2/SL prices.
+PA_OI_SWING_LOOKBACK = int(os.getenv("PA_OI_SWING_LOOKBACK", "12"))
+PA_OI_TARGET_MIN_STEPS = float(os.getenv("PA_OI_TARGET_MIN_STEPS", "1.0"))
+PA_OI_T1_MAX_SWING_DISTANCE_STEPS = float(os.getenv("PA_OI_T1_MAX_SWING_DISTANCE_STEPS", "3.0"))
+PA_OI_STOP_BUFFER_STEPS = float(os.getenv("PA_OI_STOP_BUFFER_STEPS", "0.25"))
+PA_OI_SECONDARY_OI_RATIO = float(os.getenv("PA_OI_SECONDARY_OI_RATIO", "0.30"))
+PA_OI_DYNAMIC_STOP_RECALC_EVERY_SCAN = os.getenv("PA_OI_DYNAMIC_STOP_RECALC_EVERY_SCAN", "1").strip().lower() not in {"0", "false", "no"}
+
+# T1/T2/SL are no longer option-Greek-derived.
+# They are authoritative NIFTY structural levels from current PA + OI.
 
 # Trade monitoring.
 REVERSAL_CONFIRMATIONS_REQUIRED = 2
@@ -1676,11 +1675,11 @@ def _intraday_option_changes(
             )
         else:
             call_oi_change = safe_float(
-                api.get("call_change"),
+                api.get("call_oi_change"),
                 safe_float(ce.get("oi")) - safe_float(ce.get("prev_oi")),
             )
             put_oi_change = safe_float(
-                api.get("put_change"),
+                api.get("put_oi_change"),
                 safe_float(pe.get("oi")) - safe_float(pe.get("prev_oi")),
             )
             ce_close = safe_float(ce.get("close_price"))
@@ -3595,6 +3594,9 @@ def select_directional_option(
     spot: float,
     market_phase: Optional[str] = None,
     *,
+    target_underlying_1: Optional[float] = None,
+    target_underlying_2: Optional[float] = None,
+    change_oi_by_strike: Optional[dict[float, dict[str, float]]] = None,
     require_option_momentum: bool = False,
 ) -> OptionCandidate:
     if direction not in {"BULLISH", "BEARISH"}:
@@ -3778,18 +3780,44 @@ def select_directional_option(
                 f"No reversal option within {REVERSAL_STRIKE_MAX_DISTANCE_STEPS:.2f} strike steps of index spot={spot:.2f}."
             )
 
-    # Deterministic strike priority: nearest directional OTM strike wins when
-    # valid; the second strike is only a fallback. Health remains a validity filter
-    # and is logged, but it cannot cause ATM+2 to beat a healthy ATM+1.
-    candidate_by_strike = {round(x.strike, 2): x for x in candidates}
-    selected = None
-    for preferred_strike in candidate_strikes:
-        key = round(float(preferred_strike), 2)
-        if key in candidate_by_strike:
-            selected = candidate_by_strike[key]
-            break
-    if selected is None:
-        raise ScannerError("No valid directional strike remained after strike filtering.")
+    # Strike selection now considers the same PA/OI structural plan used for T1/T2/SL.
+    # ATM+1/ATM+2 remain the permitted directional universe, but the winner is
+    # chosen by current option-flow alignment + option health + T1 moneyness.
+    def strike_flow_bias(strike: float) -> int:
+        flow = (change_oi_by_strike or {}).get(float(strike), {})
+        return int(flow.get("call_bias", 0)) if option_type == "CE" else int(flow.get("put_bias", 0))
+
+    scored: list[tuple[float, int, float, OptionCandidate]] = []
+    for priority, candidate in enumerate(candidates):
+        health = option_health_score(candidate, atm, step)
+        flow_bias = strike_flow_bias(candidate.strike)
+        desired_flow = 1 if direction == "BULLISH" else -1
+        flow_score = 1.0 if flow_bias == desired_flow else 0.5 if flow_bias == 0 else 0.0
+
+        if target_underlying_1 is not None and math.isfinite(safe_float(target_underlying_1, float("nan"))):
+            target_u = float(target_underlying_1)
+            if direction == "BEARISH":
+                itm_depth = max(candidate.strike - target_u, 0.0) / max(step, 1.0)
+            else:
+                itm_depth = max(target_u - candidate.strike, 0.0) / max(step, 1.0)
+            target_fit = min(itm_depth / 2.0, 1.0)
+        else:
+            target_fit = 0.5
+
+        delta_abs = abs(candidate.delta)
+        delta_fit = max(0.0, 1.0 - abs(delta_abs - 0.55) / 0.30)
+        total = 0.40 * flow_score + 0.30 * health + 0.20 * delta_fit + 0.10 * target_fit
+        scored.append((total, -priority, candidate.strike, candidate))
+        logger.info(
+            "STRIKE RANK: %s %.0f total=%.3f flow=%.3f health=%.3f delta_fit=%.3f target_fit=%.3f "
+            "T1_NIFTY=%s flow_bias=%+d",
+            option_type, candidate.strike, total, flow_score, health, delta_fit, target_fit,
+            f"{target_underlying_1:.2f}" if target_underlying_1 is not None else "-",
+            flow_bias,
+        )
+
+    scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
+    selected = scored[0][3]
 
     # Final hard invariant for continuous entries. This is deliberately checked
     # after candidate filtering/ranking so an invalid strike can NEVER propagate
@@ -3889,229 +3917,333 @@ def validate_continuous_option_entry(
 # DYNAMIC LEVEL / GREEK TARGET ENGINE
 # =============================================================================
 
-def choose_underlying_levels(
-    structure: StructureResult,
+
+def _completed_price_action_frame(
+    price_session: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    if price_session is None or price_session.empty:
+        return pd.DataFrame()
+    work = filter_completed_candles(price_session.copy(), 3)
+    if work.empty:
+        return work
+    work = work.sort_values("timestamp").copy()
+    for column in ("open", "high", "low", "close"):
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    return work.dropna(subset=["high", "low", "close"])
+
+
+def _price_action_swings(
+    price_session: Optional[pd.DataFrame],
+    *,
+    direction: str,
     spot: float,
-    tf_frames: dict[int, pd.DataFrame],
-) -> tuple[float, float, float]:
-    """Build T1/T2/SL from the next structural wall or 1.5x/3x ATR.
+    lookback: int = PA_OI_SWING_LOOKBACK,
+) -> dict[str, list[float]]:
+    """Return recent completed 3m swing levels without ATR-derived targets."""
+    work = _completed_price_action_frame(price_session)
+    if work.empty:
+        return {"highs": [], "lows": []}
+    work = work.tail(max(int(lookback), 5)).reset_index(drop=True)
 
-    T1 prefers the next major option-chain wall when it is sufficiently
-    separated from spot; otherwise it falls back to 1.5 ATR. T2 prefers the
-    second wall; otherwise it uses 3 ATR. The stop sits behind the nearest
-    structural anchor, using VWAP, Supertrend and the opposite option wall.
-    """
-    atr3 = max(safe_float(tf_frames[3]["atr"].iloc[-1], 0.0), 1.0)
-    atr15 = max(safe_float(tf_frames[15]["atr"].iloc[-1], atr3), atr3)
+    swing_highs: list[float] = []
+    swing_lows: list[float] = []
+    for i in range(1, len(work) - 1):
+        high_i = safe_float(work.loc[i, "high"], float("nan"))
+        low_i = safe_float(work.loc[i, "low"], float("nan"))
+        prev_high = safe_float(work.loc[i - 1, "high"], float("nan"))
+        next_high = safe_float(work.loc[i + 1, "high"], float("nan"))
+        prev_low = safe_float(work.loc[i - 1, "low"], float("nan"))
+        next_low = safe_float(work.loc[i + 1, "low"], float("nan"))
+        if math.isfinite(high_i) and high_i >= prev_high and high_i >= next_high:
+            swing_highs.append(high_i)
+        if math.isfinite(low_i) and low_i <= prev_low and low_i <= next_low:
+            swing_lows.append(low_i)
 
-    # Keep the risk model realistic for unusually large ATR readings.
-    max_allowed_atr = max(spot * 0.0025, 1.0)
-    atr3 = min(atr3, max_allowed_atr)
-    atr15 = min(max(atr15, atr3), max_allowed_atr * 1.5)
+    # Include the latest completed extreme as price-action context even when it
+    # is not a textbook pivot. This prevents a flat series from returning no PA level.
+    if not swing_highs:
+        latest_high = safe_float(work["high"].max(), float("nan"))
+        if math.isfinite(latest_high):
+            swing_highs.append(latest_high)
+    if not swing_lows:
+        latest_low = safe_float(work["low"].min(), float("nan"))
+        if math.isfinite(latest_low):
+            swing_lows.append(latest_low)
 
-    st3 = safe_float(tf_frames[3]["supertrend"].iloc[-1], spot)
-    st15 = safe_float(tf_frames[15]["supertrend"].iloc[-1], spot)
+    return {
+        "highs": sorted({round(x, 2) for x in swing_highs if math.isfinite(x)}),
+        "lows": sorted({round(x, 2) for x in swing_lows if math.isfinite(x)}),
+    }
 
-    is_bear = structure.direction == "BEARISH"
-    if is_bear:
-        wall1 = structure.support_1 if structure.support_1 < spot else float("nan")
-        wall2 = structure.support_2 if structure.support_2 < spot else float("nan")
-        wall1_dist = spot - wall1 if math.isfinite(wall1) else 0.0
-        target1 = wall1 if wall1_dist >= 0.50 * atr3 else spot - 1.50 * atr3
-        if math.isfinite(wall2) and wall2 < target1 and (spot - wall2) >= 1.00 * atr3:
-            target2 = wall2
+
+def _rank_current_oi_walls(
+    chain: list[dict[str, Any]],
+    spot: float,
+    *,
+    side: str,
+    change_oi_by_strike: Optional[dict[float, dict[str, float]]] = None,
+) -> list[dict[str, Any]]:
+    """Rank current OI walls; no price-derived level is substituted for OI."""
+    rows = chain_rows(chain)
+    strikes = sorted(rows)
+    if not strikes:
+        return []
+    step = strike_step(strikes)
+    candidates: list[dict[str, Any]] = []
+
+    for strike, row in rows.items():
+        distance_steps = abs(float(strike) - float(spot)) / max(step, 1.0)
+        if distance_steps < PA_OI_TARGET_MIN_STEPS:
+            continue
+        if side == "support":
+            if float(strike) >= float(spot):
+                continue
+            option_type = "PE"
+            oi = max(safe_float(option_side_data(row, "PE").get("oi")), 0.0)
+            flow_bias = int((change_oi_by_strike or {}).get(float(strike), {}).get("put_bias", 0))
+            if flow_bias == 0:
+                change = safe_float((change_oi_by_strike or {}).get(float(strike), {}).get("put_oi_change"), 0.0)
+                flow_bias = int(1 if change > 0 else -1 if change < 0 else 0)
         else:
-            target2 = spot - 3.00 * atr3
+            if float(strike) <= float(spot):
+                continue
+            option_type = "CE"
+            oi = max(safe_float(option_side_data(row, "CE").get("oi")), 0.0)
+            flow_bias = int((change_oi_by_strike or {}).get(float(strike), {}).get("call_bias", 0))
+            if flow_bias == 0:
+                change = safe_float((change_oi_by_strike or {}).get(float(strike), {}).get("call_oi_change"), 0.0)
+                flow_bias = int(1 if change > 0 else -1 if change < 0 else 0)
+        if oi <= 0:
+            continue
+        candidates.append({
+            "strike": float(strike),
+            "oi": float(oi),
+            "flow_bias": int(flow_bias),
+            "option_type": option_type,
+            "distance_steps": float(distance_steps),
+        })
 
-        recent_swing_high = safe_float(tf_frames[3]["high"].tail(6).max(), spot)
-        stop_candidates = [
-            structure.vwap + 0.25 * atr3,
-            st3 + 0.20 * atr3,
-            st15 + 0.20 * atr15,
-            recent_swing_high + STRUCTURAL_STOP_BUFFER_ATR * atr3,
-        ]
-        if structure.resistance_1 > spot:
-            stop_candidates.append(structure.resistance_1 + 0.25 * atr3)
-        # For a bearish trade the nearest valid anchor above spot is the stop.
-        underlying_stop = min(x for x in stop_candidates if x > spot)
-        if underlying_stop <= spot:
-            underlying_stop = spot + 0.80 * atr3
+    if not candidates:
+        return []
 
-        target1 = min(target1, spot - 0.25 * atr3)
-        target2 = min(target2, target1 - 0.50 * atr3)
-        return float(target1), float(target2), float(underlying_stop)
+    max_oi = max(x["oi"] for x in candidates)
+    median_oi = float(np.median([x["oi"] for x in candidates])) if candidates else 0.0
+    for item in candidates:
+        oi_ratio = item["oi"] / max(max_oi, 1.0)
+        proximity = 1.0 / (1.0 + item["distance_steps"])
+        # Wall ranking is deliberately dominated by OI. Flow only breaks ties /
+        # improves a wall that is actively behaving like a structural barrier.
+        flow_bonus = 0.10 if item["flow_bias"] != 0 else 0.0
+        item["oi_ratio"] = oi_ratio
+        item["strength"] = 0.75 * oi_ratio + 0.15 * proximity + flow_bonus
+        item["meaningful"] = bool(oi_ratio >= max(PA_OI_SECONDARY_OI_RATIO, 0.20) or item["oi"] >= median_oi)
 
-    wall1 = structure.resistance_1 if structure.resistance_1 > spot else float("nan")
-    wall2 = structure.resistance_2 if structure.resistance_2 > spot else float("nan")
-    wall1_dist = wall1 - spot if math.isfinite(wall1) else 0.0
-    target1 = wall1 if wall1_dist >= 0.50 * atr3 else spot + 1.50 * atr3
-    if math.isfinite(wall2) and wall2 > target1 and (wall2 - spot) >= 1.00 * atr3:
-        target2 = wall2
-    else:
-        target2 = spot + 3.00 * atr3
-
-    recent_swing_low = safe_float(tf_frames[3]["low"].tail(6).min(), spot)
-    stop_candidates = [
-        structure.vwap - 0.25 * atr3,
-        st3 - 0.20 * atr3,
-        st15 - 0.20 * atr15,
-        recent_swing_low - STRUCTURAL_STOP_BUFFER_ATR * atr3,
-    ]
-    if structure.support_1 < spot:
-        stop_candidates.append(structure.support_1 - 0.25 * atr3)
-    # For a bullish trade the nearest valid anchor below spot is the stop.
-    underlying_stop = max(x for x in stop_candidates if x < spot)
-    if underlying_stop >= spot:
-        underlying_stop = spot - 0.80 * atr3
-
-    target1 = max(target1, spot + 0.25 * atr3)
-    target2 = max(target2, target1 + 0.50 * atr3)
-    return float(target1), float(target2), float(underlying_stop)
+    return sorted(
+        candidates,
+        key=lambda x: (-float(x["strength"]), float(x["distance_steps"]), -float(x["oi"]), float(x["strike"])),
+    )
 
 
-def project_option_premium(
-    entry: float,
-    underlying_move: float,
-    delta: float,
-    gamma: float,
-) -> float:
-    """Conservative long-option premium projection for target estimation.
+def _distinct_oi_levels(
+    walls: list[dict[str, Any]],
+    *,
+    direction: str,
+    anchor: Optional[float] = None,
+    limit: int = 4,
+) -> list[float]:
+    out: list[float] = []
+    for wall in walls:
+        strike = float(wall["strike"])
+        if direction == "BEARISH":
+            if anchor is not None and strike >= anchor - 0.01:
+                continue
+        else:
+            if anchor is not None and strike <= anchor + 0.01:
+                continue
+        if strike not in out:
+            out.append(strike)
+        if len(out) >= limit:
+            break
+    return out
 
-    The first-order delta estimate is the primary component.  Gamma is allowed
-    only as a bounded adjustment (default 10% of the delta contribution). This
-    prevents a large dS² term from exploding T1/T2 while still acknowledging
-    that delta changes as the option moves ITM/OTM. This is a target estimate,
-    not a pricing model or execution guarantee.
-    """
-    move = abs(float(underlying_move))
-    first_order = abs(float(delta)) * move
-    raw_gamma = 0.5 * abs(float(gamma)) * move * move
-    gamma_cap = max(0.0, OPTION_TARGET_GAMMA_MAX_FRACTION) * first_order
-    gamma_adjustment = min(raw_gamma, gamma_cap)
-    change = first_order + gamma_adjustment
-    return float(max(0.0, entry + change))
+
+def _initial_structural_stop(
+    spot: float,
+    direction: str,
+    price_action: dict[str, list[float]],
+    opposing_walls: list[dict[str, Any]],
+    strike_step_value: float,
+) -> tuple[float, str]:
+    """Choose initial SL from price-action invalidation and opposing OI wall."""
+    buffer = max(0.10, strike_step_value * PA_OI_STOP_BUFFER_STEPS)
+    if direction == "BEARISH":
+        pa = min([x for x in price_action.get("highs", []) if x > spot], default=float("nan"))
+        oi = min([float(x["strike"]) for x in opposing_walls if float(x["strike"]) > spot], default=float("nan"))
+        candidates: list[tuple[float, str]] = []
+        if math.isfinite(pa):
+            candidates.append((pa + buffer, "PRICE_ACTION_SWING_HIGH"))
+        if math.isfinite(oi):
+            candidates.append((oi + buffer, "OI_RESISTANCE"))
+        if not candidates:
+            raise ScannerError("No valid bearish price-action/OI stop level available.")
+        # Use the nearest structural invalidation. The market's separate VWAP /
+        # phase invalidation remains active as a second layer.
+        return min(candidates, key=lambda x: x[0])
+
+    pa = max([x for x in price_action.get("lows", []) if x < spot], default=float("nan"))
+    oi = max([float(x["strike"]) for x in opposing_walls if float(x["strike"]) < spot], default=float("nan"))
+    candidates = []
+    if math.isfinite(pa):
+        candidates.append((pa - buffer, "PRICE_ACTION_SWING_LOW"))
+    if math.isfinite(oi):
+        candidates.append((oi - buffer, "OI_SUPPORT"))
+    if not candidates:
+        raise ScannerError("No valid bullish price-action/OI stop level available.")
+    return max(candidates, key=lambda x: x[0])
 
 
-def migrate_active_trade_targets(
-    trade: dict[str, Any],
-) -> bool:
-    """Migrate one legacy active trade to the V21 target engine exactly once.
+def determine_structural_trade_levels(
+    chain: list[dict[str, Any]],
+    spot: float,
+    structure: StructureResult,
+    price_session: Optional[pd.DataFrame],
+    change_oi_by_strike: Optional[dict[float, dict[str, float]]] = None,
+) -> tuple[float, float, float, dict[str, Any]]:
+    """Determine authoritative NIFTY T1/T2/SL strictly from price action + OI."""
+    direction = str(structure.direction).upper()
+    if direction not in {"BULLISH", "BEARISH"}:
+        raise ScannerError("Structural trade levels require BULLISH or BEARISH direction.")
 
-    The migration deliberately uses the trade's stored entry-underlying and
-    underlying target/stop levels. It does not recompute structural levels from
-    the current market, and it never runs again after the engine version is saved.
-    If T1 has already been hit, the live monetary levels are preserved because
-    changing a milestone retrospectively would alter an in-flight trade.
-    """
-    current_engine = str(trade.get("target_engine_version", "")).strip()
-    if current_engine == OPTION_TARGET_ENGINE_VERSION:
-        return False
+    rows = chain_rows(chain)
+    step = strike_step(sorted(rows))
+    swings = _price_action_swings(price_session, direction=direction, spot=spot)
 
-    if bool(trade.get("t1_hit", False)):
-        logger.warning(
-            "TARGET ENGINE MIGRATION: preserving legacy levels because T1 is already hit | %s",
-            trade.get("trading_symbol", ""),
-        )
-        trade["target_engine_version"] = OPTION_TARGET_ENGINE_VERSION
-        return True
-
-    entry = safe_float(trade.get("entry"), float("nan"))
-    entry_underlying = safe_float(trade.get("entry_underlying"), float("nan"))
-    underlying_t1 = safe_float(trade.get("underlying_target_1"), float("nan"))
-    underlying_t2 = safe_float(trade.get("underlying_target_2"), float("nan"))
-    underlying_stop = safe_float(trade.get("underlying_stop"), float("nan"))
-    delta = safe_float(trade.get("delta"), float("nan"))
-    gamma = safe_float(trade.get("gamma"), 0.0)
-    direction = str(trade.get("direction", "")).upper()
-
-    values = (entry, entry_underlying, underlying_t1, underlying_t2, underlying_stop, delta)
-    if not all(math.isfinite(v) for v in values):
-        logger.warning(
-            "TARGET ENGINE MIGRATION: insufficient stored levels/Greeks; preserving legacy levels | %s",
-            trade.get("trading_symbol", ""),
-        )
-        return False
+    support_walls = _rank_current_oi_walls(
+        chain, spot, side="support", change_oi_by_strike=change_oi_by_strike,
+    )
+    resistance_walls = _rank_current_oi_walls(
+        chain, spot, side="resistance", change_oi_by_strike=change_oi_by_strike,
+    )
 
     if direction == "BEARISH":
-        move_t1 = entry_underlying - underlying_t1
-        move_t2 = entry_underlying - underlying_t2
-        adverse_move = underlying_stop - entry_underlying
-    elif direction == "BULLISH":
-        move_t1 = underlying_t1 - entry_underlying
-        move_t2 = underlying_t2 - entry_underlying
-        adverse_move = entry_underlying - underlying_stop
+        target_walls = [x for x in support_walls if bool(x["meaningful"])]
+        if not target_walls:
+            target_walls = support_walls
+        if not target_walls:
+            raise ScannerError("No meaningful OI support exists for bearish T1/T2.")
+        # T1 is the authoritative OI support selected by the chain engine. T2
+        # is the next distinct deeper OI wall; price action is fallback only.
+        t1 = safe_float(structure.support_1, float("nan"))
+        if not math.isfinite(t1) or t1 >= spot:
+            t1 = max(float(x["strike"]) for x in target_walls if float(x["strike"]) < spot)
+        deeper = [x for x in support_walls if float(x["strike"]) < t1]
+        if not deeper:
+            deeper = [x for x in support_walls if float(x["strike"]) < t1]
+        pa_lows = sorted([x for x in swings.get("lows", []) if x < t1 - 0.01], reverse=True)
+        oi_t2 = sorted([float(x["strike"]) for x in deeper], reverse=True)
+        if oi_t2:
+            t2 = oi_t2[0]
+        elif pa_lows:
+            t2 = pa_lows[0]
+        else:
+            raise ScannerError("No second price-action/OI downside objective exists for bearish trade.")
+        stop_walls = ([{"strike": float(structure.resistance_1)}] if math.isfinite(safe_float(structure.resistance_1, float("nan"))) and structure.resistance_1 > spot else resistance_walls)
+        stop_u, stop_source = _initial_structural_stop(
+            spot, direction, swings, stop_walls, step,
+        )
+        meta = {
+            "t1_source": "OPTION_OI_SUPPORT",
+            "t2_source": "OPTION_OI_SUPPORT" if deeper else "PRICE_ACTION_SWING_LOW",
+            "sl_source": stop_source,
+            "t1_oi": target_walls[0]["oi"],
+            "t2_oi": next((x["oi"] for x in deeper if float(x["strike"]) == t2), 0.0),
+            "price_action_swing": swings,
+            "t1_oi_wall_count": len(target_walls),
+        }
+        return float(t1), float(t2), float(stop_u), meta
+
+    target_walls = [x for x in resistance_walls if bool(x["meaningful"])]
+    if not target_walls:
+        target_walls = resistance_walls
+    if not target_walls:
+        raise ScannerError("No meaningful OI resistance exists for bullish T1/T2.")
+    # T1 is the authoritative OI resistance selected by the chain engine. T2
+    # is the next distinct higher OI wall; price action is fallback only.
+    t1 = safe_float(structure.resistance_1, float("nan"))
+    if not math.isfinite(t1) or t1 <= spot:
+        t1 = min(float(x["strike"]) for x in target_walls if float(x["strike"]) > spot)
+    higher = [x for x in target_walls if float(x["strike"]) > t1]
+    if not higher:
+        higher = [x for x in resistance_walls if float(x["strike"]) > t1]
+    pa_highs = sorted([x for x in swings.get("highs", []) if x > t1 + 0.01])
+    oi_t2 = sorted([float(x["strike"]) for x in higher])
+    t2 = oi_t2[0] if oi_t2 else (pa_highs[0] if pa_highs else float("nan"))
+    if not math.isfinite(t2):
+        raise ScannerError("No second price-action/OI upside objective exists for bullish trade.")
+    stop_walls = ([{"strike": float(structure.support_1)}] if math.isfinite(safe_float(structure.support_1, float("nan"))) and structure.support_1 < spot else support_walls)
+    stop_u, stop_source = _initial_structural_stop(
+        spot, direction, swings, stop_walls, step,
+    )
+    meta = {
+        "t1_source": "OPTION_OI_RESISTANCE",
+        "t2_source": "OPTION_OI_RESISTANCE" if higher else "PRICE_ACTION_SWING_HIGH",
+        "sl_source": stop_source,
+        "t1_oi": target_walls[0]["oi"],
+        "t2_oi": next((x["oi"] for x in higher if float(x["strike"]) == t2), 0.0),
+        "price_action_swing": swings,
+        "t1_oi_wall_count": len(target_walls),
+    }
+    return float(t1), float(t2), float(stop_u), meta
+
+
+def dynamic_oi_stop_after_t1(
+    chain: list[dict[str, Any]],
+    spot: float,
+    direction: str,
+    price_session: Optional[pd.DataFrame],
+    entry_underlying: Optional[float] = None,
+) -> tuple[float, str, float]:
+    """Use the CURRENT opposing OI wall as the post-T1 structural stop."""
+    direction = str(direction).upper()
+    rows = chain_rows(chain)
+    step = strike_step(sorted(rows))
+    swings = _price_action_swings(price_session, direction=direction, spot=spot)
+
+    walls = _rank_current_oi_walls(
+        chain, spot,
+        side="resistance" if direction == "BEARISH" else "support",
+        change_oi_by_strike=None,
+    )
+    meaningful = [x for x in walls if bool(x["meaningful"])] or walls
+    if direction == "BEARISH":
+        entry_u = safe_float(entry_underlying, float("nan"))
+        favorable = [
+            x for x in meaningful
+            if float(x["strike"]) > spot
+            and (not math.isfinite(entry_u) or float(x["strike"]) < entry_u)
+        ]
+        oi_pool = favorable or [x for x in meaningful if float(x["strike"]) > spot]
+        oi_stop = float(oi_pool[0]["strike"]) if oi_pool else float("nan")
+        pa_stop = min([x for x in swings.get("highs", []) if x > spot], default=float("nan"))
+        if math.isfinite(oi_stop):
+            return float(oi_stop), "CURRENT_OI_RESISTANCE", float(step)
+        if math.isfinite(pa_stop):
+            return float(pa_stop), "CURRENT_PRICE_ACTION_SWING_HIGH", float(step)
     else:
-        logger.warning(
-            "TARGET ENGINE MIGRATION: unknown direction=%s; preserving legacy levels | %s",
-            direction, trade.get("trading_symbol", ""),
-        )
-        return False
-
-    if move_t1 <= 0 or move_t2 <= move_t1 or adverse_move <= 0 or entry <= 0:
-        logger.warning(
-            "TARGET ENGINE MIGRATION: stored underlying levels invalid; preserving legacy levels | %s "
-            "entry_u=%.2f T1u=%.2f T2u=%.2f SLu=%.2f",
-            trade.get("trading_symbol", ""), entry_underlying, underlying_t1, underlying_t2, underlying_stop,
-        )
-        return False
-
-    target1 = project_option_premium(entry, move_t1, delta, gamma)
-    target2 = project_option_premium(entry, move_t2, delta, gamma)
-
-    delta_abs = abs(delta)
-    gamma_abs = abs(gamma)
-    estimated_loss = (delta_abs * adverse_move) - (0.5 * gamma_abs * adverse_move * adverse_move)
-    estimated_loss = max(0.0, estimated_loss)
-    min_loss = entry * OPTION_MIN_STOP_PCT
-    max_loss = entry * OPTION_MAX_STOP_PCT
-    risk = min(max(estimated_loss, min_loss), max_loss)
-    stop_loss = entry - risk
-
-    min_t1 = entry + MIN_T1_RISK_REWARD * risk
-    min_t2 = entry + MIN_T2_RISK_REWARD * risk
-    target1 = max(target1, min_t1)
-    target2 = max(target2, min_t2, target1 + 0.25 * risk)
-
-    if not (stop_loss < entry < target1 < target2):
-        logger.warning(
-            "TARGET ENGINE MIGRATION: generated levels invalid; preserving legacy levels | %s",
-            trade.get("trading_symbol", ""),
-        )
-        return False
-
-    old = (
-        safe_float(trade.get("target_1"), float("nan")),
-        safe_float(trade.get("target_2"), float("nan")),
-        safe_float(trade.get("stop_loss"), float("nan")),
-    )
-    trade["target_1"] = round(target1, 2)
-    trade["target_2"] = round(target2, 2)
-    trade["stop_loss"] = round(stop_loss, 2)
-    trade["target_engine_version"] = OPTION_TARGET_ENGINE_VERSION
-
-    logger.info(
-        "TARGET ENGINE MIGRATED: %s | old T1=%.2f T2=%.2f SL=%.2f -> "
-        "V21 T1=%.2f T2=%.2f SL=%.2f | entry=%.2f entry_u=%.2f "
-        "T1u=%.2f T2u=%.2f SLu=%.2f delta=%.4f gamma=%.6f risk=%.2f | "
-        "engine=%s",
-        trade.get("trading_symbol", ""), old[0], old[1], old[2],
-        target1, target2, stop_loss, entry, entry_underlying,
-        underlying_t1, underlying_t2, underlying_stop, delta, gamma,
-        risk, OPTION_TARGET_ENGINE_VERSION,
-    )
-    return True
-
-
-def project_option_premium_signed(
-    entry: float,
-    underlying_move: float,
-    delta: float,
-    gamma: float,
-) -> float:
-    """Signed second-order premium projection for trailing-stop estimation."""
-    move = float(underlying_move)
-    change = float(delta) * move + 0.5 * abs(float(gamma)) * move * move
-    return float(max(0.0, entry + change))
+        entry_u = safe_float(entry_underlying, float("nan"))
+        favorable = [
+            x for x in meaningful
+            if float(x["strike"]) < spot
+            and (not math.isfinite(entry_u) or float(x["strike"]) > entry_u)
+        ]
+        oi_pool = favorable or [x for x in meaningful if float(x["strike"]) < spot]
+        oi_stop = float(oi_pool[0]["strike"]) if oi_pool else float("nan")
+        pa_stop = max([x for x in swings.get("lows", []) if x < spot], default=float("nan"))
+        if math.isfinite(oi_stop):
+            return float(oi_stop), "CURRENT_OI_SUPPORT", float(step)
+        if math.isfinite(pa_stop):
+            return float(pa_stop), "CURRENT_PRICE_ACTION_SWING_LOW", float(step)
+    raise ScannerError("Unable to derive a dynamic post-T1 OI/price-action stop.")
 
 
 def create_dynamic_targets(
@@ -4119,102 +4251,122 @@ def create_dynamic_targets(
     structure: StructureResult,
     spot: float,
     tf_frames: dict[int, pd.DataFrame],
+    *,
+    chain: list[dict[str, Any]],
+    price_session: Optional[pd.DataFrame],
+    change_oi_by_strike: Optional[dict[float, dict[str, float]]] = None,
 ) -> tuple[float, float, float, float, float, float]:
-    """Create option and underlying targets without allowing risk math to crash a valid signal.
+    """Create NIFTY structural T1/T2/SL from current price action + OI.
 
-    Important: the option is long, so an adverse underlying move must reduce
-    premium. The previous implementation accidentally used the *positive*
-    premium projection for the adverse move; with a high-delta/high-gamma
-    option that could make ``adverse_premium >= entry`` and produce zero risk.
+    ``target_1``, ``target_2`` and ``stop_loss`` now intentionally carry the
+    authoritative NIFTY structural levels for state/monitor compatibility.
+    Option premium is monitored live and is not forecast with static Greeks.
     """
-    target_u1, target_u2, stop_u = choose_underlying_levels(
-        structure, spot, tf_frames,
+    target_u1, target_u2, stop_u, meta = determine_structural_trade_levels(
+        chain,
+        spot,
+        structure,
+        price_session,
+        change_oi_by_strike=change_oi_by_strike,
     )
 
-    atr3 = max(safe_float(tf_frames[3]["atr"].iloc[-1], 0.0), 1.0)
-    atr15 = max(safe_float(tf_frames[15]["atr"].iloc[-1], atr3), atr3)
-
-    # Final defensive validation/fallback for unusual chain levels.
-    if structure.direction == "BEARISH":
-        if target_u1 >= spot:
-            target_u1 = spot - 0.75 * atr3
-        if target_u2 >= target_u1:
-            target_u2 = target_u1 - max(0.75 * atr3, 0.50 * atr15)
-        if stop_u <= spot:
-            stop_u = spot + 0.80 * atr3
-        move_t1 = spot - target_u1
-        move_t2 = spot - target_u2
-        adverse_move = stop_u - spot
-    else:
-        if target_u1 <= spot:
-            target_u1 = spot + 0.75 * atr3
-        if target_u2 <= target_u1:
-            target_u2 = target_u1 + max(0.75 * atr3, 0.50 * atr15)
-        if stop_u >= spot:
-            stop_u = spot - 0.80 * atr3
-        move_t1 = target_u1 - spot
-        move_t2 = target_u2 - spot
-        adverse_move = spot - stop_u
-
-    if move_t1 <= 0:
-        move_t1 = 0.75 * atr3
-        target_u1 = spot + move_t1 if structure.direction == "BULLISH" else spot - move_t1
-    if move_t2 <= move_t1:
-        move_t2 = max(1.25 * atr15, move_t1 + 0.50 * atr3)
-        target_u2 = spot + move_t2 if structure.direction == "BULLISH" else spot - move_t2
-    if adverse_move <= 0:
-        adverse_move = 0.80 * atr3
-        stop_u = spot - adverse_move if structure.direction == "BULLISH" else spot + adverse_move
-
-    target1 = project_option_premium(option.ltp, move_t1, option.delta, option.gamma)
-    target2 = project_option_premium(option.ltp, move_t2, option.delta, option.gamma)
-
-    logger.info(
-        "OPTION TARGET PROJECTION: move1=%.2f move2=%.2f delta=%.3f gamma=%.5f "
-        "gamma_cap=%.0f%% T1=%.2f T2=%.2f",
-        move_t1, move_t2, abs(option.delta), abs(option.gamma),
-        OPTION_TARGET_GAMMA_MAX_FRACTION * 100.0, target1, target2,
-    )
-
-    # Correct signed adverse-premium estimate for a LONG option.
-    # First order loses premium; gamma partially offsets that loss.
-    delta_abs = abs(option.delta)
-    gamma_abs = abs(option.gamma)
-    estimated_loss = (delta_abs * adverse_move) - (0.5 * gamma_abs * adverse_move * adverse_move)
-    estimated_loss = max(0.0, estimated_loss)
-
-    # Always keep a real, bounded monetary risk. This is a safety bound, not
-    # a directional veto. Near-expiry/high-gamma options can otherwise make
-    # the second-order approximation mathematically negative.
-    min_loss = option.ltp * OPTION_MIN_STOP_PCT
-    max_loss = option.ltp * OPTION_MAX_STOP_PCT
-    risk = min(max(estimated_loss, min_loss), max_loss)
-    stop_loss = option.ltp - risk
-
-    # Guarantee valid ordering without rejecting a structurally valid market
-    # signal merely because the option's local Greek approximation is noisy.
-    min_t1 = option.ltp + MIN_T1_RISK_REWARD * risk
-    min_t2 = option.ltp + MIN_T2_RISK_REWARD * risk
-    target1 = max(target1, min_t1)
-    target2 = max(target2, min_t2, target1 + 0.25 * risk)
-
-    if not (stop_loss < option.ltp < target1 < target2):
+    if structure.direction == "BEARISH" and not (target_u2 < target_u1 < spot < stop_u):
         raise ScannerError(
-            f"Invalid option risk levels after fallback: entry={option.ltp:.2f}, "
-            f"SL={stop_loss:.2f}, T1={target1:.2f}, T2={target2:.2f}."
+            f"Invalid bearish PA/OI levels: spot={spot:.2f} T1={target_u1:.2f} T2={target_u2:.2f} SL={stop_u:.2f}"
+        )
+    if structure.direction == "BULLISH" and not (stop_u < spot < target_u1 < target_u2):
+        raise ScannerError(
+            f"Invalid bullish PA/OI levels: spot={spot:.2f} T1={target_u1:.2f} T2={target_u2:.2f} SL={stop_u:.2f}"
         )
 
     logger.info(
-        "OPTION RISK: entry=%.2f SL=%.2f risk=%.2f (%.1f%%) T1=%.2f T2=%.2f | "
-        "underlying T1=%.2f T2=%.2f SL=%.2f",
-        option.ltp, stop_loss, risk, 100.0 * risk / option.ltp,
-        target1, target2, target_u1, target_u2, stop_u,
+        "PA/OI TRADE LEVELS: direction=%s T1_NIFTY=%.2f(%s) T2_NIFTY=%.2f(%s) SL_NIFTY=%.2f(%s) "
+        "support=%.2f/%.2f resistance=%.2f/%.2f",
+        structure.direction,
+        target_u1, meta.get("t1_source", ""),
+        target_u2, meta.get("t2_source", ""),
+        stop_u, meta.get("sl_source", ""),
+        structure.support_1, structure.support_2,
+        structure.resistance_1, structure.resistance_2,
     )
 
+    # Compatibility: these three fields are now NIFTY structural levels; monitor
+    # exits at those levels and closes the option at the live option LTP.
     return (
-        round(target1, 2), round(target2, 2), round(stop_loss, 2),
+        round(target_u1, 2), round(target_u2, 2), round(stop_u, 2),
         round(stop_u, 2), round(target_u1, 2), round(target_u2, 2),
     )
+
+
+def migrate_active_trade_to_v23(
+    trade: dict[str, Any],
+    *,
+    chain: list[dict[str, Any]],
+    spot: float,
+    structure: StructureResult,
+    price_session: Optional[pd.DataFrame],
+    change_oi_by_strike: Optional[dict[float, dict[str, float]]],
+) -> bool:
+    """One-time migration from V19/V21/V22 premium levels to structural PA/OI levels."""
+    engine = str(trade.get("target_engine_version", "")).strip()
+    if engine == OPTION_TARGET_ENGINE_VERSION:
+        return False
+    if bool(trade.get("t1_hit", False)):
+        trade["target_engine_version"] = OPTION_TARGET_ENGINE_VERSION
+        return True
+
+    direction = str(trade.get("direction", structure.direction)).upper()
+    if direction != structure.direction:
+        direction_structure = type("TradeStructure", (), {
+            "direction": direction,
+            "support_1": structure.support_1,
+            "support_2": structure.support_2,
+            "resistance_1": structure.resistance_1,
+            "resistance_2": structure.resistance_2,
+            "vwap": structure.vwap,
+        })()
+    else:
+        direction_structure = structure
+
+    try:
+        t1, t2, sl, _, u1, u2 = create_dynamic_targets(
+            option=OptionCandidate(
+                instrument_key=str(trade.get("instrument_key", "")),
+                trading_symbol=str(trade.get("trading_symbol", "")),
+                option_type=str(trade.get("option_type", "PE")),
+                strike=safe_float(trade.get("strike"), 0.0),
+                expiry=str(trade.get("expiry", "")),
+                ltp=max(safe_float(trade.get("entry"), 1.0), 1.0),
+                oi=0.0, prev_oi=0.0, volume=0.0, bid=0.0, ask=0.0,
+                bid_qty=0.0, ask_qty=0.0, delta=safe_float(trade.get("delta"), 0.0),
+                gamma=0.0, theta=0.0, iv=0.0, spread_pct=0.0, theta_burden_pct_day=0.0,
+            ),
+            structure=direction_structure,
+            spot=spot,
+            tf_frames={},
+            chain=chain,
+            price_session=price_session,
+            change_oi_by_strike=change_oi_by_strike,
+        )
+    except Exception as exc:
+        logger.warning("V23 TRADE MIGRATION FAILED: preserving existing trade levels | %s", exc)
+        return False
+
+    old = (trade.get("target_1"), trade.get("target_2"), trade.get("stop_loss"))
+    trade["target_1"] = t1
+    trade["target_2"] = t2
+    trade["stop_loss"] = sl
+    trade["underlying_target_1"] = u1
+    trade["underlying_target_2"] = u2
+    trade["underlying_stop"] = sl
+    trade["target_engine_version"] = OPTION_TARGET_ENGINE_VERSION
+    logger.info(
+        "V23 TRADE MIGRATION: %s | old T1=%s T2=%s SL=%s -> "
+        "PA/OI T1=%.2f T2=%.2f SL=%.2f | spot=%.2f",
+        trade.get("trading_symbol", ""), old[0], old[1], old[2],
+        t1, t2, sl, spot,
+    )
+    return True
 
 
 # =============================================================================
@@ -4279,15 +4431,16 @@ def signal_hash(signal: Signal) -> str:
 
 
 def format_engine_output(signal: Signal) -> str:
-    """Return the exact six-part scanner output requested by the strategy spec."""
+    """Display NIFTY structural levels; option exits use the live option LTP."""
     return (
         f"1. Market State: [{signal.market_state}]\n"
         f"2. Bias: [{signal.bias}]\n"
         f"3. Entry Trigger: [{signal.entry_trigger}]\n"
         f"4. Targets:\n"
-        f"   - T1: {signal.target_1:.2f} (underlying {signal.underlying_target_1:.2f})\n"
-        f"   - T2: {signal.target_2:.2f} (underlying {signal.underlying_target_2:.2f})\n"
-        f"5. Stop Loss: {signal.stop_loss:.2f} (underlying {signal.underlying_stop:.2f})\n"
+        f"   - T1: NIFTY {signal.underlying_target_1:.2f}\n"
+        f"   - T2: NIFTY {signal.underlying_target_2:.2f}\n"
+        f"5. Stop Loss: NIFTY {signal.underlying_stop:.2f}\n"
+        f"   Option exits at the live option LTP when the NIFTY structural level is reached.\n"
         f"6. Invalidation Rule: [{signal.invalidation_rule}]"
     )
 
@@ -4342,12 +4495,12 @@ def signal_email_body(signal: Signal) -> str:
 <tr><td><b>Option</b></td><td>{html.escape(signal.trading_symbol)}</td></tr>
 <tr><td><b>Strike</b></td><td>{signal.strike:.0f} {signal.option_type}</td></tr>
 <tr><td><b>Entry</b></td><td>₹{signal.entry:.2f}</td></tr>
-<tr><td><b>Target 1</b></td><td>₹{signal.target_1:.2f}</td></tr>
-<tr><td><b>Target 2</b></td><td>₹{signal.target_2:.2f}</td></tr>
-<tr><td><b>Stop Loss</b></td><td>₹{signal.stop_loss:.2f}</td></tr>
-<tr><td><b>Underlying T1</b></td><td>{signal.underlying_target_1:.2f}</td></tr>
-<tr><td><b>Underlying T2</b></td><td>{signal.underlying_target_2:.2f}</td></tr>
-<tr><td><b>Underlying SL</b></td><td>{signal.underlying_stop:.2f}</td></tr>
+<tr><td><b>NIFTY Target 1</b></td><td>{signal.underlying_target_1:.2f}</td></tr>
+<tr><td><b>NIFTY Target 2</b></td><td>{signal.underlying_target_2:.2f}</td></tr>
+<tr><td><b>NIFTY Structural SL</b></td><td>{signal.underlying_stop:.2f}</td></tr>
+<tr><td><b>Option Exit at T1</b></td><td>Live option LTP when NIFTY T1 is reached</td></tr>
+<tr><td><b>Option Exit at T2</b></td><td>Live option LTP when NIFTY T2 is reached</td></tr>
+<tr><td><b>Structural Exit</b></td><td>Live option LTP when NIFTY SL is breached</td></tr>
 <tr><td><b>Delta</b></td><td>{signal.delta:.4f}</td></tr>
 <tr><td><b>Gamma</b></td><td>{signal.gamma:.6f}</td></tr>
 <tr><td><b>Theta</b></td><td>{signal.theta:.4f}</td></tr>
@@ -4444,6 +4597,9 @@ def monitor_active_trade(
     state: dict[str, Any],
     structure: StructureResult,
     tf_frames: Optional[dict[int, pd.DataFrame]] = None,
+    *,
+    chain: Optional[list[dict[str, Any]]] = None,
+    price_session: Optional[pd.DataFrame] = None,
 ) -> str:
     trade = active_trade_from_state(state)
     if trade is None:
@@ -4470,138 +4626,90 @@ def monitor_active_trade(
         return "ACTIVE"
 
     entry = safe_float(trade.get("entry"))
-    target1 = safe_float(trade.get("target_1"))
-    target2 = safe_float(trade.get("target_2"))
-    stop = safe_float(trade.get("stop_loss"))
-    t1_hit = bool(trade.get("t1_hit", False)) or ltp >= target1
+    underlying_t1 = safe_float(trade.get("underlying_target_1"), float("nan"))
+    underlying_t2 = safe_float(trade.get("underlying_target_2"), float("nan"))
+    underlying_stop = safe_float(trade.get("underlying_stop"), float("nan"))
+    t1_hit = bool(trade.get("t1_hit", False))
     intrabar_outcome = None
     intrabar_exit_reference = None
     intrabar_reason = "DISABLED"
 
+    # Current NIFTY spot is the authoritative trigger for structural exits.
+    snapshot_for_trade = state.get("market_snapshot") if isinstance(state.get("market_snapshot"), dict) else {}
+    spot_now = safe_float(snapshot_for_trade.get("spot"), float("nan"))
+    if not math.isfinite(spot_now) or spot_now <= 0:
+        try:
+            spot_now = extract_ltp(get_quote(NIFTY_KEY))
+        except ScannerError:
+            spot_now = float("nan")
+
     if ACTIVE_TRADE_INTRABAR_MONITOR:
         try:
-            option_1m_raw = get_intraday_candles(
-                str(trade["instrument_key"]), 1, strict=False
-            )
-            option_1m = _prepare_active_trade_1m_window(trade, option_1m_raw)
-
-            # A stop on the option is subordinate to the NIFTY structural stop.
-            # Fetch the underlying 1m bars separately so an option IV/theta spike
-            # cannot close a trade while NIFTY is still respecting its structure.
-            underlying_1m = None
-            if ACTIVE_TRADE_REQUIRE_UNDERLYING_CONFIRMATION:
-                underlying_1m_raw = get_intraday_candles(
-                    NIFTY_KEY, 1, strict=False
-                )
-                underlying_1m = _prepare_active_trade_1m_window(
-                    trade, underlying_1m_raw
-                )
-
+            underlying_1m_raw = get_intraday_candles(NIFTY_KEY, 1, strict=False)
+            underlying_1m = _prepare_active_trade_1m_window(trade, underlying_1m_raw)
             (
                 intrabar_outcome,
                 intrabar_exit_reference,
                 intrabar_reason,
             ) = _active_trade_intrabar_exit(
                 trade,
-                option_1m,
+                None,
                 underlying_1m=underlying_1m,
                 underlying_3m=(tf_frames or {}).get(3),
             )
-
-            # Record the newest bar examined, but the helper always rechecks the
-            # latest bar because that candle may still be forming.
-            if option_1m is not None and not option_1m.empty:
-                trade["intrabar_last_checked_at"] = (
-                    option_1m["timestamp"].max().isoformat()
-                )
-
-            if intrabar_outcome:
-                logger.info(
-                    "ACTIVE TRADE INTRABAR: %s outcome=%s reference=%.2f reason=%s",
-                    trade["trading_symbol"],
-                    intrabar_outcome,
-                    float(intrabar_exit_reference or 0.0),
-                    intrabar_reason,
-                )
-            else:
-                logger.info(
-                    "ACTIVE TRADE INTRABAR: %s no exit | structure=%s",
-                    trade["trading_symbol"],
-                    intrabar_reason,
-                )
+            if underlying_1m is not None and not underlying_1m.empty:
+                trade["intrabar_last_checked_at"] = underlying_1m["timestamp"].max().isoformat()
+            logger.info(
+                "ACTIVE TRADE STRUCTURE MONITOR: %s outcome=%s reference=%s reason=%s",
+                trade["trading_symbol"],
+                intrabar_outcome or "NONE",
+                f"{intrabar_exit_reference:.2f}" if intrabar_exit_reference is not None else "-",
+                intrabar_reason,
+            )
         except Exception as exc:
             intrabar_reason = f"1M_MONITOR_ERROR:{exc}"
-            logger.info(
-                "Active trade 1m monitor unavailable: %s",
-                exc,
-            )
+            logger.info("Active trade NIFTY 1m monitor unavailable: %s", exc)
 
     if intrabar_outcome == "T1_HIT":
         t1_hit = True
+        trade["t1_hit"] = True
 
-    # A quote-only option stop is not allowed to override the underlying
-    # structure when structural confirmation is enabled. The current NIFTY
-    # snapshot is a second line of defence; the 1m structural breach is the
-    # preferred intrabar path above.
-    snapshot_for_stop = (
-        state.get("market_snapshot")
-        if isinstance(state.get("market_snapshot"), dict)
-        else {}
-    )
-    spot_for_stop = safe_float(snapshot_for_stop.get("spot"), float("nan"))
-    underlying_stop_for_quote = safe_float(
-        trade.get("underlying_stop"), float("nan")
-    )
-    direction_for_quote = str(trade.get("direction", "")).upper()
-    latest_3m_close = float("nan")
-    latest_3m_bar = ""
-    if tf_frames and 3 in tf_frames and not tf_frames[3].empty:
-        latest_3m_close = safe_float(tf_frames[3]["close"].iloc[-1], float("nan"))
-        latest_3m_bar = str(tf_frames[3]["timestamp"].iloc[-1])
-    armed_bar = str(trade.get("underlying_stop_armed_bar") or "")
-    quote_stop_structure_confirmed = not ACTIVE_TRADE_REQUIRE_UNDERLYING_CONFIRMATION
-    if not quote_stop_structure_confirmed and math.isfinite(underlying_stop_for_quote) and math.isfinite(latest_3m_close):
-        newer_bar = True
-        if armed_bar and latest_3m_bar:
-            try:
-                newer_bar = pd.Timestamp(latest_3m_bar) > pd.Timestamp(armed_bar)
-            except Exception:
-                newer_bar = True
-        quote_stop_structure_confirmed = newer_bar and (
-            (direction_for_quote == "BULLISH" and latest_3m_close <= underlying_stop_for_quote)
-            or (direction_for_quote == "BEARISH" and latest_3m_close >= underlying_stop_for_quote)
-        )
+    # Quote-level structural trigger is a backup when the intrabar path had no bar breach.
+    if math.isfinite(spot_now):
+        if not t1_hit and math.isfinite(underlying_t1):
+            t1_hit = (
+                spot_now <= underlying_t1 if str(trade.get("direction", "")).upper() == "BEARISH"
+                else spot_now >= underlying_t1
+            )
+        t2_reached = (
+            spot_now <= underlying_t2 if str(trade.get("direction", "")).upper() == "BEARISH"
+            else spot_now >= underlying_t2
+        ) if math.isfinite(underlying_t2) else False
+        stop_reached = (
+            spot_now >= underlying_stop if str(trade.get("direction", "")).upper() == "BEARISH"
+            else spot_now <= underlying_stop
+        ) if math.isfinite(underlying_stop) else False
+    else:
+        t2_reached = False
+        stop_reached = False
 
-    # T1 is a milestone, not a full exit. Once reached, the stop ratchets to
-    # cost and then trails until T2 or a protective stop is reached.
-    if intrabar_outcome == "STOP_LOSS":
+    if intrabar_outcome == "STOP_LOSS" or stop_reached:
         outcome = "STOP_LOSS"
-        exit_ltp = float(intrabar_exit_reference or stop)
-    elif intrabar_outcome == "TARGET_2":
+    elif intrabar_outcome == "TARGET_2" or t2_reached:
         outcome = "TARGET_2"
-        exit_ltp = float(intrabar_exit_reference or target2)
-    elif ltp >= target2:
-        outcome = "TARGET_2"
-        exit_ltp = ltp
-    elif ltp <= stop and quote_stop_structure_confirmed:
-        outcome = "STOP_LOSS"
-        exit_ltp = ltp
     else:
         outcome = ""
-        exit_ltp = ltp
 
     if outcome:
         closed = dict(trade)
-        closed.update(
-            {
-                "status": "CLOSED",
-                "outcome": outcome,
-                "exit_ltp": round(exit_ltp, 2),
-                "closed_at": now_ist().isoformat(),
-                "exit_reason": intrabar_reason if intrabar_outcome else "QUOTE_LTP",
-                "exit_3m_bar": str((state.get("market_snapshot") or {}).get("latest_completed_3m_bar", "")),
-            }
-        )
+        closed.update({
+            "status": "CLOSED",
+            "outcome": outcome,
+            "exit_ltp": round(ltp, 2),
+            "closed_at": now_ist().isoformat(),
+            "exit_reason": intrabar_reason if intrabar_outcome else "NIFTY_STRUCTURAL_LEVEL",
+            "exit_3m_bar": str((state.get("market_snapshot") or {}).get("latest_completed_3m_bar", "")),
+        })
         state["active_trade"] = None
         state["last_completed_trade"] = closed
         save_state(state)
@@ -4609,96 +4717,72 @@ def monitor_active_trade(
         send_email(
             f"NIFTY TRADE {outcome} - {trade['trading_symbol']}",
             (
-                f"<p>{html.escape(str(trade['direction']))} trade closed.</p>"
+                f"<p>{html.escape(str(trade['direction']))} trade closed on the NIFTY structural level.</p>"
                 f"<p>Option: {html.escape(str(trade['trading_symbol']))}<br>"
                 f"Entry: ₹{entry:.2f}<br>"
-                f"Exit: ₹{exit_ltp:.2f}<br>"
-                f"Outcome: {outcome}<br>"
-                f"Reason: {html.escape(intrabar_reason if intrabar_outcome else 'live quote')}</p>"
+                f"Live option exit: ₹{ltp:.2f}<br>"
+                f"NIFTY T1: {underlying_t1:.2f}<br>"
+                f"NIFTY T2: {underlying_t2:.2f}<br>"
+                f"NIFTY SL: {underlying_stop:.2f}<br>"
+                f"Outcome: {outcome}</p>"
             ),
+        )
+        logger.info(
+            "TRADE CLOSED: %s outcome=%s exit_option=%.2f trigger_nifty=%.2f",
+            trade["trading_symbol"], outcome, ltp, spot_now,
         )
         return "CLOSED"
 
-    # After T1, move the option stop to cost and then trail from the live
-    # underlying Supertrend/ATR boundary. This ratchets risk only upward.
-    if t1_hit:
-        trade["t1_hit"] = True
-        current_stop = safe_float(trade.get("stop_loss"), 0.0)
-        if entry > current_stop:
-            current_stop = entry
-        trade["stop_loss"] = round(current_stop, 2)
-
-        if tf_frames and 3 in tf_frames:
-            try:
-                atr3 = max(safe_float(tf_frames[3]["atr"].iloc[-1], 0.0), 1.0)
-                st3 = safe_float(tf_frames[3]["supertrend"].iloc[-1], 0.0)
-                snapshot = state.get("market_snapshot") if isinstance(state.get("market_snapshot"), dict) else {}
-                spot_now = safe_float(snapshot.get("spot"), 0.0)
-                base_spot = safe_float(trade.get("entry_underlying"), spot_now)
-                direction = str(trade.get("direction", "")).upper()
-                if spot_now > 0 and base_spot > 0 and st3 > 0:
-                    recent_low = safe_float(tf_frames[3]["low"].tail(6).min(), spot_now)
-                    recent_high = safe_float(tf_frames[3]["high"].tail(6).max(), spot_now)
-                    if direction == "BULLISH":
-                        structural_trail = max(
-                            st3 - STRUCTURAL_STOP_BUFFER_ATR * atr3,
-                            recent_low - STRUCTURAL_STOP_BUFFER_ATR * atr3,
-                        )
-                        trail_underlying = min(
-                            structural_trail,
-                            spot_now - TRAIL_MIN_DISTANCE_ATR * atr3,
-                        )
-                        previous_underlying_stop = safe_float(trade.get("underlying_stop"), -float("inf"))
-                        trail_underlying = max(previous_underlying_stop, trail_underlying)
-                    else:
-                        structural_trail = min(
-                            st3 + STRUCTURAL_STOP_BUFFER_ATR * atr3,
-                            recent_high + STRUCTURAL_STOP_BUFFER_ATR * atr3,
-                        )
-                        trail_underlying = max(
-                            structural_trail,
-                            spot_now + TRAIL_MIN_DISTANCE_ATR * atr3,
-                        )
-                        previous_underlying_stop = safe_float(trade.get("underlying_stop"), float("inf"))
-                        trail_underlying = min(previous_underlying_stop, trail_underlying)
-
-                    old_underlying_stop = safe_float(trade.get("underlying_stop"), float("nan"))
-                    trade["underlying_stop"] = round(trail_underlying, 2)
-                    latest_bar = str(tf_frames[3]["timestamp"].iloc[-1])
-                    if not math.isfinite(old_underlying_stop) or abs(trail_underlying - old_underlying_stop) >= 0.01:
-                        # The new stop is armed only from this completed 3m bar onward;
-                        # never use the same bar retroactively against a newly raised stop.
-                        trade["underlying_stop_armed_bar"] = latest_bar
-                    signed_move = trail_underlying - base_spot
-                    # Do not tighten beyond the entry-side direction: for a
-                    # long CE, trail must remain above entry underlying; for a
-                    # long PE, it must remain below entry underlying.
-                    signed_move = signed_move if (
-                        (direction == "BULLISH" and signed_move > 0)
-                        or (direction == "BEARISH" and signed_move < 0)
-                    ) else 0.0
-                    trail_option = project_option_premium_signed(
-                        entry, signed_move, safe_float(trade.get("delta")), safe_float(trade.get("gamma"))
-                    )
-                    # A long option stop must remain below the current premium.
-                    trail_option = min(trail_option, max(0.0, ltp - 0.01))
-                    trade["stop_loss"] = round(max(safe_float(trade.get("stop_loss")), trail_option), 2)
-            except (KeyError, IndexError, TypeError, ValueError) as exc:
-                logger.info("Trailing-stop update skipped: %s", exc)
+    # Once T1 is reached, CURRENT OI—not the old SL—becomes the dynamic structural stop.
+    if t1_hit and chain and price_session is not None and math.isfinite(spot_now):
+        try:
+            dynamic_stop, dynamic_source, step = dynamic_oi_stop_after_t1(
+                chain, spot_now, str(trade.get("direction", "")).upper(), price_session,
+                entry_underlying=safe_float(trade.get("entry_underlying"), float("nan")),
+            )
+            old_stop = safe_float(trade.get("underlying_stop"), float("nan"))
+            direction = str(trade.get("direction", "")).upper()
+            if math.isfinite(old_stop):
+                # Ratchet only in the favorable direction; the level itself is
+                # always calculated from current OI, never from the old stop.
+                effective_stop = min(old_stop, dynamic_stop) if direction == "BEARISH" else max(old_stop, dynamic_stop)
+            else:
+                effective_stop = dynamic_stop
+            changed = (not math.isfinite(old_stop)) or abs(effective_stop - old_stop) >= 0.01
+            trade["underlying_stop"] = round(effective_stop, 2)
+            trade["stop_loss"] = round(effective_stop, 2)
+            latest_bar = str((tf_frames or {}).get(3, pd.DataFrame())["timestamp"].iloc[-1]) if tf_frames and 3 in tf_frames and not tf_frames[3].empty else ""
+            if changed and latest_bar:
+                trade["underlying_stop_armed_bar"] = latest_bar
+            logger.info(
+                "DYNAMIC T1 SL: option=%s T1_NIFTY=%.2f current_spot=%.2f OI_stop=%.2f source=%s "
+                "effective_SL_NIFTY=%.2f old_SL=%.2f changed=%s",
+                trade["trading_symbol"],
+                underlying_t1,
+                spot_now,
+                dynamic_stop,
+                dynamic_source,
+                effective_stop,
+                old_stop,
+                changed,
+            )
+        except ScannerError as exc:
+            logger.info("Dynamic post-T1 OI stop unavailable: %s", exc)
 
     if t1_hit and not bool(trade.get("t1_notified", False)):
+        trade["t1_hit"] = True
         trade["t1_notified"] = True
         send_email(
             f"NIFTY T1 HIT - {trade['trading_symbol']}",
             (
-                f"<p>T1 reached; trade remains active for T2.</p>"
+                f"<p>NIFTY T1 reached. Trade remains active toward T2.</p>"
                 f"<p>Option: {html.escape(str(trade['trading_symbol']))}<br>"
-                f"Entry: ₹{entry:.2f}<br>"
-                f"Current: ₹{ltp:.2f}<br>"
-                f"New protective SL: ₹{safe_float(trade.get('stop_loss')):.2f}</p>"
+                f"Entry option LTP: ₹{entry:.2f}<br>"
+                f"Current option LTP: ₹{ltp:.2f}<br>"
+                f"NIFTY T1: {underlying_t1:.2f}<br>"
+                f"Dynamic OI SL: {safe_float(trade.get('underlying_stop')):.2f}</p>"
             ),
         )
-
     active_direction = str(trade.get("direction", "")).upper()
     last_opposite = int(trade.get("reversal_confirmations", 0) or 0)
 
@@ -4825,13 +4909,13 @@ def monitor_active_trade(
     save_state(state)
 
     logger.info(
-        "ACTIVE TRADE: %s LTP=%.2f T1=%.2f T2=%.2f SL=%.2f "
+        "ACTIVE TRADE: %s option_LTP=%.2f NIFTY_T1=%.2f NIFTY_T2=%.2f NIFTY_SL=%.2f "
         "market=%s reversal=%d/%d",
         trade["trading_symbol"],
         ltp,
-        target1,
-        target2,
-        stop,
+        safe_float(trade.get("underlying_target_1"), float("nan")),
+        safe_float(trade.get("underlying_target_2"), float("nan")),
+        safe_float(trade.get("underlying_stop"), float("nan")),
         structure.direction,
         last_opposite,
         REVERSAL_CONFIRMATIONS_REQUIRED,
@@ -4902,117 +4986,83 @@ def _active_trade_intrabar_exit(
     underlying_1m: Optional[pd.DataFrame] = None,
     underlying_3m: Optional[pd.DataFrame] = None,
 ) -> tuple[Optional[str], Optional[float], str]:
-    """Return (outcome, exit_reference, reason) from post-entry 1m OHLC.
+    """Use NIFTY price levels—not option premium forecasts—for T1/T2/SL."""
+    underlying = underlying_1m
+    if underlying is None or underlying.empty:
+        return None, None, "NO_UNDERLYING_1M_DATA"
 
-    Two protections are important here:
-
-    1. Only candles after the actual option entry are eligible. A 1m candle can
-       contain movement that occurred before the trade was opened.
-    2. A structural stop on the option is confirmed by the NIFTY index. This
-       prevents a later trailing option stop from being compared with an old
-       option candle and prevents option-only IV/theta noise from overriding a
-       still-valid NIFTY trend.
-
-    For a single OHLC bar that touches both a protective stop and a target, the
-    stop is treated as first for conservative, non-look-ahead accounting.
-    """
-    if df_1m is None or df_1m.empty:
-        return None, None, "NO_1M_DATA"
-
-    work = df_1m.copy().sort_values("timestamp")
+    work = underlying.copy().sort_values("timestamp")
     work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
-    for column in ("high", "low"):
+    for column in ("high", "low", "close"):
         work[column] = pd.to_numeric(work[column], errors="coerce")
     work = work.dropna(subset=["timestamp", "high", "low"])
     if work.empty:
-        return None, None, "INVALID_1M_DATA"
+        return None, None, "INVALID_UNDERLYING_1M_DATA"
 
-    stop = safe_float(trade.get("stop_loss"), float("nan"))
-    target1 = safe_float(trade.get("target_1"), float("nan"))
-    target2 = safe_float(trade.get("target_2"), float("nan"))
+    t1 = safe_float(trade.get("underlying_target_1"), float("nan"))
+    t2 = safe_float(trade.get("underlying_target_2"), float("nan"))
+    stop = safe_float(trade.get("underlying_stop"), float("nan"))
     direction = str(trade.get("direction", "")).upper()
-    underlying_stop = safe_float(trade.get("underlying_stop"), float("nan"))
+    t1_already_hit = bool(trade.get("t1_hit", False))
 
-    underlying = None
-    if underlying_1m is not None and not underlying_1m.empty:
-        underlying = underlying_1m.copy().sort_values("timestamp")
-        underlying["timestamp"] = pd.to_datetime(
-            underlying["timestamp"], utc=True, errors="coerce"
-        )
-        for column in ("high", "low"):
-            underlying[column] = pd.to_numeric(underlying[column], errors="coerce")
-        underlying = underlying.dropna(subset=["timestamp", "high", "low"])
+    if underlying_3m is not None and not underlying_3m.empty:
+        u3 = underlying_3m.copy().sort_values("timestamp")
+        u3["timestamp"] = pd.to_datetime(u3["timestamp"], utc=True, errors="coerce")
+        u3["close"] = pd.to_numeric(u3["close"], errors="coerce")
+        u3 = u3.dropna(subset=["timestamp", "close"])
+    else:
+        u3 = pd.DataFrame()
 
     for _, bar in work.tail(max(ACTIVE_TRADE_INTRABAR_LOOKBACK, 1)).iterrows():
-        low = float(bar["low"])
         high = float(bar["high"])
-        ts_value = pd.Timestamp(bar["timestamp"])
-        ts = ts_value.isoformat()
+        low = float(bar["low"])
+        ts = pd.Timestamp(bar["timestamp"]).isoformat()
 
-        # Match the same underlying 1m candle. Exact timestamp matching is
-        # preferable to nearest-neighbour matching because the stop is a
-        # structural confirmation, not an approximate quote proxy.
-        # Structural confirmation is based on completed 3m closes, not a single
-        # 1m wick. This aligns the stop with the market structure and prevents
-        # option IV/noise or a transient index spike from closing the trade.
-        underlying_breach = False
-        underlying_close = float("nan")
-        underlying_3m_ts = ""
-        if underlying_3m is not None and not underlying_3m.empty and math.isfinite(underlying_stop):
-            u3 = underlying_3m.copy().sort_values("timestamp")
-            u3["timestamp"] = pd.to_datetime(u3["timestamp"], utc=True, errors="coerce")
-            u3["close"] = pd.to_numeric(u3["close"], errors="coerce")
-            u3 = u3.dropna(subset=["timestamp", "close"])
-            if not u3.empty:
-                required = max(STRUCTURAL_STOP_CONFIRM_BARS, 1)
-                recent = u3.tail(required)
-                armed_raw = str(trade.get("underlying_stop_armed_bar") or "").strip()
-                armed_ts = None
-                if armed_raw:
-                    try:
-                        armed_ts = pd.Timestamp(armed_raw)
-                        if armed_ts.tzinfo is None:
-                            armed_ts = armed_ts.tz_localize("UTC")
-                        else:
-                            armed_ts = armed_ts.tz_convert("UTC")
-                    except Exception:
-                        armed_ts = None
-                if armed_ts is not None:
+        stop_confirmed = True
+        stop_reference = ""
+        if ACTIVE_TRADE_REQUIRE_UNDERLYING_CONFIRMATION and math.isfinite(stop) and not u3.empty:
+            required = max(STRUCTURAL_STOP_CONFIRM_BARS, 1)
+            recent = u3.tail(required)
+            armed_raw = str(trade.get("underlying_stop_armed_bar") or "").strip()
+            if armed_raw:
+                try:
+                    armed_ts = pd.Timestamp(armed_raw)
+                    if armed_ts.tzinfo is None:
+                        armed_ts = armed_ts.tz_localize("UTC")
+                    else:
+                        armed_ts = armed_ts.tz_convert("UTC")
                     recent = recent[recent["timestamp"] > armed_ts]
-                if len(recent) >= required:
-                    closes = recent["close"].to_numpy(dtype=float)
-                    underlying_breach = (
-                        bool(np.all(closes <= underlying_stop)) if direction == "BULLISH"
-                        else bool(np.all(closes >= underlying_stop))
-                    )
-                    if underlying_breach:
-                        underlying_close = float(closes[-1])
-                        underlying_3m_ts = pd.Timestamp(recent["timestamp"].iloc[-1]).isoformat()
-
-        if math.isfinite(stop) and low <= stop:
-            if ACTIVE_TRADE_REQUIRE_UNDERLYING_CONFIRMATION:
-                if underlying_breach:
-                    return (
-                        "STOP_LOSS",
-                        stop,
-                        f"OPTION_1M_LOW={low:.2f}@{ts}; "
-                        f"NIFTY_3M_CLOSE_BREACH={underlying_close:.2f}@{underlying_3m_ts}; "
-                        f"underlying_stop={underlying_stop:.2f}",
-                    )
-                # Do not let the option alone invalidate the trade. T1/target
-                # checks below remain valid because they are favourable events.
+                except Exception:
+                    pass
+            if len(recent) < required:
+                stop_confirmed = False
             else:
-                return "STOP_LOSS", stop, f"1M_LOW={low:.2f}@{ts}"
+                closes = recent["close"].to_numpy(dtype=float)
+                stop_confirmed = bool(
+                    np.all(closes >= stop) if direction == "BEARISH" else np.all(closes <= stop)
+                )
+                if stop_confirmed:
+                    stop_reference = f"NIFTY_3M_CLOSE={closes[-1]:.2f}"
 
-        if math.isfinite(target2) and high >= target2:
-            return "TARGET_2", target2, f"1M_HIGH={high:.2f}@{ts}"
-        if math.isfinite(target1) and high >= target1:
-            # T1 is handled as a milestone below; do not fully close here.
-            return "T1_HIT", target1, f"1M_HIGH={high:.2f}@{ts}"
+        if math.isfinite(stop) and stop_confirmed:
+            if direction == "BEARISH" and high >= stop:
+                return "STOP_LOSS", stop, f"NIFTY_1M_HIGH={high:.2f}@{ts};{stop_reference};SL_NIFTY={stop:.2f}"
+            if direction == "BULLISH" and low <= stop:
+                return "STOP_LOSS", stop, f"NIFTY_1M_LOW={low:.2f}@{ts};{stop_reference};SL_NIFTY={stop:.2f}"
 
-    if ACTIVE_TRADE_REQUIRE_UNDERLYING_CONFIRMATION:
-        return None, None, "NO_INTRABAR_EXIT_OR_NIFTY_STRUCTURE_STOP_NOT_BREACHED"
-    return None, None, "NO_INTRABAR_EXIT"
+        if math.isfinite(t2):
+            if direction == "BEARISH" and low <= t2:
+                return "TARGET_2", t2, f"NIFTY_1M_LOW={low:.2f}@{ts};T2_NIFTY={t2:.2f}"
+            if direction == "BULLISH" and high >= t2:
+                return "TARGET_2", t2, f"NIFTY_1M_HIGH={high:.2f}@{ts};T2_NIFTY={t2:.2f}"
+
+        if not t1_already_hit and math.isfinite(t1):
+            if direction == "BEARISH" and low <= t1:
+                return "T1_HIT", t1, f"NIFTY_1M_LOW={low:.2f}@{ts};T1_NIFTY={t1:.2f}"
+            if direction == "BULLISH" and high >= t1:
+                return "T1_HIT", t1, f"NIFTY_1M_HIGH={high:.2f}@{ts};T1_NIFTY={t1:.2f}"
+
+    return None, None, "NO_NIFTY_STRUCTURAL_LEVEL_BREACH"
 
 
 def execute_scan(
@@ -5344,11 +5394,24 @@ def execute_scan(
 
     active_trade = active_trade_from_state(state)
     if active_trade is not None:
-        migrated = migrate_active_trade_targets(active_trade)
+        migrated = migrate_active_trade_to_v23(
+            active_trade,
+            chain=chain,
+            spot=spot,
+            structure=structure,
+            price_session=index_session,
+            change_oi_by_strike=change_oi_by_strike,
+        )
         if migrated:
             state["active_trade"] = active_trade
             save_state(state)
-        monitor_active_trade(state, structure, tf_frames)
+        monitor_active_trade(
+            state,
+            structure,
+            tf_frames,
+            chain=chain,
+            price_session=index_session,
+        )
         return None
 
     # Defensive duplicate guard: the same direction/strike/session signal should
@@ -5544,11 +5607,28 @@ def execute_scan(
             return None
         option_require_momentum = False
 
+    target_u1, target_u2, stop_u, level_meta = determine_structural_trade_levels(
+        chain,
+        spot,
+        structure,
+        index_session,
+        change_oi_by_strike=change_oi_by_strike,
+    )
+    logger.info(
+        "ENTRY PA/OI LEVELS: T1=%.2f(%s) T2=%.2f(%s) SL=%.2f(%s)",
+        target_u1, level_meta.get("t1_source", ""),
+        target_u2, level_meta.get("t2_source", ""),
+        stop_u, level_meta.get("sl_source", ""),
+    )
+
     option = select_directional_option(
         chain=chain,
         direction=structure.direction,
         spot=spot,
         market_phase=structure.market_phase,
+        target_underlying_1=target_u1,
+        target_underlying_2=target_u2,
+        change_oi_by_strike=change_oi_by_strike,
         require_option_momentum=False,
     )
     validate_continuous_option_entry(
@@ -5558,12 +5638,8 @@ def execute_scan(
         market_phase=structure.market_phase,
         spot=spot,
     )
-    target1, target2, stop_loss, underlying_stop, underlying_target1, underlying_target2 = create_dynamic_targets(
-        option=option,
-        structure=structure,
-        spot=spot,
-        tf_frames=tf_frames,
-    )
+    target1, target2, stop_loss = target_u1, target_u2, stop_u
+    underlying_stop, underlying_target1, underlying_target2 = stop_u, target_u1, target_u2
 
     setup_label = (
         "TACTICAL REVERSAL ENTRY"
@@ -5577,8 +5653,7 @@ def execute_scan(
         f"Strike rule: {'ATM-1/ATM-2 CE' if structure.direction == 'BULLISH' else 'ATM+1/ATM+2 PE'}.",
         f"Index spot used for option ATM selection={spot:.2f}; futures LTP={futures_ltp_now:.2f}; futures/index basis={futures_ltp_now - spot:+.2f}.",
         f"Selected option health: spread={option.spread_pct:.2%}, theta burden={option.theta_burden_pct_day:.2%}/day, volume={option.volume:.0f}, OI={option.oi:.0f}, delta={option.delta:.3f}.",
-        f"Dynamic underlying targets: T1={underlying_target1:.2f}, T2={underlying_target2:.2f}, SL={underlying_stop:.2f}.",
-        f"Dynamic option targets: T1=₹{target1:.2f}, T2=₹{target2:.2f}, SL=₹{stop_loss:.2f}.",
+        f"PA/OI structural levels: NIFTY T1={underlying_target1:.2f}, T2={underlying_target2:.2f}, SL={underlying_stop:.2f}; option exit uses live LTP at the structural trigger.",
         "Primary entry alignment: NIFTY price vs VWAP + structural support/resistance + confirming Change-OI.",
         "Futures price/OI, PCR and higher-timeframe Supertrend are confirmation/context only; they do not override a confirmed structural breakout or breakdown.",
     ])
@@ -5923,6 +5998,18 @@ def self_test() -> None:
     assert ce.option_type == "CE" and ce.strike in {74000.0, 74050.0}
     assert pe.option_type == "PE" and pe.strike in {74150.0, 74200.0}
 
+    # V23 strike-selection regression: when both permitted strikes are healthy,
+    # current same-direction option flow is allowed to select ATM+2/ATM-2.
+    flow_selected = select_directional_option(
+        simple_chain, "BEARISH", 74100.0,
+        target_underlying_1=73800.0,
+        change_oi_by_strike={
+            74150.0: {"put_bias": 1, "call_bias": 0},
+            74200.0: {"put_bias": -1, "call_bias": 0},
+        },
+    )
+    assert flow_selected.strike == 74200.0
+
     # V19 regression: neutral intraday snapshot must fall back to strongly
     # directional current-session API Change-OI rather than becoming SIDEWAYS.
     neutral_intraday_levels = dict(bearish_levels)
@@ -5962,39 +6049,45 @@ def self_test() -> None:
     assert oct8_result.entry_confirmed
     assert oct8_result.components["structure_change_oi_source"] == "DAY_CHANGE_API_FALLBACK_NEUTRAL_INTRADAY"
 
-    # V21 regression: target projection must not explode from the quadratic
-    # gamma term.  The capped projection must remain close to the delta-based
-    # estimate even for a large underlying move.
-    target_option = OptionCandidate(
-        instrument_key="TEST_PE_22300", trading_symbol="TESTPE", option_type="PE",
-        strike=22300.0, expiry="2026-10-13", ltp=192.65, oi=5000000.0,
-        prev_oi=4900000.0, volume=1000000.0, bid=192.4, ask=192.9,
-        bid_qty=1000.0, ask_qty=1000.0, delta=-0.60, gamma=0.01,
-        theta=-8.0, iv=20.0, spread_pct=0.0026, theta_burden_pct_day=0.04,
-    )
-    target_frames = {
-        3: pd.DataFrame({
-            "atr": [40.0], "supertrend": [22400.0],
-            "high": [22380.0], "low": [22300.0],
-        }),
-        15: pd.DataFrame({
-            "atr": [55.0], "supertrend": [22450.0],
-            "high": [22460.0], "low": [22300.0],
-        }),
-    }
-    target_structure = type("TargetStructure", (), {
-        "direction": "BEARISH", "support_1": 22200.0, "support_2": 22000.0,
-        "resistance_1": 22500.0, "resistance_2": 22600.0, "vwap": 22450.0,
+    # V23 regression: structural levels come from OI + price action, never ATR/Greek math.
+    v23_chain = []
+    for strike, put_oi, call_oi in [
+        (21900, 9000000, 3000000),
+        (22000, 12000000, 3500000),
+        (22100, 1000000, 5000000),
+        (22200, 5000000, 6000000),
+        (22300, 4000000, 7000000),
+        (22400, 5000000, 9000000),
+        (22500, 4000000, 12000000),
+    ]:
+        v23_chain.append({
+            "strike_price": strike,
+            "expiry": "2026-10-13",
+            "call_options": {"instrument_key": f"CE{strike}", "market_data": {"ltp": 100.0, "oi": call_oi, "prev_oi": call_oi, "volume": 100000, "bid_price": 99.5, "ask_price": 100.5, "bid_qty": 1000, "ask_qty": 1000}, "option_greeks": {"delta": 0.55, "gamma": 0.01, "theta": -2.0, "iv": 20.0}},
+            "put_options": {"instrument_key": f"PE{strike}", "market_data": {"ltp": 100.0, "oi": put_oi, "prev_oi": put_oi, "volume": 100000, "bid_price": 99.5, "ask_price": 100.5, "bid_qty": 1000, "ask_qty": 1000}, "option_greeks": {"delta": -0.55, "gamma": 0.01, "theta": -2.0, "iv": 20.0}},
+        })
+    v23_pa = _synthetic_candles([22300, 22280, 22260, 22240, 22220, 22210, 22220, 22200, 22180, 22160])
+    v23_structure = type("V23Structure", (), {
+        "direction": "BEARISH",
+        "support_1": 22000.0, "support_2": 21900.0,
+        "resistance_1": 22500.0, "resistance_2": 22400.0,
+        "vwap": 22350.0,
     })()
-    t1, t2, sl, _, u1, u2 = create_dynamic_targets(
-        target_option, target_structure, 22316.25, target_frames
+    v23_t1, v23_t2, v23_sl, v23_meta = determine_structural_trade_levels(
+        v23_chain, 22250.0, v23_structure, v23_pa,
+        change_oi_by_strike={k: {"put_bias": 1 if k <= 22000 else 0, "call_bias": -1 if k >= 22400 else 0} for k in [21900, 22000, 22100, 22200, 22300, 22400, 22500]},
     )
-    assert 192.65 < t1 < t2
-    assert t1 < 330.0, (t1, t2)
-    assert t2 < 430.0, (t1, t2)
-    naive_move_t2 = abs(22316.25 - u2)
-    naive_t2 = 192.65 + (0.60 * naive_move_t2) + (0.5 * 0.01 * naive_move_t2 * naive_move_t2)
-    assert t2 < naive_t2
+    assert v23_t1 == 22000.0
+    assert v23_t2 == 21900.0
+    assert v23_t2 < v23_t1 < 22250.0 < v23_sl
+    assert "OI" in v23_meta["t1_source"] and "OI" in v23_meta["t2_source"]
+
+    # V23 dynamic post-T1 stop must use current opposing OI, not the legacy SL.
+    dyn_stop, dyn_source, _ = dynamic_oi_stop_after_t1(
+        v23_chain, 22000.0, "BEARISH", v23_pa, entry_underlying=22250.0,
+    )
+    assert dyn_source == "CURRENT_OI_RESISTANCE"
+    assert dyn_stop == 22200.0
 
     # Strong intraday/day conflict must never authorize a directional Change-OI
     # entry by itself; price can retain only a directional WATCH state.
@@ -6012,30 +6105,47 @@ def self_test() -> None:
     assert conflict_result.market_phase == "BEARISH"
     assert not conflict_result.entry_confirmed
 
-    # V22 regression: a legacy active trade must be migrated exactly once using
-    # its stored entry/underlying levels and the V21 target engine.
+    # V23 regression: a legacy premium-target trade is migrated to structural NIFTY levels once.
     legacy_trade = {
         "status": "ACTIVE",
         "trading_symbol": "NIFTY25OCT22500PE",
         "direction": "BEARISH",
         "entry": 192.65,
         "entry_underlying": 22316.25,
+        "option_type": "PE",
+        "strike": 22350.0,
+        "target_1": 261.76,
+        "target_2": 423.71,
+        "stop_loss": 143.06,
         "underlying_target_1": 22200.0,
         "underlying_target_2": 22000.0,
         "underlying_stop": 22400.0,
         "delta": -0.60,
         "gamma": 0.01,
-        "target_1": 261.76,
-        "target_2": 423.71,
-        "stop_loss": 143.06,
         "t1_hit": False,
+        "target_engine_version": "V21_DELTA_FIRST_GAMMA_CAPPED_10PCT",
     }
-    assert migrate_active_trade_targets(legacy_trade)
+    v23_structure_for_migration = v23_structure
+    assert migrate_active_trade_to_v23(
+        legacy_trade,
+        chain=v23_chain,
+        spot=22250.0,
+        structure=v23_structure_for_migration,
+        price_session=v23_pa,
+        change_oi_by_strike={k: {"put_bias": 0, "call_bias": 0} for k in [21900, 22000, 22100, 22200, 22300, 22400, 22500]},
+    )
     assert legacy_trade["target_engine_version"] == OPTION_TARGET_ENGINE_VERSION
-    assert legacy_trade["target_1"] < 300.0
-    assert legacy_trade["target_2"] < 410.0
+    assert legacy_trade["target_1"] == 22000.0
+    assert legacy_trade["target_2"] == 21900.0
     migrated_values = (legacy_trade["target_1"], legacy_trade["target_2"], legacy_trade["stop_loss"])
-    assert not migrate_active_trade_targets(legacy_trade)
+    assert not migrate_active_trade_to_v23(
+        legacy_trade,
+        chain=v23_chain,
+        spot=22250.0,
+        structure=v23_structure_for_migration,
+        price_session=v23_pa,
+        change_oi_by_strike={k: {"put_bias": 0, "call_bias": 0} for k in [21900, 22000, 22100, 22200, 22300, 22400, 22500]},
+    )
     assert migrated_values == (legacy_trade["target_1"], legacy_trade["target_2"], legacy_trade["stop_loss"])
 
     logger.info("SELF-TEST PASSED.")
@@ -6108,12 +6218,12 @@ def main() -> int:
         )
 
         logger.info(
-            "NEW SIGNAL LOCKED: %s | entry=%.2f T1=%.2f T2=%.2f SL=%.2f",
+            "NEW SIGNAL LOCKED: %s | entry_option=%.2f NIFTY_T1=%.2f NIFTY_T2=%.2f NIFTY_SL=%.2f",
             signal.trading_symbol,
             signal.entry,
-            signal.target_1,
-            signal.target_2,
-            signal.stop_loss,
+            signal.underlying_target_1,
+            signal.underlying_target_2,
+            signal.underlying_stop,
         )
         return 0
 
