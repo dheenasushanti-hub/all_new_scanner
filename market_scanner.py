@@ -159,7 +159,7 @@ REVERSAL_STRIKE_PREFERRED_DISTANCE_STEPS = float(os.getenv("REVERSAL_STRIKE_PREF
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-10-08-STRUCTURE-V19-FINAL"
+SCANNER_VERSION = "2026-10-08-STRUCTURE-V20-FINAL"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -268,6 +268,7 @@ STRUCTURE_BREAK_BUFFER_ATR = float(os.getenv("STRUCTURE_BREAK_BUFFER_ATR", "0.08
 STRUCTURE_HOLD_BARS = int(os.getenv("STRUCTURE_HOLD_BARS", "2"))
 STRUCTURE_CHANGE_OI_CONFIRM = float(os.getenv("STRUCTURE_CHANGE_OI_CONFIRM", "0.08"))
 STRUCTURE_CHANGE_OI_STRONG = float(os.getenv("STRUCTURE_CHANGE_OI_STRONG", "0.20"))
+STRUCTURE_CHANGE_OI_CONFLICT = float(os.getenv("STRUCTURE_CHANGE_OI_CONFLICT", "0.35"))
 STRUCTURE_VWAP_RECLAIM_BUFFER_ATR = float(os.getenv("STRUCTURE_VWAP_RECLAIM_BUFFER_ATR", "0.05"))
 STRUCTURE_MIN_LEVEL_STRENGTH = float(os.getenv("STRUCTURE_MIN_LEVEL_STRENGTH", "0.20"))
 STRUCTURE_ACTIVITY_PRICE_NOISE_PCT = float(os.getenv("STRUCTURE_ACTIVITY_PRICE_NOISE_PCT", "0.002"))
@@ -2975,6 +2976,53 @@ def overall_market_movement(
 # MARKET STRUCTURE ENGINE
 # =============================================================================
 
+def resolve_change_oi_flow(
+    intraday_score: float,
+    intraday_bias: int,
+    day_score: float,
+    day_bias: int,
+    flow_mode: str,
+) -> tuple[float, int, str, bool]:
+    """Resolve the Change-OI signal without allowing neutral/contradictory snapshots to mislead direction.
+
+    Priority:
+      1. Warm/strong scan-to-scan intraday flow is primary.
+      2. If the intraday snapshot is neutral/insufficient, the current-session
+         Upstox aggregate Change-OI is the fallback.
+      3. A strong contradiction is reported as a conflict and supplies no
+         directional Change-OI confirmation; price/VWAP may still retain a
+         directional WATCH state, but the conflicting flow cannot authorize entry.
+    """
+    intra = float(intraday_score) if math.isfinite(float(intraday_score)) else 0.0
+    day = float(day_score) if math.isfinite(float(day_score)) else 0.0
+    intra_abs = abs(intra)
+    day_abs = abs(day)
+    intra_directional = intra_abs >= STRUCTURE_CHANGE_OI_CONFIRM
+    day_directional = day_abs >= STRUCTURE_CHANGE_OI_STRONG
+
+    if str(flow_mode).upper() == "INTRADAY_SNAPSHOT" and intra_directional:
+        if day_directional and (intra * day) < 0 and intra_abs >= STRUCTURE_CHANGE_OI_CONFLICT and day_abs >= STRUCTURE_CHANGE_OI_CONFLICT:
+            # Current intraday flow is the most responsive signal, but a strong
+            # cumulative contradiction is important enough to block confirmation.
+            return 0.0, 0, "INTRADAY_DAY_CONFLICT", True
+        bias = 1 if intra >= STRUCTURE_CHANGE_OI_CONFIRM else -1
+        return intra, bias, "INTRADAY_PRIMARY", False
+
+    # Neutral/empty intraday snapshot: fall back to the aggregate current-session
+    # Change-OI endpoint rather than turning a clearly bearish/bullish session into
+    # SIDEWAYS merely because the latest scan's local changes cancelled out.
+    if day_directional:
+        bias = 1 if day >= STRUCTURE_CHANGE_OI_STRONG else -1
+        source = "DAY_CHANGE_API_FALLBACK_NEUTRAL_INTRADAY" if str(flow_mode).upper() == "INTRADAY_SNAPSHOT" else "DAY_CHANGE_API"
+        return day, bias, source, False
+
+    if intra_abs > 0.0:
+        bias = 1 if intra >= STRUCTURE_CHANGE_OI_CONFIRM else -1 if intra <= -STRUCTURE_CHANGE_OI_CONFIRM else 0
+        return intra, bias, "INTRADAY_WEAK", False
+
+    return 0.0, 0, "NO_DIRECTIONAL_CHANGE_OI", False
+
+
 def build_market_structure(
     spot: float,
     futures_3m: pd.DataFrame,
@@ -3082,21 +3130,20 @@ def build_market_structure(
     below_support_bars = int(np.sum(closes < support_1 - break_buffer)) if len(closes) else 0
     above_resistance_bars = int(np.sum(closes > resistance_1 + break_buffer)) if len(closes) else 0
 
-    # The scan-to-scan intraday Change-OI flow is primary once the snapshot is
-    # warm. The Upstox day Change-OI value is only a first-scan fallback.
     flow_mode = str(chain_levels.get("flow_mode", "DAY_CHANGE_API_WARMUP")).upper()
-    if flow_mode == "INTRADAY_SNAPSHOT":
-        bearish_flow_ok = change_flow_score <= -STRUCTURE_CHANGE_OI_CONFIRM
-        bullish_flow_ok = change_flow_score >= STRUCTURE_CHANGE_OI_CONFIRM
-    else:
-        bearish_flow_ok = bool(
-            change_flow_score <= -STRUCTURE_CHANGE_OI_CONFIRM
-            or change_oi_score <= -STRUCTURE_CHANGE_OI_STRONG
-        )
-        bullish_flow_ok = bool(
-            change_flow_score >= STRUCTURE_CHANGE_OI_CONFIRM
-            or change_oi_score >= STRUCTURE_CHANGE_OI_STRONG
-        )
+    intraday_flow_score = change_flow_score
+    intraday_flow_bias = change_flow_bias
+    effective_change_flow, effective_change_bias, effective_change_source, change_flow_conflict = resolve_change_oi_flow(
+        intraday_score=intraday_flow_score,
+        intraday_bias=intraday_flow_bias,
+        day_score=change_oi_score,
+        day_bias=change_oi_bias,
+        flow_mode=flow_mode,
+    )
+    change_flow_score = float(effective_change_flow)
+    change_flow_bias = int(effective_change_bias)
+    bearish_flow_ok = bool(change_flow_score <= -STRUCTURE_CHANGE_OI_CONFIRM and not change_flow_conflict)
+    bullish_flow_ok = bool(change_flow_score >= STRUCTURE_CHANGE_OI_CONFIRM and not change_flow_conflict)
 
     price_info = price_action_regime_snapshot(primary_session, vwap, atr3)
     session_atr = safe_float(price_info.get("session_move_atr"), 0.0)
@@ -3121,6 +3168,8 @@ def build_market_structure(
         or (price_structure == "HH_HL" and up_ratio >= 0.45)
     )
 
+    bearish_environment = bool(below_vwap and bearish_movement)
+    bullish_environment = bool(above_vwap and bullish_movement)
     bearish_base = bool(below_vwap and bearish_flow_ok)
     bullish_base = bool(above_vwap and bullish_flow_ok)
 
@@ -3183,85 +3232,99 @@ def build_market_structure(
     )
 
     if continuous_bearish and continuous_bullish:
-        # Impossible under a valid VWAP-side split, but fail closed if a bad feed
-        # reports both sides simultaneously.
+        # Valid VWAP-side logic should make this impossible. If a malformed feed
+        # creates both states, refuse a trade and retain only the Change-OI side.
         if change_flow_score < 0:
             continuous_bullish = False
-        else:
+        elif change_flow_score > 0:
             continuous_bearish = False
+        else:
+            continuous_bearish = continuous_bullish = False
 
     if continuous_bearish:
         direction = "BEARISH"
         market_phase = "CONTINUOUS_BEARISH"
         entry_confirmed = True
         confirmation_state = "STRUCTURAL_CONTINUATION"
-        interpretation = (
-            "CONTINUOUS BEARISH — SUPPORT BROKEN + BELOW VWAP + CHANGE-OI CONFIRMED"
-            if fresh_bearish_break
-            else "CONTINUOUS BEARISH — BELOW VWAP + BEARISH CHANGE-OI; SHORT-TERM BOUNCE IS A PULLBACK"
-        )
+        interpretation = "CONTINUOUS BEARISH — BELOW VWAP + SUSTAINED DOWNWARD STRUCTURE + CHANGE-OI CONFIRMED"
         scenario_trigger = (
-            f"NIFTY is below structural support {support_1:.2f}; bearish Change-OI confirms; PE setup confirmed."
-            if fresh_bearish_break
-            else "NIFTY remains below VWAP with persistent bearish price movement and bearish Change-OI; PE setup confirmed even through a normal short-term pullback."
+            f"NIFTY remains below VWAP with bearish Change-OI and sustained bearish price structure; "
+            f"support={support_1:.2f} is a strengthening breakdown trigger, not a prerequisite for the bearish regime."
         )
-        scenario_invalidation = "Invalidate bearish structure only after a sustained VWAP reclaim with opposing Change-OI and bullish price persistence."
+        scenario_invalidation = (
+            f"Invalidate bearish structure on sustained VWAP reclaim with opposing Change-OI and/or decisive HH/HL transition. "
+            f"A temporary 3m bounce alone does not invalidate the regime."
+        )
     elif continuous_bullish:
         direction = "BULLISH"
         market_phase = "CONTINUOUS_BULLISH"
         entry_confirmed = True
         confirmation_state = "STRUCTURAL_CONTINUATION"
-        interpretation = (
-            "CONTINUOUS BULLISH — RESISTANCE BROKEN + ABOVE VWAP + CHANGE-OI CONFIRMED"
-            if fresh_bullish_break
-            else "CONTINUOUS BULLISH — ABOVE VWAP + BULLISH CHANGE-OI; SHORT-TERM PULLBACK IS CONTEXT"
-        )
+        interpretation = "CONTINUOUS BULLISH — ABOVE VWAP + SUSTAINED UPWARD STRUCTURE + CHANGE-OI CONFIRMED"
         scenario_trigger = (
-            f"NIFTY is above structural resistance {resistance_1:.2f}; bullish Change-OI confirms; CE setup confirmed."
-            if fresh_bullish_break
-            else "NIFTY remains above VWAP with persistent bullish price movement and bullish Change-OI; CE setup confirmed even through a normal short-term pullback."
+            f"NIFTY remains above VWAP with bullish Change-OI and sustained bullish price structure; "
+            f"resistance={resistance_1:.2f} is a strengthening breakout trigger, not a prerequisite for the bullish regime."
         )
-        scenario_invalidation = "Invalidate bullish structure only after a sustained VWAP loss with opposing Change-OI and bearish price persistence."
-    elif fresh_bearish_break:
+        scenario_invalidation = (
+            f"Invalidate bullish structure on sustained VWAP loss with opposing Change-OI and/or decisive LH/LL transition. "
+            f"A temporary 3m dip alone does not invalidate the regime."
+        )
+    elif below_vwap and change_flow_conflict:
         direction = "BEARISH"
-        market_phase = "BEARISH_BREAKDOWN"
+        market_phase = "BEARISH"
         entry_confirmed = False
-        confirmation_state = "STRUCTURAL_BREAK"
-        interpretation = "BEARISH BREAKDOWN — SUPPORT BROKEN, WAITING FOR PERSISTENCE"
-        scenario_trigger = f"Support {support_1:.2f} has broken with bearish Change-OI; require structural persistence."
-        scenario_invalidation = f"Breakdown fails if NIFTY reclaims {support_1:.2f} and VWAP."
-    elif fresh_bullish_break:
+        confirmation_state = "FLOW_WAIT"
+        interpretation = "BEARISH — BELOW VWAP / BEARISH PRICE ENVIRONMENT, CHANGE-OI CONFLICT"
+        scenario_trigger = f"Maintain bearish watch; wait for non-conflicting bearish Change-OI before continuous confirmation. Support={support_1:.2f}."
+        scenario_invalidation = "Bearish bias weakens on sustained VWAP reclaim and bullish price structure."
+    elif above_vwap and change_flow_conflict:
         direction = "BULLISH"
-        market_phase = "BULLISH_BREAKOUT"
+        market_phase = "BULLISH"
         entry_confirmed = False
-        confirmation_state = "STRUCTURAL_BREAK"
-        interpretation = "BULLISH BREAKOUT — RESISTANCE BROKEN, WAITING FOR PERSISTENCE"
-        scenario_trigger = f"Resistance {resistance_1:.2f} has broken with bullish Change-OI; require structural persistence."
-        scenario_invalidation = f"Breakout fails if NIFTY falls back below {resistance_1:.2f} and VWAP."
-    elif bearish_base:
+        confirmation_state = "FLOW_WAIT"
+        interpretation = "BULLISH — ABOVE VWAP / BULLISH PRICE ENVIRONMENT, CHANGE-OI CONFLICT"
+        scenario_trigger = f"Maintain bullish watch; wait for non-conflicting bullish Change-OI before continuous confirmation. Resistance={resistance_1:.2f}."
+        scenario_invalidation = "Bullish bias weakens on sustained VWAP loss and bearish price structure."
+    elif below_vwap and bearish_flow_ok:
         direction = "BEARISH"
         market_phase = "BEARISH"
         entry_confirmed = False
         confirmation_state = "STRUCTURAL_WATCH"
         interpretation = "BEARISH — BELOW VWAP + BEARISH CHANGE-OI, CONTINUATION NOT YET ESTABLISHED"
-        scenario_trigger = f"Maintain bearish bias; continuation strengthens as NIFTY sustains lower movement and/or breaks support {support_1:.2f}."
-        scenario_invalidation = "Bearish bias weakens on a sustained VWAP reclaim with opposing Change-OI."
-    elif bullish_base:
+        scenario_trigger = f"Maintain bearish bias; continuous bearish state requires sustained downward price structure and/or a confirmed support breakdown. Support={support_1:.2f}."
+        scenario_invalidation = "Bearish bias weakens on sustained VWAP reclaim with opposing price structure and Change-OI."
+    elif above_vwap and bullish_flow_ok:
         direction = "BULLISH"
         market_phase = "BULLISH"
         entry_confirmed = False
         confirmation_state = "STRUCTURAL_WATCH"
         interpretation = "BULLISH — ABOVE VWAP + BULLISH CHANGE-OI, CONTINUATION NOT YET ESTABLISHED"
-        scenario_trigger = f"Maintain bullish bias; continuation strengthens as NIFTY sustains higher movement and/or breaks resistance {resistance_1:.2f}."
-        scenario_invalidation = "Bullish bias weakens on a sustained VWAP loss with opposing Change-OI."
+        scenario_trigger = f"Maintain bullish bias; continuous bullish state requires sustained upward price structure and/or a confirmed resistance breakout. Resistance={resistance_1:.2f}."
+        scenario_invalidation = "Bullish bias weakens on sustained VWAP loss with opposing price structure and Change-OI."
+    elif bearish_environment:
+        direction = "BEARISH"
+        market_phase = "BEARISH"
+        entry_confirmed = False
+        confirmation_state = "FLOW_WAIT"
+        interpretation = "BEARISH — PRICE/VWAP STRUCTURE DOWN, CHANGE-OI NOT CONFIRMING"
+        scenario_trigger = f"Maintain bearish price watch; wait for bearish Change-OI confirmation. Support={support_1:.2f}."
+        scenario_invalidation = "Bearish bias weakens on sustained VWAP reclaim and bullish price structure."
+    elif bullish_environment:
+        direction = "BULLISH"
+        market_phase = "BULLISH"
+        entry_confirmed = False
+        confirmation_state = "FLOW_WAIT"
+        interpretation = "BULLISH — PRICE/VWAP STRUCTURE UP, CHANGE-OI NOT CONFIRMING"
+        scenario_trigger = f"Maintain bullish price watch; wait for bullish Change-OI confirmation. Resistance={resistance_1:.2f}."
+        scenario_invalidation = "Bullish bias weakens on sustained VWAP loss and bearish price structure."
     else:
         direction = "NEUTRAL"
         market_phase = "SIDEWAYS"
         entry_confirmed = False
         confirmation_state = "NO_TRADE"
         interpretation = "SIDEWAYS / MIXED — NO STRUCTURAL DIRECTION CONFIRMED"
-        scenario_trigger = f"Wait for VWAP-side alignment plus Change-OI and directional price persistence; structural levels support={support_1:.2f} resistance={resistance_1:.2f}."
-        scenario_invalidation = "No directional entry while VWAP/Change-OI/price structure remain mixed."
+        scenario_trigger = f"Wait for VWAP-side alignment plus sustained price structure and Change-OI; support={support_1:.2f} resistance={resistance_1:.2f}."
+        scenario_invalidation = "No directional entry while VWAP/price structure/Change-OI remain mixed."
 
     pcr = safe_float(pcr_value, safe_float(chain_levels.get("pcr"), float("nan")))
     pcr_bias = 1 if math.isfinite(pcr) and pcr >= 1.10 else -1 if math.isfinite(pcr) and pcr <= 0.90 else 0
@@ -3297,7 +3360,7 @@ def build_market_structure(
         f"PRIMARY STRUCTURE: direction={direction}; phase={market_phase}; NIFTY={current_close:.2f}; VWAP={vwap:.2f}; distance={vwap_distance_atr:.2f}ATR.",
         f"STRUCTURAL LEVELS: support={support_1:.2f}/{support_2:.2f}; resistance={resistance_1:.2f}/{resistance_2:.2f}; break_buffer={break_buffer:.2f}; hold_bars={hold_bars}.",
         f"BREAK TEST: below_support_bars={below_support_bars}; above_resistance_bars={above_resistance_bars}; breakdown={fresh_bearish_break}; breakout={fresh_bullish_break}.",
-        f"CHANGE-OI PRIMARY: intraday_flow={change_flow_score:+.3f}; bias={change_flow_bias:+d}; API_day_change={change_oi_score:+.3f}; mode={chain_levels.get('flow_mode','UNKNOWN')}.",
+        f"CHANGE-OI PRIMARY: effective={change_flow_score:+.3f}; bias={change_flow_bias:+d}; source={effective_change_source}; raw_intraday={intraday_flow_score:+.3f}; API_day_change={change_oi_score:+.3f}; mode={flow_mode}; conflict={change_flow_conflict}.",
         f"PRICE ACTION CONTEXT: structure={price_structure}; session={session_atr:+.2f}ATR; recent7={recent7_atr:+.2f}ATR; recent12={recent12_atr:+.2f}ATR; recent3={recent3_atr:+.2f}ATR; down_ratio={down_ratio:.2f}; up_ratio={up_ratio:.2f}; efficiency={efficiency:.2f}; recent 3-bar movement is context only.",
         f"FUTURES CONFIRMATION: regime={futures_regime}; bias={futures_bias:+d}; strength={futures_strength:.3f}.",
         f"PCR CONFIRMATION: value={pcr:.3f}; bias={pcr_bias:+d}; 15m_rate={pcr_rate_15m:+.3f}.",
@@ -3305,6 +3368,11 @@ def build_market_structure(
         f"SECONDARY CONFIRMATIONS: {confirmation_count}/5 align with {direction}; not used as primary directional voters.",
     ]
 
+    logger.info(
+        "CHANGE-OI RESOLUTION: effective=%+.3f bias=%+d source=%s raw_intraday=%+.3f api_day=%+.3f conflict=%s",
+        change_flow_score, change_flow_bias, effective_change_source,
+        intraday_flow_score, change_oi_score, change_flow_conflict,
+    )
     logger.info(
         "STRUCTURE ENGINE: phase=%s direction=%s price=%.2f VWAP=%.2f support=%.2f resistance=%.2f "
         "ChangeOI=%+.3f flow=%+.3f below_support=%d above_resistance=%d breakout=%s breakdown=%s Entry=%s",
@@ -3315,6 +3383,10 @@ def build_market_structure(
 
     components = {
         "structure_change_oi": float(change_flow_score),
+        "structure_change_oi_intraday_raw": float(intraday_flow_score),
+        "structure_change_oi_day_raw": float(change_oi_score),
+        "structure_change_oi_conflict": 1.0 if change_flow_conflict else 0.0,
+        "structure_change_oi_source": effective_change_source,
         "structure_vwap": float(1 if above_vwap else -1 if below_vwap else 0),
         "structure_price_break": float(1 if fresh_bullish_break else -1 if fresh_bearish_break else 0),
         "structure_support": float(support_1),
@@ -5525,10 +5597,10 @@ def self_test() -> None:
         "support_change_strength": 0.60, "resistance_change_strength": 0.70,
         "pcr": 0.70,
     }
-    # Bearish bias can be present without a continuous bearish entry when the
-    # market has not established a sustained downward regime and/or has moved
-    # into a materially strong countertrend recovery.
-    watch_session = _synthetic_candles([120, 122, 124, 127, 126, 125, 122, 121])
+    # Range-bound price action must remain neutral even when derivatives carry a
+    # bearish background signal; derivatives cannot manufacture direction from
+    # an otherwise sideways NIFTY price structure.
+    watch_session = _synthetic_candles([120.0, 121.0, 122.0, 121.0, 122.0, 121.0, 122.0, 121.0])
     watch_levels = dict(bearish_levels)
     watch_levels.update({"support_1": 100.0, "support_2": 95.0, "resistance_1": 130.0, "resistance_2": 135.0})
     watch = build_market_structure(
@@ -5714,6 +5786,61 @@ def self_test() -> None:
     pe = select_directional_option(simple_chain, "BEARISH", 74100.0)
     assert ce.option_type == "CE" and ce.strike in {74000.0, 74050.0}
     assert pe.option_type == "PE" and pe.strike in {74150.0, 74200.0}
+
+    # V19 regression: neutral intraday snapshot must fall back to strongly
+    # directional current-session API Change-OI rather than becoming SIDEWAYS.
+    neutral_intraday_levels = dict(bearish_levels)
+    neutral_intraday_levels.update({
+        "flow_mode": "INTRADAY_SNAPSHOT",
+        "change_flow_score": 0.0,
+        "change_flow_bias": 0,
+    })
+    neutral_intraday_result = build_market_structure(
+        102.0, fut_bear, fut_bear, frames_bear, tf_bear, neutral_intraday_levels,
+        -1, -0.10, -1, -0.65, price_session=_synthetic_candles([120, 118, 116, 114, 112, 110, 108, 107, 106, 105]),
+    )
+    assert neutral_intraday_result.direction == "BEARISH"
+    assert neutral_intraday_result.market_phase == "CONTINUOUS_BEARISH"
+    assert neutral_intraday_result.entry_confirmed
+    assert neutral_intraday_result.components["structure_change_oi"] < -0.20
+
+    # Exact Oct-8 V19 regression: intraday flow snapshot is neutral but the
+    # current-session API Change-OI is strongly bearish. The scanner must fall
+    # back to the API reading and must not call this market SIDEWAYS when price
+    # is materially below VWAP with sustained bearish movement.
+    oct8_levels = dict(bearish_levels)
+    oct8_levels.update({
+        "support_1": 22000.0, "support_2": 21950.0,
+        "resistance_1": 22600.0, "resistance_2": 22650.0,
+        "flow_mode": "INTRADAY_SNAPSHOT",
+        "change_flow_score": 0.0,
+        "change_flow_bias": 0,
+    })
+    oct8_result = build_market_structure(
+        102.0, fut_bear, fut_bear, frames_bear, tf_bear, oct8_levels,
+        -1, -0.10, -1, -0.65,
+        price_session=_synthetic_candles([120, 118, 116, 114, 112, 110, 108, 107, 106, 105]),
+    )
+    assert oct8_result.direction == "BEARISH"
+    assert oct8_result.market_phase == "CONTINUOUS_BEARISH"
+    assert oct8_result.entry_confirmed
+    assert oct8_result.components["structure_change_oi_source"] == "DAY_CHANGE_API_FALLBACK_NEUTRAL_INTRADAY"
+
+    # Strong intraday/day conflict must never authorize a directional Change-OI
+    # entry by itself; price can retain only a directional WATCH state.
+    conflict_levels = dict(bearish_levels)
+    conflict_levels.update({
+        "flow_mode": "INTRADAY_SNAPSHOT",
+        "change_flow_score": 0.90,
+        "change_flow_bias": 1,
+    })
+    conflict_result = build_market_structure(
+        102.0, fut_bear, fut_bear, frames_bear, tf_bear, conflict_levels,
+        -1, -0.10, -1, -0.65, price_session=_synthetic_candles([120, 118, 116, 114, 112, 110, 108, 107, 106, 105]),
+    )
+    assert conflict_result.direction == "BEARISH"
+    assert conflict_result.market_phase == "BEARISH"
+    assert not conflict_result.entry_confirmed
 
     logger.info("SELF-TEST PASSED.")
 
