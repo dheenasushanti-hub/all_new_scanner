@@ -4091,9 +4091,13 @@ def migrate_active_trade_targets(
 
     logger.info(
         "TARGET ENGINE MIGRATED: %s | old T1=%.2f T2=%.2f SL=%.2f -> "
-        "V21 T1=%.2f T2=%.2f SL=%.2f | entry_u=%.2f T1u=%.2f T2u=%.2f SLu=%.2f",
+        "V21 T1=%.2f T2=%.2f SL=%.2f | entry=%.2f entry_u=%.2f "
+        "T1u=%.2f T2u=%.2f SLu=%.2f delta=%.4f gamma=%.6f risk=%.2f | "
+        "engine=%s",
         trade.get("trading_symbol", ""), old[0], old[1], old[2],
-        target1, target2, stop_loss, entry_underlying, underlying_t1, underlying_t2, underlying_stop,
+        target1, target2, stop_loss, entry, entry_underlying,
+        underlying_t1, underlying_t2, underlying_stop, delta, gamma,
+        risk, OPTION_TARGET_ENGINE_VERSION,
     )
     return True
 
