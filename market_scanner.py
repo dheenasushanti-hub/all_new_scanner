@@ -159,7 +159,7 @@ REVERSAL_STRIKE_PREFERRED_DISTANCE_STEPS = float(os.getenv("REVERSAL_STRIKE_PREF
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-10-08-STRUCTURE-V20-FINAL"
+SCANNER_VERSION = "2026-10-08-STRUCTURE-V21-FINAL"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -373,6 +373,13 @@ MIN_T1_RISK_REWARD = 1.10
 MIN_T2_RISK_REWARD = 1.60
 OPTION_MAX_STOP_PCT = 0.30
 OPTION_MIN_STOP_PCT = 0.15
+# Option targets use the underlying structural targets, but the option-price
+# projection is deliberately conservative.  The linear delta term is primary;
+# the quadratic gamma term is capped so large underlying moves cannot create
+# unrealistic premium targets.
+OPTION_TARGET_GAMMA_MAX_FRACTION = float(
+    os.getenv("OPTION_TARGET_GAMMA_MAX_FRACTION", "0.10")
+)
 
 # Trade monitoring.
 REVERSAL_CONFIRMATIONS_REQUIRED = 2
@@ -3967,14 +3974,20 @@ def project_option_premium(
     delta: float,
     gamma: float,
 ) -> float:
-    """
-    Second-order local Greek approximation:
-        Δpremium ≈ |delta| * |dS| + 0.5 * |gamma| * dS²
+    """Conservative long-option premium projection for target estimation.
 
-    This is deliberately used only for target/stop estimation, not execution.
+    The first-order delta estimate is the primary component.  Gamma is allowed
+    only as a bounded adjustment (default 10% of the delta contribution). This
+    prevents a large dS² term from exploding T1/T2 while still acknowledging
+    that delta changes as the option moves ITM/OTM. This is a target estimate,
+    not a pricing model or execution guarantee.
     """
     move = abs(float(underlying_move))
-    change = abs(delta) * move + 0.5 * abs(gamma) * move * move
+    first_order = abs(float(delta)) * move
+    raw_gamma = 0.5 * abs(float(gamma)) * move * move
+    gamma_cap = max(0.0, OPTION_TARGET_GAMMA_MAX_FRACTION) * first_order
+    gamma_adjustment = min(raw_gamma, gamma_cap)
+    change = first_order + gamma_adjustment
     return float(max(0.0, entry + change))
 
 
@@ -4044,6 +4057,13 @@ def create_dynamic_targets(
 
     target1 = project_option_premium(option.ltp, move_t1, option.delta, option.gamma)
     target2 = project_option_premium(option.ltp, move_t2, option.delta, option.gamma)
+
+    logger.info(
+        "OPTION TARGET PROJECTION: move1=%.2f move2=%.2f delta=%.3f gamma=%.5f "
+        "gamma_cap=%.0f%% T1=%.2f T2=%.2f",
+        move_t1, move_t2, abs(option.delta), abs(option.gamma),
+        OPTION_TARGET_GAMMA_MAX_FRACTION * 100.0, target1, target2,
+    )
 
     # Correct signed adverse-premium estimate for a LONG option.
     # First order loses premium; gamma partially offsets that loss.
@@ -5825,6 +5845,40 @@ def self_test() -> None:
     assert oct8_result.market_phase == "CONTINUOUS_BEARISH"
     assert oct8_result.entry_confirmed
     assert oct8_result.components["structure_change_oi_source"] == "DAY_CHANGE_API_FALLBACK_NEUTRAL_INTRADAY"
+
+    # V21 regression: target projection must not explode from the quadratic
+    # gamma term.  The capped projection must remain close to the delta-based
+    # estimate even for a large underlying move.
+    target_option = OptionCandidate(
+        instrument_key="TEST_PE_22300", trading_symbol="TESTPE", option_type="PE",
+        strike=22300.0, expiry="2026-10-13", ltp=192.65, oi=5000000.0,
+        prev_oi=4900000.0, volume=1000000.0, bid=192.4, ask=192.9,
+        bid_qty=1000.0, ask_qty=1000.0, delta=-0.60, gamma=0.01,
+        theta=-8.0, iv=20.0, spread_pct=0.0026, theta_burden_pct_day=0.04,
+    )
+    target_frames = {
+        3: pd.DataFrame({
+            "atr": [40.0], "supertrend": [22400.0],
+            "high": [22380.0], "low": [22300.0],
+        }),
+        15: pd.DataFrame({
+            "atr": [55.0], "supertrend": [22450.0],
+            "high": [22460.0], "low": [22300.0],
+        }),
+    }
+    target_structure = type("TargetStructure", (), {
+        "direction": "BEARISH", "support_1": 22200.0, "support_2": 22000.0,
+        "resistance_1": 22500.0, "resistance_2": 22600.0, "vwap": 22450.0,
+    })()
+    t1, t2, sl, _, u1, u2 = create_dynamic_targets(
+        target_option, target_structure, 22316.25, target_frames
+    )
+    assert 192.65 < t1 < t2
+    assert t1 < 330.0, (t1, t2)
+    assert t2 < 430.0, (t1, t2)
+    naive_move_t2 = abs(22316.25 - u2)
+    naive_t2 = 192.65 + (0.60 * naive_move_t2) + (0.5 * 0.01 * naive_move_t2 * naive_move_t2)
+    assert t2 < naive_t2
 
     # Strong intraday/day conflict must never authorize a directional Change-OI
     # entry by itself; price can retain only a directional WATCH state.
