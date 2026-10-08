@@ -7,10 +7,14 @@ What this version fixes:
 - Uses completed/currently-available multi-timeframe NIFTY structure:
   3m, 15m, 30m, 60m, 120m, 180m Supertrend.
 - Uses NIFTY futures price/OI regime as a confirmation and positioning factor.
-- Uses INDEX VWAP level + VWAP slope/position.
+- Uses INDEX VWAP level + VWAP slope/position; when the index has no reliable traded volume,
+  NIFTY futures volume is used only as the VWAP weighting proxy.
 - Uses both option-chain OI concentration and Change-in-OI to derive
   dynamic support/resistance and directional pressure.
 - Separates market-state detection from trade-entry readiness.
+- Correctly treats a rising long PE premium as bearish confirmation (no underlying-sign inversion).
+- Treats ordinary counter-trend 3m candles as pullbacks; only materially opposing impulses veto continuation.
+- Option-premium confirmation is optional and disabled by default; it cannot erase a valid market signal.
 - Detects continuous bullish/bearish states, weakening, sideways, and both reversal directions.
 - Uses strict continuation confirmation plus an adaptive reversal gate so genuine turns are not suppressed by lagging cumulative positioning.
 - Selects Bullish ATM-1/ATM-2 CE or Bearish ATM+1/ATM+2 PE, but ranks
@@ -24,8 +28,8 @@ What this version fixes:
   older v2 intraday candle API is deprecated.
 
 Run:
-    python nifty_scanner.py --self-test
-    python nifty_scanner.py
+    python final_scanner_nifty.py --self-test
+    python final_scanner_nifty.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -159,7 +163,7 @@ REVERSAL_STRIKE_PREFERRED_DISTANCE_STEPS = float(os.getenv("REVERSAL_STRIKE_PREF
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-10-07-REGIME-MATRIX-V13"
+SCANNER_VERSION = "2026-10-08-REGIME-MATRIX-V14.1"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -281,6 +285,14 @@ OPTION_CONFIRMATION_LIVE_MIN_MOVE_ATR = float(
 OPTION_CONFIRMATION_REQUIRE_LATEST_BAR = os.getenv(
     "OPTION_CONFIRMATION_REQUIRE_LATEST_BAR", "1"
 ).strip().lower() not in {"0", "false", "no"}
+
+# Option premium is an execution-quality signal, not a market-direction veto.
+# A bullish underlying long CE and bearish underlying long PE both require the
+# selected option premium itself to be rising; the underlying direction must NOT
+# be multiplied into option-premium sign.
+OPTION_PREMIUM_HARD_GATE = os.getenv("OPTION_PREMIUM_HARD_GATE", "0").strip().lower() not in {"0", "false", "no"}
+CONTINUATION_MAX_OPPOSING_BAR_ATR = float(os.getenv("CONTINUATION_MAX_OPPOSING_BAR_ATR", "0.35"))
+PRICE_PULLBACK_RECENT3_MAX_ATR = float(os.getenv("PRICE_PULLBACK_RECENT3_MAX_ATR", "0.35"))
 
 # Active-trade protection uses 1m OHLC when available so an intrabar stop/target
 # is not silently missed between the normal scanner polls.
@@ -1126,33 +1138,67 @@ def calculate_supertrend(
     return out
 
 
-def calculate_vwap(df: pd.DataFrame) -> pd.Series:
+def calculate_vwap(
+    df: pd.DataFrame,
+    volume_source: Optional[pd.DataFrame] = None,
+) -> pd.Series:
+    """Calculate session VWAP, using futures volume as the index-volume proxy when needed.
+
+    NIFTY index candles are not a directly traded volume series. When their volume
+    is missing/zero, the calculation keeps the NIFTY index price as the numerator
+    price series but uses timestamp-matched NIFTY futures volume as the activity
+    weight. This is a practical index-VWAP proxy without replacing the index with
+    futures price.
+    """
     if df.empty:
         return pd.Series(dtype=float)
 
-    typical = (df["high"] + df["low"] + df["close"]) / 3.0
-    volume = (
-        pd.to_numeric(df["volume"], errors="coerce")
+    work = df.copy()
+    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
+    work = work.sort_values("timestamp")
+    typical = (
+        pd.to_numeric(work["high"], errors="coerce")
+        + pd.to_numeric(work["low"], errors="coerce")
+        + pd.to_numeric(work["close"], errors="coerce")
+    ) / 3.0
+
+    index_volume = (
+        pd.to_numeric(work.get("volume", 0.0), errors="coerce")
         .fillna(0.0)
         .clip(lower=0.0)
     )
+    volume = index_volume
+    volume_mode = "INDEX_VOLUME"
 
-    local_date = (
-        pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        .dt.tz_convert(IST)
-        .dt.date
-    )
+    # For an index-VWAP snapshot, a matched traded derivative volume feed is the
+    # preferred activity weight. This keeps the NIFTY index as the price series
+    # while avoiding treating the non-traded index volume field as true trade size.
+    if volume_source is not None and not volume_source.empty:
+        src = volume_source.copy()
+        src["timestamp"] = pd.to_datetime(src["timestamp"], utc=True, errors="coerce")
+        src["volume"] = pd.to_numeric(src.get("volume", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+        src = src.dropna(subset=["timestamp"]).sort_values("timestamp")
+        if not src.empty and float(src["volume"].sum()) > 0:
+            src_map = src.drop_duplicates("timestamp", keep="last").set_index("timestamp")["volume"]
+            volume = work["timestamp"].map(src_map).fillna(0.0)
+            if float(volume.sum()) > 0:
+                volume_mode = "FUTURES_VOLUME_PROXY"
 
+    local_date = work["timestamp"].dt.tz_convert(IST).dt.date
     cum_vol = volume.groupby(local_date).cumsum()
     cum_pv = (typical * volume).groupby(local_date).cumsum()
-
     vwap = cum_pv / cum_vol.replace(0, np.nan)
 
     if vwap.isna().all():
+        # Last-resort non-volume price average when neither feed supplies usable volume.
         vwap = typical.groupby(local_date, sort=False).transform(
             lambda x: x.expanding().mean()
         )
-    return vwap.ffill()
+        volume_mode = "PRICE_AVERAGE_FALLBACK"
+
+    vwap = vwap.ffill()
+    vwap.attrs["volume_mode"] = volume_mode
+    return vwap
 
 def trend_direction(
     df: pd.DataFrame,
@@ -1502,6 +1548,7 @@ def option_side_data(
     return {
         "instrument_key": block.get("instrument_key"),
         "ltp": safe_float(market.get("ltp")),
+        "close_price": safe_float(market.get("close_price"), safe_float(market.get("ltp"))),
         "oi": safe_float(market.get("oi")),
         "prev_oi": safe_float(market.get("prev_oi")),
         "volume": safe_float(market.get("volume")),
@@ -1521,14 +1568,17 @@ def chain_oi_support_resistance(
     spot: float,
     change_oi_by_strike: Optional[dict[float, dict[str, float]]] = None,
 ) -> dict[str, Any]:
-    """Derive dynamic option-chain walls and predictive OI migration.
+    """Build dynamic support/resistance plus interpreted option OI activity.
 
-    Support = put-OI concentration below spot.
-    Resistance = call-OI concentration above spot.
-
-    The engine also measures how those walls are changing. A strong CE wall
-    that is building while PE support weakens is predictive bearish evidence;
-    the inverse is predictive bullish evidence.
+    Raw positive/negative Change-OI is NOT inherently bullish or bearish.
+    Directional interpretation needs the option premium response as context:
+      * Call premium up + OI up  -> call buying / bullish pressure
+      * Call premium down + OI up -> call writing / bearish pressure
+      * Put premium up + OI up   -> put buying / bearish pressure
+      * Put premium down + OI up -> put writing / bullish pressure
+    The unwind cases are treated as the corresponding opposite-side closing
+    activity. This prevents a large positive put OI figure from being labelled
+    bullish without checking what the put premium is doing.
     """
     rows = chain_rows(chain)
     strikes = sorted(rows)
@@ -1536,21 +1586,75 @@ def chain_oi_support_resistance(
     atm = nearest_strike(spot, strikes)
 
     entries: list[dict[str, float]] = []
+    labels: dict[str, dict[str, Any]] = {}
+
     for strike, row in rows.items():
         ce = option_side_data(row, "CE")
         pe = option_side_data(row, "PE")
         c_oi = max(safe_float(ce["oi"]), 0.0)
         p_oi = max(safe_float(pe["oi"]), 0.0)
+        c_prev_oi = max(safe_float(ce["prev_oi"]), 0.0)
+        p_prev_oi = max(safe_float(pe["prev_oi"]), 0.0)
+        c_close = safe_float(ce.get("close_price"), safe_float(ce["ltp"]))
+        p_close = safe_float(pe.get("close_price"), safe_float(pe["ltp"]))
+        c_price_move = (safe_float(ce["ltp"]) - c_close) / max(abs(c_close), 1.0)
+        p_price_move = (safe_float(pe["ltp"]) - p_close) / max(abs(p_close), 1.0)
         api_change = (change_oi_by_strike or {}).get(float(strike), {})
         c_chg = safe_float(api_change.get("call_change"), safe_float(ce["oi"]) - safe_float(ce["prev_oi"]))
         p_chg = safe_float(api_change.get("put_change"), safe_float(pe["oi"]) - safe_float(pe["prev_oi"]))
         dist_steps = abs(strike - atm) / step if step > 0 else 0.0
         proximity = 1.0 / (1.0 + dist_steps)
+
+        c_eps = 0.001
+        p_eps = 0.001
+        call_activity = "CALL_NEUTRAL"
+        put_activity = "PUT_NEUTRAL"
+        call_dir = 0
+        put_dir = 0
+
+        if abs(c_chg) > 0:
+            if c_chg > 0 and c_price_move > c_eps:
+                call_activity, call_dir = "CALL_BUYING", 1
+            elif c_chg > 0 and c_price_move < -c_eps:
+                call_activity, call_dir = "CALL_WRITING", -1
+            elif c_chg < 0 and c_price_move > c_eps:
+                call_activity, call_dir = "CALL_SHORT_COVERING", 1
+            elif c_chg < 0 and c_price_move < -c_eps:
+                call_activity, call_dir = "CALL_LONG_UNWINDING", -1
+            else:
+                call_activity = "CALL_OI_CHANGE_UNRESOLVED"
+
+        if abs(p_chg) > 0:
+            if p_chg > 0 and p_price_move > p_eps:
+                put_activity, put_dir = "PUT_BUYING", -1
+            elif p_chg > 0 and p_price_move < -p_eps:
+                put_activity, put_dir = "PUT_WRITING", 1
+            elif p_chg < 0 and p_price_move > p_eps:
+                put_activity, put_dir = "PUT_SHORT_COVERING", -1
+            elif p_chg < 0 and p_price_move < -p_eps:
+                put_activity, put_dir = "PUT_LONG_UNWINDING", 1
+            else:
+                put_activity = "PUT_OI_CHANGE_UNRESOLVED"
+
+        c_oi_scale = abs(c_chg) / max(c_prev_oi, c_oi, 1.0)
+        p_oi_scale = abs(p_chg) / max(p_prev_oi, p_oi, 1.0)
+        c_strength = min(1.0, c_oi_scale) * min(1.0, abs(c_price_move) / 0.02 if abs(c_price_move) > 0 else 0.0)
+        p_strength = min(1.0, p_oi_scale) * min(1.0, abs(p_price_move) / 0.02 if abs(p_price_move) > 0 else 0.0)
+
         entries.append({
             "strike": float(strike), "call_oi": c_oi, "put_oi": p_oi,
             "call_change": c_chg, "put_change": p_chg,
+            "call_price_move": c_price_move, "put_price_move": p_price_move,
+            "call_dir": float(call_dir), "put_dir": float(put_dir),
+            "call_activity_strength": c_strength, "put_activity_strength": p_strength,
             "proximity": proximity,
         })
+        labels[str(float(strike))] = {
+            "call_activity": call_activity,
+            "put_activity": put_activity,
+            "call_price_move_pct": c_price_move * 100.0,
+            "put_price_move_pct": p_price_move * 100.0,
+        }
 
     near_entries = [x for x in entries if abs(x["strike"] - atm) <= step * 10]
     max_call = max((x["call_oi"] for x in near_entries), default=1.0)
@@ -1563,13 +1667,13 @@ def chain_oi_support_resistance(
         oi = x["put_oi"] / max(max_put, 1.0)
         change = max(x["put_change"], 0.0) / max(max_put, 1.0)
         opposite = max(-x["call_change"], 0.0) / max(max_call, 1.0)
-        return min(1.0, 0.55 * oi + 0.30 * change + 0.15 * opposite) * x["proximity"]
+        return min(1.0, 0.50 * oi + 0.30 * change + 0.20 * opposite) * x["proximity"]
 
     def resistance_strength(x: dict[str, float]) -> float:
         oi = x["call_oi"] / max(max_call, 1.0)
         change = max(x["call_change"], 0.0) / max(max_call, 1.0)
         opposite = max(-x["put_change"], 0.0) / max(max_put, 1.0)
-        return min(1.0, 0.55 * oi + 0.30 * change + 0.15 * opposite) * x["proximity"]
+        return min(1.0, 0.50 * oi + 0.30 * change + 0.20 * opposite) * x["proximity"]
 
     supports_ranked = sorted(
         [(x, support_strength(x)) for x in support_rows],
@@ -1593,20 +1697,25 @@ def chain_oi_support_resistance(
 
     support_strength_value = support_strength(support1_row) if support1_row else 0.0
     resistance_strength_value = resistance_strength(resistance1_row) if resistance1_row else 0.0
-    support_change_strength = (
-        max(support1_row["put_change"], 0.0) / max(max_put, 1.0) if support1_row else 0.0
-    )
-    resistance_change_strength = (
-        max(resistance1_row["call_change"], 0.0) / max(max_call, 1.0) if resistance1_row else 0.0
-    )
+    support_change_strength = max(support1_row["put_change"], 0.0) / max(max_put, 1.0) if support1_row else 0.0
+    resistance_change_strength = max(resistance1_row["call_change"], 0.0) / max(max_call, 1.0) if resistance1_row else 0.0
 
-    # Local pressure around ATM, still useful but no longer the sole engine.
     nearby = [x for x in entries if abs(x["strike"] - atm) <= step * 5]
-    bull_pressure = sum(x["proximity"] * (max(x["put_change"], 0.0) + max(-x["call_change"], 0.0)) for x in nearby)
-    bear_pressure = sum(x["proximity"] * (max(x["call_change"], 0.0) + max(-x["put_change"], 0.0)) for x in nearby)
+    bull_pressure = 0.0
+    bear_pressure = 0.0
+    for x in nearby:
+        bull_pressure += x["proximity"] * (
+            max(x["put_dir"], 0.0) * x["put_activity_strength"]
+            + max(x["call_dir"], 0.0) * x["call_activity_strength"]
+        )
+        bear_pressure += x["proximity"] * (
+            max(-x["put_dir"], 0.0) * x["put_activity_strength"]
+            + max(-x["call_dir"], 0.0) * x["call_activity_strength"]
+        )
     pressure_den = bull_pressure + bear_pressure
     pressure_score = (bull_pressure - bear_pressure) / pressure_den if pressure_den > 0 else 0.0
 
+    # Aggregate OI-only context remains available as a secondary signal.
     total_put_oi = sum(x["put_oi"] for x in entries)
     total_call_oi = sum(x["call_oi"] for x in entries)
     pcr = total_put_oi / total_call_oi if total_call_oi > 0 else float("nan")
@@ -1616,12 +1725,24 @@ def chain_oi_support_resistance(
         else 0
     )
 
-    # Level/migration logic. This is intentionally predictive when a wall is
-    # close enough to matter for the current ATR, not merely when spot crosses it.
-    spot_ref_atr = max(
-        safe_float(rows[atm].get("_scanner_atr"), 0.0),
-        1.0,
+    # Interpreted Change-OI score for the five-pillar engine. Prefer this over
+    # put_change-call_change, because it uses the premium response to resolve
+    # buying vs writing.
+    activity_bull = sum(x["proximity"] * (
+        max(x["put_dir"], 0.0) * x["put_activity_strength"]
+        + max(x["call_dir"], 0.0) * x["call_activity_strength"]
+    ) for x in near_entries)
+    activity_bear = sum(x["proximity"] * (
+        max(-x["put_dir"], 0.0) * x["put_activity_strength"]
+        + max(-x["call_dir"], 0.0) * x["call_activity_strength"]
+    ) for x in near_entries)
+    activity_den = activity_bull + activity_bear
+    change_pressure_score = (
+        (activity_bull - activity_bear) / activity_den
+        if activity_den > 0 else 0.0
     )
+
+    spot_ref_atr = max(safe_float(rows[atm].get("_scanner_atr"), 0.0), 1.0)
     res_dist = resistance_1 - spot if resistance_1 > spot else float("inf")
     sup_dist = spot - support_1 if support_1 < spot else float("inf")
 
@@ -1639,8 +1760,16 @@ def chain_oi_support_resistance(
         else 0
     )
 
-    predictive_raw = 0.55 * pressure_score + 0.25 * (support_strength_value - resistance_strength_value) + 0.20 * migration_bias
-    predictive_bias = 1 if predictive_raw >= CHAIN_PREDICTIVE_STRENGTH_THRESHOLD else -1 if predictive_raw <= -CHAIN_PREDICTIVE_STRENGTH_THRESHOLD else 0
+    predictive_raw = (
+        0.55 * pressure_score
+        + 0.25 * (support_strength_value - resistance_strength_value)
+        + 0.20 * migration_bias
+    )
+    predictive_bias = (
+        1 if predictive_raw >= CHAIN_PREDICTIVE_STRENGTH_THRESHOLD
+        else -1 if predictive_raw <= -CHAIN_PREDICTIVE_STRENGTH_THRESHOLD
+        else 0
+    )
 
     major_support_row = max(support_rows, key=lambda x: x["put_oi"], default=None)
     major_resistance_row = max(resistance_rows, key=lambda x: x["call_oi"], default=None)
@@ -1648,11 +1777,19 @@ def chain_oi_support_resistance(
     typical_abs_change = float(np.median(abs_changes)) if abs_changes else 0.0
 
     def heavy_positive(change: float, wall_oi: float) -> bool:
-        threshold = max(WALL_HEAVY_CHANGE_OI_RATIO * max(wall_oi, 1.0), WALL_HEAVY_CHANGE_MULTIPLIER * typical_abs_change, 1.0)
+        threshold = max(
+            WALL_HEAVY_CHANGE_OI_RATIO * max(wall_oi, 1.0),
+            WALL_HEAVY_CHANGE_MULTIPLIER * typical_abs_change,
+            1.0,
+        )
         return change >= threshold
 
     def heavy_negative(change: float, wall_oi: float) -> bool:
-        threshold = max(WALL_HEAVY_CHANGE_OI_RATIO * max(wall_oi, 1.0), WALL_HEAVY_CHANGE_MULTIPLIER * typical_abs_change, 1.0)
+        threshold = max(
+            WALL_HEAVY_CHANGE_OI_RATIO * max(wall_oi, 1.0),
+            WALL_HEAVY_CHANGE_MULTIPLIER * typical_abs_change,
+            1.0,
+        )
         return change <= -threshold
 
     major_support = float(major_support_row["strike"]) if major_support_row else float(support_1)
@@ -1662,29 +1799,40 @@ def chain_oi_support_resistance(
     major_resistance_call_change = float(major_resistance_row["call_change"]) if major_resistance_row else 0.0
     major_resistance_put_change = float(major_resistance_row["put_change"]) if major_resistance_row else 0.0
 
-    put_writing_at_support = bool(major_support_row and heavy_positive(major_support_put_change, major_support_row["put_oi"]))
+    put_writing_at_support = bool(major_support_row and labels.get(str(float(major_support)), {}).get("put_activity") == "PUT_WRITING")
+    put_buying_at_support = bool(major_support_row and labels.get(str(float(major_support)), {}).get("put_activity") == "PUT_BUYING")
+    call_writing_at_resistance = bool(major_resistance_row and labels.get(str(float(major_resistance)), {}).get("call_activity") == "CALL_WRITING")
+    call_buying_at_resistance = bool(major_resistance_row and labels.get(str(float(major_resistance)), {}).get("call_activity") == "CALL_BUYING")
     put_unwinding_at_support = bool(major_support_row and heavy_negative(major_support_put_change, major_support_row["put_oi"]))
-    call_writing_at_resistance = bool(major_resistance_row and heavy_positive(major_resistance_call_change, major_resistance_row["call_oi"]))
     call_unwinding_at_resistance = bool(major_resistance_row and heavy_negative(major_resistance_call_change, major_resistance_row["call_oi"]))
 
     logger.info(
         "CHAIN PREDICTIVE ENGINE: S1=%.0f(%.3f) S2=%.0f R1=%.0f(%.3f) R2=%.0f "
-        "support_chg=%.3f resistance_chg=%.3f pressure=%+.3f migration=%+d "
-        "level_bias=%+d predictive=%+d raw=%+.3f",
+        "change_pressure=%+.3f pressure=%+.3f migration=%+d level_bias=%+d "
+        "predictive=%+d raw=%+.3f support_chg=%.3f resistance_chg=%.3f",
         support_1, support_strength_value, support_2,
         resistance_1, resistance_strength_value, resistance_2,
+        change_pressure_score, pressure_score, migration_bias, level_bias,
+        predictive_bias, predictive_raw,
         support_change_strength, resistance_change_strength,
-        pressure_score, migration_bias, level_bias, predictive_bias, predictive_raw,
     )
+
+    if major_support_row:
+        s_label = labels.get(str(float(major_support)), {}).get("put_activity", "PUT_NEUTRAL")
+        logger.info("CHAIN SUPPORT ACTIVITY: strike=%.0f put_activity=%s", major_support, s_label)
+    if major_resistance_row:
+        r_label = labels.get(str(float(major_resistance)), {}).get("call_activity", "CALL_NEUTRAL")
+        logger.info("CHAIN RESISTANCE ACTIVITY: strike=%.0f call_activity=%s", major_resistance, r_label)
 
     return {
         "support_1": float(support_1), "support_2": float(support_2),
         "resistance_1": float(resistance_1), "resistance_2": float(resistance_2),
         "pressure_score": float(pressure_score),
+        "change_pressure_score": float(change_pressure_score),
         "normalized_diff": float(pressure_score),
-        "normalized_change": float(migration_bias),
+        "normalized_change": float(change_pressure_score),
         "oi_bias": int(1 if pressure_score > 0.08 else -1 if pressure_score < -0.08 else 0),
-        "change_bias": int(migration_bias),
+        "change_bias": int(1 if change_pressure_score > 0.10 else -1 if change_pressure_score < -0.10 else 0),
         "predictive_bias": int(predictive_bias),
         "predictive_strength": float(abs(predictive_raw)),
         "level_bias": int(level_bias),
@@ -1699,14 +1847,16 @@ def chain_oi_support_resistance(
         "major_resistance_call_change": major_resistance_call_change,
         "major_resistance_put_change": major_resistance_put_change,
         "put_writing_at_support": put_writing_at_support,
-        "put_unwinding_at_support": put_unwinding_at_support,
+        "put_buying_at_support": put_buying_at_support,
         "call_writing_at_resistance": call_writing_at_resistance,
+        "call_buying_at_resistance": call_buying_at_resistance,
+        "put_unwinding_at_support": put_unwinding_at_support,
         "call_unwinding_at_resistance": call_unwinding_at_resistance,
         "typical_abs_change": typical_abs_change,
         "pcr": float(pcr) if math.isfinite(pcr) else float("nan"),
         "pcr_bias": int(pcr_bias),
+        "activity_labels": labels,
     }
-
 
 def get_daily_oi_confirmation(
     expiry: str,
@@ -1871,6 +2021,7 @@ def get_intraday_pcr(expiry: str) -> tuple[float, float, int, bool, bool]:
 
 def vwap_snapshot(
     price_session: pd.DataFrame,
+    volume_source: Optional[pd.DataFrame] = None,
 ) -> tuple[float, float, int]:
     """Calculate session VWAP from the NIFTY index price feed.
 
@@ -1902,7 +2053,7 @@ def vwap_snapshot(
     if work.empty:
         raise ScannerError("No valid index session candles available for VWAP.")
 
-    vwap_series = calculate_vwap(work).replace([np.inf, -np.inf], np.nan).dropna()
+    vwap_series = calculate_vwap(work, volume_source=volume_source).replace([np.inf, -np.inf], np.nan).dropna()
     if vwap_series.empty:
         typical = (work["high"] + work["low"] + work["close"]) / 3.0
         vwap_series = typical.expanding().mean().dropna()
@@ -1912,9 +2063,10 @@ def vwap_snapshot(
     price = float(work["close"].iloc[-1])
     level_bias = 1 if price > current_vwap else -1 if price < current_vwap else 0
 
+    volume_mode = str(getattr(vwap_series, "attrs", {}).get("volume_mode", "INDEX_VOLUME"))
     logger.info(
-        "INDEX VWAP: price=%.2f vwap=%.2f slope=%+.2f level_bias=%+d bars=%d",
-        price, current_vwap, slope, level_bias, len(vwap_series),
+        "INDEX VWAP: price=%.2f vwap=%.2f slope=%+.2f level_bias=%+d bars=%d mode=%s",
+        price, current_vwap, slope, level_bias, len(vwap_series), volume_mode,
     )
     return current_vwap, slope, level_bias
 
@@ -2004,13 +2156,11 @@ def price_action_regime_snapshot(
     vwap: float,
     atr3: float,
 ) -> dict[str, Any]:
-    """Classify the immediate NIFTY price regime before derivatives can vote.
+    """Classify the live NIFTY price regime from completed 3m candles.
 
-    Price action is the primary market truth here. The five derivative/core
-    pillars can confirm it, but they cannot convert a lower-high/lower-low
-    sequence into a bullish trade. This specifically addresses the Oct-7
-    failure where PCR/Change-OI stayed positive while 3m/short-term NIFTY
-    structure had already deteriorated.
+    The important change from V13 is that a modest counter-trend 3m pullback
+    does not erase a still-valid LH/LL or HH/HL structure. Only a materially
+    opposing impulse can weaken the directional state.
     """
     result: dict[str, Any] = {
         "state": "UNKNOWN",
@@ -2086,23 +2236,28 @@ def price_action_regime_snapshot(
     recent3_atr = recent3_move / atr
     latest_atr = latest_move / atr
 
+    # Directional structure should survive a normal pullback. The previous V13
+    # test required recent3 to be almost unchanged, which caused an established
+    # bearish trend to become SIDEWAYS merely because the last 3m bar bounced.
     bullish_structure = bool(
         higher_structure
         and recent7_atr >= REGIME_PRICE_MIN_MOVE_ATR
-        and recent3_atr > -0.10
+        and recent3_atr >= -PRICE_PULLBACK_RECENT3_MAX_ATR
         and price_above_vwap
     )
     bearish_structure = bool(
         lower_structure
         and recent7_atr <= -REGIME_PRICE_MIN_MOVE_ATR
-        and recent3_atr < 0.10
+        and recent3_atr <= PRICE_PULLBACK_RECENT3_MAX_ATR
         and price_below_vwap
     )
 
     sideways = bool(
-        range12 / atr <= REGIME_SIDEWAYS_RANGE_ATR
+        not bullish_structure
+        and not bearish_structure
+        and range12 / atr <= REGIME_SIDEWAYS_RANGE_ATR
         and abs(recent7_atr) <= REGIME_SIDEWAYS_NET_ATR
-        and abs(price - vwap) / atr <= REGIME_SIDEWAYS_VWAP_DISTANCE_ATR
+        and vwap_distance <= REGIME_SIDEWAYS_VWAP_DISTANCE_ATR
         and alternation >= REGIME_SIDEWAYS_ALTERNATION
     )
 
@@ -2113,7 +2268,7 @@ def price_action_regime_snapshot(
             1.0,
             0.35 * min(abs(recent7_atr) / 1.0, 1.0)
             + 0.25 * min(abs(recent3_atr) / 0.75, 1.0)
-            + 0.20 * (1.0 if latest_atr >= 0 else 0.0)
+            + 0.20 * (1.0 if latest_atr >= 0 else max(0.0, 1.0 - abs(latest_atr) / 0.75))
             + 0.20 * min(vwap_distance, 1.0),
         )
     elif bearish_structure and not sideways:
@@ -2123,7 +2278,7 @@ def price_action_regime_snapshot(
             1.0,
             0.35 * min(abs(recent7_atr) / 1.0, 1.0)
             + 0.25 * min(abs(recent3_atr) / 0.75, 1.0)
-            + 0.20 * (1.0 if latest_atr <= 0 else 0.0)
+            + 0.20 * (1.0 if latest_atr <= 0 else max(0.0, 1.0 - abs(latest_atr) / 0.75))
             + 0.20 * min(vwap_distance, 1.0),
         )
     elif sideways:
@@ -2131,8 +2286,6 @@ def price_action_regime_snapshot(
         bias = 0
         strength = max(0.0, min(1.0, 0.55 + 0.15 * alternation))
     elif session_atr > 0.15 and recent7_atr < -0.15:
-        # Up-session with current lower-high/lower-low pressure: bullish trend
-        # is weakening. This is a HOLD/WAIT state, not a CE entry.
         state = "BULLISH_WEAKENING"
         bias = -1
         strength = min(1.0, abs(recent7_atr) / 1.5)
@@ -2340,11 +2493,13 @@ def continuation_price_confirmation(
             f"3M_NET_MOVE_TOO_WEAK_{direction}_{stats['net_move_atr']:+.2f}ATR",
             stats,
         )
-    if (
-        OPTION_CONFIRMATION_REQUIRE_LATEST_BAR
-        and latest_move * target_sign <= 0
-    ):
-        return False, f"3M_LATEST_BAR_OPPOSES_{direction}", stats
+    # A single small counter-trend 3m candle is a normal pullback, not a
+    # reversal. Only a materially adverse bar blocks the continuation.
+    latest_against = latest_move * target_sign
+    if latest_against < -CONTINUATION_MAX_OPPOSING_BAR_ATR:
+        return False, f"3M_STRONG_OPPOSING_BAR_{direction}", stats
+    if latest_against < 0:
+        return True, "3M_PULLBACK_WITHIN_TREND", stats
 
     return True, "3M_PRICE_ALIGNED", stats
 
@@ -2356,7 +2511,12 @@ def continuation_market_timing_filter(
     atr3: float,
     market_movement_factor: float,
 ) -> tuple[bool, str, float, float]:
-    """Continuation entry gate: current price action must agree, not just score."""
+    """Confirm continuation without rejecting ordinary pullbacks.
+
+    The last completed 3m candle is treated as a pullback unless it is a
+    materially opposing impulse. This lets the scanner detect a live bearish
+    trend while still avoiding entries during a genuine bullish reversal.
+    """
     if price_session is None or price_session.empty or direction not in {"BULLISH", "BEARISH"}:
         return False, "INSUFFICIENT_DATA", float("inf"), float("inf")
 
@@ -2368,14 +2528,17 @@ def continuation_market_timing_filter(
     info = price_action_regime_snapshot(work, vwap, atr)
     sign = _directional_sign(direction)
     vwap_distance_atr = float(info["vwap_distance_atr"])
-    latest_move_atr = abs(float(info["latest_move_atr"]))
+    latest_signed_atr = float(info["latest_move_atr"])
+    latest_move_atr = abs(latest_signed_atr)
 
     if info["state"] == "SIDEWAYS":
         return False, "SIDEWAYS_PRICE_REGIME", vwap_distance_atr, latest_move_atr
+
     if direction == "BULLISH" and info["bias"] < 0:
         return False, "PRICE_ACTION_OPPOSES_BULLISH", vwap_distance_atr, latest_move_atr
     if direction == "BEARISH" and info["bias"] > 0:
         return False, "PRICE_ACTION_OPPOSES_BEARISH", vwap_distance_atr, latest_move_atr
+
     if vwap_distance_atr > REGIME_ENTRY_MAX_VWAP_DISTANCE_ATR:
         return False, "VWAP_TOO_FAR_FOR_ENTRY", vwap_distance_atr, latest_move_atr
     if latest_move_atr > ENTRY_MAX_3M_MOVE_ATR:
@@ -2385,23 +2548,26 @@ def continuation_market_timing_filter(
     if ((float(pd.to_numeric(work["close"], errors="coerce").iloc[-1]) - vwap) * sign) <= 0:
         return False, "PRICE_ON_WRONG_SIDE_OF_VWAP", vwap_distance_atr, latest_move_atr
 
-    # The latest completed price bar cannot materially oppose the proposed trade.
-    if info["latest_move_atr"] * sign < -0.15:
-        return False, "LATEST_COMPLETED_BAR_OPPOSES", vwap_distance_atr, latest_move_atr
+    # Only a materially opposing completed candle blocks continuation. A small
+    # counter-bar is explicitly treated as a pullback within the existing trend.
+    opposing_atr = latest_signed_atr * sign
+    if opposing_atr < -CONTINUATION_MAX_OPPOSING_BAR_ATR:
+        return False, "STRONG_OPPOSING_3M_BAR", vwap_distance_atr, latest_move_atr
+    if opposing_atr < 0:
+        return True, "DIRECTIONAL_PULLBACK_WITHIN_TREND", vwap_distance_atr, latest_move_atr
 
     return True, "PRICE_ACTION_CONTINUATION_CONFIRMED", vwap_distance_atr, latest_move_atr
-
 
 def option_momentum_confirmation(
     option: OptionCandidate,
     direction: str,
 ) -> tuple[bool, str, dict[str, float]]:
-    """Require option premium momentum aligned with the actual trade direction.
+    """Measure option-premium confirmation for execution quality.
 
-    A live quote above the previous candle is not enough: a large adverse
-    completed-bar/net decline followed by a temporary bounce must not qualify.
-    This directly removes the Oct-7 failure mode where CE 22600 passed only via
-    a live bounce while its recent premium structure was strongly negative.
+    IMPORTANT: a long PE bought for a bearish underlying move also needs its
+    premium to rise. Therefore option-premium direction is always +1 for a
+    profitable long-option continuation; it is NOT the same sign as the
+    underlying direction.
     """
     stats = {
         "net_move_atr": 0.0,
@@ -2417,7 +2583,6 @@ def option_momentum_confirmation(
     if direction not in {"BULLISH", "BEARISH"}:
         return False, "INVALID_DIRECTION", stats
 
-    sign = _directional_sign(direction)
     try:
         option_bars = get_intraday_candles(option.instrument_key, 3, strict=False)
     except Exception as exc:
@@ -2452,51 +2617,34 @@ def option_momentum_confirmation(
     latest_move = float(diffs[-1]) if len(diffs) else 0.0
     recent_count = min(OPTION_CONFIRMATION_RECENT_BARS, len(diffs))
     recent_diffs = diffs[-recent_count:] if recent_count else np.array([])
-    directional_bars = int(np.sum(recent_diffs * sign > 0))
+    directional_bars = int(np.sum(recent_diffs > 0))  # long option premium must rise
     live_move = float(option.ltp - closes[-1])
 
-    aligned_net = net_move * sign / atr
-    aligned_latest = latest_move * sign / atr
-    aligned_live = live_move * sign / atr
+    aligned_net = net_move / atr
+    aligned_latest = latest_move / atr
+    aligned_live = live_move / atr
 
-    stats.update(
-        {
-            "net_move_atr": net_move / atr,
-            "latest_move_atr": latest_move / atr,
-            "live_move_atr": live_move / atr,
-            "directional_bars": float(directional_bars),
-            "completed_bars": float(len(work)),
-            "last_close": float(closes[-1]),
-            "aligned_net_move_atr": aligned_net,
-            "aligned_latest_move_atr": aligned_latest,
-            "aligned_live_move_atr": aligned_live,
-        }
-    )
+    stats.update({
+        "net_move_atr": net_move / atr,
+        "latest_move_atr": latest_move / atr,
+        "live_move_atr": live_move / atr,
+        "directional_bars": float(directional_bars),
+        "completed_bars": float(len(work)),
+        "last_close": float(closes[-1]),
+        "aligned_net_move_atr": aligned_net,
+        "aligned_latest_move_atr": aligned_latest,
+        "aligned_live_move_atr": aligned_live,
+    })
 
-    # Live acceleration is valid only when the underlying completed premium
-    # structure is not materially adverse. A bounce cannot rescue a falling option.
-    if (
-        aligned_live >= REGIME_LIVE_OPTION_MIN_ALIGNED_ATR
-        and aligned_latest >= -REGIME_LIVE_OPTION_MAX_ADVERSE_ATR
-        and aligned_net >= -REGIME_OPTION_MAX_ADVERSE_NET_ATR
-        and directional_bars >= 1
-    ):
-        return True, "LIVE_PREMIUM_ACCELERATION_CONFIRMED", stats
-
-    if (
-        aligned_latest >= OPTION_CONFIRMATION_MIN_NET_MOVE_ATR
-        and aligned_net >= -REGIME_OPTION_MAX_ADVERSE_NET_ATR
-    ):
-        return True, "LAST_COMPLETED_PREMIUM_MOVE", stats
-
-    if (
-        aligned_net >= OPTION_CONFIRMATION_MIN_NET_MOVE_ATR
-        and directional_bars >= REGIME_REQUIRE_OPTION_DIRECTIONAL_BARS
-    ):
-        return True, "RECENT_PREMIUM_TREND", stats
-
-    return False, "OPTION_PREMIUM_NOT_CONFIRMING", stats
-
+    # Soft quality assessment. The market-direction engine is allowed to issue a
+    # directional setup even when the option itself is temporarily lagging.
+    if aligned_live >= REGIME_LIVE_OPTION_MIN_ALIGNED_ATR and aligned_latest >= -REGIME_LIVE_OPTION_MAX_ADVERSE_ATR:
+        return True, "LIVE_PREMIUM_RISING", stats
+    if aligned_latest >= OPTION_CONFIRMATION_MIN_NET_MOVE_ATR:
+        return True, "LAST_COMPLETED_PREMIUM_RISING", stats
+    if aligned_net >= OPTION_CONFIRMATION_MIN_NET_MOVE_ATR and directional_bars >= 1:
+        return True, "RECENT_PREMIUM_RISING", stats
+    return False, "OPTION_PREMIUM_LAGGING", stats
 
 def infer_prior_session_direction(
     price_session: pd.DataFrame,
@@ -2556,6 +2704,7 @@ def vwap_acceptance_context(
     price_session: pd.DataFrame,
     vwap: float,
     atr3: float,
+    volume_source: Optional[pd.DataFrame] = None,
 ) -> dict[str, Any]:
     """Measure completed-3m VWAP acceptance/rejection and slope change."""
     result = {
@@ -2574,7 +2723,7 @@ def vwap_acceptance_context(
     work = work.dropna(subset=["close", "high", "low"])
     if len(work) < 3:
         return result
-    v = calculate_vwap(work).replace([np.inf, -np.inf], np.nan).dropna()
+    v = calculate_vwap(work, volume_source=volume_source).replace([np.inf, -np.inf], np.nan).dropna()
     if len(v) < 3:
         return result
     current_slope = float(v.iloc[-1] - v.iloc[-2])
@@ -2728,7 +2877,7 @@ def build_market_structure(
         if price_session is not None and not price_session.empty
         else futures_session
     )
-    vwap, vwap_slope, vwap_level_bias = vwap_snapshot(primary_session)
+    vwap, vwap_slope, vwap_level_bias = vwap_snapshot(primary_session, volume_source=futures_session)
 
     futures_info = futures_oi_structure(futures_3m, futures_live_quote)
     if futures_3m is None or len(futures_3m) < 4:
@@ -2773,7 +2922,7 @@ def build_market_structure(
     # Five core pillars — graded, not binary. Small OI/PCR differences are
     # deliberately treated as mild evidence instead of full-strength votes.
     # ------------------------------------------------------------------
-    change_raw = safe_float(change_oi_score, 0.0)
+    change_raw = safe_float(chain_levels.get("change_pressure_score"), safe_float(change_oi_score, 0.0))
     abs_change = abs(change_raw)
     if abs_change <= REGIME_CHANGE_OI_DEADZONE:
         change_factor = 0.0
@@ -2881,7 +3030,7 @@ def build_market_structure(
     # Reversal — price/VWAP lead; derivatives may lag but cannot be strongly
     # hostile across both futures and chain pressure.
     # ------------------------------------------------------------------
-    acceptance = vwap_acceptance_context(primary_session, vwap, atr3)
+    acceptance = vwap_acceptance_context(primary_session, vwap, atr3, volume_source=futures_session)
     reversal_bear_score = sum([
         1 if price_info["bias"] < 0 else 0,
         1 if acceptance["bear_cross"] or acceptance["bear_acceptance"] else 0,
@@ -2914,7 +3063,7 @@ def build_market_structure(
         not hard_sideways
         and not conflict
         and price_bullish_now
-        and price_info["recent3_move_atr"] >= -0.05
+        and price_info["recent3_move_atr"] >= -PRICE_PULLBACK_RECENT3_MAX_ATR
         and movement_factor >= 0.20
         and vwap_level_bias > 0
         and bull_votes >= REGIME_MIN_BULL_BEAR_VOTES
@@ -2930,7 +3079,7 @@ def build_market_structure(
         not hard_sideways
         and not conflict
         and price_bearish_now
-        and price_info["recent3_move_atr"] <= 0.05
+        and price_info["recent3_move_atr"] <= PRICE_PULLBACK_RECENT3_MAX_ATR
         and movement_factor <= -0.20
         and vwap_level_bias < 0
         and bear_votes >= REGIME_MIN_BULL_BEAR_VOTES
@@ -3421,41 +3570,36 @@ def select_directional_option(
             f"No healthy directional {option_type} option. {detail}"
         )
 
-    # Continuous entries require the option premium itself to confirm the
-    # direction. Try both hard-permitted strikes; never let a healthy-looking
-    # but falling option win solely on delta/spread/liquidity.
+    # Option premium confirmation is an optional execution-quality gate. It is
+    # disabled by default so a valid market-direction signal cannot disappear
+    # because an option's IV/theta/noise is temporarily lagging the underlying.
+    # When enabled, cache the result so each candidate needs only one candle request.
     if require_option_momentum and not is_reversal:
-        confirmed: list[OptionCandidate] = []
+        option_momentum_cache: dict[float, tuple[bool, str, dict[str, float]]] = {}
         for candidate in candidates:
-            ok, reason, momentum_stats = option_momentum_confirmation(
-                candidate, direction
-            )
+            result = option_momentum_confirmation(candidate, direction)
+            option_momentum_cache[round(candidate.strike, 2)] = result
+            ok, reason, momentum_stats = result
             logger.info(
-                "OPTION MOMENTUM: %s %.0f ltp=%.2f net=%.2fATR latest=%.2fATR "
-                "directional_bars=%d/%d status=%s reason=%s",
-                candidate.option_type,
-                candidate.strike,
-                candidate.ltp,
-                momentum_stats["net_move_atr"],
-                momentum_stats["latest_move_atr"],
-                int(momentum_stats["directional_bars"]),
-                OPTION_CONFIRMATION_RECENT_BARS,
-                "PASS" if ok else "FAIL",
-                reason,
+                "OPTION MOMENTUM: %s %.0f ltp=%.2f net=%+.2fATR latest=%+.2fATR "
+                "directional_bars=%d/%d status=%s reason=%s hard_gate=%s",
+                candidate.option_type, candidate.strike, candidate.ltp,
+                momentum_stats["net_move_atr"], momentum_stats["latest_move_atr"],
+                int(momentum_stats["directional_bars"]), OPTION_CONFIRMATION_RECENT_BARS,
+                "PASS" if ok else "FAIL", reason, OPTION_PREMIUM_HARD_GATE,
             )
-            if ok:
-                confirmed.append(candidate)
-            else:
-                rejection_log.append(
-                    f"{option_type} {candidate.strike:.0f}: {reason}"
-                )
 
-        if not confirmed:
+        candidates = [
+            candidate for candidate in candidates
+            if option_momentum_cache.get(round(candidate.strike, 2), (False, "", {}))[0]
+        ]
+        if not candidates:
             detail = "; ".join(rejection_log[-8:]) or "no option momentum confirmation"
-            raise ScannerError(
-                f"No directional {option_type} option with premium confirmation. {detail}"
-            )
-        candidates = confirmed
+            raise ScannerError(f"No directional {option_type} option with premium confirmation. {detail}")
+    else:
+        logger.info(
+            "OPTION MOMENTUM: execution gate disabled; market-direction engine selects the option by strike + liquidity + delta + spread + theta health."
+        )
 
     if is_reversal:
         candidates = [
@@ -4723,7 +4867,7 @@ def execute_scan(
     previous_reversal_confirmations = int(previous_snapshot.get("reversal_confirmations", 0) or 0)
 
     # Provisional index direction for history reconstruction.
-    vwap_seed, _, _ = vwap_snapshot(index_session)
+    vwap_seed, _, _ = vwap_snapshot(index_session, volume_source=futures_session)
     provisional_intraday_bias, _, provisional_intraday_score = intraday_trend_snapshot(
         index_session, vwap_seed
     )
@@ -5004,7 +5148,7 @@ def execute_scan(
                 "No entry: reversal timing filter rejected setup: %s.", timing_state
             )
             return None
-        option_require_momentum = True
+        option_require_momentum = OPTION_PREMIUM_HARD_GATE
 
     elif continuous_state:
         completed_for_confirmation = filter_completed_candles(index_session, 3)
@@ -5075,7 +5219,7 @@ def execute_scan(
             logger.info("No entry: NIFTY 3m price confirmation rejected setup: %s.", price_reason)
             save_state(state)
             return None
-        option_require_momentum = True
+        option_require_momentum = OPTION_PREMIUM_HARD_GATE
 
     else:
         state["continuation_phase"] = ""
@@ -5102,7 +5246,7 @@ def execute_scan(
                 timing_state,
             )
             return None
-        option_require_momentum = True
+        option_require_momentum = OPTION_PREMIUM_HARD_GATE
 
     option = select_directional_option(
         chain=chain,
@@ -5256,6 +5400,28 @@ def self_test() -> None:
     assert u.market_phase == "CONTINUOUS_BULLISH"
     assert u.entry_confirmed
 
+    # A mild bullish 3m pullback inside a bearish LH/LL move must remain bearish
+    # rather than collapse into SIDEWAYS.
+    bear_pullback = _synthetic_candles([100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 91, 90.5, 90.0, 89.8, 89.6])
+    pull_vwap_series = calculate_vwap(bear_pullback)
+    pull_vwap = pull_vwap_series.iloc[-1]
+
+    # Index-VWAP proxy regression: timestamp-matched futures volume is preferred
+    # when supplied, while the NIFTY price series remains the numerator.
+    pull_futures = bear_pullback.copy()
+    pull_futures["volume"] = np.linspace(1000.0, 2000.0, len(pull_futures))
+    proxy_vwap = calculate_vwap(bear_pullback, volume_source=pull_futures)
+    assert proxy_vwap.attrs.get("volume_mode") == "FUTURES_VOLUME_PROXY"
+    pull_atr = float(calculate_atr(bear_pullback).iloc[-1])
+    pull_info = price_action_regime_snapshot(bear_pullback, pull_vwap, pull_atr)
+    assert pull_info["bias"] == -1, pull_info
+    ok_pull, _, _, _ = continuation_market_timing_filter(bear_pullback, "BEARISH", pull_vwap, pull_atr, -0.70)
+    assert ok_pull
+    pull_price_ok, pull_price_reason, _ = continuation_price_confirmation(
+        bear_pullback, "BEARISH", {3: st_down.copy()}, pull_atr
+    )
+    assert pull_price_ok, pull_price_reason
+
     # Regression for the Oct-7 failure: positive PCR/Change-OI cannot override
     # lower-high/lower-low NIFTY price action + short-build-up Futures + bearish chain.
     # Session remains positive, but the latest 8/3 bars are negative.
@@ -5290,8 +5456,8 @@ def self_test() -> None:
     original_get_intraday = get_intraday_candles
     try:
         globals()["get_intraday_candles"] = lambda key, interval_minutes, strict=False: _synthetic_candles(
-            [120, 118, 116, 114, 112, 110, 108]
-        ) if key.endswith("PE") else _synthetic_candles([100, 102, 104, 106, 108, 110, 112])
+            [100, 102, 104, 106, 108, 110, 112]
+        )
         fake_pe = OptionCandidate(
             instrument_key="TEST_PE", trading_symbol="TESTPE", option_type="PE", strike=100.0,
             expiry="2026-10-13", ltp=112.0, oi=10000, prev_oi=9000, volume=100000,
