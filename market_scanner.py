@@ -11,9 +11,11 @@ What this version fixes:
   dynamic support/resistance and directional pressure.
 - Separates market-state detection from trade-entry readiness.
 - Detects continuous bullish/bearish states, weakening, sideways, and directional watch states; entries are limited to continuous structure.
-- Uses strict continuous-structure entry confirmation; ordinary countertrend pullbacks do not flip an established trend.
-- Selects Bullish ATM-1/ATM-2 CE or Bearish ATM+1/ATM+2 PE, but ranks
-  candidates by liquidity, delta, theta burden, spread, and structure.
+- Uses persistent continuous-structure entries plus a separately gated, high-confirmation exhaustion reversal scalp; ordinary pullbacks cannot flip an established trend.
+- Classifies Direction x Intensity (NORMAL / STRONG / EXHAUSTION / SIDEWAYS).
+- Applies time-of-day gates, expiry-day OTM bans, option-premium VWAP filters,
+  15-30 minute OI velocity, delta floors, moneyness weighting, and a 5% safety override.
+- Forces new-entry cutoff at 15:15 IST and detects 3-candle 5-minute stagnation exits.
 - Builds NIFTY T1/T2/SL directly from price action + option OI; option Greeks
   are ranking/context only and are not used to forecast target premiums.
 - No order placement. The script only creates a signal, persists state,
@@ -23,8 +25,8 @@ What this version fixes:
   older v2 intraday candle API is deprecated.
 
 Run:
-    python final_scanner_oct8_v25.py --self-test
-    python final_scanner_oct8_v25.py
+    python market_scanner_v27_regime_matrix.py --self-test
+    python market_scanner_v27_regime_matrix.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -54,7 +56,7 @@ import sys
 import time as time_module
 import traceback
 import urllib.parse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -102,14 +104,29 @@ STATE_HISTORY_LIMIT = int(os.getenv("STATE_HISTORY_LIMIT", "60"))
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
 
-SCANNER_VERSION = "2026-10-08-STRUCTURE-V25-AUTHORITATIVE-PA-OI"
-OPTION_TARGET_ENGINE_VERSION = "V25_AUTHORITATIVE_PA_OI_DYNAMIC"
+SCANNER_VERSION = "2026-10-09-STRUCTURE-V27-REGIME-TOD-COI"
+OPTION_TARGET_ENGINE_VERSION = "V27_REGIME_TOD_COI_PA_OI"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
-
+NEW_ENTRY_CUTOFF = time(15, 15)
+OPENING_END = time(10, 30)
+MIDDAY_END = time(13, 30)
 
 ATR_PERIOD = 14
+ADX_PERIOD = int(os.getenv("ADX_PERIOD", "14"))
+ADX_SIDEWAYS_THRESHOLD = float(os.getenv("ADX_SIDEWAYS_THRESHOLD", "20"))
+ADX_STRONG_THRESHOLD = float(os.getenv("ADX_STRONG_THRESHOLD", "25"))
+MIDDAY_MIN_ADX = float(os.getenv("MIDDAY_MIN_ADX", "23"))
+MIDDAY_MIN_PERSISTENCE = int(os.getenv("MIDDAY_MIN_PERSISTENCE", "3"))
+STRONG_VOLUME_MULTIPLIER = float(os.getenv("STRONG_VOLUME_MULTIPLIER", "1.20"))
+OPTION_OI_MIN_AGE_MINUTES = int(os.getenv("OPTION_OI_MIN_AGE_MINUTES", "15"))
+OPTION_OI_MAX_AGE_MINUTES = int(os.getenv("OPTION_OI_MAX_AGE_MINUTES", "30"))
+OPTION_OI_HISTORY_KEEP_MINUTES = int(os.getenv("OPTION_OI_HISTORY_KEEP_MINUTES", "60"))
+COI_STRONG_CHANGE_PCT = float(os.getenv("COI_STRONG_CHANGE_PCT", "0.01"))
+STAGNATION_RANGE_PCT = float(os.getenv("STAGNATION_RANGE_PCT", "0.001"))
+STAGNATION_REQUIRED_BARS = int(os.getenv("STAGNATION_REQUIRED_BARS", "3"))
+OPENING_MAX_SPREAD_PCT = float(os.getenv("OPENING_MAX_SPREAD_PCT", "0.08"))
 
 # Option-flow classification threshold.
 STRUCTURE_ACTIVITY_PRICE_NOISE_PCT = float(os.getenv("STRUCTURE_ACTIVITY_PRICE_NOISE_PCT", "0.002"))
@@ -134,6 +151,9 @@ STRUCTURE_HOLD_BARS = int(os.getenv("STRUCTURE_HOLD_BARS", "2"))
 STRUCTURE_CHANGE_OI_CONFIRM = float(os.getenv("STRUCTURE_CHANGE_OI_CONFIRM", "0.08"))
 STRUCTURE_CHANGE_OI_STRONG = float(os.getenv("STRUCTURE_CHANGE_OI_STRONG", "0.20"))
 STRUCTURE_CHANGE_OI_CONFLICT = float(os.getenv("STRUCTURE_CHANGE_OI_CONFLICT", "0.35"))
+# A strong opposite futures price/OI regime blocks a fresh option entry; it does
+# not independently reverse the NIFTY structure.
+STRUCTURE_FUTURES_CONFLICT_STRENGTH = float(os.getenv("STRUCTURE_FUTURES_CONFLICT_STRENGTH", "0.50"))
 STRUCTURE_VWAP_RECLAIM_BUFFER_ATR = float(os.getenv("STRUCTURE_VWAP_RECLAIM_BUFFER_ATR", "0.05"))
 # Structural levels are option-OI levels. Price swings are retained only as
 # secondary context for risk/targets and are never silently substituted into
@@ -144,8 +164,10 @@ STRUCTURE_VWAP_RECLAIM_BUFFER_ATR = float(os.getenv("STRUCTURE_VWAP_RECLAIM_BUFF
 
 # Entry confirmation controls. One scanner pass is sufficient once the overall
 # market is aligned; forcing two polls would delay fast reversal/continuation entries.
+# Require the same directional regime on two distinct completed 3-minute bars.
+# This suppresses one-scan opening noise and rapid CE/PE reversals.
 CONTINUATION_CONFIRMATIONS_REQUIRED = int(
-    os.getenv("CONTINUATION_CONFIRMATIONS_REQUIRED", "1")
+    os.getenv("CONTINUATION_CONFIRMATIONS_REQUIRED", "2")
 )
 
 # Active-trade protection uses 1m OHLC when available so an intrabar stop/target
@@ -250,6 +272,15 @@ class OptionCandidate:
     theta: float
     spread_pct: float
     theta_burden_pct_day: float
+    premium_vwap: float = float("nan")
+    flow_score: float = float("nan")
+    vwap_score: float = float("nan")
+    oi_momentum_score: float = float("nan")
+    delta_weight: float = float("nan")
+    call_oi_change_pct_15m: float = float("nan")
+    put_oi_change_pct_15m: float = float("nan")
+    oi_velocity_baseline_minutes: float = float("nan")
+    market_intensity: str = "UNKNOWN"
 
 
 @dataclass(frozen=True)
@@ -323,6 +354,7 @@ class Signal:
     resistance_1: float
     resistance_2: float
     reasons: list[str]
+    market_intensity: str = "NORMAL"
 
 
 class ScannerError(Exception):
@@ -786,6 +818,246 @@ def calculate_vwap(df: pd.DataFrame) -> pd.Series:
         )
     return vwap.ffill()
 
+def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder RSI, returning NaN until there is enough real price history."""
+    values = pd.to_numeric(close, errors="coerce")
+    delta = values.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    warmup = max(5, int(period) // 2)
+    avg_gain = gain.ewm(alpha=1.0 / max(int(period), 1), adjust=False, min_periods=warmup).mean()
+    avg_loss = loss.ewm(alpha=1.0 / max(int(period), 1), adjust=False, min_periods=warmup).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi = rsi.where(avg_loss > 0.0, 100.0)
+    rsi = rsi.where(avg_gain > 0.0, 0.0).where(avg_loss > 0.0, rsi)
+    both_flat = (avg_gain == 0.0) & (avg_loss == 0.0)
+    return rsi.where(~both_flat, 50.0).clip(0.0, 100.0)
+
+
+def calculate_adx(df: pd.DataFrame, period: int = ADX_PERIOD) -> pd.Series:
+    """Wilder ADX with a conservative warm-up for intraday bar sets."""
+    if df is None or df.empty or not {"high", "low", "close"}.issubset(df.columns):
+        return pd.Series(dtype=float)
+    work = df.copy()
+    high = pd.to_numeric(work["high"], errors="coerce")
+    low = pd.to_numeric(work["low"], errors="coerce")
+    close = pd.to_numeric(work["close"], errors="coerce")
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=work.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=work.index)
+    previous_close = close.shift(1)
+    true_range = pd.concat(
+        [(high - low), (high - previous_close).abs(), (low - previous_close).abs()], axis=1
+    ).max(axis=1)
+    n = max(int(period), 2)
+    warmup = max(5, n // 2)
+    atr = true_range.ewm(alpha=1.0 / n, adjust=False, min_periods=warmup).mean()
+    plus_smoothed = plus_dm.ewm(alpha=1.0 / n, adjust=False, min_periods=warmup).mean()
+    minus_smoothed = minus_dm.ewm(alpha=1.0 / n, adjust=False, min_periods=warmup).mean()
+    plus_di = 100.0 * plus_smoothed / atr.replace(0.0, np.nan)
+    minus_di = 100.0 * minus_smoothed / atr.replace(0.0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
+    return dx.ewm(alpha=1.0 / n, adjust=False, min_periods=warmup).mean().clip(0.0, 100.0)
+
+
+def calculate_vwap_bands(df: pd.DataFrame) -> tuple[float, float, float]:
+    """Return current-session VWAP, upper 1-sigma band and lower 1-sigma band."""
+    if df is None or df.empty:
+        return float("nan"), float("nan"), float("nan")
+    work = df.copy()
+    for column in ("high", "low", "close", "volume"):
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    typical = (work["high"] + work["low"] + work["close"]) / 3.0
+    volume = work["volume"].fillna(0.0).clip(lower=0.0)
+    local_date = pd.to_datetime(work["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST).dt.date
+    cum_v = volume.groupby(local_date).cumsum()
+    cum_pv = (typical * volume).groupby(local_date).cumsum()
+    cum_p2v = (typical.pow(2) * volume).groupby(local_date).cumsum()
+    vwap_series = cum_pv / cum_v.replace(0.0, np.nan)
+    variance = (cum_p2v / cum_v.replace(0.0, np.nan)) - vwap_series.pow(2)
+    std_series = np.sqrt(variance.clip(lower=0.0))
+    if vwap_series.notna().any():
+        vwap_now = safe_float(vwap_series.dropna().iloc[-1], float("nan"))
+        std_now = safe_float(std_series.dropna().iloc[-1], float("nan")) if std_series.notna().any() else float("nan")
+    else:
+        vwap_now, std_now = float("nan"), float("nan")
+    return vwap_now, vwap_now + std_now, vwap_now - std_now
+
+
+def _resample_ohlcv(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
+    work = work.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+    for c in ("open", "high", "low", "close", "volume"):
+        if c in work:
+            work[c] = pd.to_numeric(work[c], errors="coerce")
+    result = work.resample(
+        f"{int(minutes)}min", origin="start_day", offset="9h15min", label="left", closed="left"
+    ).agg(open=("open", "first"), high=("high", "max"), low=("low", "min"),
+          close=("close", "last"), volume=("volume", "sum"))
+    result = result.dropna(subset=["open", "high", "low", "close"]).reset_index()
+    return filter_completed_candles(result, minutes)
+
+
+def detect_rsi_divergence(df: pd.DataFrame, window: int = 5) -> str:
+    """Detect a basic confirmed price/RSI divergence over two non-overlapping windows."""
+    if df is None or df.empty or len(df) < 2 * window:
+        return "NONE"
+    work = df.copy().reset_index(drop=True)
+    work["close"] = pd.to_numeric(work["close"], errors="coerce")
+    work["high"] = pd.to_numeric(work["high"], errors="coerce")
+    work["low"] = pd.to_numeric(work["low"], errors="coerce")
+    work["rsi"] = calculate_rsi(work["close"], 14)
+    previous = work.iloc[-2 * window:-window]
+    recent = work.iloc[-window:]
+    if previous["rsi"].notna().sum() < max(3, window // 2) or recent["rsi"].notna().sum() < max(3, window // 2):
+        return "NONE"
+    p_low_i = previous["low"].idxmin()
+    r_low_i = recent["low"].idxmin()
+    p_high_i = previous["high"].idxmax()
+    r_high_i = recent["high"].idxmax()
+    previous_low, recent_low = work.loc[p_low_i], work.loc[r_low_i]
+    previous_high, recent_high = work.loc[p_high_i], work.loc[r_high_i]
+    bullish = (
+        safe_float(recent_low["low"]) < safe_float(previous_low["low"])
+        and safe_float(recent_low["rsi"], float("nan")) >= safe_float(previous_low["rsi"], float("nan")) + 2.0
+    )
+    bearish = (
+        safe_float(recent_high["high"]) > safe_float(previous_high["high"])
+        and safe_float(recent_high["rsi"], float("nan")) <= safe_float(previous_high["rsi"], float("nan")) - 2.0
+    )
+    if bullish and not bearish:
+        return "BULLISH"
+    if bearish and not bullish:
+        return "BEARISH"
+    return "NONE"
+
+
+def time_of_day_window(now: Optional[datetime] = None) -> str:
+    current = now or now_ist()
+    clock = current.astimezone(IST).time() if current.tzinfo else current.time()
+    if clock >= NEW_ENTRY_CUTOFF:
+        return "CUTOFF"
+    if clock < OPENING_END:
+        return "OPENING"
+    if clock < MIDDAY_END:
+        return "MIDDAY"
+    return "AFTERNOON"
+
+
+def classify_market_regime(
+    price_session: pd.DataFrame,
+    current_spot: float,
+    current_vwap: float,
+    proposed_direction: str,
+    support: float,
+    resistance: float,
+) -> dict[str, Any]:
+    """Classify direction/intensity; unknown or sideways conditions never authorize buying."""
+    work = filter_completed_candles(price_session, 3) if price_session is not None and not price_session.empty else pd.DataFrame()
+    result: dict[str, Any] = {
+        "direction": "NEUTRAL", "intensity": "UNKNOWN", "adx": float("nan"),
+        "rsi_3m": float("nan"), "rsi_15m": float("nan"), "upper_vwap_band": float("nan"),
+        "lower_vwap_band": float("nan"), "volume_confirmed": False, "divergence": "NONE",
+        "near_structural_level": False, "reversal_price_confirmed": False,
+        "reason": "Insufficient completed candles.",
+    }
+    if work.empty or len(work) < 8 or not math.isfinite(current_vwap) or current_spot <= 0:
+        return result
+    work = work.sort_values("timestamp").reset_index(drop=True)
+    for column in ("high", "low", "close", "volume"):
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    adx_values = calculate_adx(work, ADX_PERIOD)
+    rsi_values = calculate_rsi(work["close"], 14)
+    adx = safe_float(adx_values.iloc[-1], float("nan")) if not adx_values.empty else float("nan")
+    rsi_3m = safe_float(rsi_values.iloc[-1], float("nan")) if not rsi_values.empty else float("nan")
+    _, upper_band, lower_band = calculate_vwap_bands(work)
+    recent = work.tail(3)
+    previous = work.iloc[-6:-3] if len(work) >= 6 else work.iloc[:-3]
+    if previous.empty:
+        return result
+    higher_high = float(recent["high"].max()) > float(previous["high"].max())
+    higher_low = float(recent["low"].min()) > float(previous["low"].min())
+    lower_high = float(recent["high"].max()) < float(previous["high"].max())
+    lower_low = float(recent["low"].min()) < float(previous["low"].min())
+    above_vwap = current_spot > current_vwap
+    below_vwap = current_spot < current_vwap
+    pa_direction = "BULLISH" if higher_high and higher_low else "BEARISH" if lower_high and lower_low else "NEUTRAL"
+    direction = str(proposed_direction or "NEUTRAL").upper()
+    if not ((direction == "BULLISH" and above_vwap and pa_direction == "BULLISH") or
+            (direction == "BEARISH" and below_vwap and pa_direction == "BEARISH")):
+        direction = "NEUTRAL"
+
+    current_volume = safe_float(work["volume"].iloc[-1], 0.0)
+    reference_volume = work["volume"].iloc[-21:-1] if len(work) > 2 else work["volume"].iloc[:-1]
+    median_volume = safe_float(reference_volume.median(), 0.0) if not reference_volume.empty else 0.0
+    volume_confirmed = median_volume > 0 and current_volume >= median_volume * STRONG_VOLUME_MULTIPLIER
+    divergence_3m = detect_rsi_divergence(work, window=5)
+    fifteen = _resample_ohlcv(work, 15)
+    divergence_15m = detect_rsi_divergence(fifteen, window=3) if len(fifteen) >= 6 else "NONE"
+    divergence = divergence_3m if divergence_3m == divergence_15m else "NONE"
+    atr_series = calculate_atr(work, ATR_PERIOD)
+    atr = safe_float(atr_series.iloc[-1], 0.0) if not atr_series.empty else 0.0
+    level_tolerance = max(0.75 * atr, current_spot * 0.0015)
+    near_support = math.isfinite(safe_float(support, float("nan"))) and abs(current_spot - support) <= level_tolerance
+    near_resistance = math.isfinite(safe_float(resistance, float("nan"))) and abs(current_spot - resistance) <= level_tolerance
+    near_level = (divergence == "BULLISH" and near_support) or (divergence == "BEARISH" and near_resistance)
+    # Divergence by itself is not an entry. Require the latest completed 3m bar
+    # to confirm a local reversal through the preceding bar's extreme.
+    last_bar = work.iloc[-1]
+    prior_bar = work.iloc[-2]
+    bullish_reversal_bar = (
+        safe_float(last_bar.get("close"), float("nan")) > safe_float(prior_bar.get("high"), float("inf"))
+        and safe_float(last_bar.get("close"), float("nan")) > safe_float(prior_bar.get("close"), float("inf"))
+    )
+    bearish_reversal_bar = (
+        safe_float(last_bar.get("close"), float("nan")) < safe_float(prior_bar.get("low"), float("-inf"))
+        and safe_float(last_bar.get("close"), float("nan")) < safe_float(prior_bar.get("close"), float("-inf"))
+    )
+    reversal_price_confirmed = bool(
+        near_level and (
+            (divergence == "BULLISH" and bullish_reversal_bar)
+            or (divergence == "BEARISH" and bearish_reversal_bar)
+        )
+    )
+
+    if not math.isfinite(adx):
+        intensity = "UNKNOWN"
+        reason = "ADX has insufficient valid bars."
+        direction = "NEUTRAL"
+    elif adx < ADX_SIDEWAYS_THRESHOLD:
+        intensity = "SIDEWAYS"
+        reason = f"ADX {adx:.1f} below {ADX_SIDEWAYS_THRESHOLD:.1f}."
+        direction = "NEUTRAL"
+    elif divergence != "NONE" and near_level:
+        intensity = "EXHAUSTION"
+        direction = divergence
+        reason = (
+            f"Confirmed 3m/15m RSI {divergence.lower()} divergence near structural level; "
+            + ("local reversal-price confirmation passed." if reversal_price_confirmed else "waiting for price to clear the preceding 3m bar extreme.")
+        )
+    elif (adx > ADX_STRONG_THRESHOLD and volume_confirmed and
+          ((direction == "BULLISH" and math.isfinite(upper_band) and current_spot >= upper_band) or
+           (direction == "BEARISH" and math.isfinite(lower_band) and current_spot <= lower_band))):
+        intensity = "STRONG"
+        reason = f"ADX {adx:.1f} > {ADX_STRONG_THRESHOLD:.1f}, price at outer VWAP band and volume confirmed."
+    else:
+        intensity = "NORMAL"
+        reason = f"Directional structure with ADX {adx:.1f}; strong-breakout confirmation absent."
+    return {
+        "direction": direction, "intensity": intensity, "adx": adx, "rsi_3m": rsi_3m,
+        "rsi_15m": safe_float(calculate_rsi(fifteen["close"], 14).iloc[-1], float("nan")) if len(fifteen) >= 8 else float("nan"),
+        "upper_vwap_band": upper_band, "lower_vwap_band": lower_band,
+        "volume_confirmed": bool(volume_confirmed), "divergence": divergence,
+        "near_structural_level": bool(near_level),
+        "reversal_price_confirmed": bool(reversal_price_confirmed), "reason": reason,
+    }
+
+
 def trend_direction(
     df: pd.DataFrame,
     lookback: int = 6,
@@ -1170,6 +1442,179 @@ def build_option_oi_snapshot(
             "put_ltp": safe_float(pe.get("ltp")),
         }
     return snapshot
+
+
+def update_option_oi_velocity_history(
+    state: dict[str, Any],
+    chain: list[dict[str, Any]],
+    expiry: str,
+    *,
+    now: Optional[datetime] = None,
+) -> dict[float, dict[str, Any]]:
+    """Measure per-strike OI change versus a 15-30 minute-old same-session snapshot."""
+    current_time = now or now_ist()
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=IST)
+    else:
+        current_time = current_time.astimezone(IST)
+    today = current_time.date().isoformat()
+    current_by_key: dict[str, dict[str, Any]] = {}
+    rows = chain_rows(chain)
+    for strike, row in rows.items():
+        for side in ("CE", "PE"):
+            data = option_side_data(row, side)
+            key = str(data.get("instrument_key") or "").strip()
+            oi = safe_float(data.get("oi"), float("nan"))
+            if key and math.isfinite(oi) and oi > 0:
+                current_by_key[key] = {"strike": float(strike), "side": side, "oi": oi}
+
+    history = state.get("option_oi_history")
+    if not isinstance(history, list):
+        history = []
+    valid_history: list[dict[str, Any]] = []
+    eligible_baselines: list[tuple[float, dict[str, Any]]] = []
+    now_stamp = pd.Timestamp(current_time)
+    for item in history:
+        if not isinstance(item, dict) or item.get("date") != today or str(item.get("expiry"))[:10] != str(expiry)[:10]:
+            continue
+        try:
+            stamp = pd.Timestamp(item.get("timestamp"))
+            if stamp.tzinfo is None:
+                stamp = stamp.tz_localize(IST)
+            else:
+                stamp = stamp.tz_convert(IST)
+        except Exception:
+            continue
+        age = (now_stamp - stamp).total_seconds() / 60.0
+        if age < 0 or age > OPTION_OI_HISTORY_KEEP_MINUTES:
+            continue
+        item_copy = dict(item)
+        item_copy["timestamp"] = stamp.isoformat()
+        valid_history.append(item_copy)
+        if OPTION_OI_MIN_AGE_MINUTES <= age <= OPTION_OI_MAX_AGE_MINUTES:
+            eligible_baselines.append((age, item_copy))
+
+    baseline_age = float("nan")
+    baseline: dict[str, Any] = {}
+    if eligible_baselines:
+        baseline_age, baseline = min(eligible_baselines, key=lambda pair: abs(pair[0] - 20.0))
+    baseline_map = baseline.get("oi_by_instrument", {}) if baseline else {}
+    by_strike: dict[float, dict[str, Any]] = {}
+    for strike, row in rows.items():
+        current_ce = option_side_data(row, "CE")
+        current_pe = option_side_data(row, "PE")
+        ce_key = str(current_ce.get("instrument_key") or "")
+        pe_key = str(current_pe.get("instrument_key") or "")
+        ce_old = baseline_map.get(ce_key, {}) if isinstance(baseline_map, dict) else {}
+        pe_old = baseline_map.get(pe_key, {}) if isinstance(baseline_map, dict) else {}
+        old_call_oi = safe_float(ce_old.get("oi"), float("nan")) if isinstance(ce_old, dict) else float("nan")
+        old_put_oi = safe_float(pe_old.get("oi"), float("nan")) if isinstance(pe_old, dict) else float("nan")
+        current_call_oi = safe_float(current_ce.get("oi"), float("nan"))
+        current_put_oi = safe_float(current_pe.get("oi"), float("nan"))
+        call_available = math.isfinite(old_call_oi) and old_call_oi > 0 and math.isfinite(current_call_oi) and current_call_oi > 0
+        put_available = math.isfinite(old_put_oi) and old_put_oi > 0 and math.isfinite(current_put_oi) and current_put_oi > 0
+        call_change = current_call_oi - old_call_oi if call_available else float("nan")
+        put_change = current_put_oi - old_put_oi if put_available else float("nan")
+        by_strike[float(strike)] = {
+            "available": bool(call_available and put_available and math.isfinite(baseline_age)),
+            "call_oi_change": call_change,
+            "put_oi_change": put_change,
+            "call_oi_change_pct": call_change / old_call_oi if call_available else float("nan"),
+            "put_oi_change_pct": put_change / old_put_oi if put_available else float("nan"),
+            "baseline_minutes": baseline_age,
+        }
+
+    current_snapshot = {
+        "date": today,
+        "expiry": str(expiry)[:10],
+        "timestamp": current_time.isoformat(),
+        "oi_by_instrument": current_by_key,
+    }
+    if not valid_history or str(valid_history[-1].get("timestamp")) != current_snapshot["timestamp"]:
+        valid_history.append(current_snapshot)
+    state["option_oi_history"] = valid_history[-40:]
+    logger.info(
+        "OPTION OI VELOCITY: baseline=%s age_min=%s strikes_with_15_30m_data=%d/%d",
+        "AVAILABLE" if eligible_baselines else "WARMING_UP",
+        f"{baseline_age:.1f}" if math.isfinite(baseline_age) else "-",
+        sum(1 for item in by_strike.values() if item.get("available")), len(by_strike),
+    )
+    return by_strike
+
+
+def permitted_strikes_for_regime(
+    atm: float,
+    step: float,
+    direction: str,
+    intensity: str,
+    *,
+    is_expiry_day: bool = False,
+    now: Optional[datetime] = None,
+) -> list[float]:
+    """Return the single authoritative strike-routing array for all call sites."""
+    direction = str(direction).upper()
+    intensity = str(intensity).upper()
+    if direction not in {"BULLISH", "BEARISH"} or step <= 0 or intensity in {"SIDEWAYS", "UNKNOWN"}:
+        return []
+    if is_expiry_day:
+        return [atm - step, atm] if direction == "BULLISH" else [atm, atm + step]
+    window = time_of_day_window(now)
+    if window == "CUTOFF":
+        return []
+    if intensity == "EXHAUSTION":
+        return [atm - 2 * step, atm - 3 * step] if direction == "BULLISH" else [atm + 2 * step, atm + 3 * step]
+    # OTM candidates are only allowed after 13:30 and only for a confirmed STRONG regime.
+    if intensity == "STRONG" and window == "AFTERNOON":
+        return [atm, atm + step, atm + 2 * step] if direction == "BULLISH" else [atm - 2 * step, atm - step, atm]
+    # Opening and normal/midday conditions keep the candidate set ATM/ITM only.
+    return [atm - step, atm] if direction == "BULLISH" else [atm, atm + step]
+
+
+def collect_option_premium_vwaps(
+    chain: list[dict[str, Any]],
+    spot: float,
+    direction: str,
+    intensity: str,
+    *,
+    is_expiry_day: bool,
+    now: Optional[datetime] = None,
+) -> dict[str, dict[str, float]]:
+    """Fetch completed 1-minute option candles and calculate each contract's own VWAP."""
+    rows = chain_rows(chain)
+    strikes = sorted(rows)
+    step = strike_step(strikes)
+    atm = nearest_strike(spot, strikes)
+    option_type = "CE" if direction == "BULLISH" else "PE"
+    targets = permitted_strikes_for_regime(
+        atm, step, direction, intensity, is_expiry_day=is_expiry_day, now=now
+    )
+    result: dict[str, dict[str, float]] = {}
+    for target in targets:
+        matched = min(strikes, key=lambda value: abs(value - target))
+        if abs(matched - target) > 0.01:
+            continue
+        data = option_side_data(rows[matched], option_type)
+        key = str(data.get("instrument_key") or "").strip()
+        if not key:
+            continue
+        try:
+            candles = get_intraday_candles(key, 1, strict=False)
+            completed = filter_completed_candles(candles, 1) if not candles.empty else pd.DataFrame()
+            if completed.empty or safe_float(completed["volume"].sum(), 0.0) <= 0:
+                logger.info("OPTION PREMIUM VWAP UNAVAILABLE: %s %.0f; candidate will be rejected.", option_type, matched)
+                continue
+            vwap_series = calculate_vwap(completed)
+            premium_vwap = safe_float(vwap_series.iloc[-1], float("nan")) if not vwap_series.empty else float("nan")
+            if math.isfinite(premium_vwap) and premium_vwap > 0:
+                result[key] = {"premium_vwap": premium_vwap}
+                logger.info(
+                    "OPTION PREMIUM VWAP: %s %.0f LTP=%.2f VWAP=%.2f above=%s",
+                    option_type, matched, safe_float(data.get("ltp")), premium_vwap,
+                    safe_float(data.get("ltp")) > premium_vwap,
+                )
+        except (ScannerError, KeyError, ValueError, TypeError) as exc:
+            logger.info("OPTION PREMIUM VWAP UNAVAILABLE: %s %.0f: %s", option_type, matched, exc)
+    return result
 
 
 def _intraday_option_changes(
@@ -1726,9 +2171,11 @@ def resolve_change_oi_flow(
     day_directional = day_abs >= STRUCTURE_CHANGE_OI_STRONG
 
     if str(flow_mode).upper() == "INTRADAY_SNAPSHOT" and intra_directional:
-        if day_directional and (intra * day) < 0 and intra_abs >= STRUCTURE_CHANGE_OI_CONFLICT and day_abs >= STRUCTURE_CHANGE_OI_CONFLICT:
-            # Current intraday flow is the most responsive signal, but a strong
-            # cumulative contradiction is important enough to block confirmation.
+        # Do not let one small scan-to-scan snapshot reverse a clearly directional
+        # session-level Change-OI signal. If both sources are directional and
+        # disagree, preserve the conflict and block a new entry until they align.
+        # This specifically guards the 09-Oct case: intraday=-0.155 vs day=+0.760.
+        if day_directional and (intra * day) < 0:
             return 0.0, 0, "INTRADAY_DAY_CONFLICT", True
         bias = 1 if intra >= STRUCTURE_CHANGE_OI_CONFIRM else -1
         return intra, bias, "INTRADAY_PRIMARY", False
@@ -1803,10 +2250,55 @@ def build_market_structure(
     bullish_prior = prior == "BULLISH" or prior_phase in {"BULLISH", "CONTINUOUS_BULLISH", "BULLISH_BREAKOUT"}
     bearish_prior = prior == "BEARISH" or prior_phase in {"BEARISH", "CONTINUOUS_BEARISH", "BEARISH_BREAKDOWN"}
 
-    if bearish_prior and math.isfinite(previous_support) and current_close < previous_support - break_buffer:
-        support_1 = previous_support
-    elif bullish_prior and math.isfinite(previous_resistance) and current_close > previous_resistance + break_buffer:
-        resistance_1 = previous_resistance
+    # Validate OI levels against the live underlying price. A previously broken
+    # resistance/support is a breakout reference, NOT the current resistance/
+    # support. The old implementation overwrote a fresh resistance with the
+    # prior resistance and could report resistance below spot (e.g. 22400 while
+    # NIFTY was trading near 22417 on 09-Oct).
+    price_reference = max(
+        x for x in (safe_float(spot, float("nan")), current_close)
+        if math.isfinite(x)
+    )
+    original_supports = [support_1, support_2]
+    original_resistances = [resistance_1, resistance_2]
+    live_supports = sorted(
+        {float(x) for x in original_supports if math.isfinite(safe_float(x, float("nan"))) and float(x) < price_reference},
+        reverse=True,
+    )
+    live_resistances = sorted(
+        {float(x) for x in original_resistances if math.isfinite(safe_float(x, float("nan"))) and float(x) > price_reference},
+    )
+    prior_support_valid = math.isfinite(previous_support) and previous_support < price_reference
+    prior_resistance_valid = math.isfinite(previous_resistance) and previous_resistance > price_reference
+
+    if live_supports:
+        support_1 = live_supports[0]
+        support_2 = live_supports[1] if len(live_supports) > 1 else float("nan")
+        if len(live_supports) == 1 and prior_support_valid and previous_support < support_1:
+            support_2 = previous_support
+    elif prior_support_valid and abs(previous_support - price_reference) <= 300.0:
+        support_1, support_2 = previous_support, float("nan")
+        chain_levels["support_source"] = "PERSISTED_OPTION_OI"
+    else:
+        support_1 = support_2 = float("nan")
+
+    if live_resistances:
+        resistance_1 = live_resistances[0]
+        resistance_2 = live_resistances[1] if len(live_resistances) > 1 else float("nan")
+        if len(live_resistances) == 1 and prior_resistance_valid and previous_resistance > resistance_1:
+            resistance_2 = previous_resistance
+    elif prior_resistance_valid and abs(previous_resistance - price_reference) <= 300.0:
+        resistance_1, resistance_2 = previous_resistance, float("nan")
+        chain_levels["resistance_source"] = "PERSISTED_OPTION_OI"
+    else:
+        resistance_1 = resistance_2 = float("nan")
+
+    if math.isfinite(support_1) and math.isfinite(resistance_1) and support_1 >= resistance_1:
+        logger.warning(
+            "INVALID OI LEVEL ORDER: support=%.2f resistance=%.2f price=%.2f; directional entries will be blocked.",
+            support_1, resistance_1, price_reference,
+        )
+        support_1 = support_2 = resistance_1 = resistance_2 = float("nan")
 
     below_vwap = math.isfinite(vwap) and current_close < vwap - STRUCTURE_VWAP_RECLAIM_BUFFER_ATR * volatility_unit
     above_vwap = math.isfinite(vwap) and current_close > vwap + STRUCTURE_VWAP_RECLAIM_BUFFER_ATR * volatility_unit
@@ -1818,8 +2310,18 @@ def build_market_structure(
         day_score=change_oi_score,
         flow_mode=flow_mode,
     )
-    bearish_flow_ok = effective_flow <= -STRUCTURE_CHANGE_OI_CONFIRM and not flow_conflict
-    bullish_flow_ok = effective_flow >= STRUCTURE_CHANGE_OI_CONFIRM and not flow_conflict
+    # Directional option entries require material, not merely marginal, Change-OI.
+    # The lower CONFIRM threshold still detects/report conflicts; the STRONG
+    # threshold is the authorization threshold for actual entries.
+    bearish_flow_ok = effective_flow <= -STRUCTURE_CHANGE_OI_STRONG and not flow_conflict
+    bullish_flow_ok = effective_flow >= STRUCTURE_CHANGE_OI_STRONG and not flow_conflict
+
+    futures_conflict_bearish = bool(
+        futures_bias > 0 and futures_strength >= STRUCTURE_FUTURES_CONFLICT_STRENGTH
+    )
+    futures_conflict_bullish = bool(
+        futures_bias < 0 and futures_strength >= STRUCTURE_FUTURES_CONFLICT_STRENGTH
+    )
 
     price_info = price_action_regime_snapshot(primary_session, vwap, volatility_unit)
     session_move = safe_float(price_info.get("session_move_atr"), 0.0)
@@ -1863,14 +2365,37 @@ def build_market_structure(
     support_is_authoritative = str(chain_levels.get("support_source", "")).upper() in {"OPTION_OI", "PERSISTED_OPTION_OI"}
     resistance_is_authoritative = str(chain_levels.get("resistance_source", "")).upper() in {"OPTION_OI", "PERSISTED_OPTION_OI"}
 
-    below_support_bars = int(np.sum(work["close"].tail(max(STRUCTURE_HOLD_BARS, 2)).to_numpy(dtype=float) < support_1 - break_buffer)) if math.isfinite(support_1) and not work.empty else 0
-    above_resistance_bars = int(np.sum(work["close"].tail(max(STRUCTURE_HOLD_BARS, 2)).to_numpy(dtype=float) > resistance_1 + break_buffer)) if math.isfinite(resistance_1) and not work.empty else 0
+    # Preserve a crossed prior OI wall only as a breakout/breakdown reference.
+    # It must never replace the current support/resistance used for targets.
+    breakdown_reference = (
+        previous_support
+        if bearish_prior and math.isfinite(previous_support) and previous_support > price_reference
+        else support_1
+    )
+    breakout_reference = (
+        previous_resistance
+        if bullish_prior and math.isfinite(previous_resistance) and previous_resistance < price_reference
+        else resistance_1
+    )
+    below_support_bars = int(np.sum(work["close"].tail(max(STRUCTURE_HOLD_BARS, 2)).to_numpy(dtype=float) < breakdown_reference - break_buffer)) if math.isfinite(breakdown_reference) and not work.empty else 0
+    above_resistance_bars = int(np.sum(work["close"].tail(max(STRUCTURE_HOLD_BARS, 2)).to_numpy(dtype=float) > breakout_reference + break_buffer)) if math.isfinite(breakout_reference) and not work.empty else 0
 
-    fresh_bearish_break = bool(support_is_authoritative and math.isfinite(support_1) and below_vwap and current_close < support_1 - break_buffer and below_support_bars >= max(1, STRUCTURE_HOLD_BARS) and bearish_flow_ok)
-    fresh_bullish_break = bool(resistance_is_authoritative and math.isfinite(resistance_1) and above_vwap and current_close > resistance_1 + break_buffer and above_resistance_bars >= max(1, STRUCTURE_HOLD_BARS) and bullish_flow_ok)
+    fresh_bearish_break = bool(support_is_authoritative and math.isfinite(breakdown_reference) and below_vwap and current_close < breakdown_reference - break_buffer and below_support_bars >= max(1, STRUCTURE_HOLD_BARS) and bearish_flow_ok)
+    fresh_bullish_break = bool(resistance_is_authoritative and math.isfinite(breakout_reference) and above_vwap and current_close > breakout_reference + break_buffer and above_resistance_bars >= max(1, STRUCTURE_HOLD_BARS) and bullish_flow_ok)
 
-    continuous_bearish = bool(bearish_base and (bearish_movement or carried_bearish or fresh_bearish_break) and not strong_bullish_reversal)
-    continuous_bullish = bool(bullish_base and (bullish_movement or carried_bullish or fresh_bullish_break) and not strong_bearish_reversal)
+    bearish_level_ok = bool(support_is_authoritative and math.isfinite(support_1) and support_1 < price_reference)
+    bullish_level_ok = bool(resistance_is_authoritative and math.isfinite(resistance_1) and resistance_1 > price_reference)
+
+    continuous_bearish = bool(
+        bearish_base and bearish_level_ok and not futures_conflict_bearish
+        and (bearish_movement or carried_bearish or fresh_bearish_break)
+        and not strong_bullish_reversal
+    )
+    continuous_bullish = bool(
+        bullish_base and bullish_level_ok and not futures_conflict_bullish
+        and (bullish_movement or carried_bullish or fresh_bullish_break)
+        and not strong_bearish_reversal
+    )
 
     if continuous_bearish and continuous_bullish:
         if effective_flow < 0:
@@ -1904,17 +2429,29 @@ def build_market_structure(
         interpretation = "BULLISH WATCH — ABOVE VWAP BUT CHANGE-OI CONFLICTING"
         scenario_trigger = f"Wait for non-conflicting bullish Change-OI and sustained bullish price action; resistance={resistance_1:.2f}."
         scenario_invalidation = "Bullish watch weakens on sustained VWAP loss and bearish price structure."
+    elif below_vwap and bearish_flow_ok and futures_conflict_bearish:
+        direction, market_phase = "BEARISH", "BEARISH"
+        entry_confirmed, confirmation_state = False, "FUTURES_CONFLICT"
+        interpretation = "BEARISH WATCH — PRICE/VWAP + CHANGE-OI BEARISH, BUT FUTURES OI IS BULLISH"
+        scenario_trigger = f"Wait for futures price/OI to stop contradicting the bearish structure; support={support_1:.2f}."
+        scenario_invalidation = "Do not open a bearish option while strong futures positioning remains bullish."
+    elif above_vwap and bullish_flow_ok and futures_conflict_bullish:
+        direction, market_phase = "BULLISH", "BULLISH"
+        entry_confirmed, confirmation_state = False, "FUTURES_CONFLICT"
+        interpretation = "BULLISH WATCH — PRICE/VWAP + CHANGE-OI BULLISH, BUT FUTURES OI IS BEARISH"
+        scenario_trigger = f"Wait for futures price/OI to stop contradicting the bullish structure; resistance={resistance_1:.2f}."
+        scenario_invalidation = "Do not open a bullish option while strong futures positioning remains bearish."
     elif below_vwap and bearish_flow_ok:
         direction, market_phase = "BEARISH", "BEARISH"
         entry_confirmed, confirmation_state = False, "STRUCTURAL_WATCH"
-        interpretation = "BEARISH WATCH — BELOW VWAP + BEARISH CHANGE-OI, PRICE PERSISTENCE NOT YET CONTINUOUS"
-        scenario_trigger = f"Wait for sustained bearish price action or a confirmed OI-support breakdown; support={support_1:.2f}."
+        interpretation = "BEARISH WATCH — BELOW VWAP + BEARISH CHANGE-OI, PRICE PERSISTENCE OR OI LEVEL NOT CONFIRMED"
+        scenario_trigger = f"Wait for sustained bearish price action and valid OI support; support={support_1:.2f}."
         scenario_invalidation = "Bearish watch weakens on sustained VWAP reclaim with opposing price structure and Change-OI."
     elif above_vwap and bullish_flow_ok:
         direction, market_phase = "BULLISH", "BULLISH"
         entry_confirmed, confirmation_state = False, "STRUCTURAL_WATCH"
-        interpretation = "BULLISH WATCH — ABOVE VWAP + BULLISH CHANGE-OI, PRICE PERSISTENCE NOT YET CONTINUOUS"
-        scenario_trigger = f"Wait for sustained bullish price action or a confirmed OI-resistance breakout; resistance={resistance_1:.2f}."
+        interpretation = "BULLISH WATCH — ABOVE VWAP + BULLISH CHANGE-OI, PRICE PERSISTENCE OR OI LEVEL NOT CONFIRMED"
+        scenario_trigger = f"Wait for sustained bullish price action and valid OI resistance; resistance={resistance_1:.2f}."
         scenario_invalidation = "Bullish watch weakens on sustained VWAP loss with opposing price structure and Change-OI."
     elif bearish_environment:
         direction, market_phase = "BEARISH", "BEARISH"
@@ -1944,8 +2481,9 @@ def build_market_structure(
         f"PRIMARY: NIFTY={current_close:.2f} vs VWAP={vwap:.2f}; below_vwap={below_vwap}; above_vwap={above_vwap}.",
         f"PRICE ACTION: structure={price_structure}; session={session_move:+.2f}vol; recent12={recent12_move:+.2f}vol; recent3={recent3_move:+.2f}vol; down_ratio={down_ratio:.2f}; up_ratio={up_ratio:.2f}; efficiency={efficiency:.2f}.",
         f"CHANGE-OI: effective={effective_flow:+.3f}; bias={effective_bias:+d}; source={effective_source}; conflict={flow_conflict}.",
-        f"OI STRUCTURE: support={support_1:.2f}/{support_2:.2f}; resistance={resistance_1:.2f}/{resistance_2:.2f}; breakdown={fresh_bearish_break}; breakout={fresh_bullish_break}.",
-        f"FUTURES CONTEXT: regime={futures_regime}; bias={futures_bias:+d}; strength={futures_strength:.3f}.",
+        f"OI STRUCTURE: support={support_1:.2f}/{support_2:.2f}; resistance={resistance_1:.2f}/{resistance_2:.2f}; breakdown_ref={breakdown_reference:.2f}; breakout_ref={breakout_reference:.2f}; breakdown={fresh_bearish_break}; breakout={fresh_bullish_break}.",
+        f"FUTURES CONTEXT: regime={futures_regime}; bias={futures_bias:+d}; strength={futures_strength:.3f}; conflict_bearish={futures_conflict_bearish}; conflict_bullish={futures_conflict_bullish}.",
+        f"ENTRY GATES: bearish_level_ok={bearish_level_ok}; bullish_level_ok={bullish_level_ok}; minimum_entry_change_oi={STRUCTURE_CHANGE_OI_STRONG:.3f}.",
         f"PCR CONTEXT: value={pcr:.3f}; bias={pcr_bias:+d}." if math.isfinite(pcr) else "PCR CONTEXT: unavailable from current chain.",
     ]
 
@@ -1964,6 +2502,8 @@ def build_market_structure(
         "structure_change_oi_day_raw": float(change_oi_score),
         "structure_change_oi_conflict": 1.0 if flow_conflict else 0.0,
         "structure_change_oi_source": effective_source,
+        "structure_futures_conflict_bullish": 1.0 if futures_conflict_bullish else 0.0,
+        "structure_futures_conflict_bearish": 1.0 if futures_conflict_bearish else 0.0,
         "structure_vwap": 1.0 if above_vwap else -1.0 if below_vwap else 0.0,
         "structure_price_break": 1.0 if fresh_bullish_break else -1.0 if fresh_bearish_break else 0.0,
         "structure_score": float(structure_score),
@@ -2058,6 +2598,7 @@ def build_option_candidate(
         theta=theta,
         spread_pct=spread_pct,
         theta_burden_pct_day=theta_burden,
+        premium_vwap=safe_float(data.get("premium_vwap"), float("nan")),
     )
 
 
@@ -2107,190 +2648,212 @@ def select_directional_option(
     *,
     target_underlying_1: Optional[float] = None,
     change_oi_by_strike: Optional[dict[float, dict[str, float]]] = None,
+    market_intensity: str = "NORMAL",
+    is_expiry_day: bool = False,
+    now: Optional[datetime] = None,
+    option_metrics_by_instrument: Optional[dict[str, dict[str, float]]] = None,
+    oi_velocity_by_strike: Optional[dict[float, dict[str, Any]]] = None,
 ) -> OptionCandidate:
+    """Select a strike using regime routing + strict option VWAP/COI/delta gates."""
+    direction = str(direction).upper()
+    intensity = str(market_intensity).upper()
     if direction not in {"BULLISH", "BEARISH"}:
         raise ScannerError("Option selection requires BULLISH or BEARISH.")
+    if intensity in {"SIDEWAYS", "UNKNOWN"}:
+        raise ScannerError(f"Directional option buying blocked for intensity={intensity}.")
 
     rows = chain_rows(chain)
     strikes = sorted(rows)
     step = strike_step(strikes)
     atm = nearest_strike(spot, strikes)
     atm_distance_steps = abs(atm - spot) / max(step, 1.0)
-
-    # Fail safe rather than silently selecting a materially displaced strike.
-    # This catches malformed/incomplete chains and prevents a stale chain from
-    # converting an otherwise correct reversal into an obviously wrong option.
     if atm_distance_steps > 1.25:
         raise ScannerError(
-            f"ATM strike sanity check failed: index spot={spot:.2f}, "
-            f"nearest strike={atm:.0f}, step={step:.0f} "
-            f"({atm_distance_steps:.2f} steps away)."
+            f"ATM strike sanity check failed: index spot={spot:.2f}, nearest strike={atm:.0f}, "
+            f"step={step:.0f} ({atm_distance_steps:.2f} steps away)."
         )
 
-    # Hard directional universe: Bullish -> ATM-1/ATM-2 CE; Bearish ->
-    # ATM+1/ATM+2 PE. Both candidates are ranked from the same current
-    # PA/OI setup used for T1/T2/SL; candidate priority is never hard-coded.
-    candidate_strikes = (
-        [atm - step, atm - 2 * step]
-        if direction == "BULLISH"
-        else [atm + step, atm + 2 * step]
-    )
+    permitted_list = [round(float(x), 2) for x in permitted_strikes_for_regime(
+        atm, step, direction, intensity, is_expiry_day=is_expiry_day, now=now
+    )]
+    if not permitted_list:
+        raise ScannerError(f"No permitted strikes for {direction}/{intensity} at this time of day.")
     option_type = "CE" if direction == "BULLISH" else "PE"
+    metrics = option_metrics_by_instrument if isinstance(option_metrics_by_instrument, dict) else {}
+    velocity_map = oi_velocity_by_strike if isinstance(oi_velocity_by_strike, dict) else {}
+    flow_map = change_oi_by_strike if isinstance(change_oi_by_strike, dict) else {}
+    tod = time_of_day_window(now)
+    max_spread = min(MAX_SPREAD_PCT, OPENING_MAX_SPREAD_PCT) if tod == "OPENING" else MAX_SPREAD_PCT
 
-    candidates: list[OptionCandidate] = []
+    eligible: list[tuple[float, OptionCandidate, bool]] = []
     rejection_log: list[str] = []
-
-    for target in candidate_strikes:
-        target = round(float(target), 2)
-
-        # Never depend on exact float equality.
-        row_key = min(strikes, key=lambda s: abs(s - target))
+    score_by_strike: dict[float, float] = {}
+    for target in permitted_list:
+        row_key = min(strikes, key=lambda value: abs(value - target))
         if abs(row_key - target) > 0.01:
-            rejection_log.append(f"{option_type} {target:.0f} absent from chain")
+            rejection_log.append(f"{option_type} {target:.0f}: strike absent from chain")
             continue
-
         data = option_side_data(rows[row_key], option_type)
-
-        if not data["instrument_key"]:
+        instrument_key = str(data.get("instrument_key") or "").strip()
+        if not instrument_key:
             rejection_log.append(f"{option_type} {row_key:.0f}: no instrument key")
             continue
-
-        if data["ltp"] <= 0:
+        ltp = safe_float(data.get("ltp"), 0.0)
+        if ltp <= 0:
             rejection_log.append(f"{option_type} {row_key:.0f}: invalid LTP")
             continue
-
-        if data["oi"] < MIN_OI:
-            rejection_log.append(
-                f"{option_type} {row_key:.0f}: OI {data['oi']:.0f} below {MIN_OI:.0f}"
-            )
+        if safe_float(data.get("oi"), 0.0) < MIN_OI or safe_float(data.get("volume"), 0.0) < MIN_VOLUME:
+            rejection_log.append(f"{option_type} {row_key:.0f}: insufficient OI/volume")
             continue
 
-        if data["volume"] < MIN_VOLUME:
-            rejection_log.append(
-                f"{option_type} {row_key:.0f}: volume {data['volume']:.0f} below {MIN_VOLUME:.0f}"
-            )
+        micro = metrics.get(instrument_key, {}) if isinstance(metrics, dict) else {}
+        premium_vwap = safe_float(micro.get("premium_vwap"), float("nan")) if isinstance(micro, dict) else float("nan")
+        if not math.isfinite(premium_vwap) or premium_vwap <= 0:
+            rejection_log.append(f"{option_type} {row_key:.0f}: own premium VWAP unavailable")
+            continue
+        if ltp <= premium_vwap:
+            rejection_log.append(f"{option_type} {row_key:.0f}: LTP {ltp:.2f} <= premium VWAP {premium_vwap:.2f}")
             continue
 
-        delta = safe_float(data["delta"], float("nan"))
-        if not math.isfinite(delta):
-            if option_type == "CE":
-               delta = 0.50 + ((spot - target) / (2 * step)) * 0.15
-            else:
-                delta = -0.50 - ((target - spot) / (2 * step)) * 0.15
-                delta = max(-0.95, min(0.95, delta))
-            data["delta"] = delta
+        delta = safe_float(data.get("delta"), float("nan"))
+        if not math.isfinite(delta) or abs(delta) > 1.0 or abs(delta) <= 0.0:
+            rejection_log.append(f"{option_type} {row_key:.0f}: valid live delta unavailable")
+            continue
+        delta_abs = abs(delta)
+        if intensity == "EXHAUSTION":
+            delta_floor = 0.75
+        elif is_expiry_day or intensity != "STRONG":
+            delta_floor = 0.50
+        else:
+            delta_floor = 0.0
+        if delta_abs < delta_floor:
+            rejection_log.append(f"{option_type} {row_key:.0f}: delta {delta_abs:.3f} below floor {delta_floor:.2f}")
+            continue
 
-        bid = safe_float(data["bid"])
-        ask = safe_float(data["ask"])
+        bid = safe_float(data.get("bid"), 0.0)
+        ask = safe_float(data.get("ask"), 0.0)
         if bid <= 0 or ask <= 0 or ask < bid:
-            rejection_log.append(
-                f"{option_type} {row_key:.0f}: invalid bid/ask"
-            )
+            rejection_log.append(f"{option_type} {row_key:.0f}: invalid bid/ask")
             continue
-
         mid = (bid + ask) / 2.0
         spread_pct = (ask - bid) / mid if mid > 0 else 1.0
-        if spread_pct > MAX_SPREAD_PCT:
-            rejection_log.append(
-                f"{option_type} {row_key:.0f}: spread={spread_pct:.1%}"
-            )
+        if spread_pct > max_spread:
+            rejection_log.append(f"{option_type} {row_key:.0f}: spread {spread_pct:.2%} > {max_spread:.2%}")
             continue
 
-        theta = safe_float(data["theta"])
-        theta_burden = abs(theta) / data["ltp"] if data["ltp"] > 0 else 999.0
+        velocity = velocity_map.get(float(row_key), {}) if isinstance(velocity_map, dict) else {}
+        if not isinstance(velocity, dict) or not bool(velocity.get("available")):
+            rejection_log.append(f"{option_type} {row_key:.0f}: 15-30 minute OI velocity baseline unavailable")
+            continue
+        call_pct = safe_float(velocity.get("call_oi_change_pct"), float("nan"))
+        put_pct = safe_float(velocity.get("put_oi_change_pct"), float("nan"))
+        baseline_minutes = safe_float(velocity.get("baseline_minutes"), float("nan"))
+        if not (math.isfinite(call_pct) and math.isfinite(put_pct) and
+                OPTION_OI_MIN_AGE_MINUTES <= baseline_minutes <= OPTION_OI_MAX_AGE_MINUTES):
+            rejection_log.append(f"{option_type} {row_key:.0f}: invalid 15-30 minute OI velocity data")
+            continue
 
-        # Upstox exposes theta as a time-decay measure. For ranking a long
-        # intraday option, we linearize it to the planned holding window only
-        # as a risk estimate. This is intentionally NOT a hard rejection rule,
-        # because theta is non-linear near expiry and can become very large.
-        trading_day_minutes = 375.0  # 09:15-15:30 IST
-        intraday_theta_burden = (
-            theta_burden * EXPECTED_HOLDING_MINUTES / trading_day_minutes
-        )
-        if intraday_theta_burden > THETA_WARNING_BURDEN:
-            logger.info(
-                "OPTION HEALTH WARNING: %s %.0f has estimated %.1f%% theta burden for the planned holding window; ranking penalty only.",
-                option_type, row_key, intraday_theta_burden * 100.0,
-            )
-        meta = {
-            "strike": row_key,
-            "type": option_type,
-            "expiry": str(rows[row_key].get("expiry", ""))[:10],
-        }
-        candidate = build_option_candidate(meta, data)
-        candidates.append(candidate)
-
-    if not candidates:
-        detail = "; ".join(rejection_log[-8:]) or "no valid candidates"
-        raise ScannerError(
-            f"No healthy directional {option_type} option. {detail}"
-        )
-
-    # Strike selection now considers the same PA/OI structural plan used for T1/T2/SL.
-    # ATM+1/ATM+2 remain the permitted directional universe, but the winner is
-    # chosen by current option-flow alignment + option health + T1 moneyness.
-    def strike_flow_bias(strike: float) -> int:
-        flow = (change_oi_by_strike or {}).get(float(strike), {})
-        return int(flow.get("call_bias", 0)) if option_type == "CE" else int(flow.get("put_bias", 0))
-
-    scored: list[tuple[float, int, float, OptionCandidate]] = []
-    for priority, candidate in enumerate(candidates):
-        health = option_health_score(candidate, atm, step)
-        flow_bias = strike_flow_bias(candidate.strike)
-        desired_flow = 1 if direction == "BULLISH" else -1
-        flow_score = 1.0 if flow_bias == desired_flow else 0.5 if flow_bias == 0 else 0.0
-
-        if target_underlying_1 is not None and math.isfinite(safe_float(target_underlying_1, float("nan"))):
-            target_u = float(target_underlying_1)
-            if direction == "BEARISH":
-                itm_depth = max(candidate.strike - target_u, 0.0) / max(step, 1.0)
-            else:
-                itm_depth = max(target_u - candidate.strike, 0.0) / max(step, 1.0)
-            target_fit = min(itm_depth / 2.0, 1.0)
+        strike_flow = flow_map.get(float(row_key), {})
+        call_bias = int(safe_float(strike_flow.get("call_bias"), 0))
+        put_bias = int(safe_float(strike_flow.get("put_bias"), 0))
+        desired_bias = 1 if direction == "BULLISH" else -1
+        selected_bias = call_bias if option_type == "CE" else put_bias
+        other_bias = put_bias if option_type == "CE" else call_bias
+        normalized_flow_bias = 1 if selected_bias == desired_bias else -1 if selected_bias == -desired_bias else 0
+        if normalized_flow_bias == 1:
+            flow_score = 1.0
+        elif selected_bias == 0 and other_bias == desired_bias:
+            flow_score = 0.80
+        elif selected_bias == -desired_bias and other_bias == desired_bias:
+            flow_score = 0.50
+        elif selected_bias == 0 and other_bias == 0:
+            flow_score = 0.50
         else:
-            target_fit = 0.5
+            # Conflicting flow lowers this component but does not erase the other valid score components.
+            flow_score = 0.10
 
-        delta_abs = abs(candidate.delta)
-        delta_fit = max(0.0, 1.0 - abs(delta_abs - 0.55) / 0.30)
-        total = 0.40 * flow_score + 0.30 * health + 0.20 * delta_fit + 0.10 * target_fit
-        scored.append((total, -priority, candidate.strike, candidate))
-        logger.info(
-            "STRIKE RANK: %s %.0f total=%.3f flow=%.3f health=%.3f delta_fit=%.3f target_fit=%.3f "
-            "T1_NIFTY=%s flow_bias=%+d",
-            option_type, candidate.strike, total, flow_score, health, delta_fit, target_fit,
-            f"{target_underlying_1:.2f}" if target_underlying_1 is not None else "-",
-            flow_bias,
+        if direction == "BULLISH":
+            unwind_pct, adding_pct = max(-call_pct, 0.0), max(put_pct, 0.0)
+        else:
+            unwind_pct, adding_pct = max(-put_pct, 0.0), max(call_pct, 0.0)
+        coi_score = 0.5 * min(unwind_pct / max(COI_STRONG_CHANGE_PCT, 1e-6), 1.0) + 0.5 * min(
+            adding_pct / max(COI_STRONG_CHANGE_PCT, 1e-6), 1.0
         )
 
-    scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
-    selected = scored[0][3]
+        if option_type == "CE":
+            moneyness = "ITM" if row_key < atm - 0.01 else "ATM" if abs(row_key - atm) <= 0.01 else "OTM"
+        else:
+            moneyness = "ITM" if row_key > atm + 0.01 else "ATM" if abs(row_key - atm) <= 0.01 else "OTM"
+        moneyness_multiplier = {"ITM": 1.0, "ATM": 0.85, "OTM": 0.65}[moneyness]
+        delta_weight = moneyness_multiplier * min(delta_abs / 0.75, 1.0)
+        premium_lift_pct = max((ltp - premium_vwap) / premium_vwap, 0.0)
+        vwap_score = 0.50 + 0.50 * min(premium_lift_pct / 0.02, 1.0)
+        total = flow_score + vwap_score + coi_score + delta_weight
 
-    # Final hard invariant. An invalid directional strike can NEVER propagate
-    # into Signal -> state -> email.
-    permitted = (
-        {round(atm - step, 2), round(atm - 2.0 * step, 2)}
-        if direction == "BULLISH"
-        else {round(atm + step, 2), round(atm + 2.0 * step, 2)}
-    )
+        theta = safe_float(data.get("theta"), 0.0)
+        theta_burden = abs(theta) / ltp if ltp > 0 else float("inf")
+        meta = {"strike": row_key, "type": option_type,
+                "expiry": str(rows[row_key].get("expiry", ""))[:10]}
+        data["premium_vwap"] = premium_vwap
+        candidate = build_option_candidate(meta, data)
+        candidate = replace(
+            candidate,
+            flow_score=flow_score,
+            vwap_score=vwap_score,
+            oi_momentum_score=coi_score,
+            delta_weight=delta_weight,
+            call_oi_change_pct_15m=call_pct * 100.0,
+            put_oi_change_pct_15m=put_pct * 100.0,
+            oi_velocity_baseline_minutes=baseline_minutes,
+            market_intensity=intensity,
+        )
+        eligible.append((total, candidate, moneyness == "OTM"))
+        score_by_strike[row_key] = total
+        logger.info(
+            "STRIKE RANK: %s %.0f regime=%s moneyness=%s total=%.3f flow=%.3f vwap=%.3f "
+            "coi_velocity=%.3f delta_weight=%.3f delta=%.3f premium_ltp=%.2f premium_vwap=%.2f "
+            "call_coi15m=%+.2f%% put_coi15m=%+.2f%% baseline=%.1fm flow_bias=%+d spread=%.2f%%",
+            option_type, row_key, intensity, moneyness, total, flow_score, vwap_score, coi_score,
+            delta_weight, delta, ltp, premium_vwap, call_pct * 100.0, put_pct * 100.0,
+            baseline_minutes, normalized_flow_bias, spread_pct * 100.0,
+        )
+
+    if not eligible:
+        detail = "; ".join(rejection_log[-10:]) or "no valid candidates"
+        raise ScannerError(f"No eligible {direction}/{intensity} option. {detail}")
+
+    eligible.sort(key=lambda item: (-item[0], item[1].strike))
+    winning_score, selected, winner_is_otm = eligible[0]
+    if winner_is_otm and winning_score > 0:
+        safer = [item for item in eligible if not item[2] and item[0] >= winning_score * 0.95]
+        if safer:
+            safer.sort(key=lambda item: (-item[0], item[1].strike))
+            safer_score, safer_candidate, _ = safer[0]
+            logger.info(
+                "THETA SAFETY OVERRIDE: OTM winner %.0f score=%.3f replaced by safer %s %.0f score=%.3f (within 5%%).",
+                selected.strike, winning_score, safer_candidate.option_type, safer_candidate.strike, safer_score,
+            )
+            selected = safer_candidate
+            winning_score = safer_score
+
+    permitted = {round(x, 2) for x in permitted_list}
     if round(selected.strike, 2) not in permitted:
         raise ScannerError(
-            f"STRICT STRIKE VALIDATION FAILED: direction={direction} "
-            f"ATM={atm:.2f} step={step:.2f} selected={selected.strike:.2f} "
-            f"permitted={sorted(permitted)}"
+            f"STRICT STRIKE VALIDATION FAILED: direction={direction} intensity={intensity} "
+            f"ATM={atm:.2f} step={step:.2f} selected={selected.strike:.2f} permitted={sorted(permitted)}"
         )
-    if direction == "BULLISH" and selected.option_type != "CE":
-        raise ScannerError("STRICT STRIKE VALIDATION FAILED: bullish entry must use CE.")
-    if direction == "BEARISH" and selected.option_type != "PE":
-        raise ScannerError("STRICT STRIKE VALIDATION FAILED: bearish entry must use PE.")
-
+    expected_type = "CE" if direction == "BULLISH" else "PE"
+    if selected.option_type != expected_type:
+        raise ScannerError(f"STRICT STRIKE VALIDATION FAILED: {direction} requires {expected_type}.")
     logger.info(
-        "OPTION SELECT: direction=%s ATM=%.0f -> %s %.0f | "
-        "LTP=%.2f OI=%.0f volume=%.0f delta=%.3f spread=%.2f%% "
-        "theta=%.4f burden=%.2f%%/day",
-        direction, atm, selected.trading_symbol, selected.strike,
-        selected.ltp, selected.oi, selected.volume, selected.delta,
-        selected.spread_pct * 100.0, selected.theta,
-        selected.theta_burden_pct_day * 100.0,
+        "OPTION SELECT: direction=%s intensity=%s tod=%s expiry_day=%s ATM=%.0f permitted=%s "
+        "selected=%s %.0f total=%.3f LTP=%.2f option_VWAP=%.2f delta=%.3f flow=%.3f VWAPscore=%.3f "
+        "COIscore=%.3f delta_weight=%.3f call_COI15m=%+.2f%% put_COI15m=%+.2f%% baseline=%.1fm",
+        direction, intensity, tod, is_expiry_day, atm, sorted(permitted), selected.option_type,
+        selected.strike, winning_score, selected.ltp, selected.premium_vwap, selected.delta,
+        selected.flow_score, selected.vwap_score, selected.oi_momentum_score, selected.delta_weight,
+        selected.call_oi_change_pct_15m, selected.put_oi_change_pct_15m,
+        selected.oi_velocity_baseline_minutes,
     )
     return selected
 
@@ -2301,59 +2864,51 @@ def validate_continuous_option_entry(
     direction: str,
     market_phase: str,
     spot: float,
+    *,
+    market_intensity: str = "NORMAL",
+    is_expiry_day: bool = False,
+    now: Optional[datetime] = None,
 ) -> None:
-    """Final pre-signal/pre-email invariant check for continuous trend trades."""
+    """Final pre-signal invariant for contract type, regime routing and hard risk filters."""
     phase = str(market_phase or "").upper()
-    if phase not in {"CONTINUOUS_BULLISH", "CONTINUOUS_BEARISH"}:
+    if phase not in {"CONTINUOUS_BULLISH", "CONTINUOUS_BEARISH"} and not phase.startswith("EXHAUSTION_"):
         return
-
     rows = chain_rows(chain)
     strikes = sorted(rows)
     step = strike_step(strikes)
     atm = nearest_strike(spot, strikes)
-    permitted = (
-        {round(atm - step, 2), round(atm - 2.0 * step, 2)}
-        if direction == "BULLISH"
-        else {round(atm + step, 2), round(atm + 2.0 * step, 2)}
-    )
+    permitted = {
+        round(float(x), 2) for x in permitted_strikes_for_regime(
+            atm, step, direction, market_intensity, is_expiry_day=is_expiry_day, now=now
+        )
+    }
     selected_strike = round(float(option.strike), 2)
-
     if selected_strike not in permitted:
         raise ScannerError(
-            f"PRE-EMAIL STRIKE VALIDATION FAILED: {direction} continuous entry "
+            f"PRE-EMAIL STRIKE VALIDATION FAILED: {direction}/{market_intensity} "
             f"requires {sorted(permitted)} but selected {selected_strike:.2f}."
         )
-
     expected_type = "CE" if direction == "BULLISH" else "PE"
     if option.option_type != expected_type:
-        raise ScannerError(
-            f"PRE-EMAIL OPTION TYPE VALIDATION FAILED: {direction} "
-            f"requires {expected_type}, got {option.option_type}."
-        )
-
+        raise ScannerError(f"PRE-EMAIL OPTION TYPE VALIDATION FAILED: {direction} requires {expected_type}.")
     exact_row = rows.get(selected_strike)
     if exact_row is None:
-        raise ScannerError(
-            f"PRE-EMAIL CHAIN VALIDATION FAILED: strike {selected_strike:.2f} "
-            "is not present in the live option chain."
-        )
-
+        raise ScannerError(f"PRE-EMAIL CHAIN VALIDATION FAILED: strike {selected_strike:.2f} absent from live chain.")
     side = option_side_data(exact_row, expected_type)
     live_key = str(side.get("instrument_key") or "")
     if not live_key or live_key != option.instrument_key:
-        raise ScannerError(
-            "PRE-EMAIL INSTRUMENT VALIDATION FAILED: selected instrument does not "
-            "match the live chain contract at the selected strike."
-        )
-
-    if safe_float(side.get("ltp"), 0.0) <= 0:
-        raise ScannerError(
-            f"PRE-EMAIL LTP VALIDATION FAILED: {expected_type} {selected_strike:.2f} has invalid LTP."
-        )
-
+        raise ScannerError("PRE-EMAIL INSTRUMENT VALIDATION FAILED: selected key does not match live chain.")
+    live_ltp = safe_float(side.get("ltp"), 0.0)
+    if live_ltp <= 0 or not math.isfinite(option.premium_vwap) or live_ltp <= option.premium_vwap:
+        raise ScannerError("PRE-EMAIL PREMIUM VWAP VALIDATION FAILED: live LTP must be above valid option VWAP.")
+    delta_floor = 0.75 if market_intensity == "EXHAUSTION" else 0.50 if (is_expiry_day or market_intensity != "STRONG") else 0.0
+    if abs(option.delta) < delta_floor:
+        raise ScannerError(f"PRE-EMAIL DELTA VALIDATION FAILED: |delta|={abs(option.delta):.3f} < {delta_floor:.2f}.")
     logger.info(
-        "STRICT STRIKE VALIDATION PASSED: direction=%s phase=%s ATM=%.0f step=%.0f selected=%s %.0f permitted=%s",
-        direction, phase, atm, step, expected_type, selected_strike, sorted(permitted),
+        "STRICT STRIKE VALIDATION PASSED: direction=%s phase=%s intensity=%s ATM=%.0f step=%.0f "
+        "selected=%s %.0f permitted=%s premium_LTP=%.2f premium_VWAP=%.2f delta=%.3f",
+        direction, phase, market_intensity, atm, step, expected_type, selected_strike,
+        sorted(permitted), live_ltp, option.premium_vwap, option.delta,
     )
 
 
@@ -2721,8 +3276,8 @@ def migrate_active_trade_to_v25(
 ) -> bool:
     """One-time migration of legacy trades to authoritative NIFTY PA/OI levels.
 
-    Legacy V19/V21/V22 trades may contain option-premium targets or a historical
-    ``t1_hit`` flag generated by the old premium-target engine. V25 therefore
+    Legacy V19/V21/V22/V25 trades may contain option-premium targets or a historical
+    ``t1_hit`` flag generated by the old premium-target engine. V26 therefore
     re-derives T1/T2/SL from current NIFTY price action + current option OI and
     then recomputes whether the new structural T1 has actually been reached.
     """
@@ -2732,7 +3287,7 @@ def migrate_active_trade_to_v25(
 
     direction = str(trade.get("direction", structure.direction)).upper()
     if direction not in {"BULLISH", "BEARISH"}:
-        logger.warning("V25 TRADE MIGRATION FAILED: invalid trade direction=%s", direction)
+        logger.warning("V26 TRADE MIGRATION FAILED: invalid trade direction=%s", direction)
         return False
 
     if direction != structure.direction:
@@ -2757,7 +3312,7 @@ def migrate_active_trade_to_v25(
         )
     except Exception as exc:
         logger.warning(
-            "V25 TRADE MIGRATION FAILED: preserving existing trade levels | %s",
+            "V26 TRADE MIGRATION FAILED: preserving existing trade levels | %s",
             exc,
         )
         return False
@@ -2793,7 +3348,7 @@ def migrate_active_trade_to_v25(
     trade["t1_hit_at"] = now_ist().isoformat() if structural_t1_hit else ""
 
     logger.info(
-        "V25 TRADE MIGRATION: %s | old T1=%s T2=%s SL=%s old_uT1=%s old_uT2=%s old_uSL=%s old_t1_hit=%s -> "
+        "V26 TRADE MIGRATION: %s | old T1=%s T2=%s SL=%s old_uT1=%s old_uT2=%s old_uSL=%s old_t1_hit=%s -> "
         "PA/OI T1=%.2f T2=%.2f SL=%.2f t1_hit=%s | spot=%.2f | sources=%s/%s/%s",
         trade.get("trading_symbol", ""),
         old[0], old[1], old[2], old[3], old[4], old[5], old[6],
@@ -3075,6 +3630,92 @@ def apply_dynamic_oi_stop_to_trade(
     return changed, float(effective_stop), dynamic_source
 
 
+def _as_ist_timestamp(value: Any) -> Optional[pd.Timestamp]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.upper().endswith(" IST"):
+        raw = raw[:-4].strip()
+    try:
+        stamp = pd.Timestamp(raw)
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize(IST)
+        else:
+            stamp = stamp.tz_convert(IST)
+        return stamp
+    except Exception:
+        return None
+
+
+def stagnation_exit_trigger(
+    trade: dict[str, Any],
+    price_5m: Optional[pd.DataFrame],
+) -> tuple[bool, str]:
+    """Detect a <0.10% total high-low range across three closed 5m bars after entry."""
+    if price_5m is None or price_5m.empty:
+        return False, "5-minute candles unavailable"
+    opened_at = _as_ist_timestamp(trade.get("opened_at"))
+    if opened_at is None:
+        return False, "trade opening timestamp unavailable"
+    bars = filter_completed_candles(price_5m, 5)
+    if bars.empty:
+        return False, "no completed 5-minute candles"
+    local_start = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST)
+    # A bar qualifies only when its close occurs after the trade was opened.
+    bars = bars.loc[local_start + pd.to_timedelta(5, unit="m") > opened_at].copy()
+    if len(bars) < max(STAGNATION_REQUIRED_BARS, 3):
+        return False, f"only {len(bars)} eligible completed 5m bars"
+    bars = bars.tail(max(STAGNATION_REQUIRED_BARS, 3))
+    high = pd.to_numeric(bars["high"], errors="coerce")
+    low = pd.to_numeric(bars["low"], errors="coerce")
+    close = pd.to_numeric(bars["close"], errors="coerce")
+    if high.isna().any() or low.isna().any() or close.isna().any() or float(close.mean()) <= 0:
+        return False, "5-minute OHLC data invalid"
+    range_pct = float((high.max() - low.min()) / close.mean())
+    timestamps = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST)
+    if range_pct < STAGNATION_RANGE_PCT:
+        return True, (
+            f"3_COMPLETED_5M_BARS_RANGE={range_pct:.4%}<" f"{STAGNATION_RANGE_PCT:.2%}; "
+            f"from={timestamps.iloc[0].strftime('%H:%M')} to={(timestamps.iloc[-1] + pd.Timedelta(minutes=5)).strftime('%H:%M')} IST"
+        )
+    return False, f"three-bar range {range_pct:.4%} is not below {STAGNATION_RANGE_PCT:.2%}"
+
+
+def force_close_active_trade_at_cutoff(state: dict[str, Any], reason: str = "TIME_CUTOFF_15_15") -> bool:
+    """Persist/email an exit decision at cutoff. This scanner does not place broker orders."""
+    trade = active_trade_from_state(state)
+    if trade is None:
+        return True
+    try:
+        exit_ltp = extract_ltp(get_quote(str(trade["instrument_key"])))
+    except ScannerError as exc:
+        logger.error("CUTOFF EXIT PENDING: cannot obtain live option LTP; trade retained in state: %s", exc)
+        return False
+    closed = dict(trade)
+    closed.update({
+        "status": "CLOSED",
+        "outcome": reason,
+        "exit_ltp": round(exit_ltp, 2),
+        "closed_at": now_ist().isoformat(),
+        "exit_reason": reason,
+        "exit_3m_bar": str((state.get("market_snapshot") or {}).get("latest_completed_3m_bar", "")),
+    })
+    state["active_trade"] = None
+    state["last_completed_trade"] = closed
+    save_state(state)
+    send_email(
+        f"NIFTY FORCED EXIT - {trade.get('trading_symbol', 'Active position')}",
+        f"<p>Intraday cutoff exit signal: {html.escape(reason)}.</p>"
+        f"<p>Option: {html.escape(str(trade.get('trading_symbol', '')))}<br>"
+        f"Entry: ₹{safe_float(trade.get('entry')):.2f}<br>"
+        f"Latest option LTP: ₹{exit_ltp:.2f}<br>"
+        f"Time: {html.escape(now_ist().strftime('%Y-%m-%d %H:%M:%S IST'))}</p>"
+        "<p>This scanner records exit decisions and sends notifications; it does not submit broker orders.</p>",
+    )
+    logger.warning("TRADE CLOSED: %s outcome=%s exit_option=%.2f", trade.get("trading_symbol", ""), reason, exit_ltp)
+    return True
+
+
 def monitor_active_trade(
     state: dict[str, Any],
     structure: StructureResult,
@@ -3132,6 +3773,34 @@ def monitor_active_trade(
         except Exception as exc:
             intrabar_reason = f"1M_MONITOR_ERROR:{exc}"
             logger.info("Active trade NIFTY 1m monitor unavailable: %s", exc)
+
+    # A three-candle stagnation breaker protects open option buys from prolonged theta decay.
+    try:
+        candles_5m = get_intraday_candles(NIFTY_KEY, 5, strict=False)
+        stagnant, stagnation_reason = stagnation_exit_trigger(trade, candles_5m)
+        logger.info("STAGNATION EXIT CHECK: %s trigger=%s reason=%s", trade.get("trading_symbol", ""), stagnant, stagnation_reason)
+        if stagnant:
+            closed = dict(trade)
+            closed.update({
+                "status": "CLOSED", "outcome": "STAGNATION_EXIT",
+                "exit_ltp": round(ltp, 2), "closed_at": now_ist().isoformat(),
+                "exit_reason": stagnation_reason,
+                "exit_3m_bar": str((state.get("market_snapshot") or {}).get("latest_completed_3m_bar", "")),
+            })
+            state["active_trade"] = None
+            state["last_completed_trade"] = closed
+            save_state(state)
+            send_email(
+                f"NIFTY STAGNATION EXIT - {trade['trading_symbol']}",
+                f"<p>Intraday trade closed by the stagnation breaker.</p><p>Option: {html.escape(str(trade['trading_symbol']))}<br>"
+                f"Entry: ₹{entry if 'entry' in locals() else safe_float(trade.get('entry')):.2f}<br>"
+                f"Current option LTP: ₹{ltp:.2f}<br>Reason: {html.escape(stagnation_reason)}</p>"
+                "<p>This scanner records exit decisions and sends notifications; it does not submit broker orders.</p>",
+            )
+            logger.warning("TRADE CLOSED: %s outcome=STAGNATION_EXIT exit_option=%.2f reason=%s", trade.get("trading_symbol", ""), ltp, stagnation_reason)
+            return "CLOSED"
+    except Exception as exc:
+        logger.info("Stagnation exit check unavailable; continuing with structural exits: %s", exc)
 
     # First detect T1 from the authoritative NIFTY structural level. The current
     # OI stop is recalculated immediately on the same scan after T1 is reached.
@@ -3314,8 +3983,30 @@ def monitor_active_trade(
             active_direction == "BULLISH" and spot_now < vwap_now
         )
 
-    same_continuous_phase = structure.market_phase == expected_phase
-    market_alignment_failure = not same_continuous_phase or vwap_reclaimed_against_trade
+    trade_intensity = str(trade.get("market_intensity", "NORMAL")).upper()
+    snapshot_intensity = str(snapshot.get("market_intensity", "UNKNOWN")).upper()
+    snapshot_regime_direction = str(snapshot.get("regime_direction", "NEUTRAL")).upper()
+    if trade_intensity == "EXHAUSTION":
+        # VWAP opposition is expected at the start of a counter-trend exhaustion
+        # scalp. Do not immediately invalidate it merely because the original
+        # trend phase is still present; its structural stop/T2 remains authoritative.
+        vwap_reclaimed_against_trade = False
+        exhaustion_confirmed = bool(
+            snapshot_intensity == "EXHAUSTION"
+            and snapshot_regime_direction == active_direction
+            and snapshot.get("reversal_price_confirmed", False)
+        )
+        opposing_trend_reasserted = (
+            structure.market_phase == ("CONTINUOUS_BEARISH" if active_direction == "BULLISH" else "CONTINUOUS_BULLISH")
+            and structure.entry_confirmed
+        )
+        market_alignment_failure = bool(opposing_trend_reasserted and not exhaustion_confirmed)
+        expected_phase = f"EXHAUSTION_{active_direction}"
+        current_phase_for_log = f"{snapshot_intensity}_{snapshot_regime_direction}"
+    else:
+        same_continuous_phase = structure.market_phase == expected_phase
+        market_alignment_failure = not same_continuous_phase or vwap_reclaimed_against_trade
+        current_phase_for_log = structure.market_phase
 
     alignment_failures = int(trade.get("market_alignment_failures", 0) or 0)
     if market_alignment_failure:
@@ -3329,7 +4020,7 @@ def monitor_active_trade(
         "vwap_reclaimed=%s failures=%d/%d",
         active_direction,
         expected_phase,
-        structure.market_phase,
+        current_phase_for_log,
         vwap_reclaimed_against_trade,
         alignment_failures,
         max(MARKET_INVALIDATION_CONFIRMATIONS_REQUIRED, 1),
@@ -3412,10 +4103,12 @@ def update_continuation_persistence(
     state: dict[str, Any],
     market_phase: str,
     latest_completed_3m_bar: Optional[Any] = None,
+    *,
+    required_confirmations: Optional[int] = None,
 ) -> tuple[bool, int]:
-    """Track continuous-state confirmations on distinct completed 3m bars."""
+    """Track continuous or explicitly confirmed exhaustion setups on distinct 3m bars."""
     phase = str(market_phase or "").upper()
-    if phase not in {"CONTINUOUS_BULLISH", "CONTINUOUS_BEARISH"}:
+    if phase not in {"CONTINUOUS_BULLISH", "CONTINUOUS_BEARISH", "EXHAUSTION_BULLISH", "EXHAUSTION_BEARISH"}:
         state["continuation_phase"] = ""
         state["continuation_count"] = 0
         state["continuation_last_bar"] = ""
@@ -3444,7 +4137,7 @@ def update_continuation_persistence(
     state["continuation_phase"] = phase
     state["continuation_count"] = count
     state["continuation_last_bar"] = current_bar
-    required = max(CONTINUATION_CONFIRMATIONS_REQUIRED, 1)
+    required = max(int(required_confirmations or CONTINUATION_CONFIRMATIONS_REQUIRED), 1)
     ready = count >= required
 
     logger.info(
@@ -3610,6 +4303,32 @@ def _active_trade_intrabar_exit(
 def execute_scan(
     state: Optional[dict[str, Any]] = None,
 ) -> Optional[Signal]:
+    state = state if isinstance(state, dict) else load_state()
+    current_time = now_ist()
+    today_iso = current_time.date().isoformat()
+    # The 15:15 cutoff is evaluated before ordinary market-hours returns, so an
+    # active intraday trade still receives its exit routine if a scan starts late.
+    if current_time.weekday() < 5 and current_time.time() >= NEW_ENTRY_CUTOFF:
+        active = active_trade_from_state(state)
+        if active:
+            if str(active.get("trade_date", ""))[:10] == today_iso:
+                force_close_active_trade_at_cutoff(state, "TIME_CUTOFF_15_15")
+            else:
+                # Do not let an expired prior-session position remain active in
+                # scanner state if its old instrument no longer has a live quote.
+                closed = dict(active)
+                closed.update({
+                    "status": "CLOSED", "outcome": "SESSION_END_CLEANUP",
+                    "closed_at": current_time.isoformat(),
+                    "exit_reason": "stale position state from a prior trading date",
+                })
+                state["active_trade"] = None
+                state["last_completed_trade"] = closed
+                save_state(state)
+                logger.warning("STALE ACTIVE TRADE STATE CLEARED for prior session: %s", active.get("trading_symbol", ""))
+        logger.info("NEW ENTRY CUTOFF: %s IST; no new positions after %s.", current_time.strftime("%H:%M:%S"), NEW_ENTRY_CUTOFF.strftime("%H:%M"))
+        return None
+
     if not market_window_open():
         logger.info("Outside NSE market hours.")
         return None
@@ -3618,9 +4337,6 @@ def execute_scan(
     logger.info("NSE status=%s", status)
     if status != "OPEN":
         return None
-
-    state = state if isinstance(state, dict) else {}
-    today_iso = now_ist().date().isoformat()
 
     # State is intraday. Reset directional memory on a new session/version; an
     # active trade is still carried long enough for the monitor to clean it up.
@@ -3636,6 +4352,7 @@ def execute_scan(
         state["continuation_last_bar"] = ""
         state["scanner_version"] = SCANNER_VERSION
         state.pop("option_oi_snapshot", None)
+        state.pop("option_oi_history", None)
         state.pop("last_signal", None)
         state.pop("last_signal_hash", None)
         state.pop("last_signal_timestamp", None)
@@ -3751,6 +4468,7 @@ def execute_scan(
         previous_resistance=safe_float(previous_snapshot.get("resistance_1"), float("nan")),
     )
     option_flow_by_strike = chain_levels.get("option_flow_by_strike", {})
+    oi_velocity_by_strike = update_option_oi_velocity_history(state, chain, expiry, now=now_ist())
     chain_levels["previous_support_1"] = safe_float(previous_snapshot.get("support_1"), float("nan"))
     chain_levels["previous_resistance_1"] = safe_float(previous_snapshot.get("resistance_1"), float("nan"))
     previous_direction = str(previous_snapshot.get("direction", "")).upper() or None
@@ -3772,6 +4490,22 @@ def execute_scan(
         previous_direction=seed_direction,
         previous_phase=previous_phase,
         price_session=index_session,
+    )
+    market_regime = classify_market_regime(
+        index_session, spot, structure.vwap, structure.direction,
+        structure.support_1, structure.resistance_1,
+    )
+    is_expiry_day = parse_date(str(expiry)) == now_ist().date()
+    tod_window = time_of_day_window(now_ist())
+    logger.info(
+        "REGIME MATRIX: direction=%s intensity=%s ADX=%s RSI3m=%s RSI15m=%s TOD=%s expiry_day=%s "
+        "volume_confirmed=%s divergence=%s reason=%s",
+        market_regime.get("direction"), market_regime.get("intensity"),
+        f"{safe_float(market_regime.get('adx'), float('nan')):.2f}" if math.isfinite(safe_float(market_regime.get("adx"), float("nan"))) else "NA",
+        f"{safe_float(market_regime.get('rsi_3m'), float('nan')):.2f}" if math.isfinite(safe_float(market_regime.get("rsi_3m"), float("nan"))) else "NA",
+        f"{safe_float(market_regime.get('rsi_15m'), float('nan')):.2f}" if math.isfinite(safe_float(market_regime.get("rsi_15m"), float("nan"))) else "NA",
+        tod_window, is_expiry_day, market_regime.get("volume_confirmed"),
+        market_regime.get("divergence"), market_regime.get("reason"),
     )
 
     state_history = state.get("market_history")
@@ -3841,6 +4575,16 @@ def execute_scan(
             if not completed_index_3m.empty else ""
         ),
         "components": structure.components,
+        "regime_direction": market_regime.get("direction", "NEUTRAL"),
+        "market_intensity": market_regime.get("intensity", "UNKNOWN"),
+        "near_structural_level": bool(market_regime.get("near_structural_level", False)),
+        "reversal_price_confirmed": bool(market_regime.get("reversal_price_confirmed", False)),
+        "adx": market_regime.get("adx") if math.isfinite(safe_float(market_regime.get("adx"), float("nan"))) else None,
+        "rsi_3m": market_regime.get("rsi_3m") if math.isfinite(safe_float(market_regime.get("rsi_3m"), float("nan"))) else None,
+        "rsi_15m": market_regime.get("rsi_15m") if math.isfinite(safe_float(market_regime.get("rsi_15m"), float("nan"))) else None,
+        "regime_reason": market_regime.get("reason", ""),
+        "tod_window": tod_window,
+        "expiry_day": is_expiry_day,
     }
     state["option_oi_snapshot"] = build_option_oi_snapshot(chain, expiry)
     state["option_flow_by_strike"] = option_flow_by_strike
@@ -3925,84 +4669,153 @@ def execute_scan(
         )
         return None
 
-    if structure.direction == "NEUTRAL":
+    intensity = str(market_regime.get("intensity", "UNKNOWN")).upper()
+    regime_direction = str(market_regime.get("direction", "NEUTRAL")).upper()
+    adx_value = safe_float(market_regime.get("adx"), float("nan"))
+    if intensity in {"SIDEWAYS", "UNKNOWN"}:
+        logger.info("NO TRADE: market intensity=%s; reason=%s", intensity, market_regime.get("reason", ""))
+        return None
+    if regime_direction not in {"BULLISH", "BEARISH"}:
+        logger.info("NO TRADE: market-regime direction is neutral.")
+        return None
+    if tod_window == "MIDDAY" and (not math.isfinite(adx_value) or adx_value < MIDDAY_MIN_ADX):
+        logger.info("NO TRADE: midday momentum gate requires ADX >= %.1f; actual=%s.", MIDDAY_MIN_ADX, adx_value)
+        return None
+
+    # Exhaustion is the only controlled counter-trend exception. RSI divergence
+    # near the matching structural wall is insufficient by itself: the latest
+    # completed 3m bar must break the prior bar's extreme, Change-OI must strongly
+    # agree with the reversal, and futures positioning must not strongly oppose it.
+    flow_value = safe_float(structure.components.get("structure_change_oi"), 0.0)
+    reversal_price_confirmed = bool(market_regime.get("reversal_price_confirmed", False))
+    if regime_direction == "BULLISH":
+        aligned_oi = flow_value >= STRUCTURE_CHANGE_OI_STRONG
+        opposing_futures = bool(
+            safe_float(structure.components.get("structure_futures_conflict_bullish"), 0.0) > 0.5
+            or (structure.futures_bias < 0 and structure.futures_oi_strength >= STRUCTURE_FUTURES_CONFLICT_STRENGTH)
+        )
+    else:
+        aligned_oi = flow_value <= -STRUCTURE_CHANGE_OI_STRONG
+        opposing_futures = bool(
+            safe_float(structure.components.get("structure_futures_conflict_bearish"), 0.0) > 0.5
+            or (structure.futures_bias > 0 and structure.futures_oi_strength >= STRUCTURE_FUTURES_CONFLICT_STRENGTH)
+        )
+    exhaustion_entry = bool(
+        intensity == "EXHAUSTION"
+        and market_regime.get("near_structural_level", False)
+        and reversal_price_confirmed
+        and aligned_oi
+        and not opposing_futures
+    )
+    if intensity == "EXHAUSTION" and not exhaustion_entry:
         logger.info(
-            "No entry: market structure is neutral/mixed; phase=%s.",
-            structure.market_phase,
+            "NO TRADE: exhaustion setup not fully confirmed; near_level=%s price_break=%s "
+            "flow=%+.3f flow_aligned=%s futures_conflict=%s.",
+            market_regime.get("near_structural_level", False), reversal_price_confirmed,
+            flow_value, aligned_oi, opposing_futures,
         )
         return None
 
-    allowed_matrix_states = {
-        "CONTINUOUS_BULLISH",
-        "CONTINUOUS_BEARISH",
-    }
+    if regime_direction != structure.direction and not exhaustion_entry:
+        logger.info(
+            "NO TRADE: regime direction=%s disagrees with PA/OI structure direction=%s.",
+            regime_direction, structure.direction,
+        )
+        return None
+
+    entry_structure = structure
+    if exhaustion_entry:
+        exhaustion_phase = f"EXHAUSTION_{regime_direction}"
+        exhaustion_trigger = (
+            f"Counter-trend exhaustion scalp: confirmed {regime_direction.lower()} 3m/15m RSI divergence "
+            "at an OI structural level, local price reversal through the prior 3m bar extreme, and aligned Change-OI."
+        )
+        exhaustion_invalidation = (
+            "Exit if the underlying breaches the structural stop or the reversal loses its OI/price confirmation; "
+            "do not assume an exhaustion signal is a new full-session trend."
+        )
+        entry_structure = replace(
+            structure,
+            direction=regime_direction,
+            score=2.0 if regime_direction == "BULLISH" else -2.0,
+            confidence=min(structure.confidence, 72.0),
+            interpretation=f"CONFIRMED EXHAUSTION {regime_direction} — COUNTER-TREND SCALP",
+            market_phase=exhaustion_phase,
+            entry_confirmed=True,
+            confirmation_state="EXHAUSTION_REVERSAL_CONFIRMED",
+            entry_trigger=exhaustion_trigger,
+            invalidation_rule=exhaustion_invalidation,
+            reasons=list(structure.reasons) + [
+                f"EXHAUSTION OVERRIDE: divergence={market_regime.get('divergence')}; "
+                f"near_level={market_regime.get('near_structural_level')}; "
+                f"price_break_confirmed={reversal_price_confirmed}; Change-OI={flow_value:+.3f}; "
+                f"futures_conflict={opposing_futures}."
+            ],
+        )
+
+    allowed_matrix_states = {"CONTINUOUS_BULLISH", "CONTINUOUS_BEARISH"}
     matrix_state = (
         structure.market_phase[:-10]
         if structure.market_phase.endswith("_CONFIRMED")
         else structure.market_phase
     )
-    if matrix_state not in allowed_matrix_states:
-        logger.info(
-            "No entry: scenario matrix state not confirmed: %s",
-            structure.market_phase,
-        )
+    if not exhaustion_entry and matrix_state not in allowed_matrix_states:
+        logger.info("No entry: PA/OI structure not continuous: %s", structure.market_phase)
         return None
-
-    if not structure.entry_confirmed:
+    if not exhaustion_entry and not structure.entry_confirmed:
         logger.info(
             "No entry: confirmation/tactical gate failed. direction=%s phase=%s state=%s invalidations=%d/%d PCR_bias=%+d",
-            structure.direction,
-            structure.market_phase,
-            structure.confirmation_state,
-            structure.reversal_confirmations,
-            MARKET_INVALIDATION_CONFIRMATIONS_REQUIRED,
-            structure.pcr_bias,
+            structure.direction, structure.market_phase, structure.confirmation_state,
+            structure.reversal_confirmations, MARKET_INVALIDATION_CONFIRMATIONS_REQUIRED, structure.pcr_bias,
         )
         return None
-
 
     volatility_unit = max(safe_float(structure.components.get("volatility_unit"), 50.0), 1.0)
     vwap_distance_atr = abs(float(spot) - float(structure.vwap)) / volatility_unit
     latest_3m_move_atr = abs(float(structure.components.get("recent3_movement_atr", 0.0)))
-
-    # Entry is intentionally continuous-structure-only: one completed 3m bar is
-    # enough when the authoritative state is already continuous. A small
-    # countertrend 3m move is treated as a pullback, not a reversal gate.
     latest_completed_bar = (
         completed_index_3m["timestamp"].iloc[-1]
         if not completed_index_3m.empty
         else None
     )
+    persistence_phase = entry_structure.market_phase
+    required_persistence = (
+        MIDDAY_MIN_PERSISTENCE if tod_window == "MIDDAY"
+        else max(2, CONTINUATION_CONFIRMATIONS_REQUIRED) if exhaustion_entry
+        else CONTINUATION_CONFIRMATIONS_REQUIRED
+    )
     persistence_ok, persistence_count = update_continuation_persistence(
         state,
-        structure.market_phase,
+        persistence_phase,
         latest_completed_3m_bar=latest_completed_bar,
+        required_confirmations=required_persistence,
     )
     logger.info(
         "STRUCTURAL ENTRY CHECK: phase=%s persistence=%d/%d support=%.2f resistance=%.2f "
-        "ChangeOI=%+.3f VWAP=%.2f; recent 3m movement is context only.",
-        structure.market_phase,
+        "ChangeOI=%+.3f VWAP=%.2f; regime=%s/%s.",
+        persistence_phase,
         persistence_count,
-        max(CONTINUATION_CONFIRMATIONS_REQUIRED, 1),
-        structure.support_1,
-        structure.resistance_1,
-        structure.components.get("structure_change_oi", 0.0),
-        structure.vwap,
+        required_persistence,
+        entry_structure.support_1,
+        entry_structure.resistance_1,
+        flow_value,
+        entry_structure.vwap,
+        regime_direction,
+        intensity,
     )
     if not persistence_ok:
         logger.info(
-            "No entry: structural persistence requires %d confirmation(s); got %d.",
-            max(CONTINUATION_CONFIRMATIONS_REQUIRED, 1),
-            persistence_count,
+            "No entry: structural persistence requires %d distinct completed-bar confirmation(s); got %d.",
+            max(required_persistence, 1), persistence_count,
         )
         save_state(state)
         return None
-    timing_state = "STRUCTURAL_CONTINUATION"
+    timing_state = "CONFIRMED_EXHAUSTION_REVERSAL" if exhaustion_entry else "STRUCTURAL_CONTINUATION"
 
     target_u1, target_u2, stop_u, level_meta = determine_structural_trade_levels(
         chain,
         spot,
-        structure,
+        entry_structure,
         index_session,
         change_oi_by_strike=option_flow_by_strike,
     )
@@ -4013,31 +4826,49 @@ def execute_scan(
         stop_u, level_meta.get("sl_source", ""),
     )
 
-    option = select_directional_option(
-        chain=chain,
-        direction=structure.direction,
-        spot=spot,
-        target_underlying_1=target_u1,
-        change_oi_by_strike=option_flow_by_strike,
+    option_micro_metrics = collect_option_premium_vwaps(
+        chain, spot, regime_direction, intensity,
+        is_expiry_day=is_expiry_day, now=now_ist(),
     )
-    validate_continuous_option_entry(
-        option=option,
-        chain=chain,
-        direction=structure.direction,
-        market_phase=structure.market_phase,
-        spot=spot,
-    )
+    try:
+        option = select_directional_option(
+            chain=chain,
+            direction=regime_direction,
+            spot=spot,
+            target_underlying_1=target_u1,
+            change_oi_by_strike=option_flow_by_strike,
+            market_intensity=intensity,
+            is_expiry_day=is_expiry_day,
+            now=now_ist(),
+            option_metrics_by_instrument=option_micro_metrics,
+            oi_velocity_by_strike=oi_velocity_by_strike,
+        )
+        validate_continuous_option_entry(
+            option=option,
+            chain=chain,
+            direction=regime_direction,
+            market_phase=entry_structure.market_phase,
+            spot=spot,
+            market_intensity=intensity,
+            is_expiry_day=is_expiry_day,
+            now=now_ist(),
+        )
+    except ScannerError as exc:
+        logger.warning("NO TRADE: option strike selection rejected all candidates: %s", exc)
+        save_state(state)
+        return None
     target1, target2, stop_loss = target_u1, target_u2, stop_u
     underlying_stop, underlying_target1, underlying_target2 = stop_u, target_u1, target_u2
 
-    setup_label = "STRUCTURAL CONTINUATION ENTRY"
-    reasons = list(structure.reasons)
+    setup_label = "CONFIRMED EXHAUSTION COUNTER-TREND SCALP" if exhaustion_entry else "STRUCTURAL CONTINUATION ENTRY"
+    reasons = list(entry_structure.reasons)
     reasons.extend([
         f"Setup type: {setup_label}.",
         f"Entry timing: {timing_state}; index VWAP distance={vwap_distance_atr:.2f} ATR; latest 3m move={latest_3m_move_atr:.2f} ATR; completed index 3m bars={completed_session_bars}.",
-        f"Strike rule: {'ATM-1/ATM-2 CE' if structure.direction == 'BULLISH' else 'ATM+1/ATM+2 PE'}.",
+        f"Regime matrix: {regime_direction}/{intensity}; ADX={adx_value:.2f}; RSI3m={safe_float(market_regime.get('rsi_3m'), float('nan')):.2f}; time window={tod_window}; {market_regime.get('reason', '')}.",
+        f"Permitted strikes={permitted_strikes_for_regime(nearest_strike(spot, sorted(chain_rows(chain))), strike_step(sorted(chain_rows(chain))), regime_direction, intensity, is_expiry_day=is_expiry_day, now=now_ist())}.",
         f"Index spot used for option ATM selection={spot:.2f}; futures LTP={futures_ltp_now:.2f}; futures/index basis={futures_ltp_now - spot:+.2f}.",
-        f"Selected option health: spread={option.spread_pct:.2%}, theta burden={option.theta_burden_pct_day:.2%}/day, volume={option.volume:.0f}, OI={option.oi:.0f}, delta={option.delta:.3f}.",
+        f"Selected option metrics: LTP={option.ltp:.2f}, premium VWAP={option.premium_vwap:.2f}, spread={option.spread_pct:.2%}, theta burden={option.theta_burden_pct_day:.2%}/day, volume={option.volume:.0f}, OI={option.oi:.0f}, delta={option.delta:.3f}, flow score={option.flow_score:.3f}, VWAP score={option.vwap_score:.3f}, 15m OI momentum={option.oi_momentum_score:.3f}, delta weight={option.delta_weight:.3f}, call COI15m={option.call_oi_change_pct_15m:+.2f}%, put COI15m={option.put_oi_change_pct_15m:+.2f}% (baseline {option.oi_velocity_baseline_minutes:.1f}m).",
         f"PA/OI structural levels: NIFTY T1={underlying_target1:.2f}, T2={underlying_target2:.2f}, SL={underlying_stop:.2f}; option exit uses live LTP at the structural trigger.",
         "Primary entry alignment: NIFTY price vs VWAP + structural support/resistance + confirming Change-OI.",
         "Futures price/OI and PCR are context only; they do not override the PA/VWAP/Change-OI market structure.",
@@ -4045,13 +4876,13 @@ def execute_scan(
 
     return Signal(
         timestamp=now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
-        direction=structure.direction,
-        regime=structure.interpretation,
-        market_state=(structure.market_phase[:-10] if structure.market_phase.endswith("_CONFIRMED") else structure.market_phase),
-        bias="Bullish" if structure.direction == "BULLISH" else "Bearish" if structure.direction == "BEARISH" else "Neutral",
-        entry_trigger=structure.entry_trigger,
-        invalidation_rule=structure.invalidation_rule,
-        confidence=structure.confidence,
+        direction=entry_structure.direction,
+        regime=f"{entry_structure.interpretation} | {regime_direction}/{intensity} | ADX={adx_value:.2f}",
+        market_state=entry_structure.market_phase,
+        bias="Bullish" if entry_structure.direction == "BULLISH" else "Bearish",
+        entry_trigger=entry_structure.entry_trigger,
+        invalidation_rule=entry_structure.invalidation_rule,
+        confidence=entry_structure.confidence,
         spot=spot,
         futures_state=structure.futures_regime,
         option_type=option.option_type,
@@ -4067,11 +4898,12 @@ def execute_scan(
         underlying_target_2=underlying_target2,
         delta=option.delta,
         theta=option.theta,
-        support_1=structure.support_1,
-        support_2=structure.support_2,
-        resistance_1=structure.resistance_1,
-        resistance_2=structure.resistance_2,
+        support_1=entry_structure.support_1,
+        support_2=entry_structure.support_2,
+        resistance_1=entry_structure.resistance_1,
+        resistance_2=entry_structure.resistance_2,
         reasons=reasons,
+        market_intensity=intensity,
     )
 
 def _synthetic_structure_chain(
@@ -4151,9 +4983,41 @@ def _synthetic_candles(
 
 
 def self_test() -> None:
-    """Deterministic regression tests for the V25 authoritative PA/OI engine."""
+    """Deterministic regression tests for V27 regime, strike-routing, VWAP and exit gates."""
     def mk_candles(values: list[float], oi: Optional[list[float]] = None) -> pd.DataFrame:
         return _synthetic_candles(values, oi=oi)
+
+    # Regression: a weak intraday snapshot must not override the clearly bullish
+    # session Change-OI score seen around 09:25 IST on 2026-10-09.
+    eff, bias, source, conflict = resolve_change_oi_flow(-0.155, +0.760, "INTRADAY_SNAPSHOT")
+    assert eff == 0.0 and bias == 0 and conflict and source == "INTRADAY_DAY_CONFLICT"
+
+    # Continuation requires two distinct completed 3m bars, not repeated scans of
+    # the same bar and not a single early-market classification.
+    persistence_state: dict[str, Any] = {}
+    ready1, count1 = update_continuation_persistence(
+        persistence_state, "CONTINUOUS_BULLISH", "2026-10-09T03:30:00+00:00"
+    )
+    ready_same, count_same = update_continuation_persistence(
+        persistence_state, "CONTINUOUS_BULLISH", "2026-10-09T03:30:00+00:00"
+    )
+    ready2, count2 = update_continuation_persistence(
+        persistence_state, "CONTINUOUS_BULLISH", "2026-10-09T03:33:00+00:00"
+    )
+    assert not ready1 and count1 == 1
+    assert not ready_same and count_same == 1
+    assert ready2 and count2 == 2
+
+    # Exhaustion reversal setups also require distinct completed-bar persistence.
+    exhaustion_state: dict[str, Any] = {}
+    exhaustion_ready1, exhaustion_count1 = update_continuation_persistence(
+        exhaustion_state, "EXHAUSTION_BULLISH", "2026-10-09T03:45:00+00:00", required_confirmations=2
+    )
+    exhaustion_ready2, exhaustion_count2 = update_continuation_persistence(
+        exhaustion_state, "EXHAUSTION_BULLISH", "2026-10-09T03:48:00+00:00", required_confirmations=2
+    )
+    assert not exhaustion_ready1 and exhaustion_count1 == 1
+    assert exhaustion_ready2 and exhaustion_count2 == 2
 
     # Basic price-action volatility and completed-bar behavior.
     down = mk_candles([100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85])
@@ -4172,6 +5036,20 @@ def self_test() -> None:
         bearish_chain, 96.5, bearish_flow, expiry="2026-10-13"
     )
     assert math.isfinite(chain_map["support_1"]) and math.isfinite(chain_map["resistance_1"])
+
+    conflict_levels = dict(chain_map)
+    conflict_levels.update({
+        "support_1": 80.0, "support_2": 70.0,
+        "resistance_1": 90.0, "resistance_2": 100.0,
+        "support_source": "OPTION_OI", "resistance_source": "OPTION_OI",
+        "flow_mode": "INTRADAY_SNAPSHOT", "change_flow_score": -0.155,
+    })
+    conflicted_structure = build_market_structure(
+        85.0, up, up, conflict_levels, +0.760,
+        previous_direction=None, previous_phase=None, price_session=down,
+    )
+    assert not conflicted_structure.entry_confirmed
+    assert conflicted_structure.confirmation_state == "FLOW_CONFLICT"
 
     # Continuous bearish: below VWAP + sustained bearish PA + bearish Change-OI.
     structure = build_market_structure(
@@ -4208,27 +5086,146 @@ def self_test() -> None:
     v16r = build_market_structure(96.0, fut_bear, fut_bear, v16, -0.45, price_session=mk_candles([104,102,100,99,98,97,96]))
     assert v16r.support_1 < v16r.resistance_1
 
-    # Option direction and strike-universe regression.
+    # Regression: a previous resistance that price has broken must never be
+    # returned as the current resistance below price (the 09-Oct 09:40 defect).
+    broken_resistance_levels = dict(pull_levels)
+    broken_resistance_levels.update({
+        "support_1": 22400.0, "support_2": 22350.0,
+        "resistance_1": 22450.0, "resistance_2": 22500.0,
+        "previous_support_1": 22350.0, "previous_resistance_1": 22400.0,
+        "support_source": "OPTION_OI", "resistance_source": "OPTION_OI",
+        "flow_mode": "INTRADAY_SNAPSHOT", "change_flow_score": 0.75,
+    })
+    rising_levels_candles = mk_candles([22320, 22340, 22360, 22380, 22400, 22417])
+    broken_resistance_result = build_market_structure(
+        22417.0, up, up, broken_resistance_levels, 0.75,
+        previous_direction="BULLISH", previous_phase="CONTINUOUS_BULLISH",
+        price_session=rising_levels_candles,
+    )
+    assert broken_resistance_result.support_1 < 22417.0
+    assert broken_resistance_result.resistance_1 > 22417.0
+    assert broken_resistance_result.support_1 < broken_resistance_result.resistance_1
+
+    # Regression: strong opposing futures OI blocks an otherwise-bullish entry.
+    future_conflict_result = build_market_structure(
+        22417.0, fut_bear, fut_bear, broken_resistance_levels, 0.75,
+        previous_direction="BULLISH", previous_phase="CONTINUOUS_BULLISH",
+        price_session=rising_levels_candles,
+    )
+    assert not future_conflict_result.entry_confirmed
+    assert future_conflict_result.confirmation_state == "FUTURES_CONFLICT"
+
+    # Regime routing regression: expiry override, time-of-day and intensity arrays.
+    test_now = datetime(2026, 10, 9, 14, 0, tzinfo=IST)
+    assert permitted_strikes_for_regime(74100, 50, "BULLISH", "NORMAL", now=test_now) == [74050, 74100]
+    assert permitted_strikes_for_regime(74100, 50, "BEARISH", "NORMAL", now=test_now) == [74100, 74150]
+    assert permitted_strikes_for_regime(74100, 50, "BULLISH", "STRONG", now=test_now) == [74100, 74150, 74200]
+    assert permitted_strikes_for_regime(74100, 50, "BEARISH", "STRONG", now=test_now) == [74000, 74050, 74100]
+    assert permitted_strikes_for_regime(74100, 50, "BULLISH", "STRONG", is_expiry_day=True, now=test_now) == [74050, 74100]
+    assert permitted_strikes_for_regime(74100, 50, "BEARISH", "SIDEWAYS", now=test_now) == []
+    midday_now = datetime(2026, 10, 9, 11, 0, tzinfo=IST)
+    assert permitted_strikes_for_regime(74100, 50, "BULLISH", "STRONG", now=midday_now) == [74050, 74100]
+    assert permitted_strikes_for_regime(74100, 50, "BULLISH", "EXHAUSTION", now=test_now) == [74000, 73950]
+
+    # Option direction, strict option VWAP/COI velocity, delta and strike-universe regression.
     simple_chain = []
     flow = {}
-    for strike in [74000, 74050, 74100, 74150, 74200]:
+    for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]:
         simple_chain.append({
             "strike_price": strike, "expiry": "2026-10-13",
-            "call_options": {"instrument_key": f"CE{strike}", "market_data": {"ltp": 100.0, "oi": 50000, "prev_oi": 49000, "volume": 10000, "bid_price": 99.5, "ask_price": 100.5, "bid_qty": 100, "ask_qty": 100}, "option_greeks": {"delta": 0.55, "theta": -2.0}},
-            "put_options": {"instrument_key": f"PE{strike}", "market_data": {"ltp": 100.0, "oi": 50000, "prev_oi": 49000, "volume": 10000, "bid_price": 99.5, "ask_price": 100.5, "bid_qty": 100, "ask_qty": 100}, "option_greeks": {"delta": -0.55, "theta": -2.0}},
+            "call_options": {"instrument_key": f"CE{strike}", "market_data": {"ltp": 100.0, "oi": 50000, "prev_oi": 49000, "volume": 10000, "bid_price": 99.5, "ask_price": 100.5, "bid_qty": 100, "ask_qty": 100}, "option_greeks": {"delta": 0.75 if strike <= 74000 else 0.55, "theta": -2.0}},
+            "put_options": {"instrument_key": f"PE{strike}", "market_data": {"ltp": 100.0, "oi": 50000, "prev_oi": 49000, "volume": 10000, "bid_price": 99.5, "ask_price": 100.5, "bid_qty": 100, "ask_qty": 100}, "option_greeks": {"delta": -0.75 if strike >= 74200 else -0.55, "theta": -2.0}},
         })
         flow[strike] = {
-            "call_bias": 1 if strike == 74000 else -1 if strike == 74050 else 0,
-            "put_bias": -1 if strike == 74200 else 1 if strike == 74150 else 0,
-            "call_oi_change": 1000 if strike == 74000 else -1000 if strike == 74050 else 0,
-            "put_oi_change": -1000 if strike == 74200 else 1000 if strike == 74150 else 0,
+            "call_bias": 1,
+            "put_bias": -1,
+            "call_oi_change": -1000,
+            "put_oi_change": 1000,
         }
-    ce = select_directional_option(simple_chain, "BULLISH", 74100.0, target_underlying_1=74200.0, change_oi_by_strike=flow)
-    pe = select_directional_option(simple_chain, "BEARISH", 74100.0, target_underlying_1=73950.0, change_oi_by_strike=flow)
-    assert ce.option_type == "CE" and ce.strike == 74000.0
-    assert pe.option_type == "PE" and pe.strike == 74200.0
-    validate_continuous_option_entry(ce, simple_chain, "BULLISH", "CONTINUOUS_BULLISH", 74100.0)
-    validate_continuous_option_entry(pe, simple_chain, "BEARISH", "CONTINUOUS_BEARISH", 74100.0)
+    option_vwaps = {
+        f"{side}{strike}": {"premium_vwap": 90.0}
+        for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]
+        for side in ("CE", "PE")
+    }
+    bull_velocity = {
+        float(strike): {"available": True, "call_oi_change_pct": -0.02, "put_oi_change_pct": 0.02, "baseline_minutes": 20.0}
+        for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]
+    }
+    bear_velocity = {
+        float(strike): {"available": True, "call_oi_change_pct": 0.02, "put_oi_change_pct": -0.02, "baseline_minutes": 20.0}
+        for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]
+    }
+    ce = select_directional_option(
+        simple_chain, "BULLISH", 74100.0, target_underlying_1=74200.0,
+        change_oi_by_strike=flow, market_intensity="NORMAL", now=test_now,
+        option_metrics_by_instrument=option_vwaps, oi_velocity_by_strike=bull_velocity,
+    )
+    pe = select_directional_option(
+        simple_chain, "BEARISH", 74100.0, target_underlying_1=73950.0,
+        change_oi_by_strike=flow, market_intensity="NORMAL", now=test_now,
+        option_metrics_by_instrument=option_vwaps, oi_velocity_by_strike=bear_velocity,
+    )
+    assert ce.option_type == "CE" and ce.strike in {74050.0, 74100.0}
+    assert pe.option_type == "PE" and pe.strike in {74100.0, 74150.0}
+    assert ce.premium_vwap < ce.ltp and ce.oi_momentum_score > 0.9
+    validate_continuous_option_entry(
+        ce, simple_chain, "BULLISH", "CONTINUOUS_BULLISH", 74100.0,
+        market_intensity="NORMAL", now=test_now,
+    )
+    validate_continuous_option_entry(
+        pe, simple_chain, "BEARISH", "CONTINUOUS_BEARISH", 74100.0,
+        market_intensity="NORMAL", now=test_now,
+    )
+
+    # Strict option premium VWAP filter must reject a candidate with LTP below VWAP.
+    bad_vwap_map = {key: {"premium_vwap": 101.0} for key in option_vwaps}
+    try:
+        select_directional_option(
+            simple_chain, "BULLISH", 74100.0, change_oi_by_strike=flow,
+            market_intensity="NORMAL", now=test_now, option_metrics_by_instrument=bad_vwap_map,
+            oi_velocity_by_strike=bull_velocity,
+        )
+        raise AssertionError("LTP <= premium VWAP should be rejected")
+    except ScannerError as exc:
+        assert "premium VWAP" in str(exc) or "VWAP" in str(exc)
+
+    # Normal regimes enforce the live delta floor rather than fabricating a delta.
+    low_delta_chain = json.loads(json.dumps(simple_chain))
+    for row in low_delta_chain:
+        row["call_options"]["option_greeks"]["delta"] = 0.45
+    try:
+        select_directional_option(
+            low_delta_chain, "BULLISH", 74100.0, change_oi_by_strike=flow,
+            market_intensity="NORMAL", now=test_now, option_metrics_by_instrument=option_vwaps,
+            oi_velocity_by_strike=bull_velocity,
+        )
+        raise AssertionError("Delta below 0.50 should be rejected in NORMAL regime")
+    except ScannerError as exc:
+        assert "delta" in str(exc).lower()
+
+    # 15-30 minute OI velocity is measured against a persisted snapshot, not daily prev_oi.
+    oi_state = {"option_oi_history": [{
+        "date": "2026-10-09", "expiry": "2026-10-13",
+        "timestamp": "2026-10-09T09:40:00+05:30",
+        "oi_by_instrument": {
+            **{f"CE{k}": {"strike": float(k), "side": "CE", "oi": 50000.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
+            **{f"PE{k}": {"strike": float(k), "side": "PE", "oi": 50000.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
+        },
+    }]}
+    oi_velocity = update_option_oi_velocity_history(
+        oi_state, simple_chain, "2026-10-13", now=datetime(2026, 10, 9, 10, 0, tzinfo=IST)
+    )
+    assert oi_velocity[74100.0]["available"] is True
+    assert oi_velocity[74100.0]["baseline_minutes"] == 20.0
+
+    # Stagnation breaker requires 3 completed 5-minute candles after entry.
+    flat5 = pd.DataFrame({
+        "timestamp": pd.date_range("2026-09-10 09:20", periods=3, freq="5min", tz="Asia/Kolkata").tz_convert("UTC"),
+        "open": [100.0, 100.0, 100.0], "high": [100.04, 100.03, 100.04],
+        "low": [99.96, 99.97, 99.96], "close": [100.0, 100.0, 100.0], "volume": [1000, 1000, 1000],
+    })
+    stagnant, _ = stagnation_exit_trigger({"opened_at": "2026-09-10 09:15:00 IST"}, flat5)
+    assert stagnant
 
     # PA/OI T1/T2/SL must be underlying structural levels, not option-premium targets.
     trade_chain, trade_flow = _synthetic_structure_chain(22250.0, 22000.0, 22500.0, 3000000.0, -2000000.0)
@@ -4302,6 +5299,7 @@ def main() -> int:
             "opened_at": signal.timestamp,
             "direction": signal.direction,
             "regime": signal.regime,
+            "market_intensity": signal.market_intensity,
             "confidence": signal.confidence,
             "instrument_key": signal.instrument_key,
             "trading_symbol": signal.trading_symbol,
