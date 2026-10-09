@@ -1,5 +1,5 @@
 """
-NIFTY 50 Predictive Options Scanner — V29 State-Preserving Optional-OI-Velocity Engine
+NIFTY 50 Predictive Options Scanner — V31 Regime/COI Execution-Veto Engine
 
 What this version fixes:
 - Uses the NIFTY INDEX as the primary market-price/VWAP/intraday structure feed.
@@ -15,7 +15,9 @@ What this version fixes:
 - Classifies Direction x Intensity (NORMAL / STRONG / EXHAUSTION / SIDEWAYS).
 - Applies time-of-day gates, expiry-day OTM bans, option-premium VWAP filters,
   15-30 minute OI velocity, delta floors, moneyness weighting, and a 5% safety override.
-- Forces new-entry cutoff at 15:15 IST and detects 3-candle 5-minute stagnation exits.
+- Enforces a +0.500 minimum score, hard vetoes active OI walls, and disqualifies OI pins.
+- Forces new-entry cutoff at 15:15 IST and exits on three consecutive 5-minute candles
+  whose total range is <=0.10%; logs index and futures candle feeds separately.
 - Builds NIFTY T1/T2/SL directly from price action + option OI; option Greeks
   are ranking/context only and are not used to forecast target premiums.
 - No order placement. The script only creates a signal, persists state,
@@ -25,8 +27,8 @@ What this version fixes:
   older v2 intraday candle API is deprecated.
 
 Run:
-    python market_scanner_v29_state_preserving.py --self-test
-    python market_scanner_v29_state_preserving.py
+    python market_scanner_v31_execution_vetoes.py --self-test
+    python market_scanner_v31_execution_vetoes.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -112,7 +114,9 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-09-STRUCTURE-V30-DYNAMIC-COI-MATRIX"
+SCANNER_VERSION = "2026-10-09-STRUCTURE-V31-REGIME-COI-EXECUTION-VETOES"
+# PA/OI target construction is unchanged; keep the V30 target engine identifier so
+# existing live trades are not needlessly re-migrated by entry-filter-only changes.
 OPTION_TARGET_ENGINE_VERSION = "V30_DYNAMIC_COI_MATRIX_PA_OI"
 
 MARKET_START = time(9, 15)
@@ -142,6 +146,7 @@ COI_UNDERLYING_MOVE_PCT = float(os.getenv("COI_UNDERLYING_MOVE_PCT", "0.001"))
 STAGNATION_RANGE_PCT = float(os.getenv("STAGNATION_RANGE_PCT", "0.001"))
 STAGNATION_REQUIRED_BARS = int(os.getenv("STAGNATION_REQUIRED_BARS", "3"))
 OPENING_MAX_SPREAD_PCT = float(os.getenv("OPENING_MAX_SPREAD_PCT", "0.08"))
+MIN_EXECUTION_SCORE = float(os.getenv("MIN_EXECUTION_SCORE", "0.500"))
 
 # Option-flow classification threshold.
 STRUCTURE_ACTIVITY_PRICE_NOISE_PCT = float(os.getenv("STRUCTURE_ACTIVITY_PRICE_NOISE_PCT", "0.002"))
@@ -302,6 +307,27 @@ class OptionCandidate:
     coi_wall_penalty: float = 0.0
     coi_matrix_label: str = "UNAVAILABLE"
     coi_baseline_mode: str = "UNAVAILABLE"
+    total_score: float = float("nan")
+
+
+def execution_veto_reason(
+    total_score: Optional[float],
+    *,
+    coi_label: str = "",
+    wall_penalty: float = 0.0,
+    disqualified: bool = False,
+) -> str:
+    """Return a hard execution veto reason; empty string means the candidate passes."""
+    label = str(coi_label or "").upper()
+    if disqualified or "PIN_DISQUALIFICATION" in label or "PIN_DISQUALIFIED" in label:
+        return "PIN_DISQUALIFICATION"
+    if safe_float(wall_penalty, 0.0) > 0.0 or "WALL_PENALTY" in label:
+        return "WALL_PENALTY_VETO"
+    if total_score is not None:
+        score = safe_float(total_score, float("nan"))
+        if not math.isfinite(score) or score < MIN_EXECUTION_SCORE:
+            return f"MINIMUM_QUALITY_SCORE_VETO score={score:.3f} required>={MIN_EXECUTION_SCORE:.3f}"
+    return ""
 
 
 @dataclass(frozen=True)
@@ -707,10 +733,14 @@ def _resample_one_minute_to_three(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_current_session_3m_candles(instrument_key: str) -> pd.DataFrame:
-    """Prefer native 3m data; fall back to 1m aggregation during opening/API lag."""
+    """Prefer native 3m data; log the instrument explicitly and fall back to 1m aggregation."""
+    instrument_label = "NIFTY_INDEX" if instrument_key == NIFTY_KEY else str(instrument_key)
     native = get_intraday_candles(instrument_key, 3, strict=False)
     if not native.empty:
-        logger.info("Current-session 3m candles: %d", len(native))
+        logger.info(
+            "CURRENT-SESSION CANDLES: instrument=%s interval=3m count=%d",
+            instrument_label, len(native),
+        )
         return native
 
     one_min = get_intraday_candles(instrument_key, 1, strict=False)
@@ -718,12 +748,15 @@ def get_current_session_3m_candles(instrument_key: str) -> pd.DataFrame:
         rebuilt = _resample_one_minute_to_three(one_min)
         if not rebuilt.empty:
             logger.warning(
-                "Native 3m futures candles unavailable; rebuilt %d 3m bars from 1m data.",
-                len(rebuilt),
+                "NATIVE 3M CANDLES UNAVAILABLE: instrument=%s; rebuilt interval=3m count=%d from 1m data.",
+                instrument_label, len(rebuilt),
             )
             return rebuilt
 
-    logger.warning("Current-session 3m/1m candles unavailable; using quote/historical fallbacks.")
+    logger.warning(
+        "CURRENT-SESSION CANDLES UNAVAILABLE: instrument=%s intervals=3m,1m; using quote/historical fallbacks.",
+        instrument_label,
+    )
     return pd.DataFrame()
 
 
@@ -1921,7 +1954,7 @@ def score_coi_matrix_for_strike(
     if pin:
         return {"available": True, "disqualified": True, "push": 0.0, "floor": 0.0,
                 "roll": 0.0, "wall_penalty": 0.0, "score": float("-inf"), "weight": coi_weight,
-                "label": "PIN_DISQUALIFIED", "baseline_mode": baseline_mode,
+                "label": "PIN_DISQUALIFICATION", "baseline_mode": baseline_mode,
                 "reason": "Large positive Call and Put COI at the same strike"}
 
     if direction == "BULLISH":
@@ -1962,7 +1995,9 @@ def score_coi_matrix_for_strike(
     roll_score = COI_ROLL_MAX_POINTS if roll_active else 0.0
     wall_penalty = 0.0
     if math.isfinite(opposing_pct) and opposing_pct >= threshold:
-        wall_penalty = COI_WALL_MAX_PENALTY * min(opposing_pct / (2.0 * threshold), 1.0)
+        # A confirmed opposing OI wall is the full configured penalty, not a
+        # fractional adjustment that could leave a wall strike executable.
+        wall_penalty = COI_WALL_MAX_PENALTY
     push_points = COI_PUSH_MAX_POINTS * push_strength
     floor_points = COI_FLOOR_MAX_POINTS * floor_strength
     raw_score = push_points + floor_points + roll_score - wall_penalty
@@ -2000,11 +2035,12 @@ def permitted_strikes_for_regime(
     intensity = str(intensity).upper()
     if direction not in {"BULLISH", "BEARISH"} or step <= 0 or intensity in {"SIDEWAYS", "UNKNOWN"}:
         return []
-    if is_expiry_day:
-        return [atm - step, atm] if direction == "BULLISH" else [atm, atm + step]
+    # The 15:15 hard cutoff overrides every regime, including expiry-day routing.
     window = time_of_day_window(now)
     if window == "CUTOFF":
         return []
+    if is_expiry_day:
+        return [atm - step, atm] if direction == "BULLISH" else [atm, atm + step]
     if intensity == "EXHAUSTION":
         return [atm - 2 * step, atm - 3 * step] if direction == "BULLISH" else [atm + 2 * step, atm + 3 * step]
     # OTM candidates are only allowed after 13:30 and only for a confirmed STRONG regime.
@@ -3209,6 +3245,24 @@ def select_directional_option(
             )
             continue
 
+        wall_penalty_raw = safe_float(coi_matrix.get("wall_penalty"), 0.0)
+        wall_veto = execution_veto_reason(
+            None, coi_label=str(coi_matrix.get("label", "")), wall_penalty=wall_penalty_raw,
+            disqualified=False,
+        )
+        if wall_veto:
+            rejection_log.append(
+                f"{option_type} {row_key:.0f}: {wall_veto}; opposing OI absorption is a hard execution veto."
+            )
+            logger.warning(
+                "COI WALL PENALTY VETO: direction=%s candidate=%s %.0f state=%s call_COI=%s put_COI=%s penalty=%.3f.",
+                direction, option_type, row_key, str(coi_matrix.get("label", "WALL_PENALTY")),
+                f"{safe_float(velocity.get('call_oi_change_pct'), float('nan')) * 100.0:+.2f}%",
+                f"{safe_float(velocity.get('put_oi_change_pct'), float('nan')) * 100.0:+.2f}%",
+                wall_penalty_raw,
+            )
+            continue
+
         call_pct = safe_float(velocity.get("call_oi_change_pct"), float("nan")) if isinstance(velocity, dict) else float("nan")
         put_pct = safe_float(velocity.get("put_oi_change_pct"), float("nan")) if isinstance(velocity, dict) else float("nan")
         baseline_minutes = safe_float(velocity.get("baseline_minutes"), float("nan")) if isinstance(velocity, dict) else float("nan")
@@ -3290,6 +3344,7 @@ def select_directional_option(
             coi_wall_penalty=coi_wall,
             coi_matrix_label=coi_label,
             coi_baseline_mode=baseline_mode if velocity_valid else "UNAVAILABLE",
+            total_score=float(total),
         )
         eligible.append((total, candidate, moneyness == "OTM"))
         logger.info(
@@ -3310,10 +3365,10 @@ def select_directional_option(
 
     logger.info(
         "COI MATRIX RANKING: valid_candidate_baselines=%d/%d protocol=%s cold_start_weight=%.2f "
-        "missing_COI_contribution=0.000; pin=HARD_DISQUALIFIER; wall=SCORING_PENALTY.",
+        "missing_COI_contribution=0.000; pin=HARD_DISQUALIFIER; wall=HARD_EXECUTION_VETO; min_score=%.3f.",
         velocity_coverage_count, len(permitted_list),
         "COLD_START_CUMULATIVE" if current_time.time() < COI_COLD_START_END else "ROLLING_15_30",
-        COI_COLD_START_WEIGHT,
+        COI_COLD_START_WEIGHT, MIN_EXECUTION_SCORE,
     )
     if not eligible:
         detail = "; ".join(rejection_log[-10:]) or "no valid candidates"
@@ -3322,7 +3377,12 @@ def select_directional_option(
     eligible.sort(key=lambda item: (-item[0], item[1].strike))
     winning_score, selected, winner_is_otm = eligible[0]
     if winner_is_otm and winning_score > 0:
-        safer = [item for item in eligible if not item[2] and item[0] >= winning_score * 0.95]
+        safer = [
+            item for item in eligible
+            if not item[2]
+            and item[0] >= winning_score * 0.95
+            and item[0] >= MIN_EXECUTION_SCORE
+        ]
         if safer:
             safer.sort(key=lambda item: (-item[0], item[1].strike))
             safer_score, safer_candidate, _ = safer[0]
@@ -3332,6 +3392,16 @@ def select_directional_option(
             )
             selected = safer_candidate
             winning_score = safer_score
+
+    final_veto = execution_veto_reason(
+        winning_score, coi_label=selected.coi_matrix_label,
+        wall_penalty=selected.coi_wall_penalty,
+        disqualified=("PIN_DISQUALIFICATION" in str(selected.coi_matrix_label).upper()),
+    )
+    if final_veto:
+        logger.warning("NO TRADE: selected strike vetoed before return: %s %.0f reason=%s score=%.3f",
+                       selected.option_type, selected.strike, final_veto, winning_score)
+        raise ScannerError(final_veto)
 
     permitted = {round(x, 2) for x in permitted_list}
     if round(selected.strike, 2) not in permitted:
@@ -3383,7 +3453,14 @@ def validate_continuous_option_entry(
     """Final pre-signal invariant for contract type, regime routing and hard risk filters."""
     phase = str(market_phase or "").upper()
     if phase not in {"CONTINUOUS_BULLISH", "CONTINUOUS_BEARISH"} and not phase.startswith("EXHAUSTION_"):
-        return
+        raise ScannerError(f"PRE-EMAIL MARKET-PHASE VETO: phase={phase} is not an approved entry phase.")
+    final_veto = execution_veto_reason(
+        option.total_score, coi_label=option.coi_matrix_label,
+        wall_penalty=option.coi_wall_penalty,
+        disqualified=("PIN_DISQUALIFICATION" in str(option.coi_matrix_label).upper()),
+    )
+    if final_veto:
+        raise ScannerError(f"PRE-EMAIL EXECUTION VETO: {final_veto}.")
     rows = chain_rows(chain)
     strikes = sorted(rows)
     step = strike_step(strikes)
@@ -4230,13 +4307,17 @@ def stagnation_exit_trigger(
     trade: dict[str, Any],
     price_5m: Optional[pd.DataFrame],
 ) -> tuple[bool, str]:
-    """Detect a <0.10% total high-low range across three closed 5m bars after entry."""
+    """Detect a <=0.10% total high-low range across three consecutive closed 5m bars after entry."""
     if price_5m is None or price_5m.empty:
         return False, "5-minute candles unavailable"
     opened_at = _as_ist_timestamp(trade.get("opened_at"))
     if opened_at is None:
         return False, "trade opening timestamp unavailable"
     bars = filter_completed_candles(price_5m, 5)
+    if not bars.empty:
+        bars = (bars.sort_values("timestamp")
+                .drop_duplicates("timestamp", keep="last")
+                .reset_index(drop=True))
     if bars.empty:
         return False, "no completed 5-minute candles"
     local_start = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST)
@@ -4245,6 +4326,10 @@ def stagnation_exit_trigger(
     if len(bars) < max(STAGNATION_REQUIRED_BARS, 3):
         return False, f"only {len(bars)} eligible completed 5m bars"
     bars = bars.tail(max(STAGNATION_REQUIRED_BARS, 3))
+    bar_stamps = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce")
+    spacing = bar_stamps.diff().dropna()
+    if len(spacing) != len(bars) - 1 or not bool((spacing == pd.Timedelta(minutes=5)).all()):
+        return False, "last three eligible candles are not consecutive 5-minute bars"
     high = pd.to_numeric(bars["high"], errors="coerce")
     low = pd.to_numeric(bars["low"], errors="coerce")
     close = pd.to_numeric(bars["close"], errors="coerce")
@@ -4252,12 +4337,12 @@ def stagnation_exit_trigger(
         return False, "5-minute OHLC data invalid"
     range_pct = float((high.max() - low.min()) / close.mean())
     timestamps = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST)
-    if range_pct < STAGNATION_RANGE_PCT:
+    if range_pct <= STAGNATION_RANGE_PCT:
         return True, (
-            f"3_COMPLETED_5M_BARS_RANGE={range_pct:.4%}<" f"{STAGNATION_RANGE_PCT:.2%}; "
+            f"3_CONSECUTIVE_COMPLETED_5M_BARS_RANGE={range_pct:.4%}<=" f"{STAGNATION_RANGE_PCT:.2%}; "
             f"from={timestamps.iloc[0].strftime('%H:%M')} to={(timestamps.iloc[-1] + pd.Timedelta(minutes=5)).strftime('%H:%M')} IST"
         )
-    return False, f"three-bar range {range_pct:.4%} is not below {STAGNATION_RANGE_PCT:.2%}"
+    return False, f"three-bar range {range_pct:.4%} exceeds {STAGNATION_RANGE_PCT:.2%}"
 
 
 def force_close_active_trade_at_cutoff(state: dict[str, Any], reason: str = "TIME_CUTOFF_15_15") -> bool:
@@ -5742,6 +5827,8 @@ def self_test() -> None:
     assert permitted_strikes_for_regime(74100, 50, "BEARISH", "STRONG", now=test_now) == [74000, 74050, 74100]
     assert permitted_strikes_for_regime(74100, 50, "BULLISH", "STRONG", is_expiry_day=True, now=test_now) == [74050, 74100]
     assert permitted_strikes_for_regime(74100, 50, "BEARISH", "SIDEWAYS", now=test_now) == []
+    cutoff_test = datetime(2026, 10, 9, 15, 15, tzinfo=IST)
+    assert permitted_strikes_for_regime(74100, 50, "BULLISH", "STRONG", is_expiry_day=True, now=cutoff_test) == []
     midday_now = datetime(2026, 10, 9, 11, 0, tzinfo=IST)
     assert permitted_strikes_for_regime(74100, 50, "BULLISH", "STRONG", now=midday_now) == [74050, 74100]
     assert permitted_strikes_for_regime(74100, 50, "BULLISH", "EXHAUSTION", now=test_now) == [74000, 73950]
@@ -5816,6 +5903,14 @@ def self_test() -> None:
         pe, simple_chain, "BEARISH", "CONTINUOUS_BEARISH", 74100.0,
         market_intensity="NORMAL", now=test_now,
     )
+    try:
+        validate_continuous_option_entry(
+            replace(ce, total_score=0.499), simple_chain, "BULLISH",
+            "CONTINUOUS_BULLISH", 74100.0, market_intensity="NORMAL", now=test_now,
+        )
+        raise AssertionError("pre-email validation must reject total score below +0.500")
+    except ScannerError as exc:
+        assert "MINIMUM_QUALITY_SCORE_VETO" in str(exc)
 
     # Strict option premium VWAP filter must reject a candidate with LTP below VWAP.
     bad_vwap_map = {key: {"premium_vwap": 101.0} for key in option_vwaps}
@@ -5843,6 +5938,43 @@ def self_test() -> None:
     except ScannerError as exc:
         assert "delta" in str(exc).lower()
 
+    # V31 execution-veto regression: any candidate with an active opposing OI wall is hard-rejected.
+    wall_velocity = {
+        float(strike): {
+            "available": True, "call_oi_change_pct": 0.02, "put_oi_change_pct": 0.0,
+            "call_ltp_change_pct": -0.02, "put_ltp_change_pct": 0.0,
+            "underlying_change_pct": 0.003, "baseline_minutes": 20.0,
+            "baseline_mode": "ROLLING_15_30",
+        } for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]
+    }
+    try:
+        select_directional_option(
+            simple_chain, "BULLISH", 74100.0, target_underlying_1=74200.0,
+            change_oi_by_strike=flow, market_intensity="NORMAL", now=test_now,
+            option_metrics_by_instrument=option_vwaps, oi_velocity_by_strike=wall_velocity,
+        )
+        raise AssertionError("all candidate Wall Penalties must be vetoed")
+    except ScannerError as exc:
+        assert "WALL_PENALTY_VETO" in str(exc) or "No eligible" in str(exc)
+
+    pin_velocity = {
+        float(strike): {
+            "available": True, "call_oi_change_pct": 0.02, "put_oi_change_pct": 0.025,
+            "call_ltp_change_pct": 0.01, "put_ltp_change_pct": 0.01,
+            "underlying_change_pct": 0.003, "baseline_minutes": 20.0,
+            "baseline_mode": "ROLLING_15_30",
+        } for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]
+    }
+    try:
+        select_directional_option(
+            simple_chain, "BULLISH", 74100.0, target_underlying_1=74200.0,
+            change_oi_by_strike=flow, market_intensity="NORMAL", now=test_now,
+            option_metrics_by_instrument=option_vwaps, oi_velocity_by_strike=pin_velocity,
+        )
+        raise AssertionError("all candidate Pin Disqualifications must be vetoed")
+    except ScannerError as exc:
+        assert "PIN_DISQUALIFICATION" in str(exc) or "No eligible" in str(exc)
+
     # V30 COI matrix: Push, Floor, Roll, Wall and Pin are independent and deterministic.
     matrix_map = {
         74100.0: {"available": True, "call_oi_change_pct": -0.02, "put_oi_change_pct": 0.00,
@@ -5867,11 +5999,16 @@ def self_test() -> None:
     wall = score_coi_matrix_for_strike("BULLISH", 74200.0, 74100.0, 50.0, matrix_map,
                                        now=datetime(2026, 10, 9, 10, 0, tzinfo=IST))
     assert wall["wall_penalty"] > 0 and wall["score"] < 0
+    assert wall["wall_penalty"] == COI_WALL_MAX_PENALTY and wall["score"] < 0
+    assert execution_veto_reason(None, coi_label=wall["label"], wall_penalty=wall["wall_penalty"]) == "WALL_PENALTY_VETO"
+    assert execution_veto_reason(0.499).startswith("MINIMUM_QUALITY_SCORE_VETO")
+    assert execution_veto_reason(0.500) == ""
     pin_map = {float(k): {**v, "call_oi_change_pct": 0.02, "put_oi_change_pct": 0.025}
                for k, v in matrix_map.items()}
     pin = score_coi_matrix_for_strike("BULLISH", 74100.0, 74100.0, 50.0, pin_map,
                                       now=datetime(2026, 10, 9, 10, 0, tzinfo=IST))
-    assert pin["disqualified"] and pin["label"] == "PIN_DISQUALIFIED"
+    assert pin["disqualified"] and pin["label"] == "PIN_DISQUALIFICATION"
+    assert execution_veto_reason(None, coi_label=pin["label"], disqualified=True) == "PIN_DISQUALIFICATION"
     cold_push = score_coi_matrix_for_strike("BULLISH", 74100.0, 74100.0, 50.0, matrix_map,
                                             now=datetime(2026, 10, 9, 9, 30, tzinfo=IST))
     standard_push = score_coi_matrix_for_strike("BULLISH", 74100.0, 74100.0, 50.0, matrix_map,
@@ -5992,6 +6129,19 @@ def self_test() -> None:
     })
     stagnant, _ = stagnation_exit_trigger({"opened_at": "2026-09-10 09:15:00 IST"}, flat5)
     assert stagnant
+    # Exactly 0.10% must trigger (inclusive <= threshold).
+    exact_flat5 = pd.DataFrame({
+        "timestamp": pd.date_range("2026-09-10 09:20", periods=3, freq="5min", tz="Asia/Kolkata").tz_convert("UTC"),
+        "open": [100.0, 100.0, 100.0], "high": [100.05, 100.05, 100.05],
+        "low": [99.95, 99.95, 99.95], "close": [100.0, 100.0, 100.0], "volume": [1000, 1000, 1000],
+    })
+    exact_stagnant, _ = stagnation_exit_trigger({"opened_at": "2026-09-10 09:15:00 IST"}, exact_flat5)
+    assert exact_stagnant
+    # Missing a 5m interval must not be misrepresented as three consecutive bars.
+    gap5 = flat5.copy()
+    gap5.loc[2, "timestamp"] = gap5.loc[2, "timestamp"] + pd.Timedelta(minutes=5)
+    gap_stagnant, gap_reason = stagnation_exit_trigger({"opened_at": "2026-09-10 09:15:00 IST"}, gap5)
+    assert not gap_stagnant and "not consecutive" in gap_reason
 
     # PA/OI T1/T2/SL must be underlying structural levels, not option-premium targets.
     trade_chain, trade_flow = _synthetic_structure_chain(22250.0, 22000.0, 22500.0, 3000000.0, -2000000.0)
