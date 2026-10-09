@@ -1,5 +1,5 @@
 """
-NIFTY 50 Predictive Options Scanner — Authoritative PA/OI Market-Structure Engine
+NIFTY 50 Predictive Options Scanner — V28 Hardened PA/OI Market-Structure Engine
 
 What this version fixes:
 - Uses the NIFTY INDEX as the primary market-price/VWAP/intraday structure feed.
@@ -102,10 +102,18 @@ MIN_ENTRY_TIME = time(9, 18)
 STATE_HISTORY_LIMIT = int(os.getenv("STATE_HISTORY_LIMIT", "60"))
 
 
-STATE_FILE = Path(os.getenv("STATE_FILE", "state/market_state.json"))
+# Anchor the default state path to this script, not the process working directory.
+# Scheduler jobs and interactive runs must load the same OI history unless STATE_FILE
+# explicitly points elsewhere. Relative overrides are resolved against this script.
+_state_file_override = os.getenv("STATE_FILE", "").strip()
+if _state_file_override:
+    _state_path = Path(_state_file_override).expanduser()
+    STATE_FILE = _state_path if _state_path.is_absolute() else (Path.cwd() / _state_path).resolve()
+else:
+    STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-09-STRUCTURE-V27-REGIME-TOD-COI"
-OPTION_TARGET_ENGINE_VERSION = "V27_REGIME_TOD_COI_PA_OI"
+SCANNER_VERSION = "2026-10-09-STRUCTURE-V28-PERSISTENT-OI-HARDENED"
+OPTION_TARGET_ENGINE_VERSION = "V28_PERSISTENT_OI_REGIME_TOD_PA_OI"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -1419,12 +1427,19 @@ def classify_option_flow(
 def build_option_oi_snapshot(
     chain: list[dict[str, Any]],
     expiry: str,
+    *,
+    now: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    """Persist current option OI/LTP by strike so the next scan can calculate true intraday changes."""
+    """Build a consistent legacy snapshot for support/resistance and migration."""
+    current_time = now or now_ist()
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=IST)
+    else:
+        current_time = current_time.astimezone(IST)
     snapshot: dict[str, Any] = {
-        "date": now_ist().date().isoformat(),
-        "expiry": expiry,
-        "timestamp": now_ist().isoformat(),
+        "date": current_time.date().isoformat(),
+        "expiry": str(expiry)[:10],
+        "timestamp": current_time.isoformat(),
         "strikes": {},
     }
     for row in chain:
@@ -1451,62 +1466,197 @@ def update_option_oi_velocity_history(
     *,
     now: Optional[datetime] = None,
 ) -> dict[float, dict[str, Any]]:
-    """Measure per-strike OI change versus a 15-30 minute-old same-session snapshot."""
+    """Return true 15–30 minute same-session OI changes with resilient contract matching.
+
+    The selected baseline must overlap the current chain. Match by instrument key first,
+    then by strike+option side as a stable fallback for API key-format/schema changes.
+    A legacy strike-keyed snapshot is migrated into the history when it is compatible.
+    """
     current_time = now or now_ist()
     if current_time.tzinfo is None:
         current_time = current_time.replace(tzinfo=IST)
     else:
         current_time = current_time.astimezone(IST)
     today = current_time.date().isoformat()
-    current_by_key: dict[str, dict[str, Any]] = {}
+    expiry_key = str(expiry)[:10]
+    now_stamp = pd.Timestamp(current_time)
+
     rows = chain_rows(chain)
+    current_by_key: dict[str, dict[str, Any]] = {}
+    current_by_contract: dict[str, dict[str, Any]] = {}
     for strike, row in rows.items():
         for side in ("CE", "PE"):
             data = option_side_data(row, side)
-            key = str(data.get("instrument_key") or "").strip()
             oi = safe_float(data.get("oi"), float("nan"))
-            if key and math.isfinite(oi) and oi > 0:
-                current_by_key[key] = {"strike": float(strike), "side": side, "oi": oi}
+            if not math.isfinite(oi) or oi <= 0:
+                continue
+            record = {"strike": float(strike), "side": side, "oi": float(oi)}
+            instrument_key = str(data.get("instrument_key") or "").strip()
+            if instrument_key:
+                current_by_key[instrument_key] = record
+            current_by_contract[f"{float(strike):.2f}|{side}"] = record
 
-    history = state.get("option_oi_history")
-    if not isinstance(history, list):
-        history = []
-    valid_history: list[dict[str, Any]] = []
-    eligible_baselines: list[tuple[float, dict[str, Any]]] = []
-    now_stamp = pd.Timestamp(current_time)
-    for item in history:
-        if not isinstance(item, dict) or item.get("date") != today or str(item.get("expiry"))[:10] != str(expiry)[:10]:
-            continue
+    def normalize_timestamp(raw: Any) -> Optional[pd.Timestamp]:
         try:
-            stamp = pd.Timestamp(item.get("timestamp"))
+            stamp = pd.Timestamp(raw)
+            if pd.isna(stamp):
+                return None
             if stamp.tzinfo is None:
                 stamp = stamp.tz_localize(IST)
             else:
                 stamp = stamp.tz_convert(IST)
-        except Exception:
-            continue
+            return stamp
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def normalize_history_item(item: Any) -> Optional[dict[str, Any]]:
+        if not isinstance(item, dict):
+            return None
+        stamp = normalize_timestamp(item.get("timestamp"))
+        if stamp is None:
+            return None
+        item_date = str(item.get("date") or stamp.date().isoformat())[:10]
+        item_expiry = str(item.get("expiry") or "")[:10]
+        if item_date != today or item_expiry != expiry_key:
+            return None
         age = (now_stamp - stamp).total_seconds() / 60.0
         if age < 0 or age > OPTION_OI_HISTORY_KEEP_MINUTES:
-            continue
-        item_copy = dict(item)
-        item_copy["timestamp"] = stamp.isoformat()
-        valid_history.append(item_copy)
-        if OPTION_OI_MIN_AGE_MINUTES <= age <= OPTION_OI_MAX_AGE_MINUTES:
-            eligible_baselines.append((age, item_copy))
+            return None
 
-    baseline_age = float("nan")
+        by_instrument: dict[str, dict[str, Any]] = {}
+        raw_by_instrument = item.get("oi_by_instrument", {})
+        if isinstance(raw_by_instrument, dict):
+            for key, detail in raw_by_instrument.items():
+                if not isinstance(detail, dict):
+                    continue
+                strike_value = safe_float(detail.get("strike"), float("nan"))
+                side_value = str(detail.get("side", "")).upper()
+                oi_value = safe_float(detail.get("oi"), float("nan"))
+                if math.isfinite(strike_value) and side_value in {"CE", "PE"} and math.isfinite(oi_value) and oi_value > 0:
+                    by_instrument[str(key).strip()] = {
+                        "strike": float(strike_value), "side": side_value, "oi": float(oi_value)
+                    }
+
+        by_contract: dict[str, dict[str, Any]] = {}
+        raw_by_contract = item.get("oi_by_contract", {})
+        if isinstance(raw_by_contract, dict):
+            for key, detail in raw_by_contract.items():
+                if not isinstance(detail, dict):
+                    continue
+                strike_value = safe_float(detail.get("strike"), float("nan"))
+                side_value = str(detail.get("side", "")).upper()
+                oi_value = safe_float(detail.get("oi"), float("nan"))
+                if math.isfinite(strike_value) and side_value in {"CE", "PE"} and math.isfinite(oi_value) and oi_value > 0:
+                    by_contract[f"{float(strike_value):.2f}|{side_value}"] = {
+                        "strike": float(strike_value), "side": side_value, "oi": float(oi_value)
+                    }
+
+        # Backfill logical contract keys for all older instrument-keyed snapshots.
+        for detail in by_instrument.values():
+            key = f"{detail['strike']:.2f}|{detail['side']}"
+            by_contract.setdefault(key, dict(detail))
+
+        # Migrate old snapshots whose schema was strikes[strike].call_oi/put_oi.
+        legacy_strikes = item.get("strikes", {})
+        if isinstance(legacy_strikes, dict):
+            for raw_strike, detail in legacy_strikes.items():
+                if not isinstance(detail, dict):
+                    continue
+                strike_value = safe_float(raw_strike, float("nan"))
+                if not math.isfinite(strike_value):
+                    continue
+                for side, field in (("CE", "call_oi"), ("PE", "put_oi")):
+                    oi_value = safe_float(detail.get(field), float("nan"))
+                    if math.isfinite(oi_value) and oi_value > 0:
+                        by_contract[f"{strike_value:.2f}|{side}"] = {
+                            "strike": float(strike_value), "side": side, "oi": float(oi_value)
+                        }
+
+        if not by_instrument and not by_contract:
+            return None
+        return {
+            "date": today,
+            "expiry": expiry_key,
+            "timestamp": stamp.isoformat(),
+            "oi_by_instrument": by_instrument,
+            "oi_by_contract": by_contract,
+        }
+
+    raw_history = state.get("option_oi_history")
+    if not isinstance(raw_history, list):
+        raw_history = []
+    valid_by_timestamp: dict[str, dict[str, Any]] = {}
+    for item in raw_history:
+        normalized = normalize_history_item(item)
+        if normalized:
+            valid_by_timestamp[normalized["timestamp"]] = normalized
+
+    # Migrate the prior V23/V24/V25/V27 single-snapshot state into the velocity ring.
+    # This preserves a usable baseline when the scanner is upgraded mid-session.
+    legacy_snapshot = normalize_history_item(state.get("option_oi_snapshot"))
+    if legacy_snapshot:
+        valid_by_timestamp.setdefault(legacy_snapshot["timestamp"], legacy_snapshot)
+
+    valid_history = sorted(
+        valid_by_timestamp.values(),
+        key=lambda item: normalize_timestamp(item["timestamp"]) or pd.Timestamp.min.tz_localize(IST),
+    )
+
+    # Build baseline candidates with their actual overlapping contract coverage. Do not
+    # select the mathematically nearest snapshot if it contains no usable OI values.
+    baseline_candidates: list[tuple[int, float, dict[str, Any]]] = []
+    eligible_age_count = 0
+    for item in valid_history:
+        stamp = normalize_timestamp(item.get("timestamp"))
+        if stamp is None:
+            continue
+        age = (now_stamp - stamp).total_seconds() / 60.0
+        if not OPTION_OI_MIN_AGE_MINUTES <= age <= OPTION_OI_MAX_AGE_MINUTES:
+            continue
+        eligible_age_count += 1
+        baseline_map = item.get("oi_by_instrument", {})
+        contract_map = item.get("oi_by_contract", {})
+        overlap = 0
+        for key, current in current_by_key.items():
+            old = baseline_map.get(key) if isinstance(baseline_map, dict) else None
+            if isinstance(old, dict) and safe_float(old.get("oi"), float("nan")) > 0:
+                overlap += 1
+        if isinstance(contract_map, dict):
+            overlap = max(overlap, sum(
+                1 for key in current_by_contract
+                if isinstance(contract_map.get(key), dict)
+                and safe_float(contract_map[key].get("oi"), float("nan")) > 0
+            ))
+        if overlap > 0:
+            baseline_candidates.append((overlap, age, item))
+
     baseline: dict[str, Any] = {}
-    if eligible_baselines:
-        baseline_age, baseline = min(eligible_baselines, key=lambda pair: abs(pair[0] - 20.0))
-    baseline_map = baseline.get("oi_by_instrument", {}) if baseline else {}
+    baseline_age = float("nan")
+    baseline_coverage = 0
+    if baseline_candidates:
+        baseline_coverage, baseline_age, baseline = max(
+            baseline_candidates,
+            key=lambda candidate: (candidate[0], -abs(candidate[1] - 20.0)),
+        )
+    baseline_by_instrument = baseline.get("oi_by_instrument", {}) if baseline else {}
+    baseline_by_contract = baseline.get("oi_by_contract", {}) if baseline else {}
+
     by_strike: dict[float, dict[str, Any]] = {}
     for strike, row in rows.items():
         current_ce = option_side_data(row, "CE")
         current_pe = option_side_data(row, "PE")
-        ce_key = str(current_ce.get("instrument_key") or "")
-        pe_key = str(current_pe.get("instrument_key") or "")
-        ce_old = baseline_map.get(ce_key, {}) if isinstance(baseline_map, dict) else {}
-        pe_old = baseline_map.get(pe_key, {}) if isinstance(baseline_map, dict) else {}
+        ce_key = str(current_ce.get("instrument_key") or "").strip()
+        pe_key = str(current_pe.get("instrument_key") or "").strip()
+        contract_ce = f"{float(strike):.2f}|CE"
+        contract_pe = f"{float(strike):.2f}|PE"
+        ce_old = baseline_by_instrument.get(ce_key, {}) if isinstance(baseline_by_instrument, dict) else {}
+        pe_old = baseline_by_instrument.get(pe_key, {}) if isinstance(baseline_by_instrument, dict) else {}
+        ce_old_oi = safe_float(ce_old.get("oi"), float("nan")) if isinstance(ce_old, dict) else float("nan")
+        pe_old_oi = safe_float(pe_old.get("oi"), float("nan")) if isinstance(pe_old, dict) else float("nan")
+        if not math.isfinite(ce_old_oi) or ce_old_oi <= 0:
+            ce_old = baseline_by_contract.get(contract_ce, {}) if isinstance(baseline_by_contract, dict) else {}
+        if not math.isfinite(pe_old_oi) or pe_old_oi <= 0:
+            pe_old = baseline_by_contract.get(contract_pe, {}) if isinstance(baseline_by_contract, dict) else {}
         old_call_oi = safe_float(ce_old.get("oi"), float("nan")) if isinstance(ce_old, dict) else float("nan")
         old_put_oi = safe_float(pe_old.get("oi"), float("nan")) if isinstance(pe_old, dict) else float("nan")
         current_call_oi = safe_float(current_ce.get("oi"), float("nan"))
@@ -1517,6 +1667,8 @@ def update_option_oi_velocity_history(
         put_change = current_put_oi - old_put_oi if put_available else float("nan")
         by_strike[float(strike)] = {
             "available": bool(call_available and put_available and math.isfinite(baseline_age)),
+            "call_available": bool(call_available),
+            "put_available": bool(put_available),
             "call_oi_change": call_change,
             "put_oi_change": put_change,
             "call_oi_change_pct": call_change / old_call_oi if call_available else float("nan"),
@@ -1526,18 +1678,38 @@ def update_option_oi_velocity_history(
 
     current_snapshot = {
         "date": today,
-        "expiry": str(expiry)[:10],
+        "expiry": expiry_key,
         "timestamp": current_time.isoformat(),
         "oi_by_instrument": current_by_key,
+        "oi_by_contract": current_by_contract,
     }
-    if not valid_history or str(valid_history[-1].get("timestamp")) != current_snapshot["timestamp"]:
+    if current_snapshot["timestamp"] not in valid_by_timestamp:
         valid_history.append(current_snapshot)
-    state["option_oi_history"] = valid_history[-40:]
+    # Keep at least a full 60-minute ring even when polling roughly once per minute.
+    history_limit = max(OPTION_OI_HISTORY_KEEP_MINUTES + 10, 40)
+    state["option_oi_history"] = valid_history[-history_limit:]
+
+    available_strikes = sum(1 for item in by_strike.values() if item.get("available"))
+    reason = (
+        "OK" if math.isfinite(baseline_age) and available_strikes else
+        "BASELINE_NOT_YET_15_MIN_OLD" if eligible_age_count == 0 else
+        "NO_CONTRACT_OVERLAP_WITH_BASELINE" if not baseline_candidates else
+        "OI_MISSING_ON_ONE_SIDE"
+    )
+    latest_age = float("nan")
+    if valid_history:
+        latest_stamp = normalize_timestamp(valid_history[-1].get("timestamp"))
+        if latest_stamp is not None:
+            latest_age = max((now_stamp - latest_stamp).total_seconds() / 60.0, 0.0)
     logger.info(
-        "OPTION OI VELOCITY: baseline=%s age_min=%s strikes_with_15_30m_data=%d/%d",
-        "AVAILABLE" if eligible_baselines else "WARMING_UP",
-        f"{baseline_age:.1f}" if math.isfinite(baseline_age) else "-",
-        sum(1 for item in by_strike.values() if item.get("available")), len(by_strike),
+        "OPTION OI VELOCITY: status=%s baseline_age_min=%s eligible_snapshots=%d "
+        "history_snapshots=%d current_contracts=%d baseline_overlap=%d strikes_15_30m=%d/%d "
+        "latest_snapshot_age_min=%s reason=%s state_file=%s",
+        "AVAILABLE" if math.isfinite(baseline_age) and available_strikes else "WARMING_UP",
+        f"{baseline_age:.1f}" if math.isfinite(baseline_age) else "NA",
+        eligible_age_count, len(state["option_oi_history"]), len(current_by_key), baseline_coverage,
+        available_strikes, len(by_strike),
+        f"{latest_age:.1f}" if math.isfinite(latest_age) else "NA", reason, STATE_FILE,
     )
     return by_strike
 
@@ -3348,7 +3520,7 @@ def migrate_active_trade_to_v25(
     trade["t1_hit_at"] = now_ist().isoformat() if structural_t1_hit else ""
 
     logger.info(
-        "V26 TRADE MIGRATION: %s | old T1=%s T2=%s SL=%s old_uT1=%s old_uT2=%s old_uSL=%s old_t1_hit=%s -> "
+        "V28 TRADE MIGRATION: %s | old T1=%s T2=%s SL=%s old_uT1=%s old_uT2=%s old_uSL=%s old_t1_hit=%s -> "
         "PA/OI T1=%.2f T2=%.2f SL=%.2f t1_hit=%s | spot=%.2f | sources=%s/%s/%s",
         trade.get("trading_symbol", ""),
         old[0], old[1], old[2], old[3], old[4], old[5], old[6],
@@ -3363,15 +3535,48 @@ def migrate_active_trade_to_v25(
 # =============================================================================
 
 def load_state() -> dict[str, Any]:
-    if not STATE_FILE.exists():
+    state_path = STATE_FILE
+    legacy_cwd_path = Path.cwd() / "state" / "market_state.json"
+    if (
+        not state_path.exists()
+        and not _state_file_override
+        and legacy_cwd_path.exists()
+        and legacy_cwd_path.resolve() != state_path.resolve()
+    ):
+        state_path = legacy_cwd_path
+        logger.warning(
+            "STATE MIGRATION: new script-anchored state file is absent; loading prior working-directory state from %s.",
+            state_path.resolve(),
+        )
+
+    if not state_path.exists():
+        logger.info("STATE LOAD: no previous state found at %s; OI velocity will warm up from fresh snapshots.", STATE_FILE)
         return {}
 
     try:
-        with STATE_FILE.open("r", encoding="utf-8") as fh:
+        with state_path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except Exception as exc:
-        logger.warning("State load failed: %s", exc)
+        if not isinstance(data, dict):
+            logger.warning("State file did not contain a JSON object: %s", state_path.resolve())
+            return {}
+        logger.info(
+            "STATE LOADED: source=%s option_oi_history_snapshots=%d legacy_oi_snapshot=%s active_trade=%s",
+            state_path.resolve(),
+            len(data.get("option_oi_history", [])) if isinstance(data.get("option_oi_history"), list) else 0,
+            isinstance(data.get("option_oi_snapshot"), dict),
+            bool(isinstance(data.get("active_trade"), dict) and str(data["active_trade"].get("status", "")).upper() == "ACTIVE"),
+        )
+        if state_path.resolve() != STATE_FILE.resolve():
+            # Migrate once to the new stable path while retaining every state key.
+            original_path = STATE_FILE
+            try:
+                save_state(data)
+                logger.info("STATE MIGRATION COMPLETE: %s -> %s", state_path.resolve(), original_path.resolve())
+            except Exception as exc:
+                logger.warning("STATE MIGRATION COPY FAILED; loaded legacy state in memory: %s", exc)
+        return data
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.error("State load failed from %s: %s", state_path.resolve(), exc)
         return {}
 
 
@@ -4468,7 +4673,10 @@ def execute_scan(
         previous_resistance=safe_float(previous_snapshot.get("resistance_1"), float("nan")),
     )
     option_flow_by_strike = chain_levels.get("option_flow_by_strike", {})
-    oi_velocity_by_strike = update_option_oi_velocity_history(state, chain, expiry, now=now_ist())
+    # Use one timestamp for both the velocity-ring record and legacy snapshot so
+    # they deduplicate exactly rather than storing near-identical samples.
+    oi_snapshot_time = now_ist()
+    oi_velocity_by_strike = update_option_oi_velocity_history(state, chain, expiry, now=oi_snapshot_time)
     chain_levels["previous_support_1"] = safe_float(previous_snapshot.get("support_1"), float("nan"))
     chain_levels["previous_resistance_1"] = safe_float(previous_snapshot.get("resistance_1"), float("nan"))
     previous_direction = str(previous_snapshot.get("direction", "")).upper() or None
@@ -4586,7 +4794,7 @@ def execute_scan(
         "tod_window": tod_window,
         "expiry_day": is_expiry_day,
     }
-    state["option_oi_snapshot"] = build_option_oi_snapshot(chain, expiry)
+    state["option_oi_snapshot"] = build_option_oi_snapshot(chain, expiry, now=oi_snapshot_time)
     state["option_flow_by_strike"] = option_flow_by_strike
     state["persistent_direction"] = (
         structure.direction if structure.direction in {"BULLISH", "BEARISH"}
@@ -5218,6 +5426,47 @@ def self_test() -> None:
     assert oi_velocity[74100.0]["available"] is True
     assert oi_velocity[74100.0]["baseline_minutes"] == 20.0
 
+    # OI velocity must survive API instrument-key changes by matching strike + side.
+    remapped_state = {"option_oi_history": [{
+        "date": "2026-10-09", "expiry": "2026-10-13",
+        "timestamp": "2026-10-09T09:40:00+05:30",
+        "oi_by_instrument": {
+            **{f"OLDCE{k}": {"strike": float(k), "side": "CE", "oi": 50000.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
+            **{f"OLDPE{k}": {"strike": float(k), "side": "PE", "oi": 50000.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
+        },
+    }]}
+    remapped = update_option_oi_velocity_history(
+        remapped_state, simple_chain, "2026-10-13", now=datetime(2026, 10, 9, 10, 0, tzinfo=IST)
+    )
+    assert remapped[74100.0]["available"] is True
+    assert remapped[74100.0]["baseline_minutes"] == 20.0
+
+    # Legacy single-snapshot state is migrated if it is a compatible 15–30m baseline.
+    legacy_oi_state = {"option_oi_snapshot": {
+        "date": "2026-10-09", "expiry": "2026-10-13",
+        "timestamp": "2026-10-09T09:40:00+05:30",
+        "strikes": {str(float(k)): {"call_oi": 50000.0, "put_oi": 50000.0}
+                    for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
+    }}
+    legacy_velocity = update_option_oi_velocity_history(
+        legacy_oi_state, simple_chain, "2026-10-13", now=datetime(2026, 10, 9, 10, 0, tzinfo=IST)
+    )
+    assert legacy_velocity[74100.0]["available"] is True
+    assert legacy_velocity[74100.0]["baseline_minutes"] == 20.0
+    assert len(legacy_oi_state["option_oi_history"]) == 2
+
+    # Future-dated snapshots must never be treated as valid baselines.
+    future_state = {"option_oi_history": [{
+        "date": "2026-10-09", "expiry": "2026-10-13",
+        "timestamp": "2026-10-09T10:01:00+05:30",
+        "oi_by_instrument": {f"CE{k}": {"strike": float(k), "side": "CE", "oi": 50000.0}
+                              for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
+    }]}
+    future_velocity = update_option_oi_velocity_history(
+        future_state, simple_chain, "2026-10-13", now=datetime(2026, 10, 9, 10, 0, tzinfo=IST)
+    )
+    assert not future_velocity[74100.0]["available"]
+
     # Stagnation breaker requires 3 completed 5-minute candles after entry.
     flat5 = pd.DataFrame({
         "timestamp": pd.date_range("2026-09-10 09:20", periods=3, freq="5min", tz="Asia/Kolkata").tz_convert("UTC"),
@@ -5280,6 +5529,8 @@ def self_test() -> None:
 
 def main() -> int:
     logger.info("NIFTY SCANNER VERSION: %s", SCANNER_VERSION)
+    logger.info("RUNNING SOURCE FILE: %s", Path(__file__).resolve())
+    logger.info("STATE STORE: %s (exists=%s)", STATE_FILE, STATE_FILE.exists())
 
     if "--self-test" in sys.argv:
         self_test()
