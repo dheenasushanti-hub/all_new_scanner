@@ -215,32 +215,43 @@
       "confidence": 95.0,
       "confirmation_state": "STRUCTURAL_CONTINUATION",
       "reversal_confirmations": 0
+    },
+    {
+      "timestamp": "2026-10-09T10:13:08.509743+05:30",
+      "spot": 22495.25,
+      "direction": "BULLISH",
+      "phase": "CONTINUOUS_BULLISH",
+      "score": 8.0,
+      "core": 1.405,
+      "confidence": 95.0,
+      "confirmation_state": "STRUCTURAL_CONTINUATION",
+      "reversal_confirmations": 0
     }
   ],
   "market_snapshot": {
-    "timestamp": "2026-10-09T10:10:07.678256+05:30",
-    "spot": 22481.9,
-    "futures_ltp": 22560.0,
-    "basis": 78.1,
+    "timestamp": "2026-10-09T10:13:08.509761+05:30",
+    "spot": 22495.25,
+    "futures_ltp": 22568.0,
+    "basis": 72.75,
     "future": "NIFTY FUT 27 OCT 26",
     "future_expiry": "2026-10-27",
     "futures_regime": "SHORT_COVERING",
     "futures_bias": 1,
-    "futures_oi_strength": 0.4608,
+    "futures_oi_strength": 0.591,
     "futures_oi_persistence": 0.2727,
-    "futures_live_oi_change": 390.0,
+    "futures_live_oi_change": 65.0,
     "intraday_bias": 1,
-    "intraday_strength": 0.1767,
-    "intraday_score": 0.1767,
+    "intraday_strength": 0.4055,
+    "intraday_score": 0.4055,
     "chain_predictive_bias": 1,
-    "chain_predictive_strength": 0.5667,
+    "chain_predictive_strength": 0.7542,
     "chain_level_bias": 0,
-    "support_strength": 7720115.0,
-    "resistance_strength": 12639250.0,
-    "support_change_strength": 0.0011,
-    "resistance_change_strength": 0.0004,
-    "vwap": 22391.69,
-    "vwap_slope": 0.5619,
+    "support_strength": 8126625.0,
+    "resistance_strength": 12738440.0,
+    "support_change_strength": 0.0017,
+    "resistance_change_strength": 0.0005,
+    "vwap": 22394.57,
+    "vwap_slope": 1.8898,
     "direction": "BULLISH",
     "persistent_direction": "BULLISH",
     "score": 8.0,
@@ -249,7 +260,7 @@
     "entry_confirmed": true,
     "reversal_confirmations": 0,
     "confirmation_state": "STRUCTURAL_CONTINUATION",
-    "pcr": 1.1395728511816765,
+    "pcr": 1.155620529862515,
     "pcr_bias": 1,
     "false_breakout": false,
     "trap_level": 0.0,
@@ -259,514 +270,514 @@
     "support_2": 22400.0,
     "resistance_1": 22400.0,
     "resistance_2": 22550.0,
-    "latest_completed_3m_bar": "2026-10-09 04:36:00+00:00",
+    "latest_completed_3m_bar": "2026-10-09 04:39:00+00:00",
     "components": {
-      "structure_change_oi": 0.5667212298057078,
-      "structure_change_oi_intraday_raw": 0.5667212298057078,
+      "structure_change_oi": 0.7542028985507246,
+      "structure_change_oi_intraday_raw": 0.7542028985507246,
       "structure_change_oi_day_raw": 1.0,
       "structure_change_oi_conflict": 0.0,
       "structure_change_oi_source": "INTRADAY_PRIMARY",
       "structure_vwap": 1.0,
       "structure_price_break": 1.0,
       "structure_score": 8.0,
-      "intraday_trend": 0.17667058627588156,
+      "intraday_trend": 0.4054594080543865,
       "vwap_level": 1.0,
-      "recent3_movement_atr": 0.22863252341586154,
-      "price_session_atr": 2.360226655869246,
-      "price_recent12_atr": 2.3486795587270284,
+      "recent3_movement_atr": 0.9819533156714783,
+      "price_session_atr": 2.8501763108954097,
+      "price_recent12_atr": 2.351425357625026,
       "price_directional_down_ratio": 0.25,
       "price_directional_up_ratio": 0.75,
-      "price_trend_efficiency": 0.549729729729714,
+      "price_trend_efficiency": 0.5412995594713551,
       "price_structure": 1.0,
-      "vwap_distance_atr": 1.8051370805645337,
-      "volatility_unit": 43.300926097861534,
+      "vwap_distance_atr": 2.206307123692596,
+      "volatility_unit": 41.80443137658587,
       "active_structure_level": 22400.0
     }
   },
   "option_oi_snapshot": {
     "date": "2026-10-09",
     "expiry": "2026-10-13",
-    "timestamp": "2026-10-09T10:10:07.678350+05:30",
+    "timestamp": "2026-10-09T10:13:08.509867+05:30",
     "strikes": {
       "20050.0": {
         "call_oi": 130.0,
-        "put_oi": 5107505.0,
+        "put_oi": 5155150.0,
         "call_ltp": 2018.5,
         "put_ltp": 0.95
       },
       "20100.0": {
         "call_oi": 0.0,
-        "put_oi": 4257630.0,
+        "put_oi": 4272775.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.05
+        "put_ltp": 1.0
       },
       "20150.0": {
         "call_oi": 0.0,
-        "put_oi": 315770.0,
+        "put_oi": 316485.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.15
+        "put_ltp": 1.1
       },
       "20200.0": {
         "call_oi": 0.0,
-        "put_oi": 785005.0,
+        "put_oi": 770770.0,
         "call_ltp": 0.0,
         "put_ltp": 1.15
       },
       "20250.0": {
         "call_oi": 0.0,
-        "put_oi": 309010.0,
+        "put_oi": 293995.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.15
+        "put_ltp": 1.2
       },
       "20300.0": {
         "call_oi": 0.0,
-        "put_oi": 908180.0,
+        "put_oi": 908245.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.15
+        "put_ltp": 1.2
       },
       "20350.0": {
         "call_oi": 0.0,
-        "put_oi": 350545.0,
+        "put_oi": 350805.0,
         "call_ltp": 0.0,
         "put_ltp": 1.25
       },
       "20400.0": {
         "call_oi": 0.0,
-        "put_oi": 756210.0,
+        "put_oi": 755950.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.2
+        "put_ltp": 1.25
       },
       "20450.0": {
         "call_oi": 0.0,
-        "put_oi": 796315.0,
+        "put_oi": 797875.0,
         "call_ltp": 0.0,
         "put_ltp": 1.3
       },
       "20500.0": {
         "call_oi": 260.0,
-        "put_oi": 4583410.0,
+        "put_oi": 4622345.0,
         "call_ltp": 1739.0,
-        "put_ltp": 1.3
+        "put_ltp": 1.25
       },
       "20550.0": {
         "call_oi": 0.0,
-        "put_oi": 410930.0,
+        "put_oi": 412620.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.35
+        "put_ltp": 1.4
       },
       "20600.0": {
         "call_oi": 0.0,
-        "put_oi": 1118325.0,
+        "put_oi": 1126125.0,
         "call_ltp": 0.0,
         "put_ltp": 1.35
       },
       "20650.0": {
         "call_oi": 0.0,
-        "put_oi": 310960.0,
+        "put_oi": 312260.0,
         "call_ltp": 0.0,
         "put_ltp": 1.45
       },
       "20700.0": {
         "call_oi": 0.0,
-        "put_oi": 1904370.0,
+        "put_oi": 1898455.0,
         "call_ltp": 0.0,
         "put_ltp": 1.45
       },
       "20750.0": {
         "call_oi": 0.0,
-        "put_oi": 406380.0,
+        "put_oi": 406640.0,
         "call_ltp": 0.0,
-        "put_ltp": 1.55
+        "put_ltp": 1.6
       },
       "20800.0": {
         "call_oi": 0.0,
-        "put_oi": 2442115.0,
+        "put_oi": 2454595.0,
         "call_ltp": 0.0,
         "put_ltp": 1.55
       },
       "20850.0": {
         "call_oi": 0.0,
-        "put_oi": 717860.0,
+        "put_oi": 718445.0,
         "call_ltp": 0.0,
         "put_ltp": 1.7
       },
       "20900.0": {
         "call_oi": 0.0,
-        "put_oi": 1309490.0,
+        "put_oi": 1310660.0,
         "call_ltp": 0.0,
         "put_ltp": 1.75
       },
       "20950.0": {
         "call_oi": 0.0,
-        "put_oi": 618410.0,
+        "put_oi": 606710.0,
         "call_ltp": 0.0,
         "put_ltp": 1.85
       },
       "21000.0": {
         "call_oi": 9945.0,
-        "put_oi": 12066990.0,
-        "call_ltp": 1480.0,
+        "put_oi": 12175020.0,
+        "call_ltp": 1508.0,
         "put_ltp": 2.0
       },
       "21050.0": {
         "call_oi": 0.0,
-        "put_oi": 559455.0,
+        "put_oi": 558220.0,
         "call_ltp": 0.0,
-        "put_ltp": 2.05
+        "put_ltp": 2.1
       },
       "21100.0": {
         "call_oi": 0.0,
-        "put_oi": 2567305.0,
+        "put_oi": 2542540.0,
         "call_ltp": 0.0,
         "put_ltp": 2.2
       },
       "21150.0": {
         "call_oi": 0.0,
-        "put_oi": 1214850.0,
+        "put_oi": 1223495.0,
         "call_ltp": 0.0,
-        "put_ltp": 2.3
+        "put_ltp": 2.25
       },
       "21200.0": {
         "call_oi": 0.0,
-        "put_oi": 6705205.0,
+        "put_oi": 6784765.0,
         "call_ltp": 0.0,
-        "put_ltp": 2.5
+        "put_ltp": 2.4
       },
       "21250.0": {
         "call_oi": 0.0,
-        "put_oi": 1674725.0,
+        "put_oi": 1682980.0,
         "call_ltp": 0.0,
         "put_ltp": 2.55
       },
       "21300.0": {
         "call_oi": 2665.0,
-        "put_oi": 4651985.0,
+        "put_oi": 4731415.0,
         "call_ltp": 1175.9,
-        "put_ltp": 2.7
+        "put_ltp": 2.65
       },
       "21350.0": {
         "call_oi": 65.0,
-        "put_oi": 1259960.0,
+        "put_oi": 1293760.0,
         "call_ltp": 1148.6,
-        "put_ltp": 2.9
+        "put_ltp": 2.85
       },
       "21400.0": {
         "call_oi": 2470.0,
-        "put_oi": 4877340.0,
+        "put_oi": 5095415.0,
         "call_ltp": 1040.0,
-        "put_ltp": 3.2
+        "put_ltp": 3.05
       },
       "21450.0": {
         "call_oi": 325.0,
-        "put_oi": 1426880.0,
+        "put_oi": 1423695.0,
         "call_ltp": 1028.3,
-        "put_ltp": 3.55
+        "put_ltp": 3.4
       },
       "21500.0": {
-        "call_oi": 75595.0,
-        "put_oi": 11322350.0,
-        "call_ltp": 1007.8,
-        "put_ltp": 3.9
+        "call_oi": 75530.0,
+        "put_oi": 11309090.0,
+        "call_ltp": 1025.0,
+        "put_ltp": 3.75
       },
       "21550.0": {
         "call_oi": 1820.0,
-        "put_oi": 2415270.0,
+        "put_oi": 2440815.0,
         "call_ltp": 930.0,
-        "put_ltp": 4.3
+        "put_ltp": 4.15
       },
       "21600.0": {
-        "call_oi": 8320.0,
-        "put_oi": 4703465.0,
-        "call_ltp": 901.0,
-        "put_ltp": 4.6
+        "call_oi": 8515.0,
+        "put_oi": 4703595.0,
+        "call_ltp": 915.0,
+        "put_ltp": 4.5
       },
       "21650.0": {
         "call_oi": 2470.0,
-        "put_oi": 3449680.0,
+        "put_oi": 3466840.0,
         "call_ltp": 844.0,
-        "put_ltp": 5.3
+        "put_ltp": 5.05
       },
       "21700.0": {
         "call_oi": 19630.0,
-        "put_oi": 6147960.0,
-        "call_ltp": 799.25,
-        "put_ltp": 6.15
+        "put_oi": 6203600.0,
+        "call_ltp": 814.8,
+        "put_ltp": 5.9
       },
       "21750.0": {
         "call_oi": 12220.0,
-        "put_oi": 2554890.0,
+        "put_oi": 2526225.0,
         "call_ltp": 727.65,
-        "put_ltp": 7.0
+        "put_ltp": 6.65
       },
       "21800.0": {
-        "call_oi": 75465.0,
-        "put_oi": 8871330.0,
-        "call_ltp": 700.0,
-        "put_ltp": 8.25
+        "call_oi": 75270.0,
+        "put_oi": 8734310.0,
+        "call_ltp": 719.25,
+        "put_ltp": 7.8
       },
       "21850.0": {
-        "call_oi": 28015.0,
-        "put_oi": 3479775.0,
-        "call_ltp": 660.65,
-        "put_ltp": 9.85
+        "call_oi": 27690.0,
+        "put_oi": 3474705.0,
+        "call_ltp": 680.0,
+        "put_ltp": 9.35
       },
       "21900.0": {
-        "call_oi": 101400.0,
-        "put_oi": 5909085.0,
-        "call_ltp": 615.05,
-        "put_ltp": 11.85
+        "call_oi": 101595.0,
+        "put_oi": 5936450.0,
+        "call_ltp": 620.7,
+        "put_ltp": 11.2
       },
       "21950.0": {
-        "call_oi": 52195.0,
-        "put_oi": 2705040.0,
-        "call_ltp": 567.6,
-        "put_ltp": 14.5
+        "call_oi": 49790.0,
+        "put_oi": 2738385.0,
+        "call_ltp": 574.05,
+        "put_ltp": 13.75
       },
       "22000.0": {
-        "call_oi": 885755.0,
-        "put_oi": 13490165.0,
-        "call_ltp": 519.85,
-        "put_ltp": 17.9
+        "call_oi": 854945.0,
+        "put_oi": 13590200.0,
+        "call_ltp": 527.2,
+        "put_ltp": 16.8
       },
       "22050.0": {
-        "call_oi": 155805.0,
-        "put_oi": 3012750.0,
-        "call_ltp": 473.5,
-        "put_ltp": 21.95
+        "call_oi": 151060.0,
+        "put_oi": 3043170.0,
+        "call_ltp": 479.9,
+        "put_ltp": 20.55
       },
       "22100.0": {
-        "call_oi": 486135.0,
-        "put_oi": 7001345.0,
-        "call_ltp": 427.65,
-        "put_ltp": 27.05
+        "call_oi": 474890.0,
+        "put_oi": 7008040.0,
+        "call_ltp": 436.5,
+        "put_ltp": 25.2
       },
       "22150.0": {
-        "call_oi": 334620.0,
-        "put_oi": 3680365.0,
-        "call_ltp": 383.0,
-        "put_ltp": 33.25
+        "call_oi": 337350.0,
+        "put_oi": 3621735.0,
+        "call_ltp": 394.05,
+        "put_ltp": 31.0
       },
       "22200.0": {
-        "call_oi": 2134275.0,
-        "put_oi": 11686870.0,
-        "call_ltp": 340.5,
-        "put_ltp": 40.7
+        "call_oi": 2111720.0,
+        "put_oi": 11746085.0,
+        "call_ltp": 349.7,
+        "put_ltp": 37.95
       },
       "22250.0": {
-        "call_oi": 1426685.0,
-        "put_oi": 5771870.0,
-        "call_ltp": 300.0,
-        "put_ltp": 50.05
+        "call_oi": 1423565.0,
+        "put_oi": 6067815.0,
+        "call_ltp": 308.8,
+        "put_ltp": 46.35
       },
       "22300.0": {
-        "call_oi": 5090410.0,
-        "put_oi": 17050410.0,
-        "call_ltp": 261.65,
-        "put_ltp": 60.5
+        "call_oi": 4997395.0,
+        "put_oi": 17038450.0,
+        "call_ltp": 268.95,
+        "put_ltp": 56.8
       },
       "22350.0": {
-        "call_oi": 2842450.0,
-        "put_oi": 9583275.0,
-        "call_ltp": 225.6,
-        "put_ltp": 73.7
+        "call_oi": 2635100.0,
+        "put_oi": 9535825.0,
+        "call_ltp": 231.6,
+        "put_ltp": 69.15
       },
       "22400.0": {
-        "call_oi": 8190780.0,
-        "put_oi": 16193970.0,
-        "call_ltp": 190.3,
-        "put_ltp": 89.5
+        "call_oi": 7895680.0,
+        "put_oi": 16182205.0,
+        "call_ltp": 196.0,
+        "put_ltp": 83.9
       },
       "22450.0": {
-        "call_oi": 6714825.0,
-        "put_oi": 7720115.0,
-        "call_ltp": 158.35,
-        "put_ltp": 107.75
+        "call_oi": 6451250.0,
+        "put_oi": 8126625.0,
+        "call_ltp": 164.3,
+        "put_ltp": 101.1
       },
       "22500.0": {
-        "call_oi": 12639250.0,
-        "put_oi": 9652435.0,
-        "call_ltp": 130.05,
-        "put_ltp": 129.1
+        "call_oi": 12738440.0,
+        "put_oi": 10420930.0,
+        "call_ltp": 135.1,
+        "put_ltp": 121.7
       },
       "22550.0": {
-        "call_oi": 5818800.0,
-        "put_oi": 1922635.0,
-        "call_ltp": 104.6,
-        "put_ltp": 153.8
+        "call_oi": 5675280.0,
+        "put_oi": 2065765.0,
+        "call_ltp": 108.55,
+        "put_ltp": 145.2
       },
       "22600.0": {
-        "call_oi": 13232700.0,
-        "put_oi": 4093960.0,
-        "call_ltp": 82.55,
-        "put_ltp": 181.7
+        "call_oi": 13070785.0,
+        "put_oi": 4212195.0,
+        "call_ltp": 85.55,
+        "put_ltp": 173.45
       },
       "22650.0": {
-        "call_oi": 5128110.0,
-        "put_oi": 1114100.0,
-        "call_ltp": 64.1,
-        "put_ltp": 211.9
+        "call_oi": 5135520.0,
+        "put_oi": 1187355.0,
+        "call_ltp": 66.15,
+        "put_ltp": 202.55
       },
       "22700.0": {
-        "call_oi": 11422645.0,
-        "put_oi": 3086850.0,
-        "call_ltp": 48.7,
-        "put_ltp": 246.75
+        "call_oi": 11617840.0,
+        "put_oi": 3151265.0,
+        "call_ltp": 50.25,
+        "put_ltp": 237.75
       },
       "22750.0": {
-        "call_oi": 5503030.0,
-        "put_oi": 492765.0,
-        "call_ltp": 35.95,
-        "put_ltp": 284.85
+        "call_oi": 5557240.0,
+        "put_oi": 503880.0,
+        "call_ltp": 37.4,
+        "put_ltp": 273.95
       },
       "22800.0": {
-        "call_oi": 10536760.0,
-        "put_oi": 1124565.0,
-        "call_ltp": 26.25,
-        "put_ltp": 325.7
+        "call_oi": 10392395.0,
+        "put_oi": 1166100.0,
+        "call_ltp": 27.0,
+        "put_ltp": 314.1
       },
       "22850.0": {
-        "call_oi": 4198220.0,
-        "put_oi": 181740.0,
-        "call_ltp": 18.95,
-        "put_ltp": 368.8
+        "call_oi": 4199910.0,
+        "put_oi": 182000.0,
+        "call_ltp": 19.35,
+        "put_ltp": 357.35
       },
       "22900.0": {
-        "call_oi": 7200830.0,
-        "put_oi": 591500.0,
-        "call_ltp": 13.5,
-        "put_ltp": 413.1
+        "call_oi": 7282925.0,
+        "put_oi": 596245.0,
+        "call_ltp": 13.75,
+        "put_ltp": 400.0
       },
       "22950.0": {
-        "call_oi": 3441295.0,
-        "put_oi": 255645.0,
-        "call_ltp": 9.8,
-        "put_ltp": 459.15
+        "call_oi": 3485495.0,
+        "put_oi": 256555.0,
+        "call_ltp": 9.9,
+        "put_ltp": 441.75
       },
       "23000.0": {
-        "call_oi": 14862120.0,
-        "put_oi": 914680.0,
+        "call_oi": 15008630.0,
+        "put_oi": 935610.0,
         "call_ltp": 7.4,
-        "put_ltp": 504.35
+        "put_ltp": 494.2
       },
       "23050.0": {
-        "call_oi": 2828410.0,
-        "put_oi": 75205.0,
-        "call_ltp": 5.25,
-        "put_ltp": 552.35
+        "call_oi": 2857335.0,
+        "put_oi": 75400.0,
+        "call_ltp": 5.2,
+        "put_ltp": 541.5
       },
       "23100.0": {
-        "call_oi": 6505005.0,
-        "put_oi": 318760.0,
-        "call_ltp": 3.85,
-        "put_ltp": 600.75
+        "call_oi": 6548750.0,
+        "put_oi": 317980.0,
+        "call_ltp": 3.75,
+        "put_ltp": 588.0
       },
       "23150.0": {
-        "call_oi": 2801500.0,
+        "call_oi": 2858765.0,
         "put_oi": 34580.0,
-        "call_ltp": 2.95,
+        "call_ltp": 2.9,
         "put_ltp": 654.0
       },
       "23200.0": {
-        "call_oi": 8125390.0,
-        "put_oi": 249665.0,
-        "call_ltp": 2.3,
-        "put_ltp": 702.0
+        "call_oi": 8405280.0,
+        "put_oi": 249470.0,
+        "call_ltp": 2.2,
+        "put_ltp": 692.2
       },
       "23250.0": {
-        "call_oi": 2019355.0,
+        "call_oi": 2020330.0,
         "put_oi": 184795.0,
-        "call_ltp": 2.05,
-        "put_ltp": 779.35
+        "call_ltp": 2.0,
+        "put_ltp": 745.2
       },
       "23300.0": {
-        "call_oi": 6751030.0,
-        "put_oi": 214760.0,
+        "call_oi": 6711120.0,
+        "put_oi": 214955.0,
         "call_ltp": 1.75,
-        "put_ltp": 800.0
+        "put_ltp": 784.5
       },
       "23350.0": {
-        "call_oi": 1248130.0,
+        "call_oi": 1245725.0,
         "put_oi": 12350.0,
         "call_ltp": 1.55,
         "put_ltp": 856.5
       },
       "23400.0": {
-        "call_oi": 5980520.0,
-        "put_oi": 218530.0,
-        "call_ltp": 1.4,
-        "put_ltp": 900.0
+        "call_oi": 5989555.0,
+        "put_oi": 218595.0,
+        "call_ltp": 1.35,
+        "put_ltp": 880.0
       },
       "23450.0": {
-        "call_oi": 1275690.0,
-        "put_oi": 10530.0,
-        "call_ltp": 1.3,
-        "put_ltp": 983.2
+        "call_oi": 1274715.0,
+        "put_oi": 10790.0,
+        "call_ltp": 1.2,
+        "put_ltp": 945.0
       },
       "23500.0": {
-        "call_oi": 10090145.0,
-        "put_oi": 302965.0,
-        "call_ltp": 1.15,
-        "put_ltp": 999.0
+        "call_oi": 10074480.0,
+        "put_oi": 301665.0,
+        "call_ltp": 1.2,
+        "put_ltp": 992.3
       },
       "23550.0": {
-        "call_oi": 786890.0,
-        "put_oi": 52065.0,
+        "call_oi": 794170.0,
+        "put_oi": 52130.0,
         "call_ltp": 1.1,
-        "put_ltp": 1076.9
+        "put_ltp": 1026.9
       },
       "23600.0": {
-        "call_oi": 3406780.0,
-        "put_oi": 65130.0,
+        "call_oi": 3405675.0,
+        "put_oi": 65065.0,
         "call_ltp": 1.0,
-        "put_ltp": 1108.65
+        "put_ltp": 1086.45
       },
       "23650.0": {
-        "call_oi": 488995.0,
+        "call_oi": 490100.0,
         "put_oi": 9750.0,
-        "call_ltp": 0.95,
-        "put_ltp": 1303.75
+        "call_ltp": 1.0,
+        "put_ltp": 1140.0
       },
       "23700.0": {
-        "call_oi": 3321695.0,
+        "call_oi": 3292770.0,
         "put_oi": 36595.0,
-        "call_ltp": 0.95,
+        "call_ltp": 0.9,
         "put_ltp": 1203.0
       },
       "23750.0": {
-        "call_oi": 550615.0,
+        "call_oi": 550745.0,
         "put_oi": 3900.0,
-        "call_ltp": 0.9,
+        "call_ltp": 0.85,
         "put_ltp": 1477.05
       },
       "23800.0": {
-        "call_oi": 3809455.0,
-        "put_oi": 32045.0,
-        "call_ltp": 0.8,
-        "put_ltp": 1300.0
+        "call_oi": 3795025.0,
+        "put_oi": 32110.0,
+        "call_ltp": 0.75,
+        "put_ltp": 1281.5
       },
       "23850.0": {
         "call_oi": 1263925.0,
         "put_oi": 2275.0,
-        "call_ltp": 0.8,
+        "call_ltp": 0.75,
         "put_ltp": 1594.0
       },
       "23900.0": {
         "call_oi": 2212340.0,
         "put_oi": 94250.0,
-        "call_ltp": 0.7,
+        "call_ltp": 0.65,
         "put_ltp": 1409.5
       },
       "23950.0": {
         "call_oi": 885495.0,
         "put_oi": 11050.0,
-        "call_ltp": 0.65,
+        "call_ltp": 0.7,
         "put_ltp": 1465.0
       },
       "24000.0": {
-        "call_oi": 10275850.0,
-        "put_oi": 312845.0,
+        "call_oi": 10047765.0,
+        "put_oi": 312780.0,
         "call_ltp": 0.7,
-        "put_ltp": 1500.0
+        "put_ltp": 1478.1
       },
       "24050.0": {
         "call_oi": 865475.0,
@@ -777,13 +788,13 @@
       "24100.0": {
         "call_oi": 1366625.0,
         "put_oi": 60385.0,
-        "call_ltp": 0.6,
+        "call_ltp": 0.65,
         "put_ltp": 1701.0
       },
       "24150.0": {
         "call_oi": 200980.0,
         "put_oi": 1625.0,
-        "call_ltp": 0.6,
+        "call_ltp": 0.55,
         "put_ltp": 1952.25
       },
       "24200.0": {
@@ -795,38 +806,38 @@
       "24250.0": {
         "call_oi": 164255.0,
         "put_oi": 1625.0,
-        "call_ltp": 0.6,
+        "call_ltp": 0.55,
         "put_ltp": 1777.65
       },
       "24300.0": {
-        "call_oi": 609310.0,
-        "put_oi": 43810.0,
-        "call_ltp": 0.5,
-        "put_ltp": 2048.6
+        "call_oi": 609375.0,
+        "put_oi": 43680.0,
+        "call_ltp": 0.55,
+        "put_ltp": 1782.0
       },
       "24350.0": {
-        "call_oi": 135655.0,
+        "call_oi": 135785.0,
         "put_oi": 715.0,
-        "call_ltp": 0.6,
+        "call_ltp": 0.55,
         "put_ltp": 1700.0
       },
       "24400.0": {
-        "call_oi": 294450.0,
+        "call_oi": 296335.0,
         "put_oi": 9685.0,
-        "call_ltp": 0.5,
+        "call_ltp": 0.55,
         "put_ltp": 1923.95
       },
       "24450.0": {
         "call_oi": 117845.0,
         "put_oi": 195.0,
-        "call_ltp": 0.55,
+        "call_ltp": 0.5,
         "put_ltp": 1690.0
       },
       "24500.0": {
         "call_oi": 2140775.0,
-        "put_oi": 111345.0,
-        "call_ltp": 0.5,
-        "put_ltp": 2015.0
+        "put_oi": 111215.0,
+        "call_ltp": 0.55,
+        "put_ltp": 1980.0
       },
       "24550.0": {
         "call_oi": 67925.0,
@@ -837,7 +848,7 @@
       "24600.0": {
         "call_oi": 266110.0,
         "put_oi": 13195.0,
-        "call_ltp": 0.45,
+        "call_ltp": 0.5,
         "put_ltp": 2200.0
       },
       "24650.0": {
@@ -847,7 +858,7 @@
         "put_ltp": 1870.0
       },
       "24700.0": {
-        "call_oi": 182065.0,
+        "call_oi": 182325.0,
         "put_oi": 910.0,
         "call_ltp": 0.5,
         "put_ltp": 2340.8
@@ -859,9 +870,9 @@
         "put_ltp": 0.0
       },
       "24800.0": {
-        "call_oi": 488540.0,
+        "call_oi": 482040.0,
         "put_oi": 3315.0,
-        "call_ltp": 0.4,
+        "call_ltp": 0.45,
         "put_ltp": 2355.0
       },
       "24850.0": {
@@ -879,13 +890,13 @@
       "24950.0": {
         "call_oi": 51480.0,
         "put_oi": 585.0,
-        "call_ltp": 0.45,
+        "call_ltp": 0.4,
         "put_ltp": 2338.35
       },
       "25000.0": {
         "call_oi": 1394185.0,
         "put_oi": 79690.0,
-        "call_ltp": 0.45,
+        "call_ltp": 0.4,
         "put_ltp": 2507.25
       },
       "25050.0": {
@@ -897,13 +908,13 @@
       "25100.0": {
         "call_oi": 57265.0,
         "put_oi": 1040.0,
-        "call_ltp": 0.45,
+        "call_ltp": 0.4,
         "put_ltp": 2820.0
       },
       "25150.0": {
         "call_oi": 65195.0,
         "put_oi": 1105.0,
-        "call_ltp": 0.4,
+        "call_ltp": 0.45,
         "put_ltp": 2528.6
       },
       "25200.0": {
@@ -921,17 +932,17 @@
       "25300.0": {
         "call_oi": 139295.0,
         "put_oi": 0.0,
-        "call_ltp": 0.5,
+        "call_ltp": 0.45,
         "put_ltp": 0.0
       },
       "25350.0": {
-        "call_oi": 115050.0,
+        "call_oi": 115115.0,
         "put_oi": 520.0,
         "call_ltp": 0.4,
         "put_ltp": 2725.0
       },
       "25400.0": {
-        "call_oi": 700830.0,
+        "call_oi": 699010.0,
         "put_oi": 13065.0,
         "call_ltp": 0.45,
         "put_ltp": 2915.0
@@ -941,67 +952,77 @@
   "option_flow_by_strike": {
     "20050.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": 6630.0,
+      "put_oi_change": 47645.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.050000000000000044,
+      "put_price_change_pct": 0.0,
+      "call_bias": 0,
+      "put_bias": 0,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "OI_BUILDING_UNCERTAIN"
+    },
+    "20100.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": 15145.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": -0.04761904761904766,
       "call_bias": 0,
       "put_bias": 1,
       "call_activity": "NO_OI_CHANGE",
       "put_activity": "PUT_WRITING"
     },
-    "20100.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": 10270.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": 0.050000000000000044,
-      "call_bias": 0,
-      "put_bias": -1,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_BUYING"
-    },
     "20150.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": -9490.0,
+      "put_oi_change": 715.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": 0.04545454545454529,
+      "put_price_change_pct": -0.043478260869565064,
+      "call_bias": 0,
+      "put_bias": 1,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "PUT_WRITING"
+    },
+    "20200.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": -14235.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": 0.0,
+      "call_bias": 0,
+      "put_bias": 0,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "OI_UNWINDING_UNCERTAIN"
+    },
+    "20250.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": -15015.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": 0.04347826086956526,
       "call_bias": 0,
       "put_bias": -1,
       "call_activity": "NO_OI_CHANGE",
       "put_activity": "PUT_SHORT_COVERING"
     },
-    "20200.0": {
+    "20300.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": 5590.0,
+      "put_oi_change": 65.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": 0.04545454545454529,
+      "put_price_change_pct": 0.04347826086956526,
       "call_bias": 0,
       "put_bias": -1,
       "call_activity": "NO_OI_CHANGE",
       "put_activity": "PUT_BUYING"
     },
-    "20250.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": 3185.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.041666666666666706,
-      "call_bias": 0,
-      "put_bias": 1,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_WRITING"
-    },
-    "20300.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": 390.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.041666666666666706,
-      "call_bias": 0,
-      "put_bias": 1,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_WRITING"
-    },
     "20350.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": -780.0,
+      "put_oi_change": 260.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": 0.0,
+      "call_bias": 0,
+      "put_bias": 0,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "OI_BUILDING_UNCERTAIN"
+    },
+    "20400.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": -260.0,
       "call_price_change_pct": 0.0,
       "put_price_change_pct": 0.041666666666666706,
       "call_bias": 0,
@@ -1009,19 +1030,9 @@
       "call_activity": "NO_OI_CHANGE",
       "put_activity": "PUT_SHORT_COVERING"
     },
-    "20400.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": -4355.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.040000000000000036,
-      "call_bias": 0,
-      "put_bias": 1,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_LONG_UNWINDING"
-    },
     "20450.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": 195.0,
+      "put_oi_change": 1560.0,
       "call_price_change_pct": 0.0,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
@@ -1031,57 +1042,27 @@
     },
     "20500.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": -2470.0,
+      "put_oi_change": 38935.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": 0.040000000000000036,
+      "put_price_change_pct": -0.03846153846153849,
       "call_bias": 0,
-      "put_bias": -1,
+      "put_bias": 1,
       "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_SHORT_COVERING"
+      "put_activity": "PUT_WRITING"
     },
     "20550.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": 4030.0,
+      "put_oi_change": 1690.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.03571428571428559,
-      "call_bias": 0,
-      "put_bias": 1,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_WRITING"
-    },
-    "20600.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": 3055.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.03571428571428559,
-      "call_bias": 0,
-      "put_bias": 1,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_WRITING"
-    },
-    "20650.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": 20670.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": 0.03571428571428575,
+      "put_price_change_pct": 0.0370370370370369,
       "call_bias": 0,
       "put_bias": -1,
       "call_activity": "NO_OI_CHANGE",
       "put_activity": "PUT_BUYING"
     },
-    "20700.0": {
+    "20600.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": 19045.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.06451612903225812,
-      "call_bias": 0,
-      "put_bias": 1,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_WRITING"
-    },
-    "20750.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": 13325.0,
+      "put_oi_change": 7800.0,
       "call_price_change_pct": 0.0,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
@@ -1089,9 +1070,39 @@
       "call_activity": "NO_OI_CHANGE",
       "put_activity": "OI_BUILDING_UNCERTAIN"
     },
+    "20650.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": 1300.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": 0.0,
+      "call_bias": 0,
+      "put_bias": 0,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "OI_BUILDING_UNCERTAIN"
+    },
+    "20700.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": -5915.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": 0.0,
+      "call_bias": 0,
+      "put_bias": 0,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "OI_UNWINDING_UNCERTAIN"
+    },
+    "20750.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": 260.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": 0.03225806451612906,
+      "call_bias": 0,
+      "put_bias": -1,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "PUT_BUYING"
+    },
     "20800.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": 30160.0,
+      "put_oi_change": 12480.0,
       "call_price_change_pct": 0.0,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
@@ -1101,27 +1112,27 @@
     },
     "20850.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": -8645.0,
+      "put_oi_change": 585.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.0285714285714286,
+      "put_price_change_pct": 0.0,
       "call_bias": 0,
-      "put_bias": 1,
+      "put_bias": 0,
       "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_LONG_UNWINDING"
+      "put_activity": "OI_BUILDING_UNCERTAIN"
     },
     "20900.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": 6045.0,
+      "put_oi_change": 1170.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.0277777777777778,
+      "put_price_change_pct": 0.0,
       "call_bias": 0,
-      "put_bias": 1,
+      "put_bias": 0,
       "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_WRITING"
+      "put_activity": "OI_BUILDING_UNCERTAIN"
     },
     "20950.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": -13065.0,
+      "put_oi_change": -11700.0,
       "call_price_change_pct": 0.0,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
@@ -1131,27 +1142,27 @@
     },
     "21000.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": -138255.0,
-      "call_price_change_pct": 0.0,
+      "put_oi_change": 108030.0,
+      "call_price_change_pct": 0.01891891891891892,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
       "put_bias": 0,
       "call_activity": "NO_OI_CHANGE",
-      "put_activity": "OI_UNWINDING_UNCERTAIN"
+      "put_activity": "OI_BUILDING_UNCERTAIN"
     },
     "21050.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": 42380.0,
+      "put_oi_change": -1235.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.023809523809523937,
+      "put_price_change_pct": 0.024390243902439157,
       "call_bias": 0,
-      "put_bias": 1,
+      "put_bias": -1,
       "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_WRITING"
+      "put_activity": "PUT_SHORT_COVERING"
     },
     "21100.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": -25350.0,
+      "put_oi_change": -24765.0,
       "call_price_change_pct": 0.0,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
@@ -1161,9 +1172,9 @@
     },
     "21150.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": 195.0,
+      "put_oi_change": 8645.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.021276595744680965,
+      "put_price_change_pct": -0.021739130434782532,
       "call_bias": 0,
       "put_bias": 1,
       "call_activity": "NO_OI_CHANGE",
@@ -1171,97 +1182,27 @@
     },
     "21200.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": -18070.0,
+      "put_oi_change": 79560.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": 0.0,
+      "put_price_change_pct": -0.040000000000000036,
       "call_bias": 0,
-      "put_bias": 0,
+      "put_bias": 1,
       "call_activity": "NO_OI_CHANGE",
-      "put_activity": "OI_UNWINDING_UNCERTAIN"
+      "put_activity": "PUT_WRITING"
     },
     "21250.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": 13390.0,
+      "put_oi_change": 8255.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.019230769230769332,
+      "put_price_change_pct": 0.0,
       "call_bias": 0,
-      "put_bias": 1,
+      "put_bias": 0,
       "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_WRITING"
+      "put_activity": "OI_BUILDING_UNCERTAIN"
     },
     "21300.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": 133380.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.01818181818181812,
-      "call_bias": 0,
-      "put_bias": 1,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_WRITING"
-    },
-    "21350.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": 3835.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": 0.0,
-      "call_bias": 0,
-      "put_bias": 0,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "OI_BUILDING_UNCERTAIN"
-    },
-    "21400.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": 14105.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.01538461538461533,
-      "call_bias": 0,
-      "put_bias": 1,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_WRITING"
-    },
-    "21450.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": -2015.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": 0.0,
-      "call_bias": 0,
-      "put_bias": 0,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "OI_UNWINDING_UNCERTAIN"
-    },
-    "21500.0": {
-      "call_oi_change": -65.0,
-      "put_oi_change": 33735.0,
-      "call_price_change_pct": 0.017979797979797933,
-      "put_price_change_pct": 0.0,
-      "call_bias": 1,
-      "put_bias": 0,
-      "call_activity": "CALL_SHORT_COVERING",
-      "put_activity": "OI_BUILDING_UNCERTAIN"
-    },
-    "21550.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": 6565.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": 0.0,
-      "call_bias": 0,
-      "put_bias": 0,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "OI_BUILDING_UNCERTAIN"
-    },
-    "21600.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": 114660.0,
-      "call_price_change_pct": 0.02107887579329105,
-      "put_price_change_pct": -0.021276595744680965,
-      "call_bias": 0,
-      "put_bias": 1,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_WRITING"
-    },
-    "21650.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": 10725.0,
+      "put_oi_change": 79430.0,
       "call_price_change_pct": 0.0,
       "put_price_change_pct": -0.018518518518518615,
       "call_bias": 0,
@@ -1269,440 +1210,510 @@
       "call_activity": "NO_OI_CHANGE",
       "put_activity": "PUT_WRITING"
     },
-    "21700.0": {
-      "call_oi_change": 65.0,
-      "put_oi_change": 47580.0,
-      "call_price_change_pct": 0.010110584518167456,
-      "put_price_change_pct": -0.015999999999999945,
+    "21350.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": 33800.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": -0.01724137931034477,
+      "call_bias": 0,
+      "put_bias": 1,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "PUT_WRITING"
+    },
+    "21400.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": 218075.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": -0.04687500000000011,
+      "call_bias": 0,
+      "put_bias": 1,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "PUT_WRITING"
+    },
+    "21450.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": -3185.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": -0.04225352112676054,
+      "call_bias": 0,
+      "put_bias": 1,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "PUT_LONG_UNWINDING"
+    },
+    "21500.0": {
+      "call_oi_change": -65.0,
+      "put_oi_change": -13260.0,
+      "call_price_change_pct": 0.01706687834887879,
+      "put_price_change_pct": -0.03846153846153844,
+      "call_bias": 1,
+      "put_bias": 1,
+      "call_activity": "CALL_SHORT_COVERING",
+      "put_activity": "PUT_LONG_UNWINDING"
+    },
+    "21550.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": 25545.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": -0.03488372093023243,
+      "call_bias": 0,
+      "put_bias": 1,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "PUT_WRITING"
+    },
+    "21600.0": {
+      "call_oi_change": 195.0,
+      "put_oi_change": 130.0,
+      "call_price_change_pct": 0.01553829078801332,
+      "put_price_change_pct": -0.021739130434782532,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_BUYING",
       "put_activity": "PUT_WRITING"
     },
+    "21650.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": 17160.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": -0.04716981132075472,
+      "call_bias": 0,
+      "put_bias": 1,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "PUT_WRITING"
+    },
+    "21700.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": 55640.0,
+      "call_price_change_pct": 0.019455739756021214,
+      "put_price_change_pct": -0.04065040650406504,
+      "call_bias": 0,
+      "put_bias": 1,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "PUT_WRITING"
+    },
     "21750.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": -29120.0,
+      "put_oi_change": -28665.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.02097902097902103,
+      "put_price_change_pct": -0.04999999999999995,
       "call_bias": 0,
       "put_bias": 1,
       "call_activity": "NO_OI_CHANGE",
       "put_activity": "PUT_LONG_UNWINDING"
     },
     "21800.0": {
-      "call_oi_change": 65.0,
-      "put_oi_change": -37180.0,
-      "call_price_change_pct": 0.0022191996563819235,
-      "put_price_change_pct": -0.011976047904191574,
-      "call_bias": 1,
-      "put_bias": 1,
-      "call_activity": "CALL_BUYING",
-      "put_activity": "PUT_LONG_UNWINDING"
-    },
-    "21850.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": 59020.0,
-      "call_price_change_pct": 0.02236149798823883,
-      "put_price_change_pct": -0.019900497512437915,
-      "call_bias": 0,
-      "put_bias": 1,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_WRITING"
-    },
-    "21900.0": {
-      "call_oi_change": 975.0,
-      "put_oi_change": -205335.0,
-      "call_price_change_pct": 0.03413198823034881,
-      "put_price_change_pct": -0.03265306122448983,
-      "call_bias": 1,
-      "put_bias": 1,
-      "call_activity": "CALL_BUYING",
-      "put_activity": "PUT_LONG_UNWINDING"
-    },
-    "21950.0": {
-      "call_oi_change": 130.0,
-      "put_oi_change": 24050.0,
-      "call_price_change_pct": 0.026865671641791086,
-      "put_price_change_pct": -0.036544850498338916,
-      "call_bias": 1,
-      "put_bias": 1,
-      "call_activity": "CALL_BUYING",
-      "put_activity": "PUT_WRITING"
-    },
-    "22000.0": {
-      "call_oi_change": -5655.0,
-      "put_oi_change": -31915.0,
-      "call_price_change_pct": 0.024334975369458174,
-      "put_price_change_pct": -0.04021447721179625,
+      "call_oi_change": -195.0,
+      "put_oi_change": -137020.0,
+      "call_price_change_pct": 0.0275,
+      "put_price_change_pct": -0.054545454545454564,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_SHORT_COVERING",
       "put_activity": "PUT_LONG_UNWINDING"
     },
+    "21850.0": {
+      "call_oi_change": -325.0,
+      "put_oi_change": -5070.0,
+      "call_price_change_pct": 0.029289336259744225,
+      "put_price_change_pct": -0.050761421319796954,
+      "call_bias": 1,
+      "put_bias": 1,
+      "call_activity": "CALL_SHORT_COVERING",
+      "put_activity": "PUT_LONG_UNWINDING"
+    },
+    "21900.0": {
+      "call_oi_change": 195.0,
+      "put_oi_change": 27365.0,
+      "call_price_change_pct": 0.00918624502073017,
+      "put_price_change_pct": -0.054852320675105516,
+      "call_bias": 1,
+      "put_bias": 1,
+      "call_activity": "CALL_BUYING",
+      "put_activity": "PUT_WRITING"
+    },
+    "21950.0": {
+      "call_oi_change": -2405.0,
+      "put_oi_change": 33345.0,
+      "call_price_change_pct": 0.011363636363636243,
+      "put_price_change_pct": -0.05172413793103448,
+      "call_bias": 1,
+      "put_bias": 1,
+      "call_activity": "CALL_SHORT_COVERING",
+      "put_activity": "PUT_WRITING"
+    },
+    "22000.0": {
+      "call_oi_change": -30810.0,
+      "put_oi_change": 100035.0,
+      "call_price_change_pct": 0.014138693853996388,
+      "put_price_change_pct": -0.061452513966480334,
+      "call_bias": 1,
+      "put_bias": 1,
+      "call_activity": "CALL_SHORT_COVERING",
+      "put_activity": "PUT_WRITING"
+    },
     "22050.0": {
-      "call_oi_change": -1755.0,
-      "put_oi_change": 28275.0,
-      "call_price_change_pct": 0.03418150049142727,
-      "put_price_change_pct": -0.04148471615720521,
+      "call_oi_change": -4745.0,
+      "put_oi_change": 30420.0,
+      "call_price_change_pct": 0.013516367476240711,
+      "put_price_change_pct": -0.06378132118451019,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_SHORT_COVERING",
       "put_activity": "PUT_WRITING"
     },
     "22100.0": {
-      "call_oi_change": -5590.0,
-      "put_oi_change": -16770.0,
-      "call_price_change_pct": 0.023453392365681353,
-      "put_price_change_pct": -0.03736654804270465,
+      "call_oi_change": -11245.0,
+      "put_oi_change": 6695.0,
+      "call_price_change_pct": 0.02069449316029469,
+      "put_price_change_pct": -0.06839186691312389,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_SHORT_COVERING",
-      "put_activity": "PUT_LONG_UNWINDING"
+      "put_activity": "PUT_WRITING"
     },
     "22150.0": {
-      "call_oi_change": -8840.0,
-      "put_oi_change": -121745.0,
-      "call_price_change_pct": 0.025297818230491202,
-      "put_price_change_pct": -0.039017341040462464,
+      "call_oi_change": 2730.0,
+      "put_oi_change": -58630.0,
+      "call_price_change_pct": 0.028851174934725877,
+      "put_price_change_pct": -0.06766917293233082,
       "call_bias": 1,
       "put_bias": 1,
-      "call_activity": "CALL_SHORT_COVERING",
+      "call_activity": "CALL_BUYING",
       "put_activity": "PUT_LONG_UNWINDING"
     },
     "22200.0": {
-      "call_oi_change": -55185.0,
-      "put_oi_change": -70785.0,
-      "call_price_change_pct": 0.02637528259231349,
-      "put_price_change_pct": -0.043478260869565084,
+      "call_oi_change": -22555.0,
+      "put_oi_change": 59215.0,
+      "call_price_change_pct": 0.02701908957415562,
+      "put_price_change_pct": -0.06756756756756756,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_SHORT_COVERING",
-      "put_activity": "PUT_LONG_UNWINDING"
+      "put_activity": "PUT_WRITING"
     },
     "22250.0": {
-      "call_oi_change": -6370.0,
-      "put_oi_change": 6955.0,
-      "call_price_change_pct": 0.02774922918807819,
-      "put_price_change_pct": -0.03934740882917474,
+      "call_oi_change": -3120.0,
+      "put_oi_change": 295945.0,
+      "call_price_change_pct": 0.02933333333333337,
+      "put_price_change_pct": -0.07392607392607385,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_SHORT_COVERING",
       "put_activity": "PUT_WRITING"
     },
     "22300.0": {
-      "call_oi_change": -52325.0,
-      "put_oi_change": -34905.0,
-      "call_price_change_pct": 0.032964863797868005,
-      "put_price_change_pct": -0.04423380726698258,
+      "call_oi_change": -93015.0,
+      "put_oi_change": -11960.0,
+      "call_price_change_pct": 0.027899866233518103,
+      "put_price_change_pct": -0.06115702479338848,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_SHORT_COVERING",
       "put_activity": "PUT_LONG_UNWINDING"
     },
     "22350.0": {
-      "call_oi_change": -33280.0,
-      "put_oi_change": 5395.0,
-      "call_price_change_pct": 0.0410706045223812,
-      "put_price_change_pct": -0.04471808165910567,
+      "call_oi_change": -207350.0,
+      "put_oi_change": -47450.0,
+      "call_price_change_pct": 0.026595744680851064,
+      "put_price_change_pct": -0.061736770691994534,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_SHORT_COVERING",
-      "put_activity": "PUT_WRITING"
+      "put_activity": "PUT_LONG_UNWINDING"
     },
     "22400.0": {
-      "call_oi_change": -52520.0,
-      "put_oi_change": 314990.0,
-      "call_price_change_pct": 0.03762268266085063,
-      "put_price_change_pct": -0.039699570815450676,
+      "call_oi_change": -295100.0,
+      "put_oi_change": -11765.0,
+      "call_price_change_pct": 0.029952706253284226,
+      "put_price_change_pct": -0.06256983240223457,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_SHORT_COVERING",
-      "put_activity": "PUT_WRITING"
+      "put_activity": "PUT_LONG_UNWINDING"
     },
     "22450.0": {
-      "call_oi_change": 14495.0,
-      "put_oi_change": 261365.0,
-      "call_price_change_pct": 0.03938299967180834,
-      "put_price_change_pct": -0.036656236030397804,
+      "call_oi_change": -263575.0,
+      "put_oi_change": 406510.0,
+      "call_price_change_pct": 0.037574992106094204,
+      "put_price_change_pct": -0.061716937354988455,
       "call_bias": 1,
       "put_bias": 1,
-      "call_activity": "CALL_BUYING",
+      "call_activity": "CALL_SHORT_COVERING",
       "put_activity": "PUT_WRITING"
     },
     "22500.0": {
-      "call_oi_change": 87360.0,
-      "put_oi_change": 426595.0,
-      "call_price_change_pct": 0.04206730769230781,
-      "put_price_change_pct": -0.03656716417910452,
+      "call_oi_change": 99190.0,
+      "put_oi_change": 768495.0,
+      "call_price_change_pct": 0.03883121876201447,
+      "put_price_change_pct": -0.057319907048799315,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_BUYING",
       "put_activity": "PUT_WRITING"
     },
     "22550.0": {
-      "call_oi_change": 65650.0,
-      "put_oi_change": 99580.0,
-      "call_price_change_pct": 0.045999999999999944,
-      "put_price_change_pct": -0.03391959798994961,
+      "call_oi_change": -143520.0,
+      "put_oi_change": 143130.0,
+      "call_price_change_pct": 0.037762906309751466,
+      "put_price_change_pct": -0.0559167750325099,
       "call_bias": 1,
       "put_bias": 1,
-      "call_activity": "CALL_BUYING",
+      "call_activity": "CALL_SHORT_COVERING",
       "put_activity": "PUT_WRITING"
     },
     "22600.0": {
-      "call_oi_change": 86450.0,
-      "put_oi_change": 102310.0,
-      "call_price_change_pct": 0.05360561582641995,
-      "put_price_change_pct": -0.03453772582359192,
+      "call_oi_change": -161915.0,
+      "put_oi_change": 118235.0,
+      "call_price_change_pct": 0.036341611144760755,
+      "put_price_change_pct": -0.045404512933406714,
       "call_bias": 1,
       "put_bias": 1,
-      "call_activity": "CALL_BUYING",
+      "call_activity": "CALL_SHORT_COVERING",
       "put_activity": "PUT_WRITING"
     },
     "22650.0": {
-      "call_oi_change": 13325.0,
-      "put_oi_change": 34645.0,
-      "call_price_change_pct": 0.057755775577557636,
-      "put_price_change_pct": -0.0348439990890458,
+      "call_oi_change": 7410.0,
+      "put_oi_change": 73255.0,
+      "call_price_change_pct": 0.031981279251170225,
+      "put_price_change_pct": -0.04412458706937232,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_BUYING",
       "put_activity": "PUT_WRITING"
     },
     "22700.0": {
-      "call_oi_change": 35880.0,
-      "put_oi_change": 30030.0,
-      "call_price_change_pct": 0.06100217864923757,
-      "put_price_change_pct": -0.03235294117647059,
+      "call_oi_change": 195195.0,
+      "put_oi_change": 64415.0,
+      "call_price_change_pct": 0.031827515400410615,
+      "put_price_change_pct": -0.0364741641337386,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_BUYING",
       "put_activity": "PUT_WRITING"
     },
     "22750.0": {
-      "call_oi_change": 57655.0,
-      "put_oi_change": 4550.0,
-      "call_price_change_pct": 0.05580029368575641,
-      "put_price_change_pct": -0.03178110129163823,
+      "call_oi_change": 54210.0,
+      "put_oi_change": 11115.0,
+      "call_price_change_pct": 0.040333796940194594,
+      "put_price_change_pct": -0.03826575390556445,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_BUYING",
       "put_activity": "PUT_WRITING"
     },
     "22800.0": {
-      "call_oi_change": 6370.0,
-      "put_oi_change": 12350.0,
-      "call_price_change_pct": 0.06060606060606061,
-      "put_price_change_pct": -0.025871093165844277,
+      "call_oi_change": -144365.0,
+      "put_oi_change": 41535.0,
+      "call_price_change_pct": 0.02857142857142857,
+      "put_price_change_pct": -0.0356155971753146,
       "call_bias": 1,
       "put_bias": 1,
-      "call_activity": "CALL_BUYING",
+      "call_activity": "CALL_SHORT_COVERING",
       "put_activity": "PUT_WRITING"
     },
     "22850.0": {
-      "call_oi_change": 51220.0,
-      "put_oi_change": 520.0,
-      "call_price_change_pct": 0.05571030640668524,
-      "put_price_change_pct": -0.03366959255862693,
+      "call_oi_change": 1690.0,
+      "put_oi_change": 260.0,
+      "call_price_change_pct": 0.02110817941952518,
+      "put_price_change_pct": -0.031046637744034676,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_BUYING",
       "put_activity": "PUT_WRITING"
     },
     "22900.0": {
-      "call_oi_change": 78845.0,
-      "put_oi_change": 0.0,
-      "call_price_change_pct": 0.058823529411764705,
-      "put_price_change_pct": -0.02027748132337236,
+      "call_oi_change": 82095.0,
+      "put_oi_change": 4745.0,
+      "call_price_change_pct": 0.018518518518518517,
+      "put_price_change_pct": -0.03171145001210366,
       "call_bias": 1,
-      "put_bias": 0,
+      "put_bias": 1,
       "call_activity": "CALL_BUYING",
-      "put_activity": "NO_OI_CHANGE"
+      "put_activity": "PUT_WRITING"
     },
     "22950.0": {
-      "call_oi_change": 115505.0,
-      "put_oi_change": 1235.0,
-      "call_price_change_pct": 0.05376344086021505,
-      "put_price_change_pct": -0.023396788259066256,
+      "call_oi_change": 44200.0,
+      "put_oi_change": 910.0,
+      "call_price_change_pct": 0.010204081632653024,
+      "put_price_change_pct": -0.0378961123815746,
       "call_bias": 1,
       "put_bias": 1,
       "call_activity": "CALL_BUYING",
       "put_activity": "PUT_WRITING"
     },
     "23000.0": {
-      "call_oi_change": 104065.0,
-      "put_oi_change": -3445.0,
-      "call_price_change_pct": 0.049645390070922064,
-      "put_price_change_pct": -0.030562229697260888,
-      "call_bias": 1,
+      "call_oi_change": 146510.0,
+      "put_oi_change": 20930.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": -0.020124913254684313,
+      "call_bias": 0,
       "put_bias": 1,
-      "call_activity": "CALL_BUYING",
-      "put_activity": "PUT_LONG_UNWINDING"
+      "call_activity": "OI_BUILDING_UNCERTAIN",
+      "put_activity": "PUT_WRITING"
     },
     "23050.0": {
-      "call_oi_change": -8710.0,
-      "put_oi_change": 325.0,
-      "call_price_change_pct": 0.05,
-      "put_price_change_pct": -0.025751829967369296,
-      "call_bias": 1,
+      "call_oi_change": 28925.0,
+      "put_oi_change": 195.0,
+      "call_price_change_pct": -0.00952380952380949,
+      "put_price_change_pct": -0.019643342083823703,
+      "call_bias": -1,
       "put_bias": 1,
-      "call_activity": "CALL_SHORT_COVERING",
+      "call_activity": "CALL_WRITING",
       "put_activity": "PUT_WRITING"
     },
     "23100.0": {
-      "call_oi_change": 9880.0,
-      "put_oi_change": -910.0,
-      "call_price_change_pct": 0.02666666666666669,
-      "put_price_change_pct": -0.0199836867862969,
-      "call_bias": 1,
+      "call_oi_change": 43745.0,
+      "put_oi_change": -780.0,
+      "call_price_change_pct": -0.025974025974025997,
+      "put_price_change_pct": -0.02122347066167291,
+      "call_bias": -1,
       "put_bias": 1,
-      "call_activity": "CALL_BUYING",
+      "call_activity": "CALL_WRITING",
       "put_activity": "PUT_LONG_UNWINDING"
     },
     "23150.0": {
-      "call_oi_change": 87360.0,
-      "put_oi_change": -65.0,
-      "call_price_change_pct": 0.01724137931034492,
-      "put_price_change_pct": -0.015060240963855422,
-      "call_bias": 1,
-      "put_bias": 1,
-      "call_activity": "CALL_BUYING",
-      "put_activity": "PUT_LONG_UNWINDING"
+      "call_oi_change": 57265.0,
+      "put_oi_change": 0.0,
+      "call_price_change_pct": -0.01694915254237297,
+      "put_price_change_pct": 0.0,
+      "call_bias": -1,
+      "put_bias": 0,
+      "call_activity": "CALL_WRITING",
+      "put_activity": "NO_OI_CHANGE"
     },
     "23200.0": {
-      "call_oi_change": -1950.0,
-      "put_oi_change": -2210.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.01646234676007005,
-      "call_bias": 0,
+      "call_oi_change": 279890.0,
+      "put_oi_change": -195.0,
+      "call_price_change_pct": -0.043478260869565064,
+      "put_price_change_pct": -0.013960113960113896,
+      "call_bias": -1,
       "put_bias": 1,
-      "call_activity": "OI_UNWINDING_UNCERTAIN",
+      "call_activity": "CALL_WRITING",
       "put_activity": "PUT_LONG_UNWINDING"
     },
     "23250.0": {
-      "call_oi_change": -2925.0,
+      "call_oi_change": 975.0,
       "put_oi_change": 0.0,
-      "call_price_change_pct": 0.02499999999999991,
-      "put_price_change_pct": 0.0,
-      "call_bias": 1,
+      "call_price_change_pct": -0.02439024390243894,
+      "put_price_change_pct": -0.04381856675434654,
+      "call_bias": -1,
       "put_bias": 0,
-      "call_activity": "CALL_SHORT_COVERING",
+      "call_activity": "CALL_WRITING",
       "put_activity": "NO_OI_CHANGE"
     },
     "23300.0": {
-      "call_oi_change": -1950.0,
-      "put_oi_change": 325.0,
-      "call_price_change_pct": 0.02941176470588238,
-      "put_price_change_pct": -0.017319739589731018,
-      "call_bias": 1,
+      "call_oi_change": -39910.0,
+      "put_oi_change": 195.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": -0.019375,
+      "call_bias": 0,
       "put_bias": 1,
-      "call_activity": "CALL_SHORT_COVERING",
+      "call_activity": "OI_UNWINDING_UNCERTAIN",
       "put_activity": "PUT_WRITING"
     },
     "23350.0": {
-      "call_oi_change": 16055.0,
+      "call_oi_change": -2405.0,
       "put_oi_change": 0.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.011027076958605109,
+      "put_price_change_pct": 0.0,
       "call_bias": 0,
       "put_bias": 0,
-      "call_activity": "OI_BUILDING_UNCERTAIN",
+      "call_activity": "OI_UNWINDING_UNCERTAIN",
       "put_activity": "NO_OI_CHANGE"
     },
     "23400.0": {
-      "call_oi_change": -13325.0,
-      "put_oi_change": -65.0,
-      "call_price_change_pct": 0.0370370370370369,
-      "put_price_change_pct": -0.01623216920806692,
-      "call_bias": 1,
+      "call_oi_change": 9035.0,
+      "put_oi_change": 65.0,
+      "call_price_change_pct": -0.03571428571428559,
+      "put_price_change_pct": -0.022222222222222223,
+      "call_bias": -1,
       "put_bias": 1,
-      "call_activity": "CALL_SHORT_COVERING",
-      "put_activity": "PUT_LONG_UNWINDING"
+      "call_activity": "CALL_WRITING",
+      "put_activity": "PUT_WRITING"
     },
     "23450.0": {
-      "call_oi_change": 520.0,
-      "put_oi_change": 0.0,
-      "call_price_change_pct": 0.040000000000000036,
-      "put_price_change_pct": 0.0,
-      "call_bias": 1,
-      "put_bias": 0,
-      "call_activity": "CALL_BUYING",
-      "put_activity": "NO_OI_CHANGE"
-    },
-    "23500.0": {
-      "call_oi_change": -19955.0,
-      "put_oi_change": -975.0,
-      "call_price_change_pct": -0.041666666666666706,
-      "put_price_change_pct": -0.011869436201780416,
+      "call_oi_change": -975.0,
+      "put_oi_change": 260.0,
+      "call_price_change_pct": -0.07692307692307698,
+      "put_price_change_pct": -0.03885272579332796,
       "call_bias": -1,
       "put_bias": 1,
       "call_activity": "CALL_LONG_UNWINDING",
+      "put_activity": "PUT_WRITING"
+    },
+    "23500.0": {
+      "call_oi_change": -15665.0,
+      "put_oi_change": -1300.0,
+      "call_price_change_pct": 0.04347826086956526,
+      "put_price_change_pct": -0.006706706706706752,
+      "call_bias": 1,
+      "put_bias": 1,
+      "call_activity": "CALL_SHORT_COVERING",
       "put_activity": "PUT_LONG_UNWINDING"
     },
     "23550.0": {
-      "call_oi_change": 5785.0,
-      "put_oi_change": 0.0,
+      "call_oi_change": 7280.0,
+      "put_oi_change": 65.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": 0.0,
+      "put_price_change_pct": -0.04642956634785031,
       "call_bias": 0,
-      "put_bias": 0,
+      "put_bias": 1,
       "call_activity": "OI_BUILDING_UNCERTAIN",
-      "put_activity": "NO_OI_CHANGE"
+      "put_activity": "PUT_WRITING"
     },
     "23600.0": {
-      "call_oi_change": -2080.0,
-      "put_oi_change": 0.0,
-      "call_price_change_pct": 0.052631578947368474,
-      "put_price_change_pct": -0.016325806308504383,
-      "call_bias": 1,
-      "put_bias": 0,
-      "call_activity": "CALL_SHORT_COVERING",
-      "put_activity": "NO_OI_CHANGE"
-    },
-    "23650.0": {
-      "call_oi_change": 130.0,
-      "put_oi_change": 0.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": 0.0,
-      "call_bias": 0,
-      "put_bias": 0,
-      "call_activity": "OI_BUILDING_UNCERTAIN",
-      "put_activity": "NO_OI_CHANGE"
-    },
-    "23700.0": {
-      "call_oi_change": -66170.0,
+      "call_oi_change": -1105.0,
       "put_oi_change": -65.0,
       "call_price_change_pct": 0.0,
-      "put_price_change_pct": -0.007220961419434702,
+      "put_price_change_pct": -0.020024353943985967,
       "call_bias": 0,
       "put_bias": 1,
       "call_activity": "OI_UNWINDING_UNCERTAIN",
       "put_activity": "PUT_LONG_UNWINDING"
     },
-    "23750.0": {
-      "call_oi_change": 0.0,
+    "23650.0": {
+      "call_oi_change": 1105.0,
       "put_oi_change": 0.0,
-      "call_price_change_pct": 0.05882352941176476,
-      "put_price_change_pct": 0.0,
-      "call_bias": 0,
+      "call_price_change_pct": 0.052631578947368474,
+      "put_price_change_pct": -0.12559923298178333,
+      "call_bias": 1,
       "put_bias": 0,
-      "call_activity": "NO_OI_CHANGE",
+      "call_activity": "CALL_BUYING",
+      "put_activity": "NO_OI_CHANGE"
+    },
+    "23700.0": {
+      "call_oi_change": -28925.0,
+      "put_oi_change": 0.0,
+      "call_price_change_pct": -0.052631578947368356,
+      "put_price_change_pct": 0.0,
+      "call_bias": -1,
+      "put_bias": 0,
+      "call_activity": "CALL_LONG_UNWINDING",
+      "put_activity": "NO_OI_CHANGE"
+    },
+    "23750.0": {
+      "call_oi_change": 130.0,
+      "put_oi_change": 0.0,
+      "call_price_change_pct": -0.0555555555555556,
+      "put_price_change_pct": 0.0,
+      "call_bias": -1,
+      "put_bias": 0,
+      "call_activity": "CALL_WRITING",
       "put_activity": "NO_OI_CHANGE"
     },
     "23800.0": {
-      "call_oi_change": 0.0,
-      "put_oi_change": 0.0,
-      "call_price_change_pct": 0.06666666666666672,
-      "put_price_change_pct": 0.0,
-      "call_bias": 0,
-      "put_bias": 0,
-      "call_activity": "NO_OI_CHANGE",
-      "put_activity": "NO_OI_CHANGE"
+      "call_oi_change": -14430.0,
+      "put_oi_change": 65.0,
+      "call_price_change_pct": -0.06250000000000006,
+      "put_price_change_pct": -0.01423076923076923,
+      "call_bias": -1,
+      "put_bias": 1,
+      "call_activity": "CALL_LONG_UNWINDING",
+      "put_activity": "PUT_WRITING"
     },
     "23850.0": {
       "call_oi_change": 0.0,
       "put_oi_change": 0.0,
-      "call_price_change_pct": 0.06666666666666672,
+      "call_price_change_pct": -0.06250000000000006,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
       "put_bias": 0,
@@ -1710,16 +1721,6 @@
       "put_activity": "NO_OI_CHANGE"
     },
     "23900.0": {
-      "call_oi_change": -1560.0,
-      "put_oi_change": 0.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": 0.0,
-      "call_bias": 0,
-      "put_bias": 0,
-      "call_activity": "OI_UNWINDING_UNCERTAIN",
-      "put_activity": "NO_OI_CHANGE"
-    },
-    "23950.0": {
       "call_oi_change": 0.0,
       "put_oi_change": 0.0,
       "call_price_change_pct": -0.07142857142857134,
@@ -1729,44 +1730,54 @@
       "call_activity": "NO_OI_CHANGE",
       "put_activity": "NO_OI_CHANGE"
     },
-    "24000.0": {
-      "call_oi_change": -39390.0,
-      "put_oi_change": -65.0,
+    "23950.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": 0.0,
       "call_price_change_pct": 0.07692307692307682,
-      "put_price_change_pct": -0.01639344262295082,
-      "call_bias": 1,
+      "put_price_change_pct": 0.0,
+      "call_bias": 0,
+      "put_bias": 0,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "NO_OI_CHANGE"
+    },
+    "24000.0": {
+      "call_oi_change": -228085.0,
+      "put_oi_change": -65.0,
+      "call_price_change_pct": 0.0,
+      "put_price_change_pct": -0.01460000000000006,
+      "call_bias": 0,
       "put_bias": 1,
-      "call_activity": "CALL_SHORT_COVERING",
+      "call_activity": "OI_UNWINDING_UNCERTAIN",
       "put_activity": "PUT_LONG_UNWINDING"
     },
     "24050.0": {
-      "call_oi_change": -3510.0,
-      "put_oi_change": 0.0,
-      "call_price_change_pct": -0.1538461538461538,
-      "put_price_change_pct": 0.0,
-      "call_bias": -1,
-      "put_bias": 0,
-      "call_activity": "CALL_LONG_UNWINDING",
-      "put_activity": "NO_OI_CHANGE"
-    },
-    "24100.0": {
-      "call_oi_change": -56160.0,
-      "put_oi_change": 0.0,
-      "call_price_change_pct": -0.07692307692307698,
-      "put_price_change_pct": 0.0,
-      "call_bias": -1,
-      "put_bias": 0,
-      "call_activity": "CALL_LONG_UNWINDING",
-      "put_activity": "NO_OI_CHANGE"
-    },
-    "24150.0": {
-      "call_oi_change": -65.0,
+      "call_oi_change": 0.0,
       "put_oi_change": 0.0,
       "call_price_change_pct": 0.0,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
       "put_bias": 0,
-      "call_activity": "OI_UNWINDING_UNCERTAIN",
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "NO_OI_CHANGE"
+    },
+    "24100.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": 0.0,
+      "call_price_change_pct": 0.08333333333333341,
+      "put_price_change_pct": 0.0,
+      "call_bias": 0,
+      "put_bias": 0,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "NO_OI_CHANGE"
+    },
+    "24150.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": 0.0,
+      "call_price_change_pct": -0.08333333333333323,
+      "put_price_change_pct": 0.0,
+      "call_bias": 0,
+      "put_bias": 0,
+      "call_activity": "NO_OI_CHANGE",
       "put_activity": "NO_OI_CHANGE"
     },
     "24200.0": {
@@ -1782,7 +1793,7 @@
     "24250.0": {
       "call_oi_change": 0.0,
       "put_oi_change": 0.0,
-      "call_price_change_pct": 0.09090909090909079,
+      "call_price_change_pct": -0.08333333333333323,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
       "put_bias": 0,
@@ -1790,26 +1801,56 @@
       "put_activity": "NO_OI_CHANGE"
     },
     "24300.0": {
-      "call_oi_change": 130.0,
-      "put_oi_change": 0.0,
-      "call_price_change_pct": 0.0,
-      "put_price_change_pct": 0.0,
-      "call_bias": 0,
-      "put_bias": 0,
-      "call_activity": "OI_BUILDING_UNCERTAIN",
-      "put_activity": "NO_OI_CHANGE"
+      "call_oi_change": 65.0,
+      "put_oi_change": -130.0,
+      "call_price_change_pct": 0.10000000000000009,
+      "put_price_change_pct": -0.1301376549838914,
+      "call_bias": 1,
+      "put_bias": 1,
+      "call_activity": "CALL_BUYING",
+      "put_activity": "PUT_LONG_UNWINDING"
     },
     "24350.0": {
-      "call_oi_change": -65.0,
+      "call_oi_change": 130.0,
       "put_oi_change": 0.0,
-      "call_price_change_pct": 0.09090909090909079,
+      "call_price_change_pct": -0.08333333333333323,
       "put_price_change_pct": 0.0,
-      "call_bias": 1,
+      "call_bias": -1,
       "put_bias": 0,
-      "call_activity": "CALL_SHORT_COVERING",
+      "call_activity": "CALL_WRITING",
       "put_activity": "NO_OI_CHANGE"
     },
     "24400.0": {
+      "call_oi_change": 1885.0,
+      "put_oi_change": 0.0,
+      "call_price_change_pct": 0.10000000000000009,
+      "put_price_change_pct": 0.0,
+      "call_bias": 1,
+      "put_bias": 0,
+      "call_activity": "CALL_BUYING",
+      "put_activity": "NO_OI_CHANGE"
+    },
+    "24450.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": 0.0,
+      "call_price_change_pct": -0.09090909090909098,
+      "put_price_change_pct": 0.0,
+      "call_bias": 0,
+      "put_bias": 0,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "NO_OI_CHANGE"
+    },
+    "24500.0": {
+      "call_oi_change": 0.0,
+      "put_oi_change": -130.0,
+      "call_price_change_pct": 0.10000000000000009,
+      "put_price_change_pct": -0.017369727047146403,
+      "call_bias": 0,
+      "put_bias": 1,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "PUT_LONG_UNWINDING"
+    },
+    "24550.0": {
       "call_oi_change": 0.0,
       "put_oi_change": 0.0,
       "call_price_change_pct": 0.0,
@@ -1819,44 +1860,14 @@
       "call_activity": "NO_OI_CHANGE",
       "put_activity": "NO_OI_CHANGE"
     },
-    "24450.0": {
-      "call_oi_change": -260.0,
+    "24600.0": {
+      "call_oi_change": 0.0,
       "put_oi_change": 0.0,
-      "call_price_change_pct": 0.10000000000000009,
-      "put_price_change_pct": 0.0,
-      "call_bias": 1,
-      "put_bias": 0,
-      "call_activity": "CALL_SHORT_COVERING",
-      "put_activity": "NO_OI_CHANGE"
-    },
-    "24500.0": {
-      "call_oi_change": -7215.0,
-      "put_oi_change": 0.0,
-      "call_price_change_pct": -0.09090909090909098,
-      "put_price_change_pct": 0.0,
-      "call_bias": -1,
-      "put_bias": 0,
-      "call_activity": "CALL_LONG_UNWINDING",
-      "put_activity": "NO_OI_CHANGE"
-    },
-    "24550.0": {
-      "call_oi_change": -975.0,
-      "put_oi_change": 0.0,
-      "call_price_change_pct": 0.0,
+      "call_price_change_pct": 0.11111111111111108,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
       "put_bias": 0,
-      "call_activity": "OI_UNWINDING_UNCERTAIN",
-      "put_activity": "NO_OI_CHANGE"
-    },
-    "24600.0": {
-      "call_oi_change": -1300.0,
-      "put_oi_change": 0.0,
-      "call_price_change_pct": -0.18181818181818185,
-      "put_price_change_pct": 0.0,
-      "call_bias": -1,
-      "put_bias": 0,
-      "call_activity": "CALL_LONG_UNWINDING",
+      "call_activity": "NO_OI_CHANGE",
       "put_activity": "NO_OI_CHANGE"
     },
     "24650.0": {
@@ -1870,13 +1881,13 @@
       "put_activity": "NO_OI_CHANGE"
     },
     "24700.0": {
-      "call_oi_change": 0.0,
+      "call_oi_change": 260.0,
       "put_oi_change": 0.0,
       "call_price_change_pct": 0.0,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
       "put_bias": 0,
-      "call_activity": "NO_OI_CHANGE",
+      "call_activity": "OI_BUILDING_UNCERTAIN",
       "put_activity": "NO_OI_CHANGE"
     },
     "24750.0": {
@@ -1890,13 +1901,13 @@
       "put_activity": "NO_OI_CHANGE"
     },
     "24800.0": {
-      "call_oi_change": 0.0,
+      "call_oi_change": -6500.0,
       "put_oi_change": 0.0,
-      "call_price_change_pct": -0.11111111111111108,
+      "call_price_change_pct": 0.12499999999999997,
       "put_price_change_pct": 0.0,
-      "call_bias": 0,
+      "call_bias": 1,
       "put_bias": 0,
-      "call_activity": "NO_OI_CHANGE",
+      "call_activity": "CALL_SHORT_COVERING",
       "put_activity": "NO_OI_CHANGE"
     },
     "24850.0": {
@@ -1922,7 +1933,7 @@
     "24950.0": {
       "call_oi_change": 0.0,
       "put_oi_change": 0.0,
-      "call_price_change_pct": 0.0,
+      "call_price_change_pct": -0.11111111111111108,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
       "put_bias": 0,
@@ -1931,13 +1942,13 @@
     },
     "25000.0": {
       "call_oi_change": 0.0,
-      "put_oi_change": -195.0,
-      "call_price_change_pct": 0.12499999999999997,
-      "put_price_change_pct": 0.002879942401151904,
+      "put_oi_change": 0.0,
+      "call_price_change_pct": -0.11111111111111108,
+      "put_price_change_pct": 0.0,
       "call_bias": 0,
-      "put_bias": -1,
+      "put_bias": 0,
       "call_activity": "NO_OI_CHANGE",
-      "put_activity": "PUT_SHORT_COVERING"
+      "put_activity": "NO_OI_CHANGE"
     },
     "25050.0": {
       "call_oi_change": 0.0,
@@ -1952,7 +1963,7 @@
     "25100.0": {
       "call_oi_change": 0.0,
       "put_oi_change": 0.0,
-      "call_price_change_pct": 0.0,
+      "call_price_change_pct": -0.11111111111111108,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
       "put_bias": 0,
@@ -1962,7 +1973,7 @@
     "25150.0": {
       "call_oi_change": 0.0,
       "put_oi_change": 0.0,
-      "call_price_change_pct": 0.0,
+      "call_price_change_pct": 0.12499999999999997,
       "put_price_change_pct": 0.0,
       "call_bias": 0,
       "put_bias": 0,
@@ -1990,7 +2001,17 @@
       "put_activity": "NO_OI_CHANGE"
     },
     "25300.0": {
-      "call_oi_change": 3120.0,
+      "call_oi_change": 0.0,
+      "put_oi_change": 0.0,
+      "call_price_change_pct": -0.09999999999999998,
+      "put_price_change_pct": 0.0,
+      "call_bias": 0,
+      "put_bias": 0,
+      "call_activity": "NO_OI_CHANGE",
+      "put_activity": "NO_OI_CHANGE"
+    },
+    "25350.0": {
+      "call_oi_change": 65.0,
       "put_oi_change": 0.0,
       "call_price_change_pct": 0.0,
       "put_price_change_pct": 0.0,
@@ -1999,24 +2020,14 @@
       "call_activity": "OI_BUILDING_UNCERTAIN",
       "put_activity": "NO_OI_CHANGE"
     },
-    "25350.0": {
-      "call_oi_change": 1040.0,
-      "put_oi_change": 0.0,
-      "call_price_change_pct": -0.11111111111111108,
-      "put_price_change_pct": 0.0,
-      "call_bias": -1,
-      "put_bias": 0,
-      "call_activity": "CALL_WRITING",
-      "put_activity": "NO_OI_CHANGE"
-    },
     "25400.0": {
-      "call_oi_change": -325.0,
+      "call_oi_change": -1820.0,
       "put_oi_change": 0.0,
-      "call_price_change_pct": 0.12499999999999997,
+      "call_price_change_pct": 0.0,
       "put_price_change_pct": 0.0,
-      "call_bias": 1,
+      "call_bias": 0,
       "put_bias": 0,
-      "call_activity": "CALL_SHORT_COVERING",
+      "call_activity": "OI_UNWINDING_UNCERTAIN",
       "put_activity": "NO_OI_CHANGE"
     }
   },
