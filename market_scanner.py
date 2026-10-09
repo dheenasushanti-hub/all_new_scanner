@@ -112,8 +112,8 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-09-STRUCTURE-V29-STATE-PRESERVING-OI-OPTIONAL-VELOCITY"
-OPTION_TARGET_ENGINE_VERSION = "V29_STATE_PRESERVING_OPTIONAL_OI_VELOCITY"
+SCANNER_VERSION = "2026-10-09-STRUCTURE-V30-DYNAMIC-COI-MATRIX"
+OPTION_TARGET_ENGINE_VERSION = "V30_DYNAMIC_COI_MATRIX_PA_OI"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -131,7 +131,14 @@ STRONG_VOLUME_MULTIPLIER = float(os.getenv("STRONG_VOLUME_MULTIPLIER", "1.20"))
 OPTION_OI_MIN_AGE_MINUTES = int(os.getenv("OPTION_OI_MIN_AGE_MINUTES", "15"))
 OPTION_OI_MAX_AGE_MINUTES = int(os.getenv("OPTION_OI_MAX_AGE_MINUTES", "30"))
 OPTION_OI_HISTORY_KEEP_MINUTES = int(os.getenv("OPTION_OI_HISTORY_KEEP_MINUTES", "60"))
+COI_COLD_START_END = time(9, 45)
+COI_COLD_START_WEIGHT = float(os.getenv("COI_COLD_START_WEIGHT", "0.35"))
 COI_STRONG_CHANGE_PCT = float(os.getenv("COI_STRONG_CHANGE_PCT", "0.01"))
+COI_PUSH_MAX_POINTS = float(os.getenv("COI_PUSH_MAX_POINTS", "1.0"))
+COI_FLOOR_MAX_POINTS = float(os.getenv("COI_FLOOR_MAX_POINTS", "1.0"))
+COI_ROLL_MAX_POINTS = float(os.getenv("COI_ROLL_MAX_POINTS", "1.5"))
+COI_WALL_MAX_PENALTY = float(os.getenv("COI_WALL_MAX_PENALTY", "1.5"))
+COI_UNDERLYING_MOVE_PCT = float(os.getenv("COI_UNDERLYING_MOVE_PCT", "0.001"))
 STAGNATION_RANGE_PCT = float(os.getenv("STAGNATION_RANGE_PCT", "0.001"))
 STAGNATION_REQUIRED_BARS = int(os.getenv("STAGNATION_REQUIRED_BARS", "3"))
 OPENING_MAX_SPREAD_PCT = float(os.getenv("OPENING_MAX_SPREAD_PCT", "0.08"))
@@ -289,6 +296,12 @@ class OptionCandidate:
     put_oi_change_pct_15m: float = float("nan")
     oi_velocity_baseline_minutes: float = float("nan")
     market_intensity: str = "UNKNOWN"
+    coi_push_score: float = 0.0
+    coi_floor_score: float = 0.0
+    coi_roll_score: float = 0.0
+    coi_wall_penalty: float = 0.0
+    coi_matrix_label: str = "UNAVAILABLE"
+    coi_baseline_mode: str = "UNAVAILABLE"
 
 
 @dataclass(frozen=True)
@@ -1442,6 +1455,7 @@ def build_option_oi_snapshot(
     expiry: str,
     *,
     now: Optional[datetime] = None,
+    spot: Optional[float] = None,
 ) -> dict[str, Any]:
     """Build a consistent legacy snapshot for support/resistance and migration."""
     current_time = now or now_ist()
@@ -1453,6 +1467,7 @@ def build_option_oi_snapshot(
         "date": current_time.date().isoformat(),
         "expiry": str(expiry)[:10],
         "timestamp": current_time.isoformat(),
+        "spot": safe_float(spot, float("nan")) if spot is not None else None,
         "strikes": {},
     }
     for row in chain:
@@ -1478,12 +1493,13 @@ def update_option_oi_velocity_history(
     expiry: str,
     *,
     now: Optional[datetime] = None,
+    spot: Optional[float] = None,
 ) -> dict[float, dict[str, Any]]:
-    """Return true 15–30 minute same-session OI changes with resilient contract matching.
+    """Persist OI/LTP snapshots and calculate the time-of-day COI matrix inputs.
 
-    The selected baseline must overlap the current chain. Match by instrument key first,
-    then by strike+option side as a stable fallback for API key-format/schema changes.
-    A legacy strike-keyed snapshot is migrated into the history when it is compatible.
+    09:15-09:45: compare cumulatively with the earliest usable same-session snapshot.
+    09:45 onward: compare with the best-overlap snapshot aged 15-30 minutes.
+    Missing history is explicitly unavailable; it never fabricates a directional score.
     """
     current_time = now or now_ist()
     if current_time.tzinfo is None:
@@ -1493,34 +1509,42 @@ def update_option_oi_velocity_history(
     today = current_time.date().isoformat()
     expiry_key = str(expiry)[:10]
     now_stamp = pd.Timestamp(current_time)
+    cold_start = current_time.time() < COI_COLD_START_END
+    current_spot = safe_float(spot, float("nan")) if spot is not None else float("nan")
 
     rows = chain_rows(chain)
     current_by_key: dict[str, dict[str, Any]] = {}
     current_by_contract: dict[str, dict[str, Any]] = {}
+    current_instrument_by_contract: dict[str, str] = {}
     for strike, row in rows.items():
         for side in ("CE", "PE"):
             data = option_side_data(row, side)
             oi = safe_float(data.get("oi"), float("nan"))
             if not math.isfinite(oi) or oi <= 0:
                 continue
-            record = {"strike": float(strike), "side": side, "oi": float(oi)}
+            ltp = safe_float(data.get("ltp"), float("nan"))
+            record = {"strike": float(strike), "side": side, "oi": float(oi), "ltp": ltp}
             instrument_key = str(data.get("instrument_key") or "").strip()
+            contract_key = f"{float(strike):.2f}|{side}"
             if instrument_key:
                 current_by_key[instrument_key] = record
-            current_by_contract[f"{float(strike):.2f}|{side}"] = record
+                current_instrument_by_contract[contract_key] = instrument_key
+            current_by_contract[contract_key] = record
 
     def normalize_timestamp(raw: Any) -> Optional[pd.Timestamp]:
         try:
             stamp = pd.Timestamp(raw)
             if pd.isna(stamp):
                 return None
-            if stamp.tzinfo is None:
-                stamp = stamp.tz_localize(IST)
-            else:
-                stamp = stamp.tz_convert(IST)
-            return stamp
+            return stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
         except (TypeError, ValueError, OverflowError):
             return None
+
+    def finite_record(raw: Any, key: str, *, positive: bool = False) -> float:
+        value = safe_float(raw.get(key), float("nan")) if isinstance(raw, dict) else float("nan")
+        if not math.isfinite(value) or (positive and value <= 0):
+            return float("nan")
+        return value
 
     def normalize_history_item(item: Any) -> Optional[dict[str, Any]]:
         if not isinstance(item, dict):
@@ -1530,7 +1554,7 @@ def update_option_oi_velocity_history(
             return None
         item_date = str(item.get("date") or stamp.date().isoformat())[:10]
         item_expiry = str(item.get("expiry") or "")[:10]
-        if item_date != today or item_expiry != expiry_key:
+        if item_date != today or item_expiry != expiry_key or stamp.time() < time(9, 15):
             return None
         age = (now_stamp - stamp).total_seconds() / 60.0
         if age < 0 or age > OPTION_OI_HISTORY_KEEP_MINUTES:
@@ -1542,12 +1566,13 @@ def update_option_oi_velocity_history(
             for key, detail in raw_by_instrument.items():
                 if not isinstance(detail, dict):
                     continue
-                strike_value = safe_float(detail.get("strike"), float("nan"))
+                strike_value = finite_record(detail, "strike")
                 side_value = str(detail.get("side", "")).upper()
-                oi_value = safe_float(detail.get("oi"), float("nan"))
-                if math.isfinite(strike_value) and side_value in {"CE", "PE"} and math.isfinite(oi_value) and oi_value > 0:
+                oi_value = finite_record(detail, "oi", positive=True)
+                if math.isfinite(strike_value) and side_value in {"CE", "PE"} and math.isfinite(oi_value):
                     by_instrument[str(key).strip()] = {
-                        "strike": float(strike_value), "side": side_value, "oi": float(oi_value)
+                        "strike": strike_value, "side": side_value, "oi": oi_value,
+                        "ltp": finite_record(detail, "ltp", positive=True),
                     }
 
         by_contract: dict[str, dict[str, Any]] = {}
@@ -1556,20 +1581,20 @@ def update_option_oi_velocity_history(
             for key, detail in raw_by_contract.items():
                 if not isinstance(detail, dict):
                     continue
-                strike_value = safe_float(detail.get("strike"), float("nan"))
+                strike_value = finite_record(detail, "strike")
                 side_value = str(detail.get("side", "")).upper()
-                oi_value = safe_float(detail.get("oi"), float("nan"))
-                if math.isfinite(strike_value) and side_value in {"CE", "PE"} and math.isfinite(oi_value) and oi_value > 0:
-                    by_contract[f"{float(strike_value):.2f}|{side_value}"] = {
-                        "strike": float(strike_value), "side": side_value, "oi": float(oi_value)
+                oi_value = finite_record(detail, "oi", positive=True)
+                if math.isfinite(strike_value) and side_value in {"CE", "PE"} and math.isfinite(oi_value):
+                    by_contract[f"{strike_value:.2f}|{side_value}"] = {
+                        "strike": strike_value, "side": side_value, "oi": oi_value,
+                        "ltp": finite_record(detail, "ltp", positive=True),
                     }
 
-        # Backfill logical contract keys for all older instrument-keyed snapshots.
+        # Backfill logical keys from historical instrument-keyed state.
         for detail in by_instrument.values():
-            key = f"{detail['strike']:.2f}|{detail['side']}"
-            by_contract.setdefault(key, dict(detail))
+            by_contract.setdefault(f"{detail['strike']:.2f}|{detail['side']}", dict(detail))
 
-        # Migrate old snapshots whose schema was strikes[strike].call_oi/put_oi.
+        # Migrate the older strikes[strike].call_oi/put_oi format, preserving LTP when present.
         legacy_strikes = item.get("strikes", {})
         if isinstance(legacy_strikes, dict):
             for raw_strike, detail in legacy_strikes.items():
@@ -1578,21 +1603,29 @@ def update_option_oi_velocity_history(
                 strike_value = safe_float(raw_strike, float("nan"))
                 if not math.isfinite(strike_value):
                     continue
-                for side, field in (("CE", "call_oi"), ("PE", "put_oi")):
-                    oi_value = safe_float(detail.get(field), float("nan"))
-                    if math.isfinite(oi_value) and oi_value > 0:
-                        by_contract[f"{strike_value:.2f}|{side}"] = {
-                            "strike": float(strike_value), "side": side, "oi": float(oi_value)
+                for side, oi_field, ltp_field in (
+                    ("CE", "call_oi", "call_ltp"), ("PE", "put_oi", "put_ltp")
+                ):
+                    oi_value = finite_record(detail, oi_field, positive=True)
+                    if math.isfinite(oi_value):
+                        key = f"{strike_value:.2f}|{side}"
+                        legacy_record = {
+                            "strike": strike_value, "side": side, "oi": oi_value,
+                            "ltp": finite_record(detail, ltp_field, positive=True),
                         }
+                        existing = by_contract.get(key)
+                        if not isinstance(existing, dict) or not math.isfinite(finite_record(existing, "oi", positive=True)):
+                            by_contract[key] = legacy_record
+                        elif not math.isfinite(finite_record(existing, "ltp", positive=True)) and math.isfinite(legacy_record["ltp"]):
+                            existing["ltp"] = legacy_record["ltp"]
 
         if not by_instrument and not by_contract:
             return None
+        stored_spot = finite_record(item, "spot", positive=True)
         return {
-            "date": today,
-            "expiry": expiry_key,
-            "timestamp": stamp.isoformat(),
-            "oi_by_instrument": by_instrument,
-            "oi_by_contract": by_contract,
+            "date": today, "expiry": expiry_key, "timestamp": stamp.isoformat(),
+            "spot": stored_spot if math.isfinite(stored_spot) else None,
+            "oi_by_instrument": by_instrument, "oi_by_contract": by_contract,
         }
 
     raw_history = state.get("option_oi_history")
@@ -1604,108 +1637,221 @@ def update_option_oi_velocity_history(
         if normalized:
             valid_by_timestamp[normalized["timestamp"]] = normalized
 
-    # Migrate the prior V23/V24/V25/V27 single-snapshot state into the velocity ring.
-    # This preserves a usable baseline when the scanner is upgraded mid-session.
     legacy_snapshot = normalize_history_item(state.get("option_oi_snapshot"))
     if legacy_snapshot:
         valid_by_timestamp.setdefault(legacy_snapshot["timestamp"], legacy_snapshot)
-
     valid_history = sorted(
         valid_by_timestamp.values(),
         key=lambda item: normalize_timestamp(item["timestamp"]) or pd.Timestamp.min.tz_localize(IST),
     )
 
-    # Build baseline candidates with their actual overlapping contract coverage. Do not
-    # select the mathematically nearest snapshot if it contains no usable OI values.
+    # Contract overlap uses logical strike+side keys so an API instrument-key change
+    # cannot make a valid historical baseline appear empty.
     baseline_candidates: list[tuple[int, float, dict[str, Any]]] = []
-    eligible_age_count = 0
+    age_window_count = 0
     for item in valid_history:
         stamp = normalize_timestamp(item.get("timestamp"))
         if stamp is None:
             continue
         age = (now_stamp - stamp).total_seconds() / 60.0
-        if not OPTION_OI_MIN_AGE_MINUTES <= age <= OPTION_OI_MAX_AGE_MINUTES:
+        if age <= 0.25:
             continue
-        eligible_age_count += 1
-        baseline_map = item.get("oi_by_instrument", {})
-        contract_map = item.get("oi_by_contract", {})
+        if cold_start:
+            if age > OPTION_OI_HISTORY_KEEP_MINUTES or stamp.time() < time(9, 15):
+                continue
+        else:
+            if not OPTION_OI_MIN_AGE_MINUTES <= age <= OPTION_OI_MAX_AGE_MINUTES:
+                continue
+            age_window_count += 1
+        baseline_by_key = item.get("oi_by_instrument", {})
+        baseline_by_contract = item.get("oi_by_contract", {})
         overlap = 0
-        for key, current in current_by_key.items():
-            old = baseline_map.get(key) if isinstance(baseline_map, dict) else None
-            if isinstance(old, dict) and safe_float(old.get("oi"), float("nan")) > 0:
+        for contract_key, current in current_by_contract.items():
+            old = baseline_by_contract.get(contract_key) if isinstance(baseline_by_contract, dict) else None
+            if not isinstance(old, dict):
+                instr = current_instrument_by_contract.get(contract_key, "")
+                old = baseline_by_key.get(instr) if isinstance(baseline_by_key, dict) else None
+            if isinstance(old, dict) and math.isfinite(finite_record(old, "oi", positive=True)):
                 overlap += 1
-        if isinstance(contract_map, dict):
-            overlap = max(overlap, sum(
-                1 for key in current_by_contract
-                if isinstance(contract_map.get(key), dict)
-                and safe_float(contract_map[key].get("oi"), float("nan")) > 0
-            ))
-        if overlap > 0:
+        if overlap:
             baseline_candidates.append((overlap, age, item))
 
     baseline: dict[str, Any] = {}
     baseline_age = float("nan")
     baseline_coverage = 0
     if baseline_candidates:
-        baseline_coverage, baseline_age, baseline = max(
-            baseline_candidates,
-            key=lambda candidate: (candidate[0], -abs(candidate[1] - 20.0)),
-        )
+        if cold_start:
+            # Cumulative opening comparison: choose the earliest observed snapshot
+            # with usable overlap, not the nearest/most convenient snapshot.
+            baseline_coverage, baseline_age, baseline = max(
+                baseline_candidates, key=lambda candidate: (candidate[1], candidate[0])
+            )
+            baseline_mode = "COLD_START_CUMULATIVE"
+        else:
+            baseline_coverage, baseline_age, baseline = max(
+                baseline_candidates, key=lambda candidate: (candidate[0], -abs(candidate[1] - 20.0))
+            )
+            baseline_mode = "ROLLING_15_30"
+    else:
+        baseline_mode = "COLD_START_WAIT" if cold_start else "ROLLING_WAIT"
+
     baseline_by_instrument = baseline.get("oi_by_instrument", {}) if baseline else {}
     baseline_by_contract = baseline.get("oi_by_contract", {}) if baseline else {}
+    baseline_spot = finite_record(baseline, "spot", positive=True) if baseline else float("nan")
+    underlying_change_pct = (
+        (current_spot - baseline_spot) / baseline_spot
+        if math.isfinite(current_spot) and current_spot > 0 and math.isfinite(baseline_spot) and baseline_spot > 0
+        else float("nan")
+    )
+
+    def old_record(instrument_key: str, contract_key: str) -> dict[str, Any]:
+        old = baseline_by_instrument.get(instrument_key, {}) if isinstance(baseline_by_instrument, dict) else {}
+        contract = baseline_by_contract.get(contract_key, {}) if isinstance(baseline_by_contract, dict) else {}
+        if not isinstance(old, dict):
+            old = {}
+        if not isinstance(contract, dict):
+            contract = {}
+        old_oi = finite_record(old, "oi", positive=True)
+        contract_oi = finite_record(contract, "oi", positive=True)
+        if not math.isfinite(old_oi) and math.isfinite(contract_oi):
+            return contract
+        if not math.isfinite(finite_record(old, "ltp", positive=True)) and math.isfinite(finite_record(contract, "ltp", positive=True)):
+            merged = dict(old)
+            merged["ltp"] = contract["ltp"]
+            return merged
+        return old
 
     by_strike: dict[float, dict[str, Any]] = {}
     for strike, row in rows.items():
-        current_ce = option_side_data(row, "CE")
-        current_pe = option_side_data(row, "PE")
-        ce_key = str(current_ce.get("instrument_key") or "").strip()
-        pe_key = str(current_pe.get("instrument_key") or "").strip()
-        contract_ce = f"{float(strike):.2f}|CE"
-        contract_pe = f"{float(strike):.2f}|PE"
-        ce_old = baseline_by_instrument.get(ce_key, {}) if isinstance(baseline_by_instrument, dict) else {}
-        pe_old = baseline_by_instrument.get(pe_key, {}) if isinstance(baseline_by_instrument, dict) else {}
-        ce_old_oi = safe_float(ce_old.get("oi"), float("nan")) if isinstance(ce_old, dict) else float("nan")
-        pe_old_oi = safe_float(pe_old.get("oi"), float("nan")) if isinstance(pe_old, dict) else float("nan")
-        if not math.isfinite(ce_old_oi) or ce_old_oi <= 0:
-            ce_old = baseline_by_contract.get(contract_ce, {}) if isinstance(baseline_by_contract, dict) else {}
-        if not math.isfinite(pe_old_oi) or pe_old_oi <= 0:
-            pe_old = baseline_by_contract.get(contract_pe, {}) if isinstance(baseline_by_contract, dict) else {}
-        old_call_oi = safe_float(ce_old.get("oi"), float("nan")) if isinstance(ce_old, dict) else float("nan")
-        old_put_oi = safe_float(pe_old.get("oi"), float("nan")) if isinstance(pe_old, dict) else float("nan")
-        current_call_oi = safe_float(current_ce.get("oi"), float("nan"))
-        current_put_oi = safe_float(current_pe.get("oi"), float("nan"))
-        call_available = math.isfinite(old_call_oi) and old_call_oi > 0 and math.isfinite(current_call_oi) and current_call_oi > 0
-        put_available = math.isfinite(old_put_oi) and old_put_oi > 0 and math.isfinite(current_put_oi) and current_put_oi > 0
-        call_change = current_call_oi - old_call_oi if call_available else float("nan")
-        put_change = current_put_oi - old_put_oi if put_available else float("nan")
+        side_values: dict[str, dict[str, Any]] = {}
+        for side, field_prefix in (("CE", "call"), ("PE", "put")):
+            current = option_side_data(row, side)
+            instrument_key = str(current.get("instrument_key") or "").strip()
+            contract_key = f"{float(strike):.2f}|{side}"
+            old = old_record(instrument_key, contract_key) if baseline else {}
+            old_oi = finite_record(old, "oi", positive=True)
+            new_oi = safe_float(current.get("oi"), float("nan"))
+            old_ltp = finite_record(old, "ltp", positive=True)
+            new_ltp = safe_float(current.get("ltp"), float("nan"))
+            oi_available = math.isfinite(old_oi) and old_oi > 0 and math.isfinite(new_oi) and new_oi > 0
+            ltp_available = math.isfinite(old_ltp) and old_ltp > 0 and math.isfinite(new_ltp) and new_ltp > 0
+            oi_change = new_oi - old_oi if oi_available else float("nan")
+            ltp_change_pct = (new_ltp - old_ltp) / old_ltp if ltp_available else float("nan")
+            side_values[field_prefix] = {
+                "available": bool(oi_available),
+                "oi_change": oi_change,
+                "oi_change_pct": oi_change / old_oi if oi_available else float("nan"),
+                "ltp_change_pct": ltp_change_pct,
+                "old_oi": old_oi,
+                "current_oi": new_oi,
+                "old_ltp": old_ltp,
+                "current_ltp": new_ltp,
+            }
+        call = side_values["call"]
+        put = side_values["put"]
         by_strike[float(strike)] = {
-            "available": bool(call_available and put_available and math.isfinite(baseline_age)),
-            "call_available": bool(call_available),
-            "put_available": bool(put_available),
-            "call_oi_change": call_change,
-            "put_oi_change": put_change,
-            "call_oi_change_pct": call_change / old_call_oi if call_available else float("nan"),
-            "put_oi_change_pct": put_change / old_put_oi if put_available else float("nan"),
+            "available": bool(call["available"] or put["available"]),
+            "call_available": call["available"], "put_available": put["available"],
+            "call_oi_change": call["oi_change"], "put_oi_change": put["oi_change"],
+            "call_oi_change_pct": call["oi_change_pct"], "put_oi_change_pct": put["oi_change_pct"],
+            "call_ltp_change_pct": call["ltp_change_pct"], "put_ltp_change_pct": put["ltp_change_pct"],
+            "underlying_change_pct": underlying_change_pct,
             "baseline_minutes": baseline_age,
+            "baseline_mode": baseline_mode,
+            "baseline_timestamp": baseline.get("timestamp") if baseline else None,
+            "pin": bool(
+                math.isfinite(call["oi_change_pct"]) and math.isfinite(put["oi_change_pct"])
+                and call["oi_change_pct"] >= COI_STRONG_CHANGE_PCT
+                and put["oi_change_pct"] >= COI_STRONG_CHANGE_PCT
+            ),
         }
 
+    # Detect long-unwinding/profit-booking separately from true short covering.
+    # A counter-trend signal remains blocked until fresh structural writing confirms it.
+    profit_booking_event: Optional[dict[str, Any]] = None
+    call_long_unwind = any(
+        math.isfinite(v.get("call_oi_change_pct", float("nan")))
+        and v["call_oi_change_pct"] <= -COI_STRONG_CHANGE_PCT
+        and math.isfinite(v.get("call_ltp_change_pct", float("nan")))
+        and v["call_ltp_change_pct"] <= -STRUCTURE_ACTIVITY_PRICE_NOISE_PCT
+        for v in by_strike.values()
+    )
+    put_long_unwind = any(
+        math.isfinite(v.get("put_oi_change_pct", float("nan")))
+        and v["put_oi_change_pct"] <= -COI_STRONG_CHANGE_PCT
+        and math.isfinite(v.get("put_ltp_change_pct", float("nan")))
+        and v["put_ltp_change_pct"] <= -STRUCTURE_ACTIVITY_PRICE_NOISE_PCT
+        for v in by_strike.values()
+    )
+    if math.isfinite(underlying_change_pct):
+        if underlying_change_pct <= -COI_UNDERLYING_MOVE_PCT and call_long_unwind:
+            profit_booking_event = {
+                "blocked_direction": "BULLISH", "reason": "CALL_LONG_UNWINDING_PROFIT_BOOKING",
+                "date": today, "expiry": expiry_key, "timestamp": current_time.isoformat(),
+                "underlying_change_pct": underlying_change_pct,
+            }
+        elif underlying_change_pct >= COI_UNDERLYING_MOVE_PCT and put_long_unwind:
+            profit_booking_event = {
+                "blocked_direction": "BEARISH", "reason": "PUT_LONG_UNWINDING_PROFIT_BOOKING",
+                "date": today, "expiry": expiry_key, "timestamp": current_time.isoformat(),
+                "underlying_change_pct": underlying_change_pct,
+            }
+
+    rows_for_writing = [(float(k), v) for k, v in by_strike.items()]
+    strike_step_value = max(strike_step(sorted(rows)), 1.0) if rows else 50.0
+    def fresh_structural_writing(direction: str) -> bool:
+        if not math.isfinite(current_spot) or not by_strike:
+            return False
+        for strike, v in rows_for_writing:
+            if abs(strike - current_spot) > 4 * strike_step_value:
+                continue
+            if direction == "BULLISH":
+                change = safe_float(v.get("put_oi_change_pct"), float("nan"))
+                premium_change = safe_float(v.get("put_ltp_change_pct"), float("nan"))
+                located = strike <= current_spot + strike_step_value
+            else:
+                change = safe_float(v.get("call_oi_change_pct"), float("nan"))
+                premium_change = safe_float(v.get("call_ltp_change_pct"), float("nan"))
+                located = strike >= current_spot - strike_step_value
+            if located and math.isfinite(change) and change >= COI_STRONG_CHANGE_PCT and math.isfinite(premium_change) and premium_change <= STRUCTURE_ACTIVITY_PRICE_NOISE_PCT:
+                return True
+        return False
+
+    guard = state.get("coi_market_guard")
+    if not isinstance(guard, dict) or guard.get("date") != today or str(guard.get("expiry", ""))[:10] != expiry_key:
+        guard = None
+        state.pop("coi_market_guard", None)
+    if isinstance(guard, dict):
+        guarded_direction = str(guard.get("blocked_direction", "")).upper()
+        if guarded_direction in {"BULLISH", "BEARISH"} and fresh_structural_writing(guarded_direction):
+            logger.info("COI PROFIT-BOOKING GUARD CLEARED: fresh %s structural writing confirmed.", guarded_direction)
+            state.pop("coi_market_guard", None)
+            guard = None
+    if profit_booking_event:
+        blocked = str(profit_booking_event["blocked_direction"])
+        if not fresh_structural_writing(blocked):
+            state["coi_market_guard"] = profit_booking_event
+            logger.warning(
+                "COI PROFIT-BOOKING GUARD: blocked_direction=%s reason=%s underlying_change=%+.3f%%; waiting for fresh structural writing.",
+                blocked, profit_booking_event["reason"], underlying_change_pct * 100.0,
+            )
+
     current_snapshot = {
-        "date": today,
-        "expiry": expiry_key,
-        "timestamp": current_time.isoformat(),
-        "oi_by_instrument": current_by_key,
-        "oi_by_contract": current_by_contract,
+        "date": today, "expiry": expiry_key, "timestamp": current_time.isoformat(),
+        "spot": current_spot if math.isfinite(current_spot) else None,
+        "oi_by_instrument": current_by_key, "oi_by_contract": current_by_contract,
     }
     if current_snapshot["timestamp"] not in valid_by_timestamp:
         valid_history.append(current_snapshot)
-    # Keep at least a full 60-minute ring even when polling roughly once per minute.
     history_limit = max(OPTION_OI_HISTORY_KEEP_MINUTES + 10, 40)
     state["option_oi_history"] = valid_history[-history_limit:]
 
-    available_strikes = sum(1 for item in by_strike.values() if item.get("available"))
+    available_strikes = sum(1 for v in by_strike.values() if v.get("available"))
+    baseline_timestamp = baseline.get("timestamp") if baseline else None
     reason = (
         "OK" if math.isfinite(baseline_age) and available_strikes else
-        "BASELINE_NOT_YET_15_MIN_OLD" if eligible_age_count == 0 else
+        "COLD_START_BASELINE_NOT_YET_AVAILABLE" if cold_start else
+        "BASELINE_NOT_YET_15_MIN_OLD" if age_window_count == 0 else
         "NO_CONTRACT_OVERLAP_WITH_BASELINE" if not baseline_candidates else
         "OI_MISSING_ON_ONE_SIDE"
     )
@@ -1715,17 +1861,130 @@ def update_option_oi_velocity_history(
         if latest_stamp is not None:
             latest_age = max((now_stamp - latest_stamp).total_seconds() / 60.0, 0.0)
     logger.info(
-        "OPTION OI VELOCITY: status=%s baseline_age_min=%s eligible_snapshots=%d "
-        "history_snapshots=%d current_contracts=%d baseline_overlap=%d strikes_15_30m=%d/%d "
-        "latest_snapshot_age_min=%s reason=%s state_file=%s",
+        "OPTION COI MATRIX DATA: protocol=%s status=%s baseline_mode=%s baseline_age_min=%s "
+        "baseline_timestamp=%s eligible_snapshots=%d history_snapshots=%d current_contracts=%d "
+        "baseline_overlap=%d strikes_with_coi=%d/%d latest_snapshot_age_min=%s reason=%s state_file=%s",
+        "COLD_START_09:15_09:45" if cold_start else "ROLLING_15_30_AFTER_09:45",
         "AVAILABLE" if math.isfinite(baseline_age) and available_strikes else "WARMING_UP",
-        f"{baseline_age:.1f}" if math.isfinite(baseline_age) else "NA",
-        eligible_age_count, len(state["option_oi_history"]), len(current_by_key), baseline_coverage,
-        available_strikes, len(by_strike),
+        baseline_mode, f"{baseline_age:.1f}" if math.isfinite(baseline_age) else "NA",
+        baseline_timestamp or "NA", age_window_count, len(state["option_oi_history"]), len(current_by_contract),
+        baseline_coverage, available_strikes, len(by_strike),
         f"{latest_age:.1f}" if math.isfinite(latest_age) else "NA", reason, STATE_FILE,
     )
     return by_strike
 
+
+def score_coi_matrix_for_strike(
+    direction: str,
+    strike: float,
+    atm: float,
+    step: float,
+    velocity_map: dict[float, dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Score Push, Floor, Roll and Wall from measured OI/LTP changes.
+
+    COI percentages are fractions (0.01 == 1%). Pin is a hard disqualifier;
+    all other COI points/penalties are weighted down during the 09:15-09:45 cold start.
+    """
+    direction = str(direction).upper()
+    current_time = now or now_ist()
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=IST)
+    else:
+        current_time = current_time.astimezone(IST)
+    cold_start = current_time.time() < COI_COLD_START_END
+    coi_weight = max(0.0, min(COI_COLD_START_WEIGHT, 1.0)) if cold_start else 1.0
+    threshold = max(COI_STRONG_CHANGE_PCT, 1e-6)
+    noise = STRUCTURE_ACTIVITY_PRICE_NOISE_PCT
+
+    def row_for(value: float) -> dict[str, Any]:
+        item = velocity_map.get(float(value), {}) if isinstance(velocity_map, dict) else {}
+        return item if isinstance(item, dict) and item.get("available") else {}
+
+    row = row_for(strike)
+    if not row:
+        return {"available": False, "disqualified": False, "push": 0.0, "floor": 0.0,
+                "roll": 0.0, "wall_penalty": 0.0, "score": 0.0, "weight": coi_weight,
+                "label": "COI_UNAVAILABLE", "baseline_mode": "UNAVAILABLE", "reason": "No same-session OI baseline"}
+
+    call_pct = safe_float(row.get("call_oi_change_pct"), float("nan"))
+    put_pct = safe_float(row.get("put_oi_change_pct"), float("nan"))
+    call_ltp_pct = safe_float(row.get("call_ltp_change_pct"), float("nan"))
+    put_ltp_pct = safe_float(row.get("put_ltp_change_pct"), float("nan"))
+    baseline_mode = str(row.get("baseline_mode", "UNKNOWN"))
+    pin = bool(
+        math.isfinite(call_pct) and math.isfinite(put_pct)
+        and call_pct >= threshold and put_pct >= threshold
+    )
+    if pin:
+        return {"available": True, "disqualified": True, "push": 0.0, "floor": 0.0,
+                "roll": 0.0, "wall_penalty": 0.0, "score": float("-inf"), "weight": coi_weight,
+                "label": "PIN_DISQUALIFIED", "baseline_mode": baseline_mode,
+                "reason": "Large positive Call and Put COI at the same strike"}
+
+    if direction == "BULLISH":
+        push_strength = min(max(-call_pct, 0.0) / threshold, 1.0) if math.isfinite(call_pct) and math.isfinite(call_ltp_pct) and call_ltp_pct >= noise else 0.0
+        floor_strength = min(max(put_pct, 0.0) / threshold, 1.0) if math.isfinite(put_pct) and math.isfinite(put_ltp_pct) and put_ltp_pct <= noise else 0.0
+        opposing_pct = call_pct
+        atm_opposing_pct = safe_float(row_for(atm).get("call_oi_change_pct"), float("nan"))
+        atm_opposing_ltp = safe_float(row_for(atm).get("call_ltp_change_pct"), float("nan"))
+        far_wall_candidates = [
+            s for s, v in velocity_map.items()
+            if isinstance(s, (int, float)) and float(s) >= atm + step - 0.01
+            and math.isfinite(safe_float(v.get("call_oi_change_pct"), float("nan")))
+            and safe_float(v.get("call_oi_change_pct"), float("nan")) >= threshold
+        ]
+        roll_active = (
+            math.isfinite(atm_opposing_pct) and atm_opposing_pct <= -threshold
+            and math.isfinite(atm_opposing_ltp) and atm_opposing_ltp >= noise
+            and any(float(strike) < float(wall) - 0.01 for wall in far_wall_candidates)
+        )
+    else:
+        push_strength = min(max(-put_pct, 0.0) / threshold, 1.0) if math.isfinite(put_pct) and math.isfinite(put_ltp_pct) and put_ltp_pct >= noise else 0.0
+        floor_strength = min(max(call_pct, 0.0) / threshold, 1.0) if math.isfinite(call_pct) and math.isfinite(call_ltp_pct) and call_ltp_pct <= noise else 0.0
+        opposing_pct = put_pct
+        atm_opposing_pct = safe_float(row_for(atm).get("put_oi_change_pct"), float("nan"))
+        atm_opposing_ltp = safe_float(row_for(atm).get("put_ltp_change_pct"), float("nan"))
+        far_wall_candidates = [
+            s for s, v in velocity_map.items()
+            if isinstance(s, (int, float)) and float(s) <= atm - step + 0.01
+            and math.isfinite(safe_float(v.get("put_oi_change_pct"), float("nan")))
+            and safe_float(v.get("put_oi_change_pct"), float("nan")) >= threshold
+        ]
+        roll_active = (
+            math.isfinite(atm_opposing_pct) and atm_opposing_pct <= -threshold
+            and math.isfinite(atm_opposing_ltp) and atm_opposing_ltp >= noise
+            and any(float(strike) > float(wall) + 0.01 for wall in far_wall_candidates)
+        )
+
+    roll_score = COI_ROLL_MAX_POINTS if roll_active else 0.0
+    wall_penalty = 0.0
+    if math.isfinite(opposing_pct) and opposing_pct >= threshold:
+        wall_penalty = COI_WALL_MAX_PENALTY * min(opposing_pct / (2.0 * threshold), 1.0)
+    push_points = COI_PUSH_MAX_POINTS * push_strength
+    floor_points = COI_FLOOR_MAX_POINTS * floor_strength
+    raw_score = push_points + floor_points + roll_score - wall_penalty
+    weighted_score = raw_score * coi_weight
+    labels = []
+    if push_points > 0:
+        labels.append("PUSH")
+    if floor_points > 0:
+        labels.append("FLOOR")
+    if roll_score > 0:
+        labels.append("ROLL")
+    if wall_penalty > 0:
+        labels.append("WALL_PENALTY")
+    label = "+".join(labels) if labels else "NO_CLEAR_COI_EDGE"
+    return {
+        "available": True, "disqualified": False,
+        "push": push_points, "floor": floor_points, "roll": roll_score,
+        "wall_penalty": wall_penalty, "score": weighted_score,
+        "raw_score": raw_score, "weight": coi_weight,
+        "label": label, "baseline_mode": baseline_mode,
+        "reason": ";".join(labels) if labels else "No qualifying Push/Floor/Roll/Wall condition",
+    }
 
 def permitted_strikes_for_regime(
     atm: float,
@@ -2842,6 +3101,11 @@ def select_directional_option(
     """Select a strike using regime routing + strict option VWAP/COI/delta gates."""
     direction = str(direction).upper()
     intensity = str(market_intensity).upper()
+    current_time = now or now_ist()
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=IST)
+    else:
+        current_time = current_time.astimezone(IST)
     if direction not in {"BULLISH", "BEARISH"}:
         raise ScannerError("Option selection requires BULLISH or BEARISH.")
     if intensity in {"SIDEWAYS", "UNKNOWN"}:
@@ -2872,7 +3136,6 @@ def select_directional_option(
 
     eligible: list[tuple[float, OptionCandidate, bool]] = []
     rejection_log: list[str] = []
-    score_by_strike: dict[float, float] = {}
     velocity_coverage_count = 0
     for target in permitted_list:
         row_key = min(strikes, key=lambda value: abs(value - target))
@@ -2927,28 +3190,54 @@ def select_directional_option(
             rejection_log.append(f"{option_type} {row_key:.0f}: spread {spread_pct:.2%} > {max_spread:.2%}")
             continue
 
-        # OI velocity is a supplementary ranking component, never a mandatory
-        # entry prerequisite. If history is warming up/unavailable, its score is
-        # exactly zero and its metrics remain NaN; no bullish/bearish evidence is
-        # fabricated. All other hard filters (structure, option VWAP, delta,
-        # spread, liquidity, routing) remain enforced.
+        # OI is scored through the four-part COI matrix. During 09:15-09:45 it
+        # uses cumulative opening COI with a reduced weight; after 09:45 it only
+        # accepts measured 15-30 minute snapshots. Missing history scores zero.
         velocity = velocity_map.get(float(row_key), {}) if isinstance(velocity_map, dict) else {}
-        call_pct = put_pct = baseline_minutes = float("nan")
-        velocity_valid = False
-        if isinstance(velocity, dict) and bool(velocity.get("available")):
-            candidate_call_pct = safe_float(velocity.get("call_oi_change_pct"), float("nan"))
-            candidate_put_pct = safe_float(velocity.get("put_oi_change_pct"), float("nan"))
-            candidate_baseline_minutes = safe_float(velocity.get("baseline_minutes"), float("nan"))
-            if (
-                math.isfinite(candidate_call_pct)
-                and math.isfinite(candidate_put_pct)
-                and OPTION_OI_MIN_AGE_MINUTES <= candidate_baseline_minutes <= OPTION_OI_MAX_AGE_MINUTES
-            ):
-                call_pct = candidate_call_pct
-                put_pct = candidate_put_pct
-                baseline_minutes = candidate_baseline_minutes
-                velocity_valid = True
-                velocity_coverage_count += 1
+        coi_matrix = score_coi_matrix_for_strike(
+            direction, float(row_key), float(atm), float(step), velocity_map, now=current_time
+        )
+        if bool(coi_matrix.get("disqualified")):
+            rejection_log.append(
+                f"{option_type} {row_key:.0f}: COI PIN disqualification; both Call and Put OI surged at the same strike."
+            )
+            logger.warning(
+                "COI PIN DISQUALIFICATION: direction=%s candidate=%s %.0f call_COI=%s put_COI=%s.",
+                direction, option_type, row_key,
+                f"{safe_float(velocity.get('call_oi_change_pct'), float('nan')) * 100.0:+.2f}%",
+                f"{safe_float(velocity.get('put_oi_change_pct'), float('nan')) * 100.0:+.2f}%",
+            )
+            continue
+
+        call_pct = safe_float(velocity.get("call_oi_change_pct"), float("nan")) if isinstance(velocity, dict) else float("nan")
+        put_pct = safe_float(velocity.get("put_oi_change_pct"), float("nan")) if isinstance(velocity, dict) else float("nan")
+        baseline_minutes = safe_float(velocity.get("baseline_minutes"), float("nan")) if isinstance(velocity, dict) else float("nan")
+        baseline_mode = str(velocity.get("baseline_mode", "UNAVAILABLE")) if isinstance(velocity, dict) else "UNAVAILABLE"
+        velocity_valid = bool(coi_matrix.get("available")) and (
+            math.isfinite(call_pct) or math.isfinite(put_pct)
+        )
+        if velocity_valid:
+            if baseline_mode == "COLD_START_CUMULATIVE":
+                velocity_valid = 0.25 < baseline_minutes <= OPTION_OI_HISTORY_KEEP_MINUTES
+            elif baseline_mode == "ROLLING_15_30":
+                velocity_valid = OPTION_OI_MIN_AGE_MINUTES <= baseline_minutes <= OPTION_OI_MAX_AGE_MINUTES
+            else:
+                velocity_valid = False
+        if not velocity_valid:
+            call_pct = put_pct = baseline_minutes = float("nan")
+            coi_score = 0.0
+            coi_push = coi_floor = coi_roll = coi_wall = 0.0
+            coi_label = "COI_UNAVAILABLE"
+            coi_weight = COI_COLD_START_WEIGHT if current_time.time() < COI_COLD_START_END else 1.0
+        else:
+            coi_score = safe_float(coi_matrix.get("score"), 0.0)
+            coi_weight = safe_float(coi_matrix.get("weight"), 1.0)
+            coi_push = safe_float(coi_matrix.get("push"), 0.0) * coi_weight
+            coi_floor = safe_float(coi_matrix.get("floor"), 0.0) * coi_weight
+            coi_roll = safe_float(coi_matrix.get("roll"), 0.0) * coi_weight
+            coi_wall = safe_float(coi_matrix.get("wall_penalty"), 0.0) * coi_weight
+            coi_label = str(coi_matrix.get("label", "NO_CLEAR_COI_EDGE"))
+            velocity_coverage_count += 1
 
         strike_flow = flow_map.get(float(row_key), {})
         call_bias = int(safe_float(strike_flow.get("call_bias"), 0))
@@ -2968,17 +3257,6 @@ def select_directional_option(
         else:
             # Conflicting flow lowers this component but does not erase the other valid score components.
             flow_score = 0.10
-
-        if velocity_valid:
-            if direction == "BULLISH":
-                unwind_pct, adding_pct = max(-call_pct, 0.0), max(put_pct, 0.0)
-            else:
-                unwind_pct, adding_pct = max(-put_pct, 0.0), max(call_pct, 0.0)
-            coi_score = 0.5 * min(unwind_pct / max(COI_STRONG_CHANGE_PCT, 1e-6), 1.0) + 0.5 * min(
-                adding_pct / max(COI_STRONG_CHANGE_PCT, 1e-6), 1.0
-            )
-        else:
-            coi_score = 0.0
 
         if option_type == "CE":
             moneyness = "ITM" if row_key < atm - 0.01 else "ATM" if abs(row_key - atm) <= 0.01 else "OTM"
@@ -3006,26 +3284,36 @@ def select_directional_option(
             put_oi_change_pct_15m=put_pct * 100.0,
             oi_velocity_baseline_minutes=baseline_minutes,
             market_intensity=intensity,
+            coi_push_score=coi_push,
+            coi_floor_score=coi_floor,
+            coi_roll_score=coi_roll,
+            coi_wall_penalty=coi_wall,
+            coi_matrix_label=coi_label,
+            coi_baseline_mode=baseline_mode if velocity_valid else "UNAVAILABLE",
         )
         eligible.append((total, candidate, moneyness == "OTM"))
-        score_by_strike[row_key] = total
         logger.info(
             "STRIKE RANK: %s %.0f regime=%s moneyness=%s total=%.3f flow=%.3f vwap=%.3f "
-            "coi_velocity=%.3f coi_data=%s delta_weight=%.3f delta=%.3f premium_ltp=%.2f premium_vwap=%.2f "
-            "call_coi15m=%s put_coi15m=%s baseline_min=%s flow_bias=%+d spread=%.2f%%",
+            "COIscore=%+.3f matrix=%s push=%.3f floor=%.3f roll=%.3f wall_penalty=%.3f "
+            "coi_data=%s COI_mode=%s delta_weight=%.3f delta=%.3f premium_ltp=%.2f premium_vwap=%.2f "
+            "call_COI=%s put_COI=%s baseline_min=%s flow_bias=%+d spread=%.2f%%",
             option_type, row_key, intensity, moneyness, total, flow_score, vwap_score, coi_score,
+            coi_label, coi_push, coi_floor, coi_roll, coi_wall,
             "AVAILABLE" if velocity_valid else "UNAVAILABLE_ZERO_WEIGHT",
+            baseline_mode if velocity_valid else "UNAVAILABLE",
             delta_weight, delta, ltp, premium_vwap,
-            f"{call_pct * 100.0:+.2f}%" if velocity_valid else "NA",
-            f"{put_pct * 100.0:+.2f}%" if velocity_valid else "NA",
+            f"{call_pct * 100.0:+.2f}%" if velocity_valid and math.isfinite(call_pct) else "NA",
+            f"{put_pct * 100.0:+.2f}%" if velocity_valid and math.isfinite(put_pct) else "NA",
             f"{baseline_minutes:.1f}" if velocity_valid else "NA",
             normalized_flow_bias, spread_pct * 100.0,
         )
 
     logger.info(
-        "OI VELOCITY RANKING: valid_candidate_baselines=%d/%d policy=SUPPLEMENTARY; "
-        "missing_baseline_contribution=0.000 (not an entry blocker).",
+        "COI MATRIX RANKING: valid_candidate_baselines=%d/%d protocol=%s cold_start_weight=%.2f "
+        "missing_COI_contribution=0.000; pin=HARD_DISQUALIFIER; wall=SCORING_PENALTY.",
         velocity_coverage_count, len(permitted_list),
+        "COLD_START_CUMULATIVE" if current_time.time() < COI_COLD_START_END else "ROLLING_15_30",
+        COI_COLD_START_WEIGHT,
     )
     if not eligible:
         detail = "; ".join(rejection_log[-10:]) or "no valid candidates"
@@ -3069,11 +3357,14 @@ def select_directional_option(
     logger.info(
         "OPTION SELECT: direction=%s intensity=%s tod=%s expiry_day=%s ATM=%.0f permitted=%s "
         "selected=%s %.0f total=%.3f LTP=%.2f option_VWAP=%.2f delta=%.3f flow=%.3f VWAPscore=%.3f "
-        "COIscore=%.3f delta_weight=%.3f call_COI15m=%s put_COI15m=%s baseline=%s",
+        "COIscore=%+.3f COI_matrix=%s push=%.3f floor=%.3f roll=%.3f wall_penalty=%.3f "
+        "delta_weight=%.3f call_COI=%s put_COI=%s baseline=%s mode=%s",
         direction, intensity, tod, is_expiry_day, atm, sorted(permitted), selected.option_type,
         selected.strike, winning_score, selected.ltp, selected.premium_vwap, selected.delta,
-        selected.flow_score, selected.vwap_score, selected.oi_momentum_score, selected.delta_weight,
-        selected_call_coi, selected_put_coi, selected_baseline,
+        selected.flow_score, selected.vwap_score, selected.oi_momentum_score,
+        selected.coi_matrix_label, selected.coi_push_score, selected.coi_floor_score,
+        selected.coi_roll_score, selected.coi_wall_penalty, selected.delta_weight,
+        selected_call_coi, selected_put_coi, selected_baseline, selected.coi_baseline_mode,
     )
     return selected
 
@@ -4750,7 +5041,7 @@ def execute_scan(
     # Use one timestamp for both the velocity-ring record and legacy snapshot so
     # they deduplicate exactly rather than storing near-identical samples.
     oi_snapshot_time = now_ist()
-    oi_velocity_by_strike = update_option_oi_velocity_history(state, chain, expiry, now=oi_snapshot_time)
+    oi_velocity_by_strike = update_option_oi_velocity_history(state, chain, expiry, now=oi_snapshot_time, spot=spot)
     chain_levels["previous_support_1"] = safe_float(previous_snapshot.get("support_1"), float("nan"))
     chain_levels["previous_resistance_1"] = safe_float(previous_snapshot.get("resistance_1"), float("nan"))
     previous_direction = str(previous_snapshot.get("direction", "")).upper() or None
@@ -4868,7 +5159,7 @@ def execute_scan(
         "tod_window": tod_window,
         "expiry_day": is_expiry_day,
     }
-    state["option_oi_snapshot"] = build_option_oi_snapshot(chain, expiry, now=oi_snapshot_time)
+    state["option_oi_snapshot"] = build_option_oi_snapshot(chain, expiry, now=oi_snapshot_time, spot=spot)
     state["option_flow_by_strike"] = option_flow_by_strike
     state["persistent_direction"] = (
         structure.direction if structure.direction in {"BULLISH", "BEARISH"}
@@ -4959,6 +5250,13 @@ def execute_scan(
         return None
     if regime_direction not in {"BULLISH", "BEARISH"}:
         logger.info("NO TRADE: market-regime direction is neutral.")
+        return None
+    coi_guard = state.get("coi_market_guard")
+    if isinstance(coi_guard, dict) and str(coi_guard.get("blocked_direction", "")).upper() == regime_direction:
+        logger.warning(
+            "NO TRADE: %s counter-trend entry blocked by COI profit-booking guard (%s); waiting for fresh structural writing.",
+            regime_direction, coi_guard.get("reason", "PROFIT_BOOKING"),
+        )
         return None
     if tod_window == "MIDDAY" and (not math.isfinite(adx_value) or adx_value < MIDDAY_MIN_ADX):
         logger.info("NO TRADE: midday momentum gate requires ADX >= %.1f; actual=%s.", MIDDAY_MIN_ADX, adx_value)
@@ -5051,6 +5349,18 @@ def execute_scan(
             structure.reversal_confirmations, MARKET_INVALIDATION_CONFIRMATIONS_REQUIRED, structure.pcr_bias,
         )
         return None
+
+    if now_time < COI_COLD_START_END:
+        volume_confirmed = bool(market_regime.get("volume_confirmed", False))
+        price_break = safe_float(structure.components.get("structure_price_break"), 0.0)
+        directional_break = (price_break > 0.5) if regime_direction == "BULLISH" else (price_break < -0.5)
+        if not (volume_confirmed or directional_break):
+            logger.info(
+                "NO TRADE: cold-start AMO filter requires volume confirmation or a fresh directional VWAP/OI structural breakout; "
+                "volume_confirmed=%s directional_break=%s COI_weight=%.2f.",
+                volume_confirmed, directional_break, COI_COLD_START_WEIGHT,
+            )
+            return None
 
     volatility_unit = max(safe_float(structure.components.get("volatility_unit"), 50.0), 1.0)
     vwap_distance_atr = abs(float(spot) - float(structure.vwap)) / volatility_unit
@@ -5150,7 +5460,7 @@ def execute_scan(
         f"Regime matrix: {regime_direction}/{intensity}; ADX={adx_value:.2f}; RSI3m={safe_float(market_regime.get('rsi_3m'), float('nan')):.2f}; time window={tod_window}; {market_regime.get('reason', '')}.",
         f"Permitted strikes={permitted_strikes_for_regime(nearest_strike(spot, sorted(chain_rows(chain))), strike_step(sorted(chain_rows(chain))), regime_direction, intensity, is_expiry_day=is_expiry_day, now=now_ist())}.",
         f"Index spot used for option ATM selection={spot:.2f}; futures LTP={futures_ltp_now:.2f}; futures/index basis={futures_ltp_now - spot:+.2f}.",
-        f"Selected option metrics: LTP={option.ltp:.2f}, premium VWAP={option.premium_vwap:.2f}, spread={option.spread_pct:.2%}, theta burden={option.theta_burden_pct_day:.2%}/day, volume={option.volume:.0f}, OI={option.oi:.0f}, delta={option.delta:.3f}, flow score={option.flow_score:.3f}, VWAP score={option.vwap_score:.3f}, 15m OI momentum={option.oi_momentum_score:.3f}, delta weight={option.delta_weight:.3f}, call COI15m={option.call_oi_change_pct_15m:+.2f}%, put COI15m={option.put_oi_change_pct_15m:+.2f}% (baseline {option.oi_velocity_baseline_minutes:.1f}m).",
+        f"Selected option metrics: LTP={option.ltp:.2f}, premium VWAP={option.premium_vwap:.2f}, spread={option.spread_pct:.2%}, theta burden={option.theta_burden_pct_day:.2%}/day, volume={option.volume:.0f}, OI={option.oi:.0f}, delta={option.delta:.3f}, flow={option.flow_score:.3f}, VWAP={option.vwap_score:.3f}, COI matrix={option.coi_matrix_label} score={option.oi_momentum_score:+.3f} (push={option.coi_push_score:.3f}, floor={option.coi_floor_score:.3f}, roll={option.coi_roll_score:.3f}, wall penalty={option.coi_wall_penalty:.3f}), call COI={option.call_oi_change_pct_15m:+.2f}%, put COI={option.put_oi_change_pct_15m:+.2f}% (baseline {option.oi_velocity_baseline_minutes:.1f}m, mode={option.coi_baseline_mode}).",
         f"PA/OI structural levels: NIFTY T1={underlying_target1:.2f}, T2={underlying_target2:.2f}, SL={underlying_stop:.2f}; option exit uses live LTP at the structural trigger.",
         "Primary entry alignment: NIFTY price vs VWAP + structural support/resistance + confirming Change-OI.",
         "Futures price/OI and PCR are context only; they do not override the PA/VWAP/Change-OI market structure.",
@@ -5457,11 +5767,21 @@ def self_test() -> None:
         for side in ("CE", "PE")
     }
     bull_velocity = {
-        float(strike): {"available": True, "call_oi_change_pct": -0.02, "put_oi_change_pct": 0.02, "baseline_minutes": 20.0}
+        float(strike): {
+            "available": True, "call_oi_change_pct": -0.02, "put_oi_change_pct": 0.02,
+            "call_ltp_change_pct": 0.025, "put_ltp_change_pct": -0.025,
+            "underlying_change_pct": 0.003, "baseline_minutes": 20.0,
+            "baseline_mode": "ROLLING_15_30",
+        }
         for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]
     }
     bear_velocity = {
-        float(strike): {"available": True, "call_oi_change_pct": 0.02, "put_oi_change_pct": -0.02, "baseline_minutes": 20.0}
+        float(strike): {
+            "available": True, "call_oi_change_pct": 0.02, "put_oi_change_pct": -0.02,
+            "call_ltp_change_pct": -0.025, "put_ltp_change_pct": 0.025,
+            "underlying_change_pct": -0.003, "baseline_minutes": 20.0,
+            "baseline_mode": "ROLLING_15_30",
+        }
         for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]
     }
     ce = select_directional_option(
@@ -5478,7 +5798,7 @@ def self_test() -> None:
     assert pe.option_type == "PE" and pe.strike in {74100.0, 74150.0}
     assert ce.premium_vwap < ce.ltp and ce.oi_momentum_score > 0.9
 
-    # V29 regression: a missing 15-30m baseline must not block a valid candidate;
+    # V30 regression: a missing COI baseline must not block a valid candidate;
     # missing OI velocity contributes zero score, never fabricated confirmation.
     ce_without_velocity = select_directional_option(
         simple_chain, "BULLISH", 74100.0, target_underlying_1=74200.0,
@@ -5523,7 +5843,92 @@ def self_test() -> None:
     except ScannerError as exc:
         assert "delta" in str(exc).lower()
 
-    # 15-30 minute OI velocity is measured against a persisted snapshot, not daily prev_oi.
+    # V30 COI matrix: Push, Floor, Roll, Wall and Pin are independent and deterministic.
+    matrix_map = {
+        74100.0: {"available": True, "call_oi_change_pct": -0.02, "put_oi_change_pct": 0.00,
+                  "call_ltp_change_pct": 0.03, "put_ltp_change_pct": -0.01,
+                  "baseline_minutes": 20.0, "baseline_mode": "ROLLING_15_30"},
+        74150.0: {"available": True, "call_oi_change_pct": -0.005, "put_oi_change_pct": 0.00,
+                  "call_ltp_change_pct": 0.01, "put_ltp_change_pct": -0.01,
+                  "baseline_minutes": 20.0, "baseline_mode": "ROLLING_15_30"},
+        74200.0: {"available": True, "call_oi_change_pct": 0.025, "put_oi_change_pct": 0.00,
+                  "call_ltp_change_pct": -0.01, "put_ltp_change_pct": -0.01,
+                  "baseline_minutes": 20.0, "baseline_mode": "ROLLING_15_30"},
+    }
+    push_floor = score_coi_matrix_for_strike("BULLISH", 74100.0, 74100.0, 50.0, {
+        **matrix_map,
+        74100.0: {**matrix_map[74100.0], "put_oi_change_pct": 0.02},
+    }, now=datetime(2026, 10, 9, 10, 0, tzinfo=IST))
+    assert push_floor["push"] == COI_PUSH_MAX_POINTS
+    assert push_floor["floor"] == COI_FLOOR_MAX_POINTS
+    roll = score_coi_matrix_for_strike("BULLISH", 74150.0, 74100.0, 50.0, matrix_map,
+                                       now=datetime(2026, 10, 9, 10, 0, tzinfo=IST))
+    assert roll["roll"] == COI_ROLL_MAX_POINTS
+    wall = score_coi_matrix_for_strike("BULLISH", 74200.0, 74100.0, 50.0, matrix_map,
+                                       now=datetime(2026, 10, 9, 10, 0, tzinfo=IST))
+    assert wall["wall_penalty"] > 0 and wall["score"] < 0
+    pin_map = {float(k): {**v, "call_oi_change_pct": 0.02, "put_oi_change_pct": 0.025}
+               for k, v in matrix_map.items()}
+    pin = score_coi_matrix_for_strike("BULLISH", 74100.0, 74100.0, 50.0, pin_map,
+                                      now=datetime(2026, 10, 9, 10, 0, tzinfo=IST))
+    assert pin["disqualified"] and pin["label"] == "PIN_DISQUALIFIED"
+    cold_push = score_coi_matrix_for_strike("BULLISH", 74100.0, 74100.0, 50.0, matrix_map,
+                                            now=datetime(2026, 10, 9, 9, 30, tzinfo=IST))
+    standard_push = score_coi_matrix_for_strike("BULLISH", 74100.0, 74100.0, 50.0, matrix_map,
+                                                now=datetime(2026, 10, 9, 10, 0, tzinfo=IST))
+    assert math.isclose(cold_push["score"], standard_push["score"] * COI_COLD_START_WEIGHT)
+
+    # Cold-start COI is cumulative from the earliest observed snapshot after the open.
+    cold_state = {"option_oi_history": [{
+        "date": "2026-10-09", "expiry": "2026-10-13",
+        "timestamp": "2026-10-09T09:15:00+05:30", "spot": 100.0,
+        "oi_by_instrument": {
+            **{f"CE{k}": {"strike": float(k), "side": "CE", "oi": 50000.0, "ltp": 100.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
+            **{f"PE{k}": {"strike": float(k), "side": "PE", "oi": 50000.0, "ltp": 100.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
+        },
+    }]}
+    cold_chain = json.loads(json.dumps(simple_chain))
+    for row in cold_chain:
+        row["call_options"]["market_data"]["oi"] = 49000.0
+        row["call_options"]["market_data"]["ltp"] = 95.0
+        row["put_options"]["market_data"]["oi"] = 52000.0
+        row["put_options"]["market_data"]["ltp"] = 95.0
+    cold_velocity = update_option_oi_velocity_history(
+        cold_state, cold_chain, "2026-10-13", now=datetime(2026, 10, 9, 9, 30, tzinfo=IST), spot=100.4
+    )
+    assert cold_velocity[74100.0]["baseline_mode"] == "COLD_START_CUMULATIVE"
+    assert cold_velocity[74100.0]["baseline_minutes"] == 15.0
+    assert math.isclose(cold_velocity[74100.0]["call_oi_change_pct"], -0.02)
+
+    # Profit-booking in calls while the underlying falls blocks counter-trend CE entries,
+    # and fresh put writing clears the guard.
+    guard_state = {"option_oi_history": [{
+        "date": "2026-10-09", "expiry": "2026-10-13",
+        "timestamp": "2026-10-09T09:15:00+05:30", "spot": 74100.0,
+        "oi_by_instrument": {
+            **{f"CE{k}": {"strike": float(k), "side": "CE", "oi": 50000.0, "ltp": 100.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
+            **{f"PE{k}": {"strike": float(k), "side": "PE", "oi": 50000.0, "ltp": 100.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
+        },
+    }]}
+    guard_chain = json.loads(json.dumps(simple_chain))
+    for row in guard_chain:
+        row["call_options"]["market_data"]["oi"] = 49000.0
+        row["call_options"]["market_data"]["ltp"] = 95.0
+        row["put_options"]["market_data"]["oi"] = 50000.0
+        row["put_options"]["market_data"]["ltp"] = 100.0
+    update_option_oi_velocity_history(
+        guard_state, guard_chain, "2026-10-13", now=datetime(2026, 10, 9, 9, 30, tzinfo=IST), spot=74000.0
+    )
+    assert guard_state.get("coi_market_guard", {}).get("blocked_direction") == "BULLISH"
+    for row in guard_chain:
+        row["put_options"]["market_data"]["oi"] = 52000.0
+        row["put_options"]["market_data"]["ltp"] = 95.0
+    update_option_oi_velocity_history(
+        guard_state, guard_chain, "2026-10-13", now=datetime(2026, 10, 9, 9, 35, tzinfo=IST), spot=73980.0
+    )
+    assert "coi_market_guard" not in guard_state
+
+    # Rolling 15-30 minute COI is measured against persisted snapshots, not daily prev_oi.
     oi_state = {"option_oi_history": [{
         "date": "2026-10-09", "expiry": "2026-10-13",
         "timestamp": "2026-10-09T09:40:00+05:30",
