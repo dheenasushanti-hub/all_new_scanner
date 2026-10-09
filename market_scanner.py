@@ -1,5 +1,5 @@
 """
-NIFTY 50 Predictive Options Scanner — V28 Hardened PA/OI Market-Structure Engine
+NIFTY 50 Predictive Options Scanner — V29 State-Preserving Optional-OI-Velocity Engine
 
 What this version fixes:
 - Uses the NIFTY INDEX as the primary market-price/VWAP/intraday structure feed.
@@ -25,8 +25,8 @@ What this version fixes:
   older v2 intraday candle API is deprecated.
 
 Run:
-    python market_scanner_v27_regime_matrix.py --self-test
-    python market_scanner_v27_regime_matrix.py
+    python market_scanner_v29_state_preserving.py --self-test
+    python market_scanner_v29_state_preserving.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -112,8 +112,8 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-09-STRUCTURE-V28-PERSISTENT-OI-HARDENED"
-OPTION_TARGET_ENGINE_VERSION = "V28_PERSISTENT_OI_REGIME_TOD_PA_OI"
+SCANNER_VERSION = "2026-10-09-STRUCTURE-V29-STATE-PRESERVING-OI-OPTIONAL-VELOCITY"
+OPTION_TARGET_ENGINE_VERSION = "V29_STATE_PRESERVING_OPTIONAL_OI_VELOCITY"
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -995,10 +995,17 @@ def classify_market_regime(
     above_vwap = current_spot > current_vwap
     below_vwap = current_spot < current_vwap
     pa_direction = "BULLISH" if higher_high and higher_low else "BEARISH" if lower_high and lower_low else "NEUTRAL"
-    direction = str(proposed_direction or "NEUTRAL").upper()
+    proposed = str(proposed_direction or "NEUTRAL").upper()
+    direction = proposed
+    direction_gate_reason = "directional price-action confirmation passed"
     if not ((direction == "BULLISH" and above_vwap and pa_direction == "BULLISH") or
             (direction == "BEARISH" and below_vwap and pa_direction == "BEARISH")):
         direction = "NEUTRAL"
+        direction_gate_reason = (
+            f"proposed={proposed}, above_vwap={above_vwap}, below_vwap={below_vwap}, "
+            f"recent_swing_structure={pa_direction}, HH={higher_high}, HL={higher_low}, "
+            f"LH={lower_high}, LL={lower_low}; price/VWAP plus matching swing structure required"
+        )
 
     current_volume = safe_float(work["volume"].iloc[-1], 0.0)
     reference_volume = work["volume"].iloc[-21:-1] if len(work) > 2 else work["volume"].iloc[:-1]
@@ -1055,7 +1062,13 @@ def classify_market_regime(
         reason = f"ADX {adx:.1f} > {ADX_STRONG_THRESHOLD:.1f}, price at outer VWAP band and volume confirmed."
     else:
         intensity = "NORMAL"
-        reason = f"Directional structure with ADX {adx:.1f}; strong-breakout confirmation absent."
+        if direction in {"BULLISH", "BEARISH"}:
+            reason = f"Directional structure with ADX {adx:.1f}; strong-breakout confirmation absent."
+        else:
+            reason = (
+                f"Direction remains NEUTRAL despite proposed={proposed}; {direction_gate_reason}; "
+                f"ADX={adx:.1f}, strong-breakout confirmation absent."
+            )
     return {
         "direction": direction, "intensity": intensity, "adx": adx, "rsi_3m": rsi_3m,
         "rsi_15m": safe_float(calculate_rsi(fifteen["close"], 14).iloc[-1], float("nan")) if len(fifteen) >= 8 else float("nan"),
@@ -2860,6 +2873,7 @@ def select_directional_option(
     eligible: list[tuple[float, OptionCandidate, bool]] = []
     rejection_log: list[str] = []
     score_by_strike: dict[float, float] = {}
+    velocity_coverage_count = 0
     for target in permitted_list:
         row_key = min(strikes, key=lambda value: abs(value - target))
         if abs(row_key - target) > 0.01:
@@ -2913,17 +2927,28 @@ def select_directional_option(
             rejection_log.append(f"{option_type} {row_key:.0f}: spread {spread_pct:.2%} > {max_spread:.2%}")
             continue
 
+        # OI velocity is a supplementary ranking component, never a mandatory
+        # entry prerequisite. If history is warming up/unavailable, its score is
+        # exactly zero and its metrics remain NaN; no bullish/bearish evidence is
+        # fabricated. All other hard filters (structure, option VWAP, delta,
+        # spread, liquidity, routing) remain enforced.
         velocity = velocity_map.get(float(row_key), {}) if isinstance(velocity_map, dict) else {}
-        if not isinstance(velocity, dict) or not bool(velocity.get("available")):
-            rejection_log.append(f"{option_type} {row_key:.0f}: 15-30 minute OI velocity baseline unavailable")
-            continue
-        call_pct = safe_float(velocity.get("call_oi_change_pct"), float("nan"))
-        put_pct = safe_float(velocity.get("put_oi_change_pct"), float("nan"))
-        baseline_minutes = safe_float(velocity.get("baseline_minutes"), float("nan"))
-        if not (math.isfinite(call_pct) and math.isfinite(put_pct) and
-                OPTION_OI_MIN_AGE_MINUTES <= baseline_minutes <= OPTION_OI_MAX_AGE_MINUTES):
-            rejection_log.append(f"{option_type} {row_key:.0f}: invalid 15-30 minute OI velocity data")
-            continue
+        call_pct = put_pct = baseline_minutes = float("nan")
+        velocity_valid = False
+        if isinstance(velocity, dict) and bool(velocity.get("available")):
+            candidate_call_pct = safe_float(velocity.get("call_oi_change_pct"), float("nan"))
+            candidate_put_pct = safe_float(velocity.get("put_oi_change_pct"), float("nan"))
+            candidate_baseline_minutes = safe_float(velocity.get("baseline_minutes"), float("nan"))
+            if (
+                math.isfinite(candidate_call_pct)
+                and math.isfinite(candidate_put_pct)
+                and OPTION_OI_MIN_AGE_MINUTES <= candidate_baseline_minutes <= OPTION_OI_MAX_AGE_MINUTES
+            ):
+                call_pct = candidate_call_pct
+                put_pct = candidate_put_pct
+                baseline_minutes = candidate_baseline_minutes
+                velocity_valid = True
+                velocity_coverage_count += 1
 
         strike_flow = flow_map.get(float(row_key), {})
         call_bias = int(safe_float(strike_flow.get("call_bias"), 0))
@@ -2944,13 +2969,16 @@ def select_directional_option(
             # Conflicting flow lowers this component but does not erase the other valid score components.
             flow_score = 0.10
 
-        if direction == "BULLISH":
-            unwind_pct, adding_pct = max(-call_pct, 0.0), max(put_pct, 0.0)
+        if velocity_valid:
+            if direction == "BULLISH":
+                unwind_pct, adding_pct = max(-call_pct, 0.0), max(put_pct, 0.0)
+            else:
+                unwind_pct, adding_pct = max(-put_pct, 0.0), max(call_pct, 0.0)
+            coi_score = 0.5 * min(unwind_pct / max(COI_STRONG_CHANGE_PCT, 1e-6), 1.0) + 0.5 * min(
+                adding_pct / max(COI_STRONG_CHANGE_PCT, 1e-6), 1.0
+            )
         else:
-            unwind_pct, adding_pct = max(-put_pct, 0.0), max(call_pct, 0.0)
-        coi_score = 0.5 * min(unwind_pct / max(COI_STRONG_CHANGE_PCT, 1e-6), 1.0) + 0.5 * min(
-            adding_pct / max(COI_STRONG_CHANGE_PCT, 1e-6), 1.0
-        )
+            coi_score = 0.0
 
         if option_type == "CE":
             moneyness = "ITM" if row_key < atm - 0.01 else "ATM" if abs(row_key - atm) <= 0.01 else "OTM"
@@ -2983,13 +3011,22 @@ def select_directional_option(
         score_by_strike[row_key] = total
         logger.info(
             "STRIKE RANK: %s %.0f regime=%s moneyness=%s total=%.3f flow=%.3f vwap=%.3f "
-            "coi_velocity=%.3f delta_weight=%.3f delta=%.3f premium_ltp=%.2f premium_vwap=%.2f "
-            "call_coi15m=%+.2f%% put_coi15m=%+.2f%% baseline=%.1fm flow_bias=%+d spread=%.2f%%",
+            "coi_velocity=%.3f coi_data=%s delta_weight=%.3f delta=%.3f premium_ltp=%.2f premium_vwap=%.2f "
+            "call_coi15m=%s put_coi15m=%s baseline_min=%s flow_bias=%+d spread=%.2f%%",
             option_type, row_key, intensity, moneyness, total, flow_score, vwap_score, coi_score,
-            delta_weight, delta, ltp, premium_vwap, call_pct * 100.0, put_pct * 100.0,
-            baseline_minutes, normalized_flow_bias, spread_pct * 100.0,
+            "AVAILABLE" if velocity_valid else "UNAVAILABLE_ZERO_WEIGHT",
+            delta_weight, delta, ltp, premium_vwap,
+            f"{call_pct * 100.0:+.2f}%" if velocity_valid else "NA",
+            f"{put_pct * 100.0:+.2f}%" if velocity_valid else "NA",
+            f"{baseline_minutes:.1f}" if velocity_valid else "NA",
+            normalized_flow_bias, spread_pct * 100.0,
         )
 
+    logger.info(
+        "OI VELOCITY RANKING: valid_candidate_baselines=%d/%d policy=SUPPLEMENTARY; "
+        "missing_baseline_contribution=0.000 (not an entry blocker).",
+        velocity_coverage_count, len(permitted_list),
+    )
     if not eligible:
         detail = "; ".join(rejection_log[-10:]) or "no valid candidates"
         raise ScannerError(f"No eligible {direction}/{intensity} option. {detail}")
@@ -3017,15 +3054,26 @@ def select_directional_option(
     expected_type = "CE" if direction == "BULLISH" else "PE"
     if selected.option_type != expected_type:
         raise ScannerError(f"STRICT STRIKE VALIDATION FAILED: {direction} requires {expected_type}.")
+    selected_call_coi = (
+        f"{selected.call_oi_change_pct_15m:+.2f}%"
+        if math.isfinite(selected.call_oi_change_pct_15m) else "NA"
+    )
+    selected_put_coi = (
+        f"{selected.put_oi_change_pct_15m:+.2f}%"
+        if math.isfinite(selected.put_oi_change_pct_15m) else "NA"
+    )
+    selected_baseline = (
+        f"{selected.oi_velocity_baseline_minutes:.1f}m"
+        if math.isfinite(selected.oi_velocity_baseline_minutes) else "NA"
+    )
     logger.info(
         "OPTION SELECT: direction=%s intensity=%s tod=%s expiry_day=%s ATM=%.0f permitted=%s "
         "selected=%s %.0f total=%.3f LTP=%.2f option_VWAP=%.2f delta=%.3f flow=%.3f VWAPscore=%.3f "
-        "COIscore=%.3f delta_weight=%.3f call_COI15m=%+.2f%% put_COI15m=%+.2f%% baseline=%.1fm",
+        "COIscore=%.3f delta_weight=%.3f call_COI15m=%s put_COI15m=%s baseline=%s",
         direction, intensity, tod, is_expiry_day, atm, sorted(permitted), selected.option_type,
         selected.strike, winning_score, selected.ltp, selected.premium_vwap, selected.delta,
         selected.flow_score, selected.vwap_score, selected.oi_momentum_score, selected.delta_weight,
-        selected.call_oi_change_pct_15m, selected.put_oi_change_pct_15m,
-        selected.oi_velocity_baseline_minutes,
+        selected_call_coi, selected_put_coi, selected_baseline,
     )
     return selected
 
@@ -3588,6 +3636,41 @@ def save_state(state: dict[str, Any]) -> None:
         json.dump(state, fh, indent=2, ensure_ascii=False)
 
     tmp.replace(STATE_FILE)
+
+
+def reset_intraday_memory_if_needed(state: dict[str, Any], today_iso: str) -> tuple[bool, str]:
+    """Reset directional memory on session/version changes without discarding compatible same-day OI history."""
+    snapshot = state.get("market_snapshot")
+    snapshot_ts = str(snapshot.get("timestamp", ""))[:10] if isinstance(snapshot, dict) else ""
+    stored_version = str(state.get("scanner_version", ""))
+    new_session = bool(snapshot_ts and snapshot_ts != today_iso)
+    version_changed = bool(stored_version and stored_version != SCANNER_VERSION)
+    if not (new_session or version_changed):
+        state["scanner_version"] = SCANNER_VERSION
+        return False, ""
+
+    state["market_history"] = []
+    state["market_snapshot"] = {}
+    state["persistent_direction"] = None
+    state["continuation_phase"] = ""
+    state["continuation_count"] = 0
+    state["continuation_last_bar"] = ""
+    state["scanner_version"] = SCANNER_VERSION
+    state.pop("last_signal", None)
+    state.pop("last_signal_hash", None)
+    state.pop("last_signal_timestamp", None)
+
+    # OI velocity is intraday and expiry-specific. Preserve it on a code-version
+    # upgrade during the SAME trading date; the history normalizer validates each
+    # timestamp/date/expiry and contract overlap before allowing it into a baseline.
+    # A new trading date must start with a clean OI ring and legacy snapshot.
+    if new_session:
+        state.pop("option_oi_snapshot", None)
+        state.pop("option_oi_history", None)
+        reason = "NEW_TRADING_SESSION"
+    else:
+        reason = "SCANNER_VERSION_CHANGE_PRESERVED_OI_HISTORY"
+    return True, reason
 
 
 def active_trade_from_state(
@@ -4543,27 +4626,18 @@ def execute_scan(
     if status != "OPEN":
         return None
 
-    # State is intraday. Reset directional memory on a new session/version; an
-    # active trade is still carried long enough for the monitor to clean it up.
-    snapshot = state.get("market_snapshot")
-    snapshot_ts = str(snapshot.get("timestamp", ""))[:10] if isinstance(snapshot, dict) else ""
-    stored_version = str(state.get("scanner_version", ""))
-    if (snapshot_ts and snapshot_ts != today_iso) or (stored_version and stored_version != SCANNER_VERSION):
-        state["market_history"] = []
-        state["market_snapshot"] = {}
-        state["persistent_direction"] = None
-        state["continuation_phase"] = ""
-        state["continuation_count"] = 0
-        state["continuation_last_bar"] = ""
-        state["scanner_version"] = SCANNER_VERSION
-        state.pop("option_oi_snapshot", None)
-        state.pop("option_oi_history", None)
-        state.pop("last_signal", None)
-        state.pop("last_signal_hash", None)
-        state.pop("last_signal_timestamp", None)
+    # Directional memory is version-scoped, but compatible same-day OI history
+    # is data, not strategy state: preserve it across code upgrades. On a new date,
+    # reset both intraday memory and the OI ring because yesterday's OI cannot be
+    # used as an intraday velocity baseline.
+    state_reset, reset_reason = reset_intraday_memory_if_needed(state, today_iso)
+    if state_reset:
+        oi_history_count = len(state.get("option_oi_history", [])) if isinstance(state.get("option_oi_history"), list) else 0
+        logger.info(
+            "STATE RESET: reason=%s; directional memory reset; preserved_OI_history_snapshots=%d; state_file=%s",
+            reset_reason, oi_history_count, STATE_FILE.resolve(),
+        )
         save_state(state)
-    else:
-        state["scanner_version"] = SCANNER_VERSION
 
     now_time = now_ist().time()
     future = get_current_nifty_future(state)
@@ -5200,6 +5274,33 @@ def self_test() -> None:
     eff, bias, source, conflict = resolve_change_oi_flow(-0.155, +0.760, "INTRADAY_SNAPSHOT")
     assert eff == 0.0 and bias == 0 and conflict and source == "INTRADAY_DAY_CONFLICT"
 
+    # V29 regression: a same-session scanner version upgrade resets directional
+    # memory but preserves the compatible OI baseline ring and legacy snapshot.
+    preserved_oi_state = {
+        "scanner_version": "OLDER_SCANNER_VERSION",
+        "market_snapshot": {"timestamp": "2026-10-09T10:00:00+05:30"},
+        "market_history": [{"direction": "BEARISH"}],
+        "persistent_direction": "BEARISH",
+        "option_oi_history": [{"timestamp": "2026-10-09T10:00:00+05:30", "expiry": "2026-10-13"}],
+        "option_oi_snapshot": {"timestamp": "2026-10-09T10:00:00+05:30", "expiry": "2026-10-13"},
+    }
+    did_reset, reset_reason = reset_intraday_memory_if_needed(preserved_oi_state, "2026-10-09")
+    assert did_reset and reset_reason == "SCANNER_VERSION_CHANGE_PRESERVED_OI_HISTORY"
+    assert len(preserved_oi_state["option_oi_history"]) == 1
+    assert preserved_oi_state["option_oi_snapshot"]["expiry"] == "2026-10-13"
+    assert preserved_oi_state["persistent_direction"] is None
+
+    # A true new trading date must clear prior-session OI history and snapshots.
+    new_day_state = {
+        "scanner_version": SCANNER_VERSION,
+        "market_snapshot": {"timestamp": "2026-10-08T15:20:00+05:30"},
+        "option_oi_history": [{"timestamp": "2026-10-08T15:00:00+05:30"}],
+        "option_oi_snapshot": {"timestamp": "2026-10-08T15:00:00+05:30"},
+    }
+    did_reset_day, reset_day_reason = reset_intraday_memory_if_needed(new_day_state, "2026-10-09")
+    assert did_reset_day and reset_day_reason == "NEW_TRADING_SESSION"
+    assert "option_oi_history" not in new_day_state and "option_oi_snapshot" not in new_day_state
+
     # Continuation requires two distinct completed 3m bars, not repeated scans of
     # the same bar and not a single early-market classification.
     persistence_state: dict[str, Any] = {}
@@ -5376,6 +5477,17 @@ def self_test() -> None:
     assert ce.option_type == "CE" and ce.strike in {74050.0, 74100.0}
     assert pe.option_type == "PE" and pe.strike in {74100.0, 74150.0}
     assert ce.premium_vwap < ce.ltp and ce.oi_momentum_score > 0.9
+
+    # V29 regression: a missing 15-30m baseline must not block a valid candidate;
+    # missing OI velocity contributes zero score, never fabricated confirmation.
+    ce_without_velocity = select_directional_option(
+        simple_chain, "BULLISH", 74100.0, target_underlying_1=74200.0,
+        change_oi_by_strike=flow, market_intensity="NORMAL", now=test_now,
+        option_metrics_by_instrument=option_vwaps, oi_velocity_by_strike={},
+    )
+    assert ce_without_velocity.option_type == "CE"
+    assert ce_without_velocity.oi_momentum_score == 0.0
+    assert math.isnan(ce_without_velocity.oi_velocity_baseline_minutes)
     validate_continuous_option_entry(
         ce, simple_chain, "BULLISH", "CONTINUOUS_BULLISH", 74100.0,
         market_intensity="NORMAL", now=test_now,
