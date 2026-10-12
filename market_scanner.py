@@ -1,5 +1,5 @@
 """
-NIFTY 50 Predictive Options Scanner — V31 Regime/COI Execution-Veto Engine
+NIFTY 50 Predictive Options Scanner — V34 Calibrated Score and Continuation-Aware Stagnation Guard
 
 What this version fixes:
 - Uses the NIFTY INDEX as the primary market-price/VWAP/intraday structure feed.
@@ -114,7 +114,7 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-09-STRUCTURE-V31-REGIME-COI-EXECUTION-VETOES"
+SCANNER_VERSION = "2026-10-12-STRUCTURE-V34-SCORE-COI-AVAILABILITY-CONTINUATION-GUARD"
 # PA/OI target construction is unchanged; keep the V30 target engine identifier so
 # existing live trades are not needlessly re-migrated by entry-filter-only changes.
 OPTION_TARGET_ENGINE_VERSION = "V30_DYNAMIC_COI_MATRIX_PA_OI"
@@ -127,6 +127,11 @@ MIDDAY_END = time(13, 30)
 
 ATR_PERIOD = 14
 ADX_PERIOD = int(os.getenv("ADX_PERIOD", "14"))
+REGIME_INDICATOR_HISTORY_BARS = max(2 * ADX_PERIOD + 30, int(os.getenv("REGIME_INDICATOR_HISTORY_BARS", "300")))
+REGIME_INDICATOR_CACHE_RETRY_SECONDS = max(60, int(os.getenv("REGIME_INDICATOR_CACHE_RETRY_SECONDS", "300")))
+REGIME_INDICATOR_CACHE_KEY = "regime_indicator_history_cache"
+FUTURES_HISTORY_CACHE_KEY = "futures_oi_history_cache"
+FUTURES_HISTORY_CACHE_BARS = 60
 ADX_SIDEWAYS_THRESHOLD = float(os.getenv("ADX_SIDEWAYS_THRESHOLD", "20"))
 ADX_STRONG_THRESHOLD = float(os.getenv("ADX_STRONG_THRESHOLD", "25"))
 MIDDAY_MIN_ADX = float(os.getenv("MIDDAY_MIN_ADX", "23"))
@@ -145,8 +150,11 @@ COI_WALL_MAX_PENALTY = float(os.getenv("COI_WALL_MAX_PENALTY", "1.5"))
 COI_UNDERLYING_MOVE_PCT = float(os.getenv("COI_UNDERLYING_MOVE_PCT", "0.001"))
 STAGNATION_RANGE_PCT = float(os.getenv("STAGNATION_RANGE_PCT", "0.001"))
 STAGNATION_REQUIRED_BARS = int(os.getenv("STAGNATION_REQUIRED_BARS", "3"))
+# A directional move of at least this fraction over the three 5m bars can suppress
+# the stagnation exit, but only when the active trade direction, index VWAP and COI agree.
+STAGNATION_MIN_FAVORABLE_PROGRESS_PCT = max(0.0, float(os.getenv("STAGNATION_MIN_FAVORABLE_PROGRESS_PCT", "0.0001")))
 OPENING_MAX_SPREAD_PCT = float(os.getenv("OPENING_MAX_SPREAD_PCT", "0.08"))
-MIN_EXECUTION_SCORE = float(os.getenv("MIN_EXECUTION_SCORE", "0.500"))
+MIN_EXECUTION_SCORE = min(1.0, max(0.0, float(os.getenv("MIN_EXECUTION_SCORE", "0.500"))))
 
 # Option-flow classification threshold.
 STRUCTURE_ACTIVITY_PRICE_NOISE_PCT = float(os.getenv("STRUCTURE_ACTIVITY_PRICE_NOISE_PCT", "0.002"))
@@ -822,6 +830,234 @@ def filter_completed_candles(
     return work.loc[completed].reset_index(drop=True)
 
 
+def get_regime_indicator_history(
+    state: dict[str, Any],
+    instrument_key: str,
+    *,
+    now: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """Return cached completed index candles from prior sessions for ADX/RSI seeding.
+
+    Historical candles are fetched once per trading date and cached in scanner
+    state. Only dates before the current IST session are retained; current-session
+    VWAP, volume confirmation and swing structure continue to use live session bars.
+    Failed fetches are retried after a short cooldown rather than on every scan.
+    """
+    current = now or now_ist()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=IST)
+    current = current.astimezone(IST)
+    today_iso = current.date().isoformat()
+    cache = state.get(REGIME_INDICATOR_CACHE_KEY) if isinstance(state, dict) else None
+
+    def _frame_from_cache(cached: dict[str, Any]) -> pd.DataFrame:
+        records = cached.get("candles", [])
+        if not isinstance(records, list) or not records:
+            return pd.DataFrame()
+        frame = pd.DataFrame(records)
+        required = {"timestamp", "open", "high", "low", "close", "volume"}
+        if not required.issubset(frame.columns):
+            return pd.DataFrame()
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+        for col in ("open", "high", "low", "close", "volume"):
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        frame = (frame.dropna(subset=["timestamp", "open", "high", "low", "close"])
+                      .sort_values("timestamp")
+                      .drop_duplicates("timestamp", keep="last"))
+        if frame.empty:
+            return pd.DataFrame()
+        local_dates = frame["timestamp"].dt.tz_convert(IST).dt.date
+        frame = frame.loc[local_dates < current.date()]
+        return frame.tail(REGIME_INDICATOR_HISTORY_BARS).reset_index(drop=True)
+
+    if (isinstance(cache, dict)
+            and str(cache.get("session_date", "")) == today_iso
+            and str(cache.get("instrument_key", "")) == instrument_key):
+        cached_frame = _frame_from_cache(cache)
+        if str(cache.get("status", "")) == "AVAILABLE" and not cached_frame.empty:
+            logger.info(
+                "REGIME INDICATOR HISTORY: source=STATE_CACHE status=AVAILABLE bars=%d instrument=%s latest=%s",
+                len(cached_frame), instrument_key,
+                cached_frame["timestamp"].iloc[-1].tz_convert(IST).isoformat(),
+            )
+            return cached_frame
+        if str(cache.get("status", "")) != "AVAILABLE":
+            attempted = pd.to_datetime(cache.get("attempted_at", ""), utc=True, errors="coerce")
+            if not pd.isna(attempted):
+                age = (pd.Timestamp(current).tz_convert("UTC") - attempted).total_seconds()
+                if 0 <= age < REGIME_INDICATOR_CACHE_RETRY_SECONDS:
+                    logger.warning(
+                        "REGIME INDICATOR HISTORY: source=STATE_CACHE status=UNAVAILABLE retry_in_seconds=%d instrument=%s",
+                        int(REGIME_INDICATOR_CACHE_RETRY_SECONDS - age), instrument_key,
+                    )
+                    return pd.DataFrame()
+
+    attempted_at = current.isoformat()
+    try:
+        historical = get_historical_candles(instrument_key, 3)
+        historical = filter_completed_candles(historical, 3, now=current)
+        if not historical.empty:
+            local_dates = historical["timestamp"].dt.tz_convert(IST).dt.date
+            historical = historical.loc[local_dates < current.date()]
+        historical = historical.tail(REGIME_INDICATOR_HISTORY_BARS).reset_index(drop=True)
+        if historical.empty:
+            raise ScannerError("Historical index endpoint returned no completed prior-session 3m candles.")
+
+        records: list[dict[str, Any]] = []
+        for row in historical.to_dict("records"):
+            timestamp = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
+            if pd.isna(timestamp):
+                continue
+            records.append({
+                "timestamp": timestamp.isoformat(),
+                "open": safe_float(row.get("open"), float("nan")),
+                "high": safe_float(row.get("high"), float("nan")),
+                "low": safe_float(row.get("low"), float("nan")),
+                "close": safe_float(row.get("close"), float("nan")),
+                "volume": max(0.0, safe_float(row.get("volume"), 0.0)),
+            })
+        historical = _frame_from_cache({"candles": records})
+        if historical.empty:
+            raise ScannerError("Historical index candles were invalid after normalization.")
+        state[REGIME_INDICATOR_CACHE_KEY] = {
+            "session_date": today_iso, "instrument_key": instrument_key,
+            "interval_minutes": 3, "status": "AVAILABLE",
+            "attempted_at": attempted_at, "candles": records,
+        }
+        logger.info(
+            "REGIME INDICATOR HISTORY: source=API_FETCH status=AVAILABLE bars=%d instrument=%s earliest=%s latest=%s",
+            len(historical), instrument_key,
+            historical["timestamp"].iloc[0].tz_convert(IST).isoformat(),
+            historical["timestamp"].iloc[-1].tz_convert(IST).isoformat(),
+        )
+        return historical
+    except (ScannerError, requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        state[REGIME_INDICATOR_CACHE_KEY] = {
+            "session_date": today_iso, "instrument_key": instrument_key,
+            "interval_minutes": 3, "status": "UNAVAILABLE",
+            "attempted_at": attempted_at, "candles": [], "error": str(exc)[:500],
+        }
+        logger.warning(
+            "REGIME INDICATOR HISTORY: source=API_FETCH status=UNAVAILABLE instrument=%s reason=%s; current-session-only warm-up will be used safely.",
+            instrument_key, exc,
+        )
+        return pd.DataFrame()
+
+
+def get_cached_futures_oi_history(
+    state: dict[str, Any],
+    instrument_key: str,
+    *,
+    now: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """Fetch and cache prior-session futures candles once per date and contract.
+
+    Current-session futures candles remain live. This cache is used only for OI
+    warm-up/context and never substitutes for current prices or current-session OI.
+    """
+    current = now or now_ist()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=IST)
+    current = current.astimezone(IST)
+    today_iso = current.date().isoformat()
+    cache = state.get(FUTURES_HISTORY_CACHE_KEY) if isinstance(state, dict) else None
+
+    def cached_frame(records: Any) -> pd.DataFrame:
+        if not isinstance(records, list) or not records:
+            return pd.DataFrame()
+        frame = pd.DataFrame(records)
+        required = {"timestamp", "open", "high", "low", "close", "volume"}
+        if not required.issubset(frame.columns):
+            return pd.DataFrame()
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+        for column in ("open", "high", "low", "close", "volume"):
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        if "oi" not in frame.columns:
+            frame["oi"] = np.nan
+        frame["oi"] = pd.to_numeric(frame["oi"], errors="coerce")
+        frame = (frame.dropna(subset=["timestamp", "open", "high", "low", "close"])
+                      .sort_values("timestamp")
+                      .drop_duplicates("timestamp", keep="last"))
+        if frame.empty:
+            return pd.DataFrame()
+        local_dates = frame["timestamp"].dt.tz_convert(IST).dt.date
+        frame = frame.loc[local_dates < current.date()]
+        return frame.tail(FUTURES_HISTORY_CACHE_BARS).reset_index(drop=True)
+
+    if (isinstance(cache, dict)
+            and str(cache.get("session_date", "")) == today_iso
+            and str(cache.get("instrument_key", "")) == instrument_key):
+        frame = cached_frame(cache.get("candles", []))
+        if str(cache.get("status", "")) == "AVAILABLE" and not frame.empty:
+            logger.info(
+                "FUTURES HISTORICAL CACHE: source=STATE_CACHE status=AVAILABLE bars=%d instrument=%s latest=%s",
+                len(frame), instrument_key, frame["timestamp"].iloc[-1].tz_convert(IST).isoformat(),
+            )
+            return frame
+        if str(cache.get("status", "")) != "AVAILABLE":
+            attempted = pd.to_datetime(cache.get("attempted_at", ""), utc=True, errors="coerce")
+            if not pd.isna(attempted):
+                age_seconds = (pd.Timestamp(current).tz_convert("UTC") - attempted).total_seconds()
+                if 0 <= age_seconds < REGIME_INDICATOR_CACHE_RETRY_SECONDS:
+                    logger.warning(
+                        "FUTURES HISTORICAL CACHE: source=STATE_CACHE status=UNAVAILABLE retry_in_seconds=%d instrument=%s",
+                        int(REGIME_INDICATOR_CACHE_RETRY_SECONDS - age_seconds), instrument_key,
+                    )
+                    return pd.DataFrame()
+
+    attempted_at = current.isoformat()
+    try:
+        historical = get_historical_candles(instrument_key, 3)
+        historical = filter_completed_candles(historical, 3, now=current)
+        if not historical.empty:
+            local_dates = historical["timestamp"].dt.tz_convert(IST).dt.date
+            historical = historical.loc[local_dates < current.date()]
+        historical = historical.tail(FUTURES_HISTORY_CACHE_BARS).reset_index(drop=True)
+        if historical.empty:
+            raise ScannerError("Historical futures endpoint returned no completed prior-session 3m candles.")
+
+        records: list[dict[str, Any]] = []
+        for row in historical.to_dict("records"):
+            timestamp = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
+            if pd.isna(timestamp):
+                continue
+            oi_value = safe_float(row.get("oi"), float("nan"))
+            records.append({
+                "timestamp": timestamp.isoformat(),
+                "open": safe_float(row.get("open"), float("nan")),
+                "high": safe_float(row.get("high"), float("nan")),
+                "low": safe_float(row.get("low"), float("nan")),
+                "close": safe_float(row.get("close"), float("nan")),
+                "volume": max(0.0, safe_float(row.get("volume"), 0.0)),
+                "oi": oi_value if math.isfinite(oi_value) else None,
+            })
+        frame = cached_frame(records)
+        if frame.empty:
+            raise ScannerError("Historical futures candles were invalid after normalization.")
+        state[FUTURES_HISTORY_CACHE_KEY] = {
+            "session_date": today_iso, "instrument_key": instrument_key,
+            "interval_minutes": 3, "status": "AVAILABLE",
+            "attempted_at": attempted_at, "candles": records,
+        }
+        logger.info(
+            "FUTURES HISTORICAL CACHE: source=API_FETCH status=AVAILABLE bars=%d instrument=%s earliest=%s latest=%s",
+            len(frame), instrument_key, frame["timestamp"].iloc[0].tz_convert(IST).isoformat(),
+            frame["timestamp"].iloc[-1].tz_convert(IST).isoformat(),
+        )
+        return frame
+    except (ScannerError, requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        state[FUTURES_HISTORY_CACHE_KEY] = {
+            "session_date": today_iso, "instrument_key": instrument_key,
+            "interval_minutes": 3, "status": "UNAVAILABLE",
+            "attempted_at": attempted_at, "candles": [], "error": str(exc)[:500],
+        }
+        logger.warning(
+            "FUTURES HISTORICAL CACHE: source=API_FETCH status=UNAVAILABLE instrument=%s reason=%s; live-session candles remain in use.",
+            instrument_key, exc,
+        )
+        return pd.DataFrame()
+
+
 # =============================================================================
 # INDICATORS
 # =============================================================================
@@ -872,17 +1108,30 @@ def calculate_vwap(df: pd.DataFrame) -> pd.Series:
         )
     return vwap.ffill()
 
-def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    """Wilder RSI, returning NaN until there is enough real price history."""
+def calculate_rsi(
+    close: pd.Series,
+    period: int = 14,
+    session_dates: Optional[pd.Series] = None,
+) -> pd.Series:
+    """Wilder RSI with a full-period warm-up and no overnight-gap return spike.
+
+    ``session_dates`` may be supplied for intraday candles. The first close-to-close
+    delta of a new session is excluded, while Wilder's smoothed averages carry over.
+    """
     values = pd.to_numeric(close, errors="coerce")
+    n = max(int(period), 2)
     delta = values.diff()
+    if session_dates is not None:
+        dates = pd.Series(session_dates, index=values.index)
+        new_session = dates.ne(dates.shift(1))
+        delta = delta.mask(new_session)
     gain = delta.clip(lower=0.0)
     loss = -delta.clip(upper=0.0)
-    warmup = max(5, int(period) // 2)
-    avg_gain = gain.ewm(alpha=1.0 / max(int(period), 1), adjust=False, min_periods=warmup).mean()
-    avg_loss = loss.ewm(alpha=1.0 / max(int(period), 1), adjust=False, min_periods=warmup).mean()
+    avg_gain = gain.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+    avg_loss = loss.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
     rsi = 100.0 - (100.0 / (1.0 + rs))
+    # Explicitly define one-sided and flat markets instead of leaking NaN values.
     rsi = rsi.where(avg_loss > 0.0, 100.0)
     rsi = rsi.where(avg_gain > 0.0, 0.0).where(avg_loss > 0.0, rsi)
     both_flat = (avg_gain == 0.0) & (avg_loss == 0.0)
@@ -890,30 +1139,59 @@ def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
 
 
 def calculate_adx(df: pd.DataFrame, period: int = ADX_PERIOD) -> pd.Series:
-    """Wilder ADX with a conservative warm-up for intraday bar sets."""
-    if df is None or df.empty or not {"high", "low", "close"}.issubset(df.columns):
+    """Wilder ADX requiring a full DI and ADX smoothing window.
+
+    Historical completed candles should be prepended to the current session so
+    the normal warm-up completes before the opening-session signal window. If a
+    timestamp is present, price gaps between sessions are not counted as intraday
+    directional movement; the first bar's own high-low range is retained.
+    """
+    required = {"high", "low", "close"}
+    if df is None or df.empty or not required.issubset(df.columns):
         return pd.Series(dtype=float)
     work = df.copy()
-    high = pd.to_numeric(work["high"], errors="coerce")
-    low = pd.to_numeric(work["low"], errors="coerce")
-    close = pd.to_numeric(work["close"], errors="coerce")
+    if "timestamp" in work.columns:
+        work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
+        work = work.dropna(subset=["timestamp"]).sort_values("timestamp")
+        work = work.drop_duplicates("timestamp", keep="last")
+    for column in ("high", "low", "close"):
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    work = work.dropna(subset=["high", "low", "close"])
+    n = max(int(period), 2)
+    if len(work) < 2 * n:
+        return pd.Series(np.nan, index=work.index, dtype=float)
+
+    high = work["high"]
+    low = work["low"]
+    close = work["close"]
     up = high.diff()
     down = -low.diff()
-    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=work.index)
-    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=work.index)
     previous_close = close.shift(1)
+    if "timestamp" in work.columns:
+        local_dates = work["timestamp"].dt.tz_convert(IST).dt.date
+        new_session = local_dates.ne(local_dates.shift(1))
+        up = up.mask(new_session)
+        down = down.mask(new_session)
+        previous_close = previous_close.mask(new_session)
+
+    valid_dm = up.notna() & down.notna()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=work.index, dtype=float).where(valid_dm)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=work.index, dtype=float).where(valid_dm)
     true_range = pd.concat(
         [(high - low), (high - previous_close).abs(), (low - previous_close).abs()], axis=1
     ).max(axis=1)
-    n = max(int(period), 2)
-    warmup = max(5, n // 2)
-    atr = true_range.ewm(alpha=1.0 / n, adjust=False, min_periods=warmup).mean()
-    plus_smoothed = plus_dm.ewm(alpha=1.0 / n, adjust=False, min_periods=warmup).mean()
-    minus_smoothed = minus_dm.ewm(alpha=1.0 / n, adjust=False, min_periods=warmup).mean()
+    # Standard Wilder smoothing: one full period for directional indicators and
+    # another full period for ADX itself. This avoids the premature, noisy ADX
+    # values produced by half-period warm-ups.
+    atr = true_range.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+    plus_smoothed = plus_dm.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+    minus_smoothed = minus_dm.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
     plus_di = 100.0 * plus_smoothed / atr.replace(0.0, np.nan)
     minus_di = 100.0 * minus_smoothed / atr.replace(0.0, np.nan)
-    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
-    return dx.ewm(alpha=1.0 / n, adjust=False, min_periods=warmup).mean().clip(0.0, 100.0)
+    denominator = (plus_di + minus_di).replace(0.0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / denominator
+    adx = dx.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean().clip(0.0, 100.0)
+    return adx.reindex(df.index)
 
 
 def calculate_vwap_bands(df: pd.DataFrame) -> tuple[float, float, float]:
@@ -957,18 +1235,32 @@ def _resample_ohlcv(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
     return filter_completed_candles(result, minutes)
 
 
-def detect_rsi_divergence(df: pd.DataFrame, window: int = 5) -> str:
-    """Detect a basic confirmed price/RSI divergence over two non-overlapping windows."""
+def detect_rsi_divergence(
+    df: pd.DataFrame,
+    window: int = 5,
+    rsi_values: Optional[pd.Series] = None,
+) -> str:
+    """Detect confirmed divergence inside the supplied window, optionally using history-seeded RSI."""
     if df is None or df.empty or len(df) < 2 * window:
         return "NONE"
     work = df.copy().reset_index(drop=True)
-    work["close"] = pd.to_numeric(work["close"], errors="coerce")
-    work["high"] = pd.to_numeric(work["high"], errors="coerce")
-    work["low"] = pd.to_numeric(work["low"], errors="coerce")
-    work["rsi"] = calculate_rsi(work["close"], 14)
+    for column in ("close", "high", "low"):
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    if rsi_values is None:
+        session_dates = (
+            pd.to_datetime(work["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST).dt.date
+            if "timestamp" in work.columns else None
+        )
+        work["rsi"] = calculate_rsi(work["close"], 14, session_dates=session_dates)
+    else:
+        seeded = pd.to_numeric(pd.Series(rsi_values).reset_index(drop=True), errors="coerce")
+        if len(seeded) != len(work):
+            return "NONE"
+        work["rsi"] = seeded.to_numpy(dtype=float)
     previous = work.iloc[-2 * window:-window]
     recent = work.iloc[-window:]
-    if previous["rsi"].notna().sum() < max(3, window // 2) or recent["rsi"].notna().sum() < max(3, window // 2):
+    required_valid = max(2, int(window))
+    if previous["rsi"].notna().sum() < required_valid or recent["rsi"].notna().sum() < required_valid:
         return "NONE"
     p_low_i = previous["low"].idxmin()
     r_low_i = recent["low"].idxmin()
@@ -984,11 +1276,7 @@ def detect_rsi_divergence(df: pd.DataFrame, window: int = 5) -> str:
         safe_float(recent_high["high"]) > safe_float(previous_high["high"])
         and safe_float(recent_high["rsi"], float("nan")) <= safe_float(previous_high["rsi"], float("nan")) - 2.0
     )
-    if bullish and not bearish:
-        return "BULLISH"
-    if bearish and not bullish:
-        return "BEARISH"
-    return "NONE"
+    return "BULLISH" if bullish else "BEARISH" if bearish else "NONE"
 
 
 def time_of_day_window(now: Optional[datetime] = None) -> str:
@@ -1010,25 +1298,73 @@ def classify_market_regime(
     proposed_direction: str,
     support: float,
     resistance: float,
+    indicator_history: Optional[pd.DataFrame] = None,
 ) -> dict[str, Any]:
-    """Classify direction/intensity; unknown or sideways conditions never authorize buying."""
+    """Classify market regime using live-session structure and history-seeded ADX/RSI.
+
+    Only current-session candles determine VWAP bands, swing structure, volume
+    confirmation and local reversal bars. Prior-session completed index candles
+    seed Wilder ADX/RSI, allowing those indicators to be valid near the open.
+    """
     work = filter_completed_candles(price_session, 3) if price_session is not None and not price_session.empty else pd.DataFrame()
     result: dict[str, Any] = {
         "direction": "NEUTRAL", "intensity": "UNKNOWN", "adx": float("nan"),
         "rsi_3m": float("nan"), "rsi_15m": float("nan"), "upper_vwap_band": float("nan"),
         "lower_vwap_band": float("nan"), "volume_confirmed": False, "divergence": "NONE",
         "near_structural_level": False, "reversal_price_confirmed": False,
-        "reason": "Insufficient completed candles.",
+        "indicator_history_bars": 0, "indicator_3m_bars": 0, "indicator_15m_bars": 0,
+        "reason": "Insufficient completed current-session candles.",
     }
     if work.empty or len(work) < 8 or not math.isfinite(current_vwap) or current_spot <= 0:
         return result
-    work = work.sort_values("timestamp").reset_index(drop=True)
+
+    work = (work.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True))
     for column in ("high", "low", "close", "volume"):
         work[column] = pd.to_numeric(work[column], errors="coerce")
-    adx_values = calculate_adx(work, ADX_PERIOD)
-    rsi_values = calculate_rsi(work["close"], 14)
+    work = work.dropna(subset=["timestamp", "high", "low", "close"]).reset_index(drop=True)
+    if len(work) < 8:
+        return result
+    today = pd.to_datetime(work["timestamp"], utc=True).dt.tz_convert(IST).dt.date.iloc[-1]
+
+    history = indicator_history.copy() if isinstance(indicator_history, pd.DataFrame) else pd.DataFrame()
+    if not history.empty:
+        history["timestamp"] = pd.to_datetime(history["timestamp"], utc=True, errors="coerce")
+        for column in ("high", "low", "close", "open", "volume"):
+            if column not in history.columns:
+                history[column] = 0.0 if column == "volume" else np.nan
+            history[column] = pd.to_numeric(history[column], errors="coerce")
+        history = history.dropna(subset=["timestamp", "high", "low", "close"])
+        history_dates = history["timestamp"].dt.tz_convert(IST).dt.date
+        history = history.loc[history_dates < today]
+        history = history.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    indicator_work = pd.concat([history, work], ignore_index=True, sort=False)
+    indicator_work["timestamp"] = pd.to_datetime(indicator_work["timestamp"], utc=True, errors="coerce")
+    indicator_work = (indicator_work.dropna(subset=["timestamp", "high", "low", "close"])
+                                      .sort_values("timestamp")
+                                      .drop_duplicates("timestamp", keep="last")
+                                      .reset_index(drop=True))
+    indicator_dates = indicator_work["timestamp"].dt.tz_convert(IST).dt.date
+    rsi3_all = calculate_rsi(indicator_work["close"], 14, session_dates=indicator_dates)
+    adx_values = calculate_adx(indicator_work, ADX_PERIOD)
     adx = safe_float(adx_values.iloc[-1], float("nan")) if not adx_values.empty else float("nan")
-    rsi_3m = safe_float(rsi_values.iloc[-1], float("nan")) if not rsi_values.empty else float("nan")
+    current_mask_3m = indicator_dates.eq(today)
+    current_rsi3 = rsi3_all.loc[current_mask_3m].reset_index(drop=True)
+    rsi_3m = safe_float(current_rsi3.iloc[-1], float("nan")) if not current_rsi3.empty else float("nan")
+
+    # Calculate indicator 15m RSI on the complete seeded series, but keep RSI
+    # divergence detection restricted to today's 15m candles to avoid comparing
+    # unrelated prior-session swings with today's structural levels.
+    fifteen_all = _resample_ohlcv(indicator_work, 15)
+    fifteen_today = pd.DataFrame()
+    rsi15_today = pd.Series(dtype=float)
+    if not fifteen_all.empty:
+        fifteen_dates = pd.to_datetime(fifteen_all["timestamp"], utc=True).dt.tz_convert(IST).dt.date
+        rsi15_all = calculate_rsi(fifteen_all["close"], 14, session_dates=fifteen_dates)
+        current_mask_15m = fifteen_dates.eq(today)
+        fifteen_today = fifteen_all.loc[current_mask_15m].reset_index(drop=True)
+        rsi15_today = rsi15_all.loc[current_mask_15m].reset_index(drop=True)
+    rsi_15m = safe_float(rsi15_today.iloc[-1], float("nan")) if not rsi15_today.empty else float("nan")
+
     _, upper_band, lower_band = calculate_vwap_bands(work)
     recent = work.tail(3)
     previous = work.iloc[-6:-3] if len(work) >= 6 else work.iloc[:-3]
@@ -1057,9 +1393,18 @@ def classify_market_regime(
     reference_volume = work["volume"].iloc[-21:-1] if len(work) > 2 else work["volume"].iloc[:-1]
     median_volume = safe_float(reference_volume.median(), 0.0) if not reference_volume.empty else 0.0
     volume_confirmed = median_volume > 0 and current_volume >= median_volume * STRONG_VOLUME_MULTIPLIER
-    divergence_3m = detect_rsi_divergence(work, window=5)
-    fifteen = _resample_ohlcv(work, 15)
-    divergence_15m = detect_rsi_divergence(fifteen, window=3) if len(fifteen) >= 6 else "NONE"
+    divergence_3m = detect_rsi_divergence(work, window=5, rsi_values=current_rsi3)
+    # Use only today's completed 15m price swings for divergence; prior-session
+    # bars seed RSI but are never paired with today's price pivots across the gap.
+    # Four current-session bars (two-vs-two) are sufficient for an early signal
+    # because it is additionally gated by 3m divergence, OI structure, and a
+    # confirmed reversal bar near support/resistance. With six bars, use 3-vs-3.
+    if len(fifteen_today) >= 6:
+        divergence_15m = detect_rsi_divergence(fifteen_today, window=3, rsi_values=rsi15_today)
+    elif len(fifteen_today) >= 4:
+        divergence_15m = detect_rsi_divergence(fifteen_today, window=2, rsi_values=rsi15_today)
+    else:
+        divergence_15m = "NONE"
     divergence = divergence_3m if divergence_3m == divergence_15m else "NONE"
     atr_series = calculate_atr(work, ATR_PERIOD)
     atr = safe_float(atr_series.iloc[-1], 0.0) if not atr_series.empty else 0.0
@@ -1067,8 +1412,6 @@ def classify_market_regime(
     near_support = math.isfinite(safe_float(support, float("nan"))) and abs(current_spot - support) <= level_tolerance
     near_resistance = math.isfinite(safe_float(resistance, float("nan"))) and abs(current_spot - resistance) <= level_tolerance
     near_level = (divergence == "BULLISH" and near_support) or (divergence == "BEARISH" and near_resistance)
-    # Divergence by itself is not an entry. Require the latest completed 3m bar
-    # to confirm a local reversal through the preceding bar's extreme.
     last_bar = work.iloc[-1]
     prior_bar = work.iloc[-2]
     bullish_reversal_bar = (
@@ -1088,7 +1431,10 @@ def classify_market_regime(
 
     if not math.isfinite(adx):
         intensity = "UNKNOWN"
-        reason = "ADX has insufficient valid bars."
+        reason = (
+            f"ADX unavailable after {len(indicator_work)} seeded completed 3m bars "
+            f"(history={len(history)}, current_session={len(work)}); historical index warm-up may be unavailable."
+        )
         direction = "NEUTRAL"
     elif adx < ADX_SIDEWAYS_THRESHOLD:
         intensity = "SIDEWAYS"
@@ -1115,15 +1461,17 @@ def classify_market_regime(
                 f"Direction remains NEUTRAL despite proposed={proposed}; {direction_gate_reason}; "
                 f"ADX={adx:.1f}, strong-breakout confirmation absent."
             )
+
     return {
         "direction": direction, "intensity": intensity, "adx": adx, "rsi_3m": rsi_3m,
-        "rsi_15m": safe_float(calculate_rsi(fifteen["close"], 14).iloc[-1], float("nan")) if len(fifteen) >= 8 else float("nan"),
-        "upper_vwap_band": upper_band, "lower_vwap_band": lower_band,
+        "rsi_15m": rsi_15m, "upper_vwap_band": upper_band, "lower_vwap_band": lower_band,
         "volume_confirmed": bool(volume_confirmed), "divergence": divergence,
         "near_structural_level": bool(near_level),
-        "reversal_price_confirmed": bool(reversal_price_confirmed), "reason": reason,
+        "reversal_price_confirmed": bool(reversal_price_confirmed),
+        "indicator_history_bars": int(len(history)), "indicator_3m_bars": int(len(indicator_work)),
+        "indicator_15m_bars": int(len(fifteen_all)),
+        "reason": reason,
     }
-
 
 def trend_direction(
     df: pd.DataFrame,
@@ -3121,6 +3469,45 @@ def option_health_score(
     )
 
 
+def normalized_execution_score(
+    flow_score: float,
+    vwap_score: float,
+    coi_score: float,
+    delta_weight: float,
+    *,
+    coi_available: bool = True,
+) -> float:
+    """Return a transparent 0..1 weighted score; exclude unavailable/neutral COI.
+
+    Flow (30%), option-premium VWAP (30%), COI (20%) and delta/moneyness (20%)
+    are normalized before aggregation. A positive COI Push/Floor/Roll result uses
+    its normalized share of the maximum configured COI points. Missing or neutral
+    COI contributes zero points; the other weights are NOT renormalized upward.
+    This prevents missing COI from being treated as evidence while also preventing
+    a weak positive COI value from lowering the score merely because it became an
+    available component. Cold-start COI has already been reduced by the COI matrix.
+
+    MIN_EXECUTION_SCORE is an explicit rule-based quality threshold, not a
+    statistically fitted win probability. Proper empirical calibration requires
+    historical replay with outcome labels.
+    """
+    flow_component = min(1.0, max(0.0, safe_float(flow_score, 0.0)))
+    vwap_component = min(1.0, max(0.0, safe_float(vwap_score, 0.0)))
+    delta_component = min(1.0, max(0.0, safe_float(delta_weight, 0.0)))
+    max_coi_points = max(
+        COI_PUSH_MAX_POINTS + COI_FLOOR_MAX_POINTS + COI_ROLL_MAX_POINTS, 1e-9
+    )
+    coi_component = min(1.0, max(0.0, safe_float(coi_score, 0.0) / max_coi_points))
+
+    score = (
+        0.30 * flow_component
+        + 0.30 * vwap_component
+        + 0.20 * delta_component
+        + (0.20 * coi_component if coi_available else 0.0)
+    )
+    return float(min(1.0, max(0.0, score)))
+
+
 def select_directional_option(
     chain: list[dict[str, Any]],
     direction: str,
@@ -3320,7 +3707,15 @@ def select_directional_option(
         delta_weight = moneyness_multiplier * min(delta_abs / 0.75, 1.0)
         premium_lift_pct = max((ltp - premium_vwap) / premium_vwap, 0.0)
         vwap_score = 0.50 + 0.50 * min(premium_lift_pct / 0.02, 1.0)
-        total = flow_score + vwap_score + coi_score + delta_weight
+        # COI contributes a score bonus only when a positive Push/Floor/Roll edge is measured.
+        # Neutral or unavailable COI is excluded from the score denominator, not treated as evidence.
+        coi_contributes = bool(velocity_valid and math.isfinite(coi_score) and coi_score > 0.0)
+        total = normalized_execution_score(
+            flow_score, vwap_score, coi_score, delta_weight, coi_available=coi_contributes
+        )
+        coi_normalized = min(1.0, max(0.0, coi_score / max(
+            COI_PUSH_MAX_POINTS + COI_FLOOR_MAX_POINTS + COI_ROLL_MAX_POINTS, 1e-9
+        )))
 
         theta = safe_float(data.get("theta"), 0.0)
         theta_burden = abs(theta) / ltp if ltp > 0 else float("inf")
@@ -3348,12 +3743,12 @@ def select_directional_option(
         )
         eligible.append((total, candidate, moneyness == "OTM"))
         logger.info(
-            "STRIKE RANK: %s %.0f regime=%s moneyness=%s total=%.3f flow=%.3f vwap=%.3f "
-            "COIscore=%+.3f matrix=%s push=%.3f floor=%.3f roll=%.3f wall_penalty=%.3f "
+            "STRIKE RANK: %s %.0f regime=%s moneyness=%s total_norm_0_1=%.3f flow=%.3f vwap=%.3f "
+            "COIraw=%+.3f COInorm=%.3f matrix=%s push=%.3f floor=%.3f roll=%.3f wall_penalty=%.3f "
             "coi_data=%s COI_mode=%s delta_weight=%.3f delta=%.3f premium_ltp=%.2f premium_vwap=%.2f "
             "call_COI=%s put_COI=%s baseline_min=%s flow_bias=%+d spread=%.2f%%",
-            option_type, row_key, intensity, moneyness, total, flow_score, vwap_score, coi_score,
-            coi_label, coi_push, coi_floor, coi_roll, coi_wall,
+            option_type, row_key, intensity, moneyness, total, flow_score, vwap_score,
+            coi_score, coi_normalized, coi_label, coi_push, coi_floor, coi_roll, coi_wall,
             "AVAILABLE" if velocity_valid else "UNAVAILABLE_ZERO_WEIGHT",
             baseline_mode if velocity_valid else "UNAVAILABLE",
             delta_weight, delta, ltp, premium_vwap,
@@ -3365,7 +3760,7 @@ def select_directional_option(
 
     logger.info(
         "COI MATRIX RANKING: valid_candidate_baselines=%d/%d protocol=%s cold_start_weight=%.2f "
-        "missing_COI_contribution=0.000; pin=HARD_DISQUALIFIER; wall=HARD_EXECUTION_VETO; min_score=%.3f.",
+        "missing_or_neutral_COI_adds_zero_points_without_reweighting; total_score_scale=0..1; pin=HARD_DISQUALIFIER; wall=HARD_EXECUTION_VETO; min_score=%.3f.",
         velocity_coverage_count, len(permitted_list),
         "COLD_START_CUMULATIVE" if current_time.time() < COI_COLD_START_END else "ROLLING_15_30",
         COI_COLD_START_WEIGHT, MIN_EXECUTION_SCORE,
@@ -4306,8 +4701,16 @@ def _as_ist_timestamp(value: Any) -> Optional[pd.Timestamp]:
 def stagnation_exit_trigger(
     trade: dict[str, Any],
     price_5m: Optional[pd.DataFrame],
+    *,
+    market_structure: Optional[StructureResult] = None,
 ) -> tuple[bool, str]:
-    """Detect a <=0.10% total high-low range across three consecutive closed 5m bars after entry."""
+    """Detect stagnation only when a tight range is not showing aligned continuation.
+
+    Three completed post-entry 5m candles must be consecutive and have a combined
+    high-low range <= STAGNATION_RANGE_PCT. Before triggering, the guard checks
+    whether the trade direction, live index VWAP side, Change-OI and observed price
+    progress still agree. A confirmed aligned move suppresses this time-decay exit.
+    """
     if price_5m is None or price_5m.empty:
         return False, "5-minute candles unavailable"
     opened_at = _as_ist_timestamp(trade.get("opened_at"))
@@ -4320,29 +4723,81 @@ def stagnation_exit_trigger(
                 .reset_index(drop=True))
     if bars.empty:
         return False, "no completed 5-minute candles"
-    local_start = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST)
-    # A bar qualifies only when its close occurs after the trade was opened.
-    bars = bars.loc[local_start + pd.to_timedelta(5, unit="m") > opened_at].copy()
-    if len(bars) < max(STAGNATION_REQUIRED_BARS, 3):
+    bar_start_utc = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce")
+    opened_utc = opened_at.tz_convert("UTC")
+    # Every counted candle must start at or after entry. A candle that began
+    # before entry is excluded even if its close is after the entry timestamp.
+    bars = bars.loc[bar_start_utc >= opened_utc].copy()
+    required_bars = max(STAGNATION_REQUIRED_BARS, 3)
+    if len(bars) < required_bars:
         return False, f"only {len(bars)} eligible completed 5m bars"
-    bars = bars.tail(max(STAGNATION_REQUIRED_BARS, 3))
+    bars = bars.tail(required_bars)
     bar_stamps = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce")
     spacing = bar_stamps.diff().dropna()
     if len(spacing) != len(bars) - 1 or not bool((spacing == pd.Timedelta(minutes=5)).all()):
-        return False, "last three eligible candles are not consecutive 5-minute bars"
+        return False, "last eligible candles are not consecutive 5-minute bars"
     high = pd.to_numeric(bars["high"], errors="coerce")
     low = pd.to_numeric(bars["low"], errors="coerce")
     close = pd.to_numeric(bars["close"], errors="coerce")
-    if high.isna().any() or low.isna().any() or close.isna().any() or float(close.mean()) <= 0:
+    open_values = pd.to_numeric(bars["open"], errors="coerce") if "open" in bars.columns else close
+    if (high.isna().any() or low.isna().any() or close.isna().any()
+            or open_values.isna().any() or float(close.mean()) <= 0):
         return False, "5-minute OHLC data invalid"
     range_pct = float((high.max() - low.min()) / close.mean())
     timestamps = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST)
-    if range_pct <= STAGNATION_RANGE_PCT:
-        return True, (
-            f"3_CONSECUTIVE_COMPLETED_5M_BARS_RANGE={range_pct:.4%}<=" f"{STAGNATION_RANGE_PCT:.2%}; "
-            f"from={timestamps.iloc[0].strftime('%H:%M')} to={(timestamps.iloc[-1] + pd.Timedelta(minutes=5)).strftime('%H:%M')} IST"
+    if range_pct > STAGNATION_RANGE_PCT:
+        return False, f"three-bar range {range_pct:.4%} exceeds {STAGNATION_RANGE_PCT:.2%}"
+
+    direction = str(trade.get("direction", "")).upper()
+    sign = 1.0 if direction == "BULLISH" else -1.0 if direction == "BEARISH" else 0.0
+    closes = close.to_numpy(dtype=float)
+    first_close = float(closes[0])
+    last_close = float(closes[-1])
+    favorable_progress_pct = sign * (last_close - first_close) / first_close if first_close > 0 else 0.0
+    close_changes = np.diff(closes)
+    favorable_close_steps = int(np.sum(sign * close_changes > 0.0)) if sign else 0
+    progress_confirms = (
+        favorable_progress_pct >= STAGNATION_MIN_FAVORABLE_PROGRESS_PCT
+        or favorable_close_steps == len(close_changes)
+    )
+
+    if market_structure is not None and sign != 0.0 and direction in {"BULLISH", "BEARISH"}:
+        current_direction = str(getattr(market_structure, "direction", "NEUTRAL")).upper()
+        components = getattr(market_structure, "components", {})
+        components = components if isinstance(components, dict) else {}
+        vwap_side = safe_float(components.get("structure_vwap"), 0.0)
+        vwap_value = safe_float(getattr(market_structure, "vwap", float("nan")), float("nan"))
+        flow_value = safe_float(components.get("structure_change_oi"), float("nan"))
+        flow_conflict = safe_float(components.get("structure_change_oi_conflict"), 1.0)
+        latest_close = float(close.iloc[-1])
+        vwap_aligned = bool(
+            sign * vwap_side > 0.0 and math.isfinite(vwap_value)
+            and sign * (latest_close - vwap_value) > 0.0
         )
-    return False, f"three-bar range {range_pct:.4%} exceeds {STAGNATION_RANGE_PCT:.2%}"
+        coi_aligned = bool(
+            math.isfinite(flow_value) and sign * flow_value >= STRUCTURE_CHANGE_OI_CONFIRM
+            and flow_conflict < 0.5
+        )
+        structure_aligned = current_direction == direction and vwap_aligned and coi_aligned
+        if structure_aligned and progress_confirms:
+            return False, (
+                f"STAGNATION_SUPPRESSED_ALIGNED_CONTINUATION direction={direction}; "
+                f"range={range_pct:.4%}<={STAGNATION_RANGE_PCT:.2%}; "
+                f"favorable_progress={favorable_progress_pct:.4%}; "
+                f"favorable_close_steps={favorable_close_steps}/{len(close_changes)}; "
+                f"VWAP={vwap_value:.2f}; effective_COI={flow_value:+.3f}; "
+                f"from={timestamps.iloc[0].strftime('%H:%M')} "
+                f"to={(timestamps.iloc[-1] + pd.Timedelta(minutes=5)).strftime('%H:%M')} IST"
+            )
+
+    return True, (
+        f"3_CONSECUTIVE_COMPLETED_5M_BARS_STAGNANT_RANGE={range_pct:.4%}<="
+        f"{STAGNATION_RANGE_PCT:.2%}; direction={direction or 'UNKNOWN'}; "
+        f"favorable_progress={favorable_progress_pct:.4%}; "
+        f"aligned_structure={bool(market_structure is not None and sign != 0.0 and current_direction == direction and vwap_aligned and coi_aligned) if market_structure is not None and sign != 0.0 else False}; "
+        f"from={timestamps.iloc[0].strftime('%H:%M')} "
+        f"to={(timestamps.iloc[-1] + pd.Timedelta(minutes=5)).strftime('%H:%M')} IST"
+    )
 
 
 def force_close_active_trade_at_cutoff(state: dict[str, Any], reason: str = "TIME_CUTOFF_15_15") -> bool:
@@ -4441,7 +4896,9 @@ def monitor_active_trade(
     # A three-candle stagnation breaker protects open option buys from prolonged theta decay.
     try:
         candles_5m = get_intraday_candles(NIFTY_KEY, 5, strict=False)
-        stagnant, stagnation_reason = stagnation_exit_trigger(trade, candles_5m)
+        stagnant, stagnation_reason = stagnation_exit_trigger(
+            trade, candles_5m, market_structure=structure
+        )
         logger.info("STAGNATION EXIT CHECK: %s trigger=%s reason=%s", trade.get("trading_symbol", ""), stagnant, stagnation_reason)
         if stagnant:
             closed = dict(trade)
@@ -5084,14 +5541,18 @@ def execute_scan(
 
     completed_index_3m = filter_completed_candles(index_session, 3)
 
-    # Historical futures bars are only for OI warm-up; historical index bars are
-    # only used if the live current-session index feed is too short.
-    try:
-        historical_futures = get_historical_candles(future.instrument_key, 3)
-        historical_completed = filter_completed_candles(historical_futures, 3)
-    except ScannerError as exc:
-        logger.warning("Historical futures 3m fallback unavailable: %s", exc)
-        historical_completed = pd.DataFrame()
+    # Seed ADX and both RSI timeframes from prior-session INDEX candles. The
+    # history is cached in state per trading day, avoiding a redundant historical
+    # API request on every 3-minute scan. Current-session structure/VWAP still use
+    # only today's bars.
+    regime_indicator_history = get_regime_indicator_history(state, NIFTY_KEY)
+
+    # Historical futures bars are cached once per trading date and selected
+    # futures instrument. Current-session futures candles and live quotes remain
+    # fresh on every scan and are never replaced by this historical cache.
+    historical_completed = get_cached_futures_oi_history(
+        state, future.instrument_key, now=current_time
+    )
 
     if futures_session.empty:
         futures_3m = historical_completed.tail(40).copy()
@@ -5152,6 +5613,18 @@ def execute_scan(
     market_regime = classify_market_regime(
         index_session, spot, structure.vwap, structure.direction,
         structure.support_1, structure.resistance_1,
+        indicator_history=regime_indicator_history,
+    )
+    logger.info(
+        "REGIME INDICATOR READINESS: history_3m=%d total_seeded_3m=%d current_15m=%d "
+        "ADX_period=%d ADX_valid=%s RSI3m_valid=%s RSI15m_valid=%s",
+        int(market_regime.get("indicator_history_bars", 0)),
+        int(market_regime.get("indicator_3m_bars", 0)),
+        int(market_regime.get("indicator_15m_bars", 0)),
+        ADX_PERIOD,
+        math.isfinite(safe_float(market_regime.get("adx"), float("nan"))),
+        math.isfinite(safe_float(market_regime.get("rsi_3m"), float("nan"))),
+        math.isfinite(safe_float(market_regime.get("rsi_15m"), float("nan"))),
     )
     is_expiry_day = parse_date(str(expiry)) == now_ist().date()
     tod_window = time_of_day_window(now_ist())
@@ -5660,9 +6133,115 @@ def _synthetic_candles(
 
 
 def self_test() -> None:
-    """Deterministic regression tests for V27 regime, strike-routing, VWAP and exit gates."""
+    """Deterministic regression tests for V33 scoring, caches, divergence and exits."""
+    global get_historical_candles
     def mk_candles(values: list[float], oi: Optional[list[float]] = None) -> pd.DataFrame:
         return _synthetic_candles(values, oi=oi)
+
+    # V32 regression: an opening session with only 11 completed 3m candles must
+    # get ADX and both RSI timeframes from prior-session index warm-up candles.
+    indicator_history_test = _synthetic_candles(
+        [100.0 + 0.18 * i + (0.7 if i % 4 in {0, 1} else -0.35) for i in range(100)],
+        start="2026-10-09 09:15",
+    )
+    opening_session_test = _synthetic_candles(
+        [118.0, 118.3, 118.1, 118.7, 118.9, 119.2, 119.0, 119.5, 119.8, 120.0, 120.3],
+        start="2026-10-12 09:15",
+    )
+    seeded_regime_test = classify_market_regime(
+        opening_session_test, current_spot=121.0, current_vwap=119.0,
+        proposed_direction="BULLISH", support=118.0, resistance=122.0,
+        indicator_history=indicator_history_test,
+    )
+    assert seeded_regime_test["indicator_history_bars"] == len(indicator_history_test)
+    assert math.isfinite(seeded_regime_test["adx"]), seeded_regime_test
+    assert math.isfinite(seeded_regime_test["rsi_3m"]), seeded_regime_test
+    assert math.isfinite(seeded_regime_test["rsi_15m"]), seeded_regime_test
+
+    # Without prior history, 11 current-session bars must not fabricate a value;
+    # the matrix stays safely UNKNOWN until a genuine ADX warm-up exists.
+    unseeded_regime_test = classify_market_regime(
+        opening_session_test, current_spot=121.0, current_vwap=119.0,
+        proposed_direction="BULLISH", support=118.0, resistance=122.0,
+    )
+    assert not math.isfinite(unseeded_regime_test["adx"])
+    assert unseeded_regime_test["intensity"] == "UNKNOWN"
+
+    # V32 regression: historical candle seeding is cached for the trading date,
+    # preventing repeat historical API calls on every scheduled scan.
+    cache_test_state: dict[str, Any] = {}
+    indicator_test_now = datetime(2026, 10, 12, 9, 50, tzinfo=IST)
+    original_get_historical = get_historical_candles
+    historical_fetch_calls = {"count": 0}
+    def fake_historical_index_fetch(instrument_key: str, interval_minutes: int) -> pd.DataFrame:
+        historical_fetch_calls["count"] += 1
+        assert instrument_key == NIFTY_KEY and interval_minutes == 3
+        return indicator_history_test.copy()
+    try:
+        get_historical_candles = fake_historical_index_fetch
+        cached_history_first = get_regime_indicator_history(
+            cache_test_state, NIFTY_KEY, now=indicator_test_now
+        )
+        get_historical_candles = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("historical cache was not reused"))
+        cached_history_second = get_regime_indicator_history(
+            cache_test_state, NIFTY_KEY, now=indicator_test_now
+        )
+    finally:
+        get_historical_candles = original_get_historical
+    assert historical_fetch_calls["count"] == 1
+    assert len(cached_history_first) == len(cached_history_second) > 0
+
+    # V33 regression: prior-session futures candles are cached by date and contract.
+    futures_cache_state: dict[str, Any] = {}
+    futures_history_calls = {"count": 0}
+    futures_instrument_test = "NSE_FO|NIFTY_FUT_TEST"
+    def fake_historical_futures_fetch(instrument_key: str, interval_minutes: int) -> pd.DataFrame:
+        futures_history_calls["count"] += 1
+        assert instrument_key == futures_instrument_test and interval_minutes == 3
+        result = indicator_history_test.copy()
+        result["oi"] = np.linspace(100000.0, 101000.0, len(result))
+        return result
+    try:
+        get_historical_candles = fake_historical_futures_fetch
+        cached_futures_first = get_cached_futures_oi_history(
+            futures_cache_state, futures_instrument_test, now=indicator_test_now
+        )
+        get_historical_candles = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("futures historical cache was not reused"))
+        cached_futures_second = get_cached_futures_oi_history(
+            futures_cache_state, futures_instrument_test, now=indicator_test_now
+        )
+    finally:
+        get_historical_candles = original_get_historical
+    assert futures_history_calls["count"] == 1
+    assert len(cached_futures_first) == len(cached_futures_second) > 0
+    assert "oi" in cached_futures_second.columns and cached_futures_second["oi"].notna().all()
+
+    # V33 regression: a confirmed two-bars-vs-two-bars current-session 15m RSI
+    # divergence is detectable earlier; prior-session swings are not silently joined.
+    divergence_frame = pd.DataFrame({
+        "timestamp": pd.date_range("2026-10-12 09:15", periods=4, freq="15min", tz="Asia/Kolkata").tz_convert("UTC"),
+        "open": [102.0, 101.0, 100.0, 99.0],
+        "high": [103.0, 102.0, 101.0, 100.0],
+        "low": [100.0, 99.0, 98.0, 97.0],
+        "close": [101.0, 100.0, 99.0, 98.0],
+        "volume": [1000.0] * 4,
+    })
+    early_divergence = detect_rsi_divergence(
+        divergence_frame, window=2, rsi_values=pd.Series([30.0, 35.0, 40.0, 42.0])
+    )
+    assert early_divergence == "BULLISH", early_divergence
+
+    # V33 regression: score is calibrated to [0,1] so the +0.500 veto is meaningful.
+    assert 0.0 <= normalized_execution_score(1.0, 1.0, 3.5, 1.0) <= 1.0
+    assert normalized_execution_score(1.0, 1.0, 3.5, 1.0) == 1.0
+    weak_score = normalized_execution_score(0.1, 0.5, 0.0, 0.5)
+    assert weak_score < MIN_EXECUTION_SCORE, weak_score
+    assert math.isclose(normalized_execution_score(1.0, 1.0, 0.0, 1.0), 0.80)
+    assert normalized_execution_score(1.0, 1.0, 0.0, 1.0, coi_available=False) == 0.80
+    assert normalized_execution_score(0.1, 0.75, 0.0, 0.667, coi_available=False) < MIN_EXECUTION_SCORE
+    score_without_coi = normalized_execution_score(0.6, 0.7, 0.0, 0.7, coi_available=False)
+    score_with_positive_coi = normalized_execution_score(0.6, 0.7, 1.0, 0.7, coi_available=True)
+    assert score_with_positive_coi > score_without_coi
 
     # Regression: a weak intraday snapshot must not override the clearly bullish
     # session Change-OI score seen around 09:25 IST on 2026-10-09.
@@ -5895,6 +6474,31 @@ def self_test() -> None:
     assert ce_without_velocity.option_type == "CE"
     assert ce_without_velocity.oi_momentum_score == 0.0
     assert math.isnan(ce_without_velocity.oi_velocity_baseline_minutes)
+
+    # V33 end-to-end regression: normalized score makes the +0.500 veto
+    # effective for a premium-VWAP marginal, inverse-flow, no-COI candidate.
+    weak_chain = json.loads(json.dumps(simple_chain))
+    for row in weak_chain:
+        row["call_options"]["option_greeks"]["delta"] = 0.50
+    weak_flow = {
+        float(row["strike_price"]): {"call_bias": -1, "put_bias": 0}
+        for row in weak_chain
+    }
+    weak_vwaps = {
+        str(side["instrument_key"]): {"premium_vwap": 99.99}
+        for row in weak_chain
+        for side in (row["call_options"], row["put_options"])
+    }
+    try:
+        select_directional_option(
+            weak_chain, "BULLISH", 74100.0, change_oi_by_strike=weak_flow,
+            market_intensity="NORMAL", now=test_now,
+            option_metrics_by_instrument=weak_vwaps, oi_velocity_by_strike={},
+        )
+        raise AssertionError("normalized minimum-quality veto must reject weak candidate")
+    except ScannerError as exc:
+        assert "MINIMUM_QUALITY_SCORE_VETO" in str(exc), str(exc)
+
     validate_continuous_option_entry(
         ce, simple_chain, "BULLISH", "CONTINUOUS_BULLISH", 74100.0,
         market_intensity="NORMAL", now=test_now,
@@ -6129,6 +6733,25 @@ def self_test() -> None:
     })
     stagnant, _ = stagnation_exit_trigger({"opened_at": "2026-09-10 09:15:00 IST"}, flat5)
     assert stagnant
+    # V34 regression: a tight but steadily advancing 5m range must not trigger
+    # theta stagnation while the active trade, index VWAP and Change-OI remain aligned.
+    rising5 = pd.DataFrame({
+        "timestamp": pd.date_range("2026-09-10 09:20", periods=3, freq="5min", tz="Asia/Kolkata").tz_convert("UTC"),
+        "open": [100.00, 100.02, 100.04], "high": [100.025, 100.045, 100.065],
+        "low": [99.995, 100.015, 100.035], "close": [100.02, 100.04, 100.06],
+        "volume": [1000, 1000, 1000],
+    })
+    aligned_bullish_structure = type("AlignedStructure", (), {
+        "direction": "BULLISH", "market_phase": "CONTINUOUS_BULLISH", "entry_confirmed": True,
+        "vwap": 99.50,
+        "components": {"structure_vwap": 1.0, "structure_change_oi": 0.45,
+                       "structure_change_oi_conflict": 0.0},
+    })()
+    aligned_result, aligned_reason = stagnation_exit_trigger(
+        {"direction": "BULLISH", "opened_at": "2026-09-10 09:15:00 IST"},
+        rising5, market_structure=aligned_bullish_structure,
+    )
+    assert not aligned_result and "SUPPRESSED_ALIGNED_CONTINUATION" in aligned_reason, aligned_reason
     # Exactly 0.10% must trigger (inclusive <= threshold).
     exact_flat5 = pd.DataFrame({
         "timestamp": pd.date_range("2026-09-10 09:20", periods=3, freq="5min", tz="Asia/Kolkata").tz_convert("UTC"),
@@ -6137,6 +6760,12 @@ def self_test() -> None:
     })
     exact_stagnant, _ = stagnation_exit_trigger({"opened_at": "2026-09-10 09:15:00 IST"}, exact_flat5)
     assert exact_stagnant
+    # A bar that started before entry cannot count, even if it closes afterwards.
+    partial_pre_entry = flat5.iloc[:3].copy()
+    pre_entry_result, pre_entry_reason = stagnation_exit_trigger(
+        {"opened_at": "2026-09-10 09:22:00 IST"}, partial_pre_entry
+    )
+    assert not pre_entry_result and "only 2 eligible" in pre_entry_reason, pre_entry_reason
     # Missing a 5m interval must not be misrepresented as three consecutive bars.
     gap5 = flat5.copy()
     gap5.loc[2, "timestamp"] = gap5.loc[2, "timestamp"] + pd.Timedelta(minutes=5)
