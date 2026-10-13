@@ -1,5 +1,5 @@
 """
-NIFTY 50 Predictive Options Scanner — V36 Scenario Integrity and Material OI Walls
+NIFTY 50 Predictive Options Scanner — V38 Local COI Scope and Verified Futures Context
 
 What this version fixes:
 - Uses the NIFTY INDEX as the primary market-price/VWAP/intraday structure feed.
@@ -10,6 +10,16 @@ What this version fixes:
 - Compares Call OI vs Put OI at every strike; emits per-strike support/resistance,
   reliability and breakout/breakdown watches; the four market scenarios use futures price + futures OI.
 - Uses option-chain OI concentration and Change-in-OI to derive dynamic structural walls.
+- Uses ATM +/-4 as the decision scope for local aggregate Change-OI, rolling/cumulative
+  COI confirmation, OI guard events, support/resistance, targets, stops, and strike ranking.
+  One full-chain response/snapshot is retained for history; no per-strike API calls are added.
+- From 09:15-09:45, cumulative COI from the earliest valid same-session snapshot is weighted
+  at 0.35; until a baseline exists, only local ATM-window API/chain Change-OI is the fallback.
+  From 09:45, valid local 15-30 minute velocity is primary; a neutral valid window is not
+  overridden by a day-total score.
+- Checks the selected futures contract's symbol/expiry and explicit quote timestamps. Stale
+  futures quotes are excluded from secondary derivatives confirmation; unavailable timestamps
+  are marked unverified. Basis outliers warn for inspection but never override NIFTY structure.
 - Supports early-session classification from at least five completed 3-minute bars when
   indicator-history seeding is unavailable but live VWAP/price structure is aligned.
 - Detects confirmed completed-bar breaks of prior OI levels, including a permitted
@@ -33,8 +43,8 @@ What this version fixes:
   older v2 intraday candle API is deprecated.
 
 Run:
-    python market_scanner_v37_atm_window_structural_guard.py --self-test
-    python market_scanner_v37_atm_window_structural_guard.py
+    python market_scanner_v38_local_coi_verified_futures.py --self-test
+    python market_scanner_v38_local_coi_verified_futures.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -110,6 +120,9 @@ LOCAL_BREAK_MIN_PRESSURE = min(-0.05, float(os.getenv("LOCAL_BREAK_MIN_PRESSURE"
 
 # Hard limit for all primary option-strike decisions: ATM plus/minus four strike steps.
 ATM_ANALYSIS_RADIUS_LEVELS = 4
+COI_WINDOW_MIN_COVERAGE_FRACTION = min(1.0, max(0.50, float(os.getenv("COI_WINDOW_MIN_COVERAGE_FRACTION", "0.60"))))
+FUTURES_QUOTE_MAX_AGE_SECONDS = max(30, int(os.getenv("FUTURES_QUOTE_MAX_AGE_SECONDS", "180")))
+FUTURES_BASIS_WARNING_PCT = max(0.001, float(os.getenv("FUTURES_BASIS_WARNING_PCT", "0.004")))
 
 
 # Market-state memory. This prevents a neutral scan from erasing the last
@@ -127,7 +140,7 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-13-STRUCTURE-V37-DYNAMIC-ATM-PLUS-MINUS-4-LOCAL-PA-OI"
+SCANNER_VERSION = "2026-10-13-STRUCTURE-V38-LOCAL-COI-VERIFIED-FUTURES-ATM4"
 # PA/OI target construction is unchanged; keep the V30 target engine identifier so
 # existing live trades are not needlessly re-migrated by entry-filter-only changes.
 OPTION_TARGET_ENGINE_VERSION = "V30_DYNAMIC_COI_MATRIX_PA_OI"
@@ -750,6 +763,74 @@ def extract_ltp(quote: dict[str, Any]) -> float:
     raise ScannerError("LTP not present in quote.")
 
 
+def quote_freshness_status(
+    quote: Optional[dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+    max_age_seconds: int = FUTURES_QUOTE_MAX_AGE_SECONDS,
+) -> dict[str, Any]:
+    """Assess an explicitly timestamped quote; absence of timestamp is UNVERIFIED, not assumed stale."""
+    current = now or now_ist()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=IST)
+    current = current.astimezone(IST)
+    if not isinstance(quote, dict):
+        return {"status": "UNAVAILABLE", "field": "", "age_seconds": float("nan"), "timestamp": ""}
+
+    timestamp_fields = (
+        "last_trade_time", "last_trade_timestamp", "exchange_timestamp",
+        "last_traded_time", "timestamp", "lastTradeTime",
+    )
+    selected_field = ""
+    parsed: Optional[pd.Timestamp] = None
+    for field in timestamp_fields:
+        raw = quote.get(field)
+        if raw is None or str(raw).strip() == "":
+            continue
+        selected_field = field
+        try:
+            numeric = safe_float(raw, float("nan"))
+            if math.isfinite(numeric) and numeric > 1_000_000_000:
+                if numeric >= 100_000_000_000_000_000:
+                    unit = "ns"
+                elif numeric >= 100_000_000_000_000:
+                    unit = "us"
+                elif numeric >= 100_000_000_000:
+                    unit = "ms"
+                else:
+                    unit = "s"
+                parsed = pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce")
+            else:
+                parsed = pd.Timestamp(raw)
+                if not pd.isna(parsed):
+                    if parsed.tzinfo is None:
+                        parsed = parsed.tz_localize(IST)
+                    else:
+                        parsed = parsed.tz_convert(IST)
+            if parsed is not None and not pd.isna(parsed):
+                parsed = parsed.tz_convert(IST) if parsed.tzinfo is not None else parsed.tz_localize(IST)
+                break
+        except (TypeError, ValueError, OverflowError):
+            parsed = None
+        parsed = None
+
+    if parsed is None or pd.isna(parsed):
+        return {"status": "UNVERIFIED", "field": selected_field, "age_seconds": float("nan"), "timestamp": ""}
+    age = (pd.Timestamp(current) - parsed).total_seconds()
+    if age < -60.0:
+        status = "FUTURE_TIMESTAMP"
+    elif age > max(30, int(max_age_seconds)):
+        status = "STALE"
+    else:
+        status = "FRESH"
+    return {
+        "status": status,
+        "field": selected_field,
+        "age_seconds": float(age),
+        "timestamp": parsed.isoformat(),
+    }
+
+
 # =============================================================================
 # INSTRUMENT DISCOVERY
 # =============================================================================
@@ -764,8 +845,13 @@ def get_current_nifty_future(state: Optional[dict[str, Any]] = None) -> FuturesC
             expiry = parse_date(str(cached.get("expiry", "")))
             key = str(cached.get("instrument_key", "")).strip()
             symbol = str(cached.get("trading_symbol", "")).strip()
-            if key and symbol and expiry and expiry >= today:
-                return FuturesContract(key, symbol, expiry.isoformat())
+            if key and symbol and expiry and expiry >= today and "NIFTY" in symbol.upper():
+                contract = FuturesContract(key, symbol, expiry.isoformat())
+                logger.info(
+                    "FUTURES CONTRACT VALIDATION: source=STATE_CACHE symbol=%s expiry=%s expiry_valid=%s key=%s",
+                    contract.trading_symbol, contract.expiry, contract.expiry >= today.isoformat(), contract.instrument_key,
+                )
+                return contract
 
     candidates: list[dict[str, Any]] = []
 
@@ -811,9 +897,9 @@ def get_current_nifty_future(state: Optional[dict[str, Any]] = None) -> FuturesC
     selected = valid[0]
 
     logger.info(
-        "Selected NIFTY future: %s | expiry=%s | key=%s",
-        selected["trading_symbol"],
-        selected["expiry"],
+        "FUTURES CONTRACT VALIDATION: source=INSTRUMENT_SEARCH symbol=%s expiry=%s expiry_valid=%s key=%s",
+        selected["trading_symbol"], selected["expiry"],
+        bool(parse_date(str(selected["expiry"])) and parse_date(str(selected["expiry"])) >= today),
         selected["instrument_key"],
     )
 
@@ -2432,22 +2518,38 @@ def update_option_oi_velocity_history(
             ),
         }
 
-    # Detect long-unwinding/profit-booking separately from true short covering.
-    # A counter-trend signal remains blocked until fresh structural writing confirms it.
+    # Keep the full chain in the history ring so the baseline survives ATM shifts,
+    # but scope all live profit-booking/guard decisions to the current ATM +/-4 window.
+    try:
+        if math.isfinite(current_spot) and current_spot > 0:
+            _, active_window_meta = option_chain_atm_window(chain, current_spot)
+            active_window_strikes = {float(x) for x in active_window_meta.get("window_strikes", [])}
+        else:
+            active_window_strikes = set()
+    except ScannerError:
+        active_window_strikes = set()
+    decision_velocity_by_strike = {
+        float(k): v for k, v in by_strike.items()
+        if float(k) in active_window_strikes and isinstance(v, dict)
+    }
+    logger.info(
+        "COI HISTORY/DECISION SCOPE: full_chain_snapshots_retained=%d contracts; current_window_velocity=%d/%d strikes",
+        len(current_by_contract), len(decision_velocity_by_strike), len(active_window_strikes),
+    )
     profit_booking_event: Optional[dict[str, Any]] = None
     call_long_unwind = any(
         math.isfinite(v.get("call_oi_change_pct", float("nan")))
         and v["call_oi_change_pct"] <= -COI_STRONG_CHANGE_PCT
         and math.isfinite(v.get("call_ltp_change_pct", float("nan")))
         and v["call_ltp_change_pct"] <= -STRUCTURE_ACTIVITY_PRICE_NOISE_PCT
-        for v in by_strike.values()
+        for v in decision_velocity_by_strike.values()
     )
     put_long_unwind = any(
         math.isfinite(v.get("put_oi_change_pct", float("nan")))
         and v["put_oi_change_pct"] <= -COI_STRONG_CHANGE_PCT
         and math.isfinite(v.get("put_ltp_change_pct", float("nan")))
         and v["put_ltp_change_pct"] <= -STRUCTURE_ACTIVITY_PRICE_NOISE_PCT
-        for v in by_strike.values()
+        for v in decision_velocity_by_strike.values()
     )
     if math.isfinite(underlying_change_pct):
         if underlying_change_pct <= -COI_UNDERLYING_MOVE_PCT and call_long_unwind:
@@ -2463,7 +2565,7 @@ def update_option_oi_velocity_history(
                 "underlying_change_pct": underlying_change_pct,
             }
 
-    rows_for_writing = [(float(k), v) for k, v in by_strike.items()]
+    rows_for_writing = [(float(k), v) for k, v in decision_velocity_by_strike.items()]
     strike_step_value = max(strike_step(sorted(rows)), 1.0) if rows else 50.0
     def fresh_structural_writing(direction: str) -> bool:
         if not math.isfinite(current_spot) or not by_strike:
@@ -3134,10 +3236,176 @@ def get_change_oi_confirmation(
     bias = 1 if score > 0.10 else -1 if score < -0.10 else 0
 
     logger.info(
-        "CHANGE-OI CONFIRMATION: put_change=%+.0f call_change=%+.0f score=%+.3f bias=%+d per_strike=%d",
+        "CHANGE-OI FULL-CHAIN DIAGNOSTIC: put_change=%+.0f call_change=%+.0f score=%+.3f bias=%+d per_strike=%d",
         put_change, call_change, score, bias, len(by_strike),
     )
     return bias, score, by_strike
+
+
+def local_change_oi_confirmation(
+    chain: list[dict[str, Any]],
+    spot: float,
+    change_oi_by_strike: Optional[dict[float, dict[str, float]]],
+    *,
+    now: Optional[datetime] = None,
+) -> tuple[float, dict[float, dict[str, Any]], dict[str, Any]]:
+    """Return the directional Change-OI score and per-strike map for ATM +/-4 only.
+
+    The full-chain API response remains a single fetch. When per-strike API rows
+    are incomplete, the helper falls back only to OI-prev_OI from strikes in the
+    same local window; it never falls back to the full-chain aggregate.
+    """
+    decision_chain, meta = option_chain_atm_window(chain, spot)
+    rows = chain_rows(decision_chain)
+    api_map: dict[float, dict[str, Any]] = {}
+    for raw_strike, detail in (change_oi_by_strike or {}).items():
+        strike = safe_float(raw_strike, float("nan"))
+        if math.isfinite(strike) and strike in rows and isinstance(detail, dict):
+            api_map[float(strike)] = dict(detail)
+
+    window_count = len(rows)
+    min_coverage = max(1, int(math.ceil(window_count * COI_WINDOW_MIN_COVERAGE_FRACTION)))
+    api_rows: dict[float, dict[str, Any]] = {}
+    for strike in rows:
+        detail = api_map.get(float(strike))
+        if not isinstance(detail, dict):
+            continue
+        call_value = safe_float(detail.get("call_oi_change", detail.get("call_change")), float("nan"))
+        put_value = safe_float(detail.get("put_oi_change", detail.get("put_change")), float("nan"))
+        if math.isfinite(call_value) and math.isfinite(put_value):
+            enriched = dict(detail)
+            enriched.update({
+                "call_oi_change": call_value, "put_oi_change": put_value,
+                "call_change": call_value, "put_change": put_value,
+            })
+            api_rows[float(strike)] = enriched
+
+    local_map: dict[float, dict[str, Any]] = {}
+    if len(api_rows) >= min_coverage:
+        local_map = api_rows
+        source = "ATM_WINDOW_PER_STRIKE_API"
+        covered = len(api_rows)
+    else:
+        # If the API's per-strike data is incomplete, use previous-OI fields from
+        # the already-fetched option chain, but only if enough local levels have them.
+        fallback: dict[float, dict[str, Any]] = {}
+        for strike, row in rows.items():
+            ce = option_side_data(row, "CE")
+            pe = option_side_data(row, "PE")
+            ce_oi, ce_prev = safe_float(ce.get("oi"), float("nan")), safe_float(ce.get("prev_oi"), float("nan"))
+            pe_oi, pe_prev = safe_float(pe.get("oi"), float("nan")), safe_float(pe.get("prev_oi"), float("nan"))
+            if not all(math.isfinite(v) and v > 0 for v in (ce_oi, ce_prev, pe_oi, pe_prev)):
+                continue
+            c_change, p_change = ce_oi - ce_prev, pe_oi - pe_prev
+            c_close, p_close = safe_float(ce.get("close_price"), float("nan")), safe_float(pe.get("close_price"), float("nan"))
+            c_ltp, p_ltp = safe_float(ce.get("ltp"), float("nan")), safe_float(pe.get("ltp"), float("nan"))
+            c_pct = (c_ltp - c_close) / c_close if math.isfinite(c_close) and c_close > 0 and math.isfinite(c_ltp) else 0.0
+            p_pct = (p_ltp - p_close) / p_close if math.isfinite(p_close) and p_close > 0 and math.isfinite(p_ltp) else 0.0
+            c_activity, c_bias = classify_option_flow("CE", c_pct, c_change)
+            p_activity, p_bias = classify_option_flow("PE", p_pct, p_change)
+            fallback[float(strike)] = {
+                "call_oi_change": c_change, "put_oi_change": p_change,
+                "call_change": c_change, "put_change": p_change,
+                "call_bias": c_bias, "put_bias": p_bias,
+                "call_activity": c_activity, "put_activity": p_activity,
+                "call_price_change_pct": c_pct, "put_price_change_pct": p_pct,
+                "source": "OPTION_CHAIN_PREV_OI_FALLBACK",
+            }
+        if len(fallback) >= min_coverage:
+            local_map = fallback
+            source = "ATM_WINDOW_OPTION_CHAIN_PREV_OI"
+            covered = len(fallback)
+        else:
+            # Keep any valid window API details for strike-level diagnostics, but
+            # do not manufacture an aggregate directional score from weak coverage.
+            local_map = api_rows
+            source = "WINDOW_COI_INSUFFICIENT_COVERAGE"
+            covered = len(api_rows)
+
+    call_total = sum(safe_float(detail.get("call_oi_change", detail.get("call_change")), 0.0) for detail in local_map.values())
+    put_total = sum(safe_float(detail.get("put_oi_change", detail.get("put_change")), 0.0) for detail in local_map.values())
+    denominator = abs(call_total) + abs(put_total)
+    raw_score = (put_total - call_total) / denominator if denominator > 0 and covered >= min_coverage else 0.0
+    current_time = now or now_ist()
+    current_time = current_time.replace(tzinfo=IST) if current_time.tzinfo is None else current_time.astimezone(IST)
+    cold_start = current_time.time() < COI_COLD_START_END
+    weight = COI_COLD_START_WEIGHT if cold_start else 1.0
+    weighted_score = raw_score * weight
+    bias = 1 if weighted_score >= 0.10 else -1 if weighted_score <= -0.10 else 0
+    meta_out = {
+        **meta,
+        "source": source,
+        "coverage": int(covered),
+        "required_coverage": int(min_coverage),
+        "call_change_sum": float(call_total),
+        "put_change_sum": float(put_total),
+        "raw_score": float(raw_score),
+        "weight": float(weight),
+        "weighted_score": float(weighted_score),
+        "bias": int(bias),
+        "protocol": "COLD_START_CUMULATIVE_OR_API_WARMUP" if cold_start else "LOCAL_DAY_CHANGE_FALLBACK",
+    }
+    logger.info(
+        "ATM CHANGE-OI DECISION SCOPE: spot=%.2f ATM=%.0f window=%d/%d coverage=%d/%d source=%s "
+        "call_change=%+.0f put_change=%+.0f raw_score=%+.3f weight=%.2f effective_score=%+.3f bias=%+d",
+        spot, safe_float(meta.get("atm_strike")), len(rows), full_chain_count_for_log(chain),
+        covered, window_count, source, call_total, put_total, raw_score, weight, weighted_score, bias,
+    )
+    return float(weighted_score), local_map, meta_out
+
+
+def full_chain_count_for_log(chain: list[dict[str, Any]]) -> int:
+    """Safe full-chain count for diagnostic logging."""
+    try:
+        return len(chain_rows(chain))
+    except ScannerError:
+        return 0
+
+
+def aggregate_atm_window_coi_velocity(
+    chain: list[dict[str, Any]],
+    spot: float,
+    velocity_by_strike: Optional[dict[float, dict[str, Any]]],
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Aggregate cumulative-opening/rolling COI velocity inside current ATM +/-4 only."""
+    decision_chain, meta = option_chain_atm_window(chain, spot)
+    rows = chain_rows(decision_chain)
+    current_time = now or now_ist()
+    current_time = current_time.replace(tzinfo=IST) if current_time.tzinfo is None else current_time.astimezone(IST)
+    cold_start = current_time.time() < COI_COLD_START_END
+    expected_mode = "COLD_START_CUMULATIVE" if cold_start else "ROLLING_15_30"
+    minimum = max(1, int(math.ceil(len(rows) * COI_WINDOW_MIN_COVERAGE_FRACTION)))
+    covered_rows: list[dict[str, Any]] = []
+    for strike in rows:
+        detail = (velocity_by_strike or {}).get(float(strike), {})
+        if not isinstance(detail, dict) or not bool(detail.get("available")):
+            continue
+        mode = str(detail.get("baseline_mode", "")).upper()
+        if mode != expected_mode:
+            continue
+        call_change = safe_float(detail.get("call_oi_change"), float("nan"))
+        put_change = safe_float(detail.get("put_oi_change"), float("nan"))
+        if bool(detail.get("call_available", math.isfinite(call_change))) and bool(detail.get("put_available", math.isfinite(put_change))) and math.isfinite(call_change) and math.isfinite(put_change):
+            covered_rows.append(detail)
+    call_total = sum(safe_float(item.get("call_oi_change"), 0.0) for item in covered_rows)
+    put_total = sum(safe_float(item.get("put_oi_change"), 0.0) for item in covered_rows)
+    den = abs(call_total) + abs(put_total)
+    available = len(covered_rows) >= minimum and den > 0
+    raw_score = (put_total - call_total) / den if available else 0.0
+    weight = COI_COLD_START_WEIGHT if cold_start else 1.0
+    weighted_score = raw_score * weight
+    baseline_ages = [safe_float(item.get("baseline_minutes"), float("nan")) for item in covered_rows]
+    baseline_ages = [age for age in baseline_ages if math.isfinite(age)]
+    return {
+        "available": bool(available), "baseline_mode": expected_mode if available else "UNAVAILABLE",
+        "coverage": len(covered_rows), "required_coverage": minimum, "window_count": len(rows),
+        "window_strikes": list(meta.get("window_strikes", [])),
+        "call_change_sum": float(call_total), "put_change_sum": float(put_total),
+        "raw_score": float(raw_score), "weight": float(weight), "score": float(weighted_score),
+        "baseline_age_minutes": float(np.median(baseline_ages)) if baseline_ages else float("nan"),
+    }
 
 
 
@@ -3391,17 +3659,24 @@ def resolve_change_oi_flow(
     intra_directional = intra_abs >= STRUCTURE_CHANGE_OI_CONFIRM
     day_directional = day_abs >= STRUCTURE_CHANGE_OI_STRONG
 
-    if str(flow_mode).upper() == "INTRADAY_SNAPSHOT" and intra_directional:
+    mode = str(flow_mode).upper()
+    primary_window_modes = {"INTRADAY_SNAPSHOT", "COLD_START_CUMULATIVE", "ROLLING_15_30"}
+    if mode in primary_window_modes and intra_directional:
         # Do not let one small scan-to-scan snapshot reverse a clearly directional
         # session-level Change-OI signal. If both sources are directional and
         # disagree, preserve the conflict and block a new entry until they align.
-        # This specifically guards the 09-Oct case: intraday=-0.155 vs day=+0.760.
         if day_directional and (intra * day) < 0:
             return 0.0, 0, "INTRADAY_DAY_CONFLICT", True
         bias = 1 if intra >= STRUCTURE_CHANGE_OI_CONFIRM else -1
-        return intra, bias, "INTRADAY_PRIMARY", False
+        return intra, bias, "INTRADAY_PRIMARY" if mode == "INTRADAY_SNAPSHOT" else mode + "_PRIMARY", False
 
-    # Neutral/empty intraday snapshot: fall back to the aggregate current-session
+    # A valid cumulative-opening or rolling-window measure that is neutral is
+    # not overridden by a stronger day-total score. That would reintroduce a
+    # day/full-chain signal precisely when the current local window is neutral.
+    if mode in {"COLD_START_CUMULATIVE", "ROLLING_15_30"}:
+        return 0.0, 0, mode + "_NEUTRAL", False
+
+    # Neutral/empty intraday snapshot: fall back to the local current-session
     # Change-OI endpoint rather than turning a clearly bearish/bullish session into
     # SIDEWAYS merely because the latest scan's local changes cancelled out.
     if day_directional:
@@ -5962,11 +6237,44 @@ def execute_scan(
     futures_session = get_current_session_3m_candles(future.instrument_key)
     futures_live_quote = get_quote(future.instrument_key)
     futures_ltp_now = extract_ltp(futures_live_quote)
+    futures_quote_check = quote_freshness_status(futures_live_quote, now=now_ist())
+    futures_quote_status = str(futures_quote_check.get("status", "UNVERIFIED"))
+    futures_analysis_quote: Optional[dict[str, Any]] = futures_live_quote
+    if futures_quote_status in {"STALE", "FUTURE_TIMESTAMP", "UNAVAILABLE"}:
+        futures_analysis_quote = None
+        logger.warning(
+            "FUTURES LIVE QUOTE EXCLUDED FROM DERIVATIVES CONFIRMATION: status=%s field=%s age_seconds=%s; "
+            "NIFTY index remains the primary decision feed.",
+            futures_quote_status, futures_quote_check.get("field", "NA"),
+            f"{safe_float(futures_quote_check.get('age_seconds'), float('nan')):.1f}"
+            if math.isfinite(safe_float(futures_quote_check.get("age_seconds"), float("nan"))) else "NA",
+        )
+    elif futures_quote_status == "UNVERIFIED":
+        logger.warning(
+            "FUTURES QUOTE FRESHNESS UNVERIFIED: timestamp field unavailable; quote is retained but not independently freshness-verified."
+        )
+    else:
+        logger.info(
+            "FUTURES QUOTE FRESHNESS: status=%s field=%s age_seconds=%.1f timestamp=%s",
+            futures_quote_status, futures_quote_check.get("field", "NA"),
+            safe_float(futures_quote_check.get("age_seconds"), float("nan")),
+            futures_quote_check.get("timestamp", "NA"),
+        )
 
+    basis = futures_ltp_now - spot
+    basis_pct = basis / spot if spot > 0 else float("nan")
     logger.info(
-        "UNDERLYING PRICES: index_spot=%.2f futures_ltp=%.2f basis=%+.2f",
-        spot, futures_ltp_now, futures_ltp_now - spot,
+        "UNDERLYING PRICES: index_spot=%.2f futures_ltp=%.2f basis=%+.2f basis_pct=%+.3f%% "
+        "futures_symbol=%s expiry=%s quote_status=%s",
+        spot, futures_ltp_now, basis, basis_pct * 100.0 if math.isfinite(basis_pct) else float("nan"),
+        future.trading_symbol, future.expiry, futures_quote_status,
     )
+    if math.isfinite(basis_pct) and abs(basis_pct) >= FUTURES_BASIS_WARNING_PCT:
+        logger.warning(
+            "FUTURES BASIS ANOMALY CHECK: basis=%+.2f (%+.3f%%) exceeds diagnostic threshold %.3f%%. "
+            "Verify symbol/expiry and quote freshness; basis alone will not veto NIFTY index signals.",
+            basis, basis_pct * 100.0, FUTURES_BASIS_WARNING_PCT * 100.0,
+        )
 
     if index_session.empty:
         ltp = spot
@@ -5983,18 +6291,22 @@ def execute_scan(
         logger.warning("INDEX SESSION: using live index quote proxy until candles arrive.")
 
     if futures_session.empty:
-        ltp = futures_ltp_now
-        opening_ts = pd.Timestamp(now_ist()).tz_convert("UTC")
-        futures_session = pd.DataFrame([{
-            "timestamp": opening_ts,
-            "open": ltp,
-            "high": ltp,
-            "low": ltp,
-            "close": ltp,
-            "volume": safe_float(futures_live_quote.get("volume"), 0.0),
-            "oi": _extract_quote_oi(futures_live_quote),
-        }])
-        logger.warning("FUTURES SESSION: using live futures quote proxy until candles arrive.")
+        if futures_analysis_quote is not None:
+            ltp = futures_ltp_now
+            opening_ts = pd.Timestamp(now_ist()).tz_convert("UTC")
+            futures_session = pd.DataFrame([{
+                "timestamp": opening_ts,
+                "open": ltp,
+                "high": ltp,
+                "low": ltp,
+                "close": ltp,
+                "volume": safe_float(futures_analysis_quote.get("volume"), 0.0),
+                "oi": _extract_quote_oi(futures_analysis_quote),
+            }])
+            logger.warning("FUTURES SESSION: using live futures quote proxy until candles arrive.")
+        else:
+            futures_session = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+            logger.warning("FUTURES SESSION: no reliable live quote/candles; futures context will be unavailable this scan.")
 
     # NIFTY index is always the price series. If index candles have no usable
     # volume, use timestamp-matched NIFTY futures volume only as the VWAP weight.
@@ -6024,9 +6336,14 @@ def execute_scan(
     # Historical futures bars are cached once per trading date and selected
     # futures instrument. Current-session futures candles and live quotes remain
     # fresh on every scan and are never replaced by this historical cache.
-    historical_completed = get_cached_futures_oi_history(
-        state, future.instrument_key, now=current_time
-    )
+    if futures_session.empty and futures_analysis_quote is None:
+        # Do not classify a current market regime from stale prior-session futures data.
+        historical_completed = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+        logger.warning("FUTURES HISTORY SKIPPED: no reliable current-session futures quote or candles.")
+    else:
+        historical_completed = get_cached_futures_oi_history(
+            state, future.instrument_key, now=current_time
+        )
 
     if futures_session.empty:
         futures_3m = historical_completed.tail(40).copy()
@@ -6045,7 +6362,10 @@ def execute_scan(
 
     # Build the option-chain structure directly from current OI and Change-OI.
     expiry, chain = get_option_chain(state)
-    _, change_oi_score, change_oi_by_strike = get_change_oi_confirmation(expiry)
+    _, full_chain_change_oi_score, full_chain_change_oi_by_strike = get_change_oi_confirmation(expiry)
+    change_oi_score, change_oi_by_strike, local_change_oi_meta = local_change_oi_confirmation(
+        chain, spot, full_chain_change_oi_by_strike, now=now_ist()
+    )
     previous_snapshot = state.get("market_snapshot") if isinstance(state.get("market_snapshot"), dict) else {}
     previous_option_snapshot = state.get("option_oi_snapshot") if isinstance(state.get("option_oi_snapshot"), dict) else {}
     chain_levels = chain_oi_support_resistance(
@@ -6062,6 +6382,50 @@ def execute_scan(
     # they deduplicate exactly rather than storing near-identical samples.
     oi_snapshot_time = now_ist()
     oi_velocity_by_strike = update_option_oi_velocity_history(state, chain, expiry, now=oi_snapshot_time, spot=spot)
+    window_velocity = aggregate_atm_window_coi_velocity(
+        chain, spot, oi_velocity_by_strike, now=oi_snapshot_time
+    )
+    if bool(window_velocity.get("available")):
+        primary_score = safe_float(window_velocity.get("score"), 0.0)
+        chain_levels["change_flow_score"] = primary_score
+        chain_levels["change_flow_bias"] = 1 if primary_score >= STRUCTURE_CHANGE_OI_CONFIRM else -1 if primary_score <= -STRUCTURE_CHANGE_OI_CONFIRM else 0
+        chain_levels["pressure_score"] = primary_score
+        chain_levels["normalized_diff"] = primary_score
+        chain_levels["flow_mode"] = str(window_velocity.get("baseline_mode", "INTRADAY_SNAPSHOT"))
+        chain_levels["coi_decision_source"] = str(window_velocity.get("baseline_mode", "UNAVAILABLE"))
+        chain_levels["coi_decision_coverage"] = int(window_velocity.get("coverage", 0))
+        logger.info(
+            "ATM COI VELOCITY PRIMARY: mode=%s coverage=%d/%d call_change=%+.0f put_change=%+.0f "
+            "raw_score=%+.3f weight=%.2f effective_score=%+.3f baseline_age_min=%s window=%s",
+            window_velocity.get("baseline_mode"), int(window_velocity.get("coverage", 0)),
+            int(window_velocity.get("window_count", 0)),
+            safe_float(window_velocity.get("call_change_sum"), 0.0),
+            safe_float(window_velocity.get("put_change_sum"), 0.0),
+            safe_float(window_velocity.get("raw_score"), 0.0),
+            safe_float(window_velocity.get("weight"), 1.0), primary_score,
+            f"{safe_float(window_velocity.get('baseline_age_minutes'), float('nan')):.1f}"
+            if math.isfinite(safe_float(window_velocity.get("baseline_age_minutes"), float("nan"))) else "NA",
+            ",".join(f"{x:.0f}" for x in window_velocity.get("window_strikes", [])),
+        )
+    else:
+        # First scan (or incomplete OI history): the already-fetched per-strike
+        # API data remains local to ATM +/-4 and is down-weighted until 09:45.
+        chain_levels["change_flow_score"] = safe_float(local_change_oi_meta.get("weighted_score"), change_oi_score)
+        chain_levels["change_flow_bias"] = int(local_change_oi_meta.get("bias", 0))
+        chain_levels["pressure_score"] = safe_float(local_change_oi_meta.get("weighted_score"), 0.0)
+        chain_levels["normalized_diff"] = safe_float(local_change_oi_meta.get("weighted_score"), 0.0)
+        chain_levels["flow_mode"] = "DAY_CHANGE_API_WARMUP" if now_ist().time() < COI_COLD_START_END else "LOCAL_DAY_CHANGE_FALLBACK"
+        chain_levels["coi_decision_source"] = str(local_change_oi_meta.get("source", "UNAVAILABLE"))
+        chain_levels["coi_decision_coverage"] = int(local_change_oi_meta.get("coverage", 0))
+        logger.warning(
+            "ATM COI VELOCITY NOT READY: baseline=%s coverage=%d/%d; using local ATM-window Change-OI fallback only, "
+            "not full-chain aggregate.",
+            window_velocity.get("baseline_mode", "UNAVAILABLE"),
+            int(window_velocity.get("coverage", 0)), int(window_velocity.get("required_coverage", 0)),
+        )
+    chain_levels["coi_window_atm"] = safe_float(local_change_oi_meta.get("atm_strike"), float("nan"))
+    chain_levels["coi_window_strikes"] = list(local_change_oi_meta.get("window_strikes", []))
+    chain_levels["full_chain_change_oi_score_diagnostic"] = safe_float(full_chain_change_oi_score, 0.0)
     chain_levels["previous_support_1"] = safe_float(previous_snapshot.get("support_1"), float("nan"))
     chain_levels["previous_resistance_1"] = safe_float(previous_snapshot.get("resistance_1"), float("nan"))
     previous_direction = str(previous_snapshot.get("direction", "")).upper() or None
@@ -6079,7 +6443,7 @@ def execute_scan(
         futures_session=futures_session,
         chain_levels=chain_levels,
         change_oi_score=change_oi_score,
-        futures_live_quote=futures_live_quote,
+        futures_live_quote=futures_analysis_quote,
         previous_direction=seed_direction,
         previous_phase=previous_phase,
         price_session=index_session,
@@ -6156,6 +6520,10 @@ def execute_scan(
         "basis": round(futures_ltp_now - spot, 2),
         "future": future.trading_symbol,
         "future_expiry": future.expiry,
+        "futures_quote_status": futures_quote_status,
+        "futures_quote_timestamp": futures_quote_check.get("timestamp", "") or None,
+        "futures_quote_age_seconds": round(safe_float(futures_quote_check.get("age_seconds"), float("nan")), 1)
+            if math.isfinite(safe_float(futures_quote_check.get("age_seconds"), float("nan"))) else None,
         "futures_regime": structure.futures_regime,
         "scenario_classification": structure.futures_regime if structure.futures_regime in {"LONG_BUILDUP", "SHORT_BUILDUP", "SHORT_COVERING", "LONG_UNWINDING"} else "NEUTRAL",
         "futures_bias": structure.futures_bias,
@@ -6579,7 +6947,7 @@ def execute_scan(
         f"Entry timing: {timing_state}; index VWAP distance={vwap_distance_atr:.2f} ATR; latest 3m move={latest_3m_move_atr:.2f} ATR; completed index 3m bars={completed_session_bars}.",
         f"Regime matrix: {regime_direction}/{intensity}; ADX={adx_value:.2f}; RSI3m={safe_float(market_regime.get('rsi_3m'), float('nan')):.2f}; time window={tod_window}; {market_regime.get('reason', '')}.",
         f"Permitted strikes={permitted_strikes_for_regime(nearest_strike(spot, sorted(chain_rows(chain))), strike_step(sorted(chain_rows(chain))), regime_direction, intensity, is_expiry_day=is_expiry_day, now=now_ist())}.",
-        f"Index spot used for option ATM selection={spot:.2f}; futures LTP={futures_ltp_now:.2f}; futures/index basis={futures_ltp_now - spot:+.2f}.",
+        f"Index spot used for option ATM selection={spot:.2f}; futures LTP={futures_ltp_now:.2f}; futures/index basis={futures_ltp_now - spot:+.2f}; futures quote status={futures_quote_status}; contract={future.trading_symbol} expiry={future.expiry}.",
         f"Selected option metrics: LTP={option.ltp:.2f}, premium VWAP={option.premium_vwap:.2f}, spread={option.spread_pct:.2%}, theta burden={option.theta_burden_pct_day:.2%}/day, volume={option.volume:.0f}, OI={option.oi:.0f}, delta={option.delta:.3f}, flow={option.flow_score:.3f}, VWAP={option.vwap_score:.3f}, COI matrix={option.coi_matrix_label} score={option.oi_momentum_score:+.3f} (push={option.coi_push_score:.3f}, floor={option.coi_floor_score:.3f}, roll={option.coi_roll_score:.3f}, wall penalty={option.coi_wall_penalty:.3f}), call COI={option.call_oi_change_pct_15m:+.2f}%, put COI={option.put_oi_change_pct_15m:+.2f}% (baseline {option.oi_velocity_baseline_minutes:.1f}m, mode={option.coi_baseline_mode}).",
         f"PA/OI structural levels: NIFTY T1={underlying_target1:.2f}, T2={underlying_target2:.2f}, SL={underlying_stop:.2f}; option exit uses live LTP at the structural trigger.",
         "Primary entry alignment: NIFTY price vs VWAP + structural support/resistance + confirming Change-OI.",
@@ -6811,6 +7179,13 @@ def self_test() -> None:
     # session Change-OI score seen around 09:25 IST on 2026-10-09.
     eff, bias, source, conflict = resolve_change_oi_flow(-0.155, +0.760, "INTRADAY_SNAPSHOT")
     assert eff == 0.0 and bias == 0 and conflict and source == "INTRADAY_DAY_CONFLICT"
+    # A valid rolling/opening local-window velocity that is neutral must not be
+    # overridden by the day-total Change-OI score.
+    eff_neutral, bias_neutral, source_neutral, conflict_neutral = resolve_change_oi_flow(
+        +0.01, +0.80, "ROLLING_15_30"
+    )
+    assert eff_neutral == 0.0 and bias_neutral == 0 and not conflict_neutral
+    assert source_neutral == "ROLLING_15_30_NEUTRAL"
 
     # V29 regression: a same-session scanner version upgrade resets directional
     # memory but preserves the compatible OI baseline ring and legacy snapshot.
@@ -7466,6 +7841,63 @@ def self_test() -> None:
         futures_regime="LONG_UNWINDING", pressure_score=0.0,
     )
     assert local_break["confirmed"] and local_break["direction"] == "BEARISH" and local_break["level"] == 22550.0
+
+    # V38: Change-OI used for a trading decision must be scoped to ATM +/-4;
+    # large signals outside the window must not override the local window score.
+    oi_scope_chain = []
+    oi_scope_changes: dict[float, dict[str, float]] = {}
+    for strike in range(22000, 23001, 50):
+        oi_scope_chain.append({
+            "strike_price": float(strike),
+            "call_options": {"market_data": {"oi": 100000.0, "prev_oi": 99000.0, "ltp": 100.0, "close_price": 99.0}},
+            "put_options": {"market_data": {"oi": 100000.0, "prev_oi": 99000.0, "ltp": 100.0, "close_price": 99.0}},
+        })
+        # Outside ATM +/-4 intentionally has a much larger opposite signal.
+        if abs(strike - 22500) > 200:
+            oi_scope_changes[float(strike)] = {"call_oi_change": 10000000.0, "put_oi_change": -10000000.0}
+        else:
+            oi_scope_changes[float(strike)] = {"call_oi_change": 1000.0, "put_oi_change": 5000.0}
+    local_score, local_change_map, local_change_meta = local_change_oi_confirmation(
+        oi_scope_chain, 22511.0, oi_scope_changes,
+        now=datetime(2026, 10, 13, 9, 30, tzinfo=IST),
+    )
+    assert len(local_change_map) == 9
+    assert set(local_change_map).issubset(set(local_change_meta["window_strikes"]))
+    assert local_change_meta["source"] == "ATM_WINDOW_PER_STRIKE_API"
+    assert local_change_meta["raw_score"] > 0.0 and local_score > 0.0
+    assert math.isclose(local_score, local_change_meta["raw_score"] * COI_COLD_START_WEIGHT, rel_tol=1e-9)
+
+    # V38: aggregate rolling/cumulative velocity ignores strikes outside the active window.
+    velocity_test = {}
+    for strike in range(22000, 23001, 50):
+        velocity_test[float(strike)] = {
+            "available": True, "call_available": True, "put_available": True,
+            "call_oi_change": 1000.0 if abs(strike - 22500) <= 200 else 10000000.0,
+            "put_oi_change": 4000.0 if abs(strike - 22500) <= 200 else 0.0,
+            "baseline_mode": "ROLLING_15_30", "baseline_minutes": 20.0,
+        }
+    local_velocity = aggregate_atm_window_coi_velocity(
+        oi_scope_chain, 22511.0, velocity_test,
+        now=datetime(2026, 10, 13, 10, 15, tzinfo=IST),
+    )
+    assert local_velocity["available"] and local_velocity["coverage"] == 9
+    assert local_velocity["score"] > 0.0
+    assert local_velocity["window_strikes"] == [22300.0, 22350.0, 22400.0, 22450.0, 22500.0, 22550.0, 22600.0, 22650.0, 22700.0]
+
+    # V38: quote age validation is deterministic; unknown timestamps are not falsely called stale.
+    quote_now = datetime(2026, 10, 13, 10, 0, tzinfo=IST)
+    fresh_quote = quote_freshness_status(
+        {"last_trade_time": str(int(pd.Timestamp(quote_now - pd.Timedelta(seconds=30)).timestamp() * 1000))},
+        now=quote_now,
+    )
+    stale_quote = quote_freshness_status(
+        {"last_trade_time": str(int(pd.Timestamp(quote_now - pd.Timedelta(minutes=10)).timestamp() * 1000))},
+        now=quote_now,
+    )
+    unknown_quote = quote_freshness_status({"last_price": 22500}, now=quote_now)
+    assert fresh_quote["status"] == "FRESH", fresh_quote
+    assert stale_quote["status"] == "STALE", stale_quote
+    assert unknown_quote["status"] == "UNVERIFIED", unknown_quote
 
     print("SELF-TEST PASSED.")
 
