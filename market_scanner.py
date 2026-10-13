@@ -1,5 +1,5 @@
 """
-NIFTY 50 Predictive Options Scanner — V39 Redundancy-Reduced Local COI and Structural Risk
+NIFTY 50 Predictive Options Scanner — V40 Breakout-State Machine and Redundancy-Reduced Local COI
 
 What this version fixes:
 - Uses the NIFTY INDEX as the primary market-price/VWAP/intraday structure feed.
@@ -43,8 +43,8 @@ What this version fixes:
   older v2 intraday candle API is deprecated.
 
 Run:
-    python market_scanner_v38_local_coi_verified_futures.py --self-test
-    python market_scanner_v38_local_coi_verified_futures.py
+    python market_scanner_v40_breakout_state_machine.py --self-test
+    python market_scanner_v40_breakout_state_machine.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -123,6 +123,12 @@ ATM_ANALYSIS_RADIUS_LEVELS = 4
 COI_WINDOW_MIN_COVERAGE_FRACTION = min(1.0, max(0.50, float(os.getenv("COI_WINDOW_MIN_COVERAGE_FRACTION", "0.60"))))
 FUTURES_QUOTE_MAX_AGE_SECONDS = max(30, int(os.getenv("FUTURES_QUOTE_MAX_AGE_SECONDS", "180")))
 FUTURES_BASIS_WARNING_PCT = max(0.001, float(os.getenv("FUTURES_BASIS_WARNING_PCT", "0.004")))
+# A weakening nearby OI wall can arm a breakout watch, but never substitutes for
+# a price-confirmed breakout. The scan reports the watch explicitly rather than
+# silently treating the setup as an executable breakout.
+BREAKOUT_WATCH_MAX_DISTANCE_STEPS = max(
+    0.5, float(os.getenv("BREAKOUT_WATCH_MAX_DISTANCE_STEPS", "1.5"))
+)
 
 
 # Market-state memory. This prevents a neutral scan from erasing the last
@@ -140,7 +146,7 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-13-STRUCTURE-V39-REDUNDANCY-REDUCED-LOCAL-COI-ATM4"
+SCANNER_VERSION = "2026-10-13-STRUCTURE-V40-CONFIRMED-BREAKOUT-HOLD-ATM4"
 # PA/OI target construction is unchanged; keep the V30 target engine identifier so
 # existing live trades are not needlessly re-migrated by entry-filter-only changes.
 OPTION_TARGET_ENGINE_VERSION = "V30_DYNAMIC_COI_MATRIX_PA_OI"
@@ -570,7 +576,7 @@ def detect_confirmed_local_oi_break(
     derivatives confirmation. It never overrides a SIDEWAYS regime.
     """
     completed = filter_completed_candles(price_session, 3) if price_session is not None and not price_session.empty else pd.DataFrame()
-    empty = {"confirmed": False, "direction": "NEUTRAL", "level": float("nan"), "reason": "INSUFFICIENT_COMPLETED_BARS"}
+    empty = {"confirmed": False, "direction": "NEUTRAL", "level": float("nan"), "reason": "NO_CONFIRMED_BREAK_OR_INSUFFICIENT_BARS"}
     if len(completed) < 2:
         return empty
     work = completed.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
@@ -623,7 +629,112 @@ def detect_confirmed_local_oi_break(
         level = min(bullish_levels, key=lambda x: (x - prev_close, x))
         return {"confirmed": True, "direction": "BULLISH", "level": float(level),
                 "reason": f"COMPLETED_3M_BREAKOUT level={level:.2f} close={last_close:.2f} pressure={pressure:+.3f} futures={fut}"}
+
+    # Recovery path for schedulers that miss the exact crossover scan. If both
+    # latest completed bars hold beyond the immediately prior scan's OI wall,
+    # the spot quote remains beyond it, and independent derivatives/flow confirm,
+    # accept the held break. Do not apply this to an arbitrary current wall.
+    prior_resistance_levels: list[float] = []
+    prior_support_levels: list[float] = []
+    for raw in (
+        safe_float((previous_snapshot or {}).get("resistance_1"), float("nan")),
+        safe_float(chain_levels.get("previous_resistance_1"), float("nan")),
+    ):
+        value = safe_float(raw, float("nan"))
+        if math.isfinite(value) and value > 0 and (not has_window or window_low - 0.01 <= value <= window_high + 0.01):
+            if all(abs(value - x) > 0.01 for x in prior_resistance_levels):
+                prior_resistance_levels.append(value)
+    for raw in (
+        safe_float((previous_snapshot or {}).get("support_1"), float("nan")),
+        safe_float(chain_levels.get("previous_support_1"), float("nan")),
+    ):
+        value = safe_float(raw, float("nan"))
+        if math.isfinite(value) and value > 0 and (not has_window or window_low - 0.01 <= value <= window_high + 0.01):
+            if all(abs(value - x) > 0.01 for x in prior_support_levels):
+                prior_support_levels.append(value)
+
+    held_bullish = [
+        level for level in prior_resistance_levels
+        if prev_close > level + buffer and last_close > level + buffer
+        and safe_float(spot) > level and last_close >= prev_close
+    ]
+    if held_bullish and last_close > last_open and bullish_confirm:
+        level = max(held_bullish)
+        return {"confirmed": True, "direction": "BULLISH", "level": float(level),
+                "reason": f"TWO_COMPLETED_3M_BARS_HOLD_ABOVE_PRIOR_RESISTANCE level={level:.2f} prev_close={prev_close:.2f} close={last_close:.2f} pressure={pressure:+.3f} futures={fut}"}
+
+    held_bearish = [
+        level for level in prior_support_levels
+        if prev_close < level - buffer and last_close < level - buffer
+        and safe_float(spot) < level and last_close <= prev_close
+    ]
+    if held_bearish and last_close < last_open and bearish_confirm:
+        level = min(held_bearish)
+        return {"confirmed": True, "direction": "BEARISH", "level": float(level),
+                "reason": f"TWO_COMPLETED_3M_BARS_HOLD_BELOW_PRIOR_SUPPORT level={level:.2f} prev_close={prev_close:.2f} close={last_close:.2f} pressure={pressure:+.3f} futures={fut}"}
     return empty
+
+
+def evaluate_local_breakout_watch(
+    *,
+    direction: str,
+    spot: float,
+    current_close: float,
+    vwap: float,
+    support: float,
+    resistance: float,
+    strike_step_value: float,
+    structure_phase: str,
+    structure_entry_confirmed: bool,
+    effective_change_oi: float,
+    futures_regime: str,
+    oi_structure_by_strike: Optional[dict[str, Any]],
+    market_intensity: str,
+) -> dict[str, Any]:
+    """Describe a near-wall breakout setup without mislabelling it as confirmed."""
+    side = str(direction or "").upper()
+    phase = str(structure_phase or "").upper()
+    intensity = str(market_intensity or "UNKNOWN").upper()
+    fut = str(futures_regime or "").upper()
+    levels = oi_structure_by_strike if isinstance(oi_structure_by_strike, dict) else {}
+    step = max(safe_float(strike_step_value, 50.0), 1.0)
+    spot_v = safe_float(spot, float("nan"))
+    close_v = safe_float(current_close, float("nan"))
+    vwap_v = safe_float(vwap, float("nan"))
+    flow = safe_float(effective_change_oi, 0.0)
+    wall = safe_float(resistance if side == "BULLISH" else support, float("nan"))
+    if (side not in {"BULLISH", "BEARISH"} or intensity in {"SIDEWAYS", "UNKNOWN"}
+            or not structure_entry_confirmed
+            or phase not in {"CONTINUOUS_BULLISH", "CONTINUOUS_BEARISH"}
+            or not all(math.isfinite(x) for x in (spot_v, close_v, vwap_v, wall))):
+        return {"armed": False, "confirmed": False, "direction": side, "level": wall, "reason": "STRUCTURE_NOT_READY"}
+    distance = wall - spot_v if side == "BULLISH" else spot_v - wall
+    if distance < 0.0 or distance > BREAKOUT_WATCH_MAX_DISTANCE_STEPS * step:
+        return {"armed": False, "confirmed": False, "direction": side, "level": wall, "reason": "WALL_NOT_NEAR_OR_ALREADY_CROSSED"}
+    vwap_aligned = close_v > vwap_v if side == "BULLISH" else close_v < vwap_v
+    flow_aligned = flow >= STRUCTURE_CHANGE_OI_CONFIRM if side == "BULLISH" else flow <= -STRUCTURE_CHANGE_OI_CONFIRM
+    fut_aligned = fut in ({"LONG_BUILDUP", "SHORT_COVERING"} if side == "BULLISH" else {"SHORT_BUILDUP", "LONG_UNWINDING"})
+    wall_row: dict[str, Any] = {}
+    for raw_key, raw_value in levels.items():
+        if abs(safe_float(raw_key, float("nan")) - wall) <= 0.01 and isinstance(raw_value, dict):
+            wall_row = raw_value
+            break
+    wall_state = str(wall_row.get("state", "")).upper()
+    if side == "BULLISH":
+        wall_weakening = wall_state == "POTENTIAL_BREAKOUT_SHORT_COVERING"
+    else:
+        wall_weakening = wall_state == "POTENTIAL_BREAKDOWN_LONG_UNWINDING"
+    armed = bool(wall_weakening and vwap_aligned and flow_aligned and fut_aligned)
+    reasons = []
+    if not wall_weakening: reasons.append("OI_WALL_NOT_CONFIRMED_WEAKENING")
+    if not vwap_aligned: reasons.append("VWAP_NOT_ALIGNED")
+    if not flow_aligned: reasons.append("CHANGE_OI_NOT_ALIGNED")
+    if not fut_aligned: reasons.append("FUTURES_CONTEXT_NOT_ALIGNED")
+    return {
+        "armed": armed, "confirmed": False, "direction": side, "level": wall,
+        "distance": distance, "wall_state": wall_state,
+        "reason": "ALL_PRE_BREAKOUT_FILTERS_ALIGNED" if armed else ";".join(reasons),
+    }
 
 
 def parse_date(raw: str) -> Optional[date]:
@@ -6393,6 +6504,38 @@ def execute_scan(
         futures_regime=structure.futures_regime,
         pressure_score=safe_float(chain_levels.get("pressure_score"), 0.0),
     )
+    completed_for_watch = filter_completed_candles(index_session, 3)
+    current_completed_close = (
+        safe_float(completed_for_watch["close"].iloc[-1], float("nan"))
+        if not completed_for_watch.empty else float("nan")
+    )
+    breakout_watch = evaluate_local_breakout_watch(
+        direction=structure.direction,
+        spot=spot,
+        current_close=current_completed_close,
+        vwap=structure.vwap,
+        support=structure.support_1,
+        resistance=structure.resistance_1,
+        strike_step_value=strike_step(sorted(chain_rows(chain))),
+        structure_phase=structure.market_phase,
+        structure_entry_confirmed=structure.entry_confirmed,
+        effective_change_oi=safe_float(structure.components.get("structure_change_oi"), 0.0),
+        futures_regime=structure.futures_regime,
+        oi_structure_by_strike=chain_levels.get("oi_structure_by_strike", {}),
+        market_intensity=str(market_regime.get("intensity", "UNKNOWN")),
+    )
+    if breakout_watch.get("armed") and not local_oi_break.get("confirmed"):
+        logger.warning(
+            "BREAKOUT WATCH ARMED (NOT AN ENTRY): direction=%s wall=%.2f spot=%.2f distance=%.2f "
+            "wall_state=%s COI=%+.3f futures=%s; price has not confirmed a close through the wall. "
+            "Wait for a completed-bar breakout/hold; the opposing-wall veto remains active.",
+            breakout_watch.get("direction", "NEUTRAL"),
+            safe_float(breakout_watch.get("level"), float("nan")),
+            safe_float(spot), safe_float(breakout_watch.get("distance"), float("nan")),
+            breakout_watch.get("wall_state", "UNKNOWN"),
+            safe_float(structure.components.get("structure_change_oi"), 0.0),
+            structure.futures_regime,
+        )
     if local_oi_break.get("confirmed") and str(market_regime.get("intensity", "UNKNOWN")).upper() != "SIDEWAYS":
         logger.warning("LOCAL OI BREAK CONFIRMED: %s", local_oi_break.get("reason", ""))
         market_regime["direction"] = str(local_oi_break["direction"])
@@ -6510,6 +6653,7 @@ def execute_scan(
         "expiry_day": is_expiry_day,
         "oi_structure_by_strike": chain_levels.get("oi_structure_by_strike", {}),
         "local_oi_break": local_oi_break,
+        "breakout_watch": breakout_watch,
     }
     state["option_oi_snapshot"] = build_option_oi_snapshot(chain, expiry, now=oi_snapshot_time, spot=spot)
     state["option_flow_by_strike"] = option_flow_by_strike
@@ -7770,6 +7914,38 @@ def self_test() -> None:
         futures_regime="LONG_UNWINDING", pressure_score=0.0,
     )
     assert local_break["confirmed"] and local_break["direction"] == "BEARISH" and local_break["level"] == 22550.0
+
+    # V40 regression: do not miss a valid breakout merely because the scan ran
+    # after the crossover candle. Two completed rising closes holding above the
+    # previous scan's OI resistance, current spot above that wall, and aligned
+    # flow/futures can confirm the held breakout.
+    held_break_df = _synthetic_candles([22570.0, 22582.0, 22608.0, 22618.0])
+    held_break_df.loc[held_break_df.index[-1], "open"] = 22610.0
+    held_break_df.loc[held_break_df.index[-1], "high"] = 22622.0
+    held_break_df.loc[held_break_df.index[-1], "low"] = 22606.0
+    held_break_df.loc[held_break_df.index[-1], "close"] = 22618.0
+    held_break = detect_confirmed_local_oi_break(
+        held_break_df, spot=22618.0, support=22550.0, resistance=22650.0,
+        previous_snapshot={"support_1": 22550.0, "resistance_1": 22600.0},
+        chain_levels={"previous_support_1": 22550.0, "previous_resistance_1": 22600.0,
+                      "window_lower_bound": 22400.0, "window_upper_bound": 22800.0},
+        futures_regime="SHORT_COVERING", pressure_score=0.50,
+    )
+    assert held_break["confirmed"] and held_break["direction"] == "BULLISH", held_break
+    assert held_break["level"] == 22600.0 and "HOLD_ABOVE_PRIOR_RESISTANCE" in held_break["reason"]
+
+    # A wall-erosion watch is informative only: it does not label a not-yet-crossed
+    # resistance as a confirmed breakout or disable the near-wall safety veto.
+    watch = evaluate_local_breakout_watch(
+        direction="BULLISH", spot=22579.45, current_close=22584.90, vwap=22504.92,
+        support=22550.0, resistance=22600.0, strike_step_value=50.0,
+        structure_phase="CONTINUOUS_BULLISH", structure_entry_confirmed=True,
+        effective_change_oi=1.0, futures_regime="SHORT_COVERING",
+        oi_structure_by_strike={22600.0: {"state": "POTENTIAL_BREAKOUT_SHORT_COVERING"}},
+        market_intensity="NORMAL",
+    )
+    assert watch["armed"] and not watch["confirmed"] and math.isclose(watch["distance"], 20.55, abs_tol=0.01)
+    assert opposing_oi_wall_veto("BULLISH", 22579.45, 22550.0, 22600.0, 50.0).startswith("NEAR_RESISTANCE_VETO")
 
     # V39: Change-OI used for a trading decision must be scoped to ATM +/-4;
     # large signals outside the window must not override the local window score.
