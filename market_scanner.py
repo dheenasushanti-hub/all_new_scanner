@@ -1,5 +1,5 @@
 """
-NIFTY 50 Predictive Options Scanner — V35 OI Dominance, Scenario and Local-Break Guard
+NIFTY 50 Predictive Options Scanner — V36 Scenario Integrity and Material OI Walls
 
 What this version fixes:
 - Uses the NIFTY INDEX as the primary market-price/VWAP/intraday structure feed.
@@ -8,7 +8,7 @@ What this version fixes:
 - Uses NIFTY futures price/OI regime as a confirmation and positioning factor.
 - Uses INDEX VWAP level + VWAP slope/position.
 - Compares Call OI vs Put OI at every strike; emits per-strike support/resistance,
-  reliability, breakout/breakdown watches, and four-scenario price/OI labels.
+  reliability and breakout/breakdown watches; the four market scenarios use futures price + futures OI.
 - Uses option-chain OI concentration and Change-in-OI to derive dynamic structural walls.
 - Supports early-session classification from at least five completed 3-minute bars when
   indicator-history seeding is unavailable but live VWAP/price structure is aligned.
@@ -33,8 +33,8 @@ What this version fixes:
   older v2 intraday candle API is deprecated.
 
 Run:
-    python market_scanner_v35_oi_dominance_scenario_guard.py --self-test
-    python market_scanner_v35_oi_dominance_scenario_guard.py
+    python market_scanner_v37_atm_window_structural_guard.py --self-test
+    python market_scanner_v37_atm_window_structural_guard.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -108,6 +108,9 @@ MIN_OPPOSING_WALL_CLEARANCE_STEPS = max(0.5, float(os.getenv("MIN_OPPOSING_WALL_
 OI_DOMINANCE_RELIABILITY_RATIO = max(1.01, float(os.getenv("OI_DOMINANCE_RELIABILITY_RATIO", "1.20")))
 LOCAL_BREAK_MIN_PRESSURE = min(-0.05, float(os.getenv("LOCAL_BREAK_MIN_PRESSURE", "-0.20")))
 
+# Hard limit for all primary option-strike decisions: ATM plus/minus four strike steps.
+ATM_ANALYSIS_RADIUS_LEVELS = 4
+
 
 # Market-state memory. This prevents a neutral scan from erasing the last
 # decisive directional regime.
@@ -124,7 +127,7 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-13-STRUCTURE-V35-OI-DOMINANCE-SCENARIO-LOCAL-BREAK-GUARD"
+SCANNER_VERSION = "2026-10-13-STRUCTURE-V37-DYNAMIC-ATM-PLUS-MINUS-4-LOCAL-PA-OI"
 # PA/OI target construction is unchanged; keep the V30 target engine identifier so
 # existing live trades are not needlessly re-migrated by entry-filter-only changes.
 OPTION_TARGET_ENGINE_VERSION = "V30_DYNAMIC_COI_MATRIX_PA_OI"
@@ -466,12 +469,16 @@ def classify_strike_oi_state(
     put_oi_change: float,
     underlying_move: float,
     step: float,
+    min_call_oi: float = 0.0,
+    min_put_oi: float = 0.0,
 ) -> dict[str, Any]:
     """Classify a single strike by OI dominance and change-OI/price confirmation.
 
-    OI dominance sets the strike's base role. Change-OI and underlying movement
-    may identify a potential wall break, but do not silently change which side
-    dominates the strike's open interest.
+    OI dominance sets the strike's base role. A wall can be called reliable only
+    when the dominant-side OI is material relative to the chain. Classic market
+    scenarios are NOT inferred from spot movement plus an option's OI change;
+    those refer to different instruments. A confirmed potential breakout/breakdown
+    may be labelled Short Covering / Long Unwinding as a strike-level watch only.
     """
     c_oi = max(safe_float(call_oi), 0.0)
     p_oi = max(safe_float(put_oi), 0.0)
@@ -480,44 +487,46 @@ def classify_strike_oi_state(
     step_value = max(safe_float(step, 50.0), 1.0)
     near_level = abs(safe_float(spot) - safe_float(strike)) <= 1.5 * step_value
 
+    reliable_call_wall = c_oi >= max(0.0, safe_float(min_call_oi, 0.0))
+    reliable_put_wall = p_oi >= max(0.0, safe_float(min_put_oi, 0.0))
     if c_oi > p_oi:
         dominant_role = "RESISTANCE"
         dominance_ratio = c_oi / max(p_oi, 1.0)
         call_unwinding = c_chg < -max(1.0, 0.002 * c_oi)
-        if underlying_move > 0 and call_unwinding and (near_level or spot >= strike):
+        if reliable_call_wall and underlying_move > 0 and call_unwinding and (near_level or spot >= strike):
             state = "POTENTIAL_BREAKOUT_SHORT_COVERING"
             reliability = "BREAKOUT_WATCH"
             scenario = "SHORT_COVERING"
-        elif dominance_ratio >= OI_DOMINANCE_RELIABILITY_RATIO and c_chg >= -max(1.0, 0.002 * c_oi):
+        elif reliable_call_wall and dominance_ratio >= OI_DOMINANCE_RELIABILITY_RATIO and c_chg >= -max(1.0, 0.002 * c_oi):
             state = "RELIABLE_RESISTANCE"
             reliability = "HIGH"
-            scenario = classify_price_oi_scenario(underlying_move, c_chg)
+            scenario = "UNCONFIRMED"
         else:
             state = "RESISTANCE"
             reliability = "MODERATE"
-            scenario = classify_price_oi_scenario(underlying_move, c_chg)
+            scenario = "UNCONFIRMED"
     elif p_oi > c_oi:
         dominant_role = "SUPPORT"
         dominance_ratio = p_oi / max(c_oi, 1.0)
         put_unwinding = p_chg < -max(1.0, 0.002 * p_oi)
-        if underlying_move < 0 and put_unwinding and (near_level or spot <= strike):
+        if reliable_put_wall and underlying_move < 0 and put_unwinding and (near_level or spot <= strike):
             state = "POTENTIAL_BREAKDOWN_LONG_UNWINDING"
             reliability = "BREAKDOWN_WATCH"
             scenario = "LONG_UNWINDING"
-        elif dominance_ratio >= OI_DOMINANCE_RELIABILITY_RATIO and p_chg >= -max(1.0, 0.002 * p_oi):
+        elif reliable_put_wall and dominance_ratio >= OI_DOMINANCE_RELIABILITY_RATIO and p_chg >= -max(1.0, 0.002 * p_oi):
             state = "RELIABLE_SUPPORT"
             reliability = "HIGH"
-            scenario = classify_price_oi_scenario(underlying_move, p_chg)
+            scenario = "UNCONFIRMED"
         else:
             state = "SUPPORT"
             reliability = "MODERATE"
-            scenario = classify_price_oi_scenario(underlying_move, p_chg)
+            scenario = "UNCONFIRMED"
     else:
         dominant_role = "BALANCED"
         dominance_ratio = 1.0 if c_oi > 0 else 0.0
         state = "BALANCED_OI"
         reliability = "LOW"
-        scenario = classify_price_oi_scenario(underlying_move, c_chg + p_chg)
+        scenario = "UNCONFIRMED"
 
     return {
         "strike": float(strike),
@@ -564,6 +573,9 @@ def detect_confirmed_local_oi_break(
         return empty
 
     levels: list[float] = []
+    window_low = safe_float(chain_levels.get("window_lower_bound"), float("nan"))
+    window_high = safe_float(chain_levels.get("window_upper_bound"), float("nan"))
+    has_window = math.isfinite(window_low) and math.isfinite(window_high) and window_low <= window_high
     for raw in (
         support, resistance,
         safe_float((previous_snapshot or {}).get("support_1"), float("nan")),
@@ -572,6 +584,9 @@ def detect_confirmed_local_oi_break(
         safe_float(chain_levels.get("previous_resistance_1"), float("nan")),
     ):
         value = safe_float(raw, float("nan"))
+        # Do not allow a stale level from a prior ATM window to trigger a local break.
+        if has_window and not (window_low - 0.01 <= value <= window_high + 0.01):
+            continue
         if math.isfinite(value) and value > 0 and all(abs(value - x) > 0.01 for x in levels):
             levels.append(value)
     if not levels:
@@ -1956,19 +1971,84 @@ def nearest_strike(spot: float, strikes: list[float]) -> float:
 
 
 def strike_step(strikes: list[float]) -> float:
+    """Infer the chain's normal strike interval without treating missing strikes as a new step."""
     unique = sorted(set(float(x) for x in strikes))
     diffs = [
-        unique[i + 1] - unique[i]
+        round(unique[i + 1] - unique[i], 4)
         for i in range(len(unique) - 1)
         if unique[i + 1] > unique[i]
     ]
     if not diffs:
         raise ScannerError("Unable to determine strike interval.")
 
-    # Median is robust against one-off gaps/anomalous strikes. Using the raw
-    # minimum can accidentally turn a 100-point chain into a 50-point chain and
-    # corrupt ATM/adjacent-strike selection.
-    return float(np.median(np.asarray(diffs, dtype=float)))
+    # A sparse test/API response may contain 50-point gaps alongside 200/250-point
+    # gaps. The mode (ties resolve to the smaller interval) is a better estimate
+    # of the contractual step than the median in that case.
+    counts: dict[float, int] = {}
+    for diff in diffs:
+        counts[diff] = counts.get(diff, 0) + 1
+    highest_frequency = max(counts.values())
+    normal_steps = [gap for gap, count in counts.items() if count == highest_frequency]
+    return float(min(normal_steps))
+
+
+def option_chain_atm_window(
+    chain: list[dict[str, Any]],
+    spot: float,
+    radius_levels: int = ATM_ANALYSIS_RADIUS_LEVELS,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return only strikes between current ATM - N steps and ATM + N steps.
+
+    The raw chain is still fetched once and can still be retained for OI history.
+    This helper restricts local analysis; it does not create per-strike API calls.
+    """
+    rows = chain_rows(chain)
+    strikes = sorted(rows)
+    step = strike_step(strikes)
+    atm = nearest_strike(float(spot), strikes)
+    radius = max(0, int(radius_levels))
+    lower_bound = float(atm - radius * step)
+    upper_bound = float(atm + radius * step)
+    atm_index = strikes.index(atm)
+    # The index cap guarantees no more than 2*N+1 contracts even if an unexpected
+    # API response mixes strike intervals; price bounds prevent a missing strike
+    # from causing a distant level to be pulled into the active window.
+    index_low = max(0, atm_index - radius)
+    index_high = min(len(strikes), atm_index + radius + 1)
+    selected = [
+        strike for strike in strikes[index_low:index_high]
+        if lower_bound - 0.01 <= float(strike) <= upper_bound + 0.01
+    ]
+    if atm not in selected:
+        raise ScannerError(
+            f"ATM window integrity check failed: ATM={atm:.2f} outside [{lower_bound:.2f}, {upper_bound:.2f}]."
+        )
+    window_chain = [rows[strike] for strike in selected]
+    meta = {
+        "atm_strike": float(atm),
+        "strike_step": float(step),
+        "radius_levels": radius,
+        "lower_bound": lower_bound,
+        "upper_bound": upper_bound,
+        "window_strikes": [float(x) for x in selected],
+        "window_count": len(selected),
+        "full_chain_count": len(strikes),
+    }
+    return window_chain, meta
+
+
+def restrict_price_action_swings(
+    swings: dict[str, list[float]],
+    lower_bound: float,
+    upper_bound: float,
+) -> dict[str, list[float]]:
+    """Keep PA reference points inside the active ATM window; never fabricate a replacement."""
+    low = min(float(lower_bound), float(upper_bound))
+    high = max(float(lower_bound), float(upper_bound))
+    return {
+        "highs": sorted({float(x) for x in swings.get("highs", []) if math.isfinite(safe_float(x, float("nan"))) and low <= float(x) <= high}),
+        "lows": sorted({float(x) for x in swings.get("lows", []) if math.isfinite(safe_float(x, float("nan"))) and low <= float(x) <= high}),
+    }
 
 
 def option_side_data(
@@ -2646,10 +2726,11 @@ def collect_option_premium_vwaps(
     now: Optional[datetime] = None,
 ) -> dict[str, dict[str, float]]:
     """Fetch completed 1-minute option candles and calculate each contract's own VWAP."""
-    rows = chain_rows(chain)
+    decision_chain, window_meta = option_chain_atm_window(chain, spot)
+    rows = chain_rows(decision_chain)
     strikes = sorted(rows)
-    step = strike_step(strikes)
-    atm = nearest_strike(spot, strikes)
+    step = safe_float(window_meta.get("strike_step"), strike_step(strikes))
+    atm = safe_float(window_meta.get("atm_strike"), nearest_strike(spot, strikes))
     option_type = "CE" if direction == "BULLISH" else "PE"
     targets = permitted_strikes_for_regime(
         atm, step, direction, intensity, is_expiry_day=is_expiry_day, now=now
@@ -2772,30 +2853,57 @@ def chain_oi_support_resistance(
     is used only to describe the wall and to break ties; it never replaces OI
     with a price-derived level.
     """
-    rows = chain_rows(chain)
+    full_chain_count = len(chain_rows(chain))
+    decision_chain, window_meta = option_chain_atm_window(chain, spot)
+    rows = chain_rows(decision_chain)
     strikes = sorted(rows)
-    step = strike_step(strikes)
-    atm = nearest_strike(spot, strikes)
+    step = safe_float(window_meta.get("strike_step"), strike_step(strikes))
+    atm = safe_float(window_meta.get("atm_strike"), nearest_strike(spot, strikes))
     flow_map, flow_mode = _intraday_option_changes(
-        chain, previous_option_snapshot, change_oi_by_strike, expiry
+        decision_chain, previous_option_snapshot, change_oi_by_strike, expiry
+    )
+    logger.info(
+        "ATM OI WINDOW: spot=%.2f ATM=%.0f step=%.0f radius=+-%d levels range=%.0f-%.0f "
+        "analysed=%d full_chain=%d strikes=%s",
+        float(spot), atm, step, ATM_ANALYSIS_RADIUS_LEVELS,
+        safe_float(window_meta.get("lower_bound")), safe_float(window_meta.get("upper_bound")),
+        int(window_meta.get("window_count", len(rows))), full_chain_count,
+        ",".join(f"{x:.0f}" for x in window_meta.get("window_strikes", [])),
     )
 
     previous_spot = safe_float((previous_option_snapshot or {}).get("spot"), float("nan"))
     underlying_move = float(spot - previous_spot) if math.isfinite(previous_spot) else 0.0
     entries: list[dict[str, Any]] = []
     oi_structure_by_strike: dict[str, dict[str, Any]] = {}
+    # A dominance ratio alone made almost every far-OTM strike look "reliable".
+    # Require meaningful absolute OI too, using the same chain-relative floor
+    # used by the support/resistance selector (30% of maximum or median OI).
+    call_oi_by_strike = {
+        float(k): max(safe_float(option_side_data(row, "CE").get("oi")), 0.0)
+        for k, row in rows.items()
+    }
+    put_oi_by_strike = {
+        float(k): max(safe_float(option_side_data(row, "PE").get("oi")), 0.0)
+        for k, row in rows.items()
+    }
+    max_call_oi = max(call_oi_by_strike.values(), default=0.0)
+    max_put_oi = max(put_oi_by_strike.values(), default=0.0)
+    min_reliable_call_oi = max(0.30 * max_call_oi, float(np.median(list(call_oi_by_strike.values()))) if call_oi_by_strike else 0.0)
+    min_reliable_put_oi = max(0.30 * max_put_oi, float(np.median(list(put_oi_by_strike.values()))) if put_oi_by_strike else 0.0)
     for strike, row in rows.items():
         ce = option_side_data(row, "CE")
         pe = option_side_data(row, "PE")
         flow = flow_map.get(float(strike), {})
         dist_steps = abs(float(strike) - atm) / max(step, 1.0)
-        call_oi = max(safe_float(ce.get("oi")), 0.0)
-        put_oi = max(safe_float(pe.get("oi")), 0.0)
+        call_oi = call_oi_by_strike[float(strike)]
+        put_oi = put_oi_by_strike[float(strike)]
         call_oi_change = safe_float(flow.get("call_oi_change"))
         put_oi_change = safe_float(flow.get("put_oi_change"))
         oi_state = classify_strike_oi_state(
             float(strike), float(spot), call_oi, put_oi,
             call_oi_change, put_oi_change, underlying_move, step,
+            min_call_oi=min_reliable_call_oi,
+            min_put_oi=min_reliable_put_oi,
         )
         entries.append({
             "strike": float(strike),
@@ -2833,7 +2941,7 @@ def chain_oi_support_resistance(
                 f"{float(item['strike']):.0f}:{item['oi_state']} role={item['dominant_role']} "
                 f"C/P={float(item['call_oi']):.0f}/{float(item['put_oi']):.0f} "
                 f"dC/dP={float(item['call_oi_change']):+.0f}/{float(item['put_oi_change']):+.0f} "
-                f"scenario={item['scenario']}"
+                f"strike_watch={item['scenario']}"
                 for item in nearby_diagnostics
             ),
         )
@@ -2902,7 +3010,9 @@ def chain_oi_support_resistance(
     pcr = total_put_oi / total_call_oi if total_call_oi > 0 else float("nan")
     pcr_bias = 1 if math.isfinite(pcr) and pcr >= PCR_BULL_THRESHOLD else -1 if math.isfinite(pcr) and pcr <= PCR_BEAR_THRESHOLD else 0
 
-    nearby = [x for x in entries if abs(float(x["strike"]) - atm) <= step * 5]
+    # All entries are restricted to the same current ATM window, so this pressure
+    # measure is local to the nine-strike decision universe rather than the full chain.
+    nearby = entries
     bull_pressure = sum(
         max(float(x["put_oi_change"]), 0.0) + max(-float(x["call_oi_change"]), 0.0) for x in nearby
     )
@@ -2958,6 +3068,13 @@ def chain_oi_support_resistance(
         "change_flow_score": float(pressure_score), "change_flow_bias": int(oi_bias),
         "option_flow_by_strike": flow_map,
         "oi_structure_by_strike": oi_structure_by_strike,
+        "window_atm_strike": float(atm),
+        "window_strike_step": float(step),
+        "window_lower_bound": float(window_meta["lower_bound"]),
+        "window_upper_bound": float(window_meta["upper_bound"]),
+        "window_strikes": list(window_meta["window_strikes"]),
+        "window_count": int(window_meta["window_count"]),
+        "full_chain_count": int(full_chain_count),
         "underlying_move_since_oi_snapshot": float(underlying_move),
     }
 
@@ -3324,6 +3441,19 @@ def build_market_structure(
     primary_session = price_session if price_session is not None and not price_session.empty else futures_session
     futures_info = futures_oi_structure(futures_3m, futures_live_quote)
     futures_regime = str(futures_info.get("regime", "UNAVAILABLE"))
+    market_scenario = (
+        futures_regime
+        if futures_regime in {"LONG_BUILDUP", "SHORT_BUILDUP", "SHORT_COVERING", "LONG_UNWINDING"}
+        else "NEUTRAL_UNCONFIRMED"
+    )
+    logger.info(
+        "MARKET SCENARIO (futures price + futures OI): %s | futures_context=%s "
+        "price_delta=%+.2f OI_delta=%+.0f; strike OI labels are structural wall/break watches.",
+        market_scenario,
+        futures_regime,
+        safe_float(futures_info.get("price_delta"), float("nan")),
+        safe_float(futures_info.get("oi_delta"), float("nan")),
+    )
     futures_bias = int(futures_info.get("bias", 0))
     futures_strength = safe_float(futures_info.get("oi_strength"), 0.0)
     completed = filter_completed_candles(primary_session.copy().sort_values("timestamp"), 3)
@@ -3810,10 +3940,11 @@ def select_directional_option(
     if intensity in {"SIDEWAYS", "UNKNOWN"}:
         raise ScannerError(f"Directional option buying blocked for intensity={intensity}.")
 
-    rows = chain_rows(chain)
+    decision_chain, window_meta = option_chain_atm_window(chain, spot)
+    rows = chain_rows(decision_chain)
     strikes = sorted(rows)
-    step = strike_step(strikes)
-    atm = nearest_strike(spot, strikes)
+    step = safe_float(window_meta.get("strike_step"), strike_step(strikes))
+    atm = safe_float(window_meta.get("atm_strike"), nearest_strike(spot, strikes))
     atm_distance_steps = abs(atm - spot) / max(step, 1.0)
     if atm_distance_steps > 1.25:
         raise ScannerError(
@@ -3824,8 +3955,14 @@ def select_directional_option(
     permitted_list = [round(float(x), 2) for x in permitted_strikes_for_regime(
         atm, step, direction, intensity, is_expiry_day=is_expiry_day, now=now
     )]
+    lower_bound = safe_float(window_meta.get("lower_bound"), atm - ATM_ANALYSIS_RADIUS_LEVELS * step)
+    upper_bound = safe_float(window_meta.get("upper_bound"), atm + ATM_ANALYSIS_RADIUS_LEVELS * step)
+    permitted_list = [x for x in permitted_list if lower_bound - 0.01 <= x <= upper_bound + 0.01]
     if not permitted_list:
-        raise ScannerError(f"No permitted strikes for {direction}/{intensity} at this time of day.")
+        raise ScannerError(
+            f"No permitted strikes inside ATM±{ATM_ANALYSIS_RADIUS_LEVELS} window "
+            f"[{lower_bound:.0f},{upper_bound:.0f}] for {direction}/{intensity} at this time of day."
+        )
     option_type = "CE" if direction == "BULLISH" else "PE"
     metrics = option_metrics_by_instrument if isinstance(option_metrics_by_instrument, dict) else {}
     velocity_map = oi_velocity_by_strike if isinstance(oi_velocity_by_strike, dict) else {}
@@ -4132,10 +4269,11 @@ def validate_continuous_option_entry(
     )
     if final_veto:
         raise ScannerError(f"PRE-EMAIL EXECUTION VETO: {final_veto}.")
-    rows = chain_rows(chain)
+    decision_chain, window_meta = option_chain_atm_window(chain, spot)
+    rows = chain_rows(decision_chain)
     strikes = sorted(rows)
-    step = strike_step(strikes)
-    atm = nearest_strike(spot, strikes)
+    step = safe_float(window_meta.get("strike_step"), strike_step(strikes))
+    atm = safe_float(window_meta.get("atm_strike"), nearest_strike(spot, strikes))
     permitted = {
         round(float(x), 2) for x in permitted_strikes_for_regime(
             atm, step, direction, market_intensity, is_expiry_day=is_expiry_day, now=now
@@ -4244,11 +4382,15 @@ def _rank_current_oi_walls(
     This is deliberately not a weighted multi-factor market vote. OI
     concentration determines the wall; distance and Change-OI are tie-breakers.
     """
-    rows = chain_rows(chain)
+    try:
+        decision_chain, window_meta = option_chain_atm_window(chain, spot)
+    except ScannerError:
+        return []
+    rows = chain_rows(decision_chain)
     strikes = sorted(rows)
     if not strikes:
         return []
-    step = max(strike_step(strikes), 1.0)
+    step = max(safe_float(window_meta.get("strike_step"), strike_step(strikes)), 1.0)
     candidates: list[dict[str, Any]] = []
 
     for strike, row in rows.items():
@@ -4348,15 +4490,20 @@ def determine_structural_trade_levels(
     if direction not in {"BULLISH", "BEARISH"}:
         raise ScannerError("Structural trade levels require BULLISH or BEARISH direction.")
 
-    rows = chain_rows(chain)
-    step = strike_step(sorted(rows))
-    swings = _price_action_swings(price_session)
+    decision_chain, window_meta = option_chain_atm_window(chain, spot)
+    rows = chain_rows(decision_chain)
+    step = max(safe_float(window_meta.get("strike_step"), strike_step(sorted(rows))), 1.0)
+    window_low = safe_float(window_meta.get("lower_bound"), float("nan"))
+    window_high = safe_float(window_meta.get("upper_bound"), float("nan"))
+    swings = restrict_price_action_swings(
+        _price_action_swings(price_session), window_low, window_high
+    )
 
     support_walls = _rank_current_oi_walls(
-        chain, spot, side="support", change_oi_by_strike=change_oi_by_strike,
+        decision_chain, spot, side="support", change_oi_by_strike=change_oi_by_strike,
     )
     resistance_walls = _rank_current_oi_walls(
-        chain, spot, side="resistance", change_oi_by_strike=change_oi_by_strike,
+        decision_chain, spot, side="resistance", change_oi_by_strike=change_oi_by_strike,
     )
 
     if direction == "BEARISH":
@@ -4401,18 +4548,33 @@ def determine_structural_trade_levels(
             t2 = pa_lows[0]
         else:
             raise ScannerError("No second price-action/OI downside objective exists for bearish trade.")
-        stop_walls = ([{"strike": float(structure.resistance_1)}] if math.isfinite(safe_float(structure.resistance_1, float("nan"))) and structure.resistance_1 > spot else resistance_walls)
+        current_resistance_matches = [x for x in resistance_walls if abs(float(x["strike"]) - safe_float(structure.resistance_1, float("nan"))) <= 0.01]
+        stop_walls = current_resistance_matches[:1] if safe_float(structure.resistance_1, float("nan")) > spot and current_resistance_matches else resistance_walls
         stop_u, stop_source = _initial_structural_stop(
             spot, direction, swings, stop_walls, step,
         )
+        if not all(math.isfinite(x) and window_low - 0.01 <= x <= window_high + 0.01 for x in (t1, t2, stop_u)):
+            raise ScannerError(
+                f"Bearish PA/OI levels outside current ATM window [{window_low:.2f},{window_high:.2f}]; "
+                "entry rejected rather than using a distant/stale reference."
+            )
+        if not (t2 < t1 < spot < stop_u):
+            raise ScannerError(
+                f"Invalid bearish structural ordering: T2={t2:.2f}, T1={t1:.2f}, spot={spot:.2f}, SL={stop_u:.2f}."
+            )
+        t1_wall = next((x for x in target_walls if abs(float(x["strike"]) - t1) <= 0.01), {})
+        t2_wall = next((x for x in deeper if abs(float(x["strike"]) - t2) <= 0.01), {})
         meta = {
             "t1_source": "OPTION_OI_SUPPORT",
-            "t2_source": "OPTION_OI_SUPPORT" if deeper else "PRICE_ACTION_SWING_LOW",
+            "t2_source": "OPTION_OI_SUPPORT" if t2_wall else "PRICE_ACTION_SWING_LOW",
             "sl_source": stop_source,
-            "t1_oi": target_walls[0]["oi"],
-            "t2_oi": next((x["oi"] for x in deeper if float(x["strike"]) == t2), 0.0),
+            "t1_oi": safe_float(t1_wall.get("oi"), 0.0),
+            "t2_oi": safe_float(t2_wall.get("oi"), 0.0),
             "price_action_swing": swings,
             "t1_oi_wall_count": len(target_walls),
+            "window_atm": float(window_meta["atm_strike"]),
+            "window_lower_bound": float(window_low),
+            "window_upper_bound": float(window_high),
         }
         return float(t1), float(t2), float(stop_u), meta
 
@@ -4451,18 +4613,33 @@ def determine_structural_trade_levels(
     t2 = oi_t2[0] if oi_t2 else (pa_highs[0] if pa_highs else float("nan"))
     if not math.isfinite(t2):
         raise ScannerError("No second price-action/OI upside objective exists for bullish trade.")
-    stop_walls = ([{"strike": float(structure.support_1)}] if math.isfinite(safe_float(structure.support_1, float("nan"))) and structure.support_1 < spot else support_walls)
+    current_support_matches = [x for x in support_walls if abs(float(x["strike"]) - safe_float(structure.support_1, float("nan"))) <= 0.01]
+    stop_walls = current_support_matches[:1] if safe_float(structure.support_1, float("nan")) < spot and current_support_matches else support_walls
     stop_u, stop_source = _initial_structural_stop(
         spot, direction, swings, stop_walls, step,
     )
+    if not all(math.isfinite(x) and window_low - 0.01 <= x <= window_high + 0.01 for x in (t1, t2, stop_u)):
+        raise ScannerError(
+            f"Bullish PA/OI levels outside current ATM window [{window_low:.2f},{window_high:.2f}]; "
+            "entry rejected rather than using a distant/stale reference."
+        )
+    if not (stop_u < spot < t1 < t2):
+        raise ScannerError(
+            f"Invalid bullish structural ordering: SL={stop_u:.2f}, spot={spot:.2f}, T1={t1:.2f}, T2={t2:.2f}."
+        )
+    t1_wall = next((x for x in target_walls if abs(float(x["strike"]) - t1) <= 0.01), {})
+    t2_wall = next((x for x in higher if abs(float(x["strike"]) - t2) <= 0.01), {})
     meta = {
         "t1_source": "OPTION_OI_RESISTANCE",
-        "t2_source": "OPTION_OI_RESISTANCE" if higher else "PRICE_ACTION_SWING_HIGH",
+        "t2_source": "OPTION_OI_RESISTANCE" if t2_wall else "PRICE_ACTION_SWING_HIGH",
         "sl_source": stop_source,
-        "t1_oi": target_walls[0]["oi"],
-        "t2_oi": next((x["oi"] for x in higher if float(x["strike"]) == t2), 0.0),
+        "t1_oi": safe_float(t1_wall.get("oi"), 0.0),
+        "t2_oi": safe_float(t2_wall.get("oi"), 0.0),
         "price_action_swing": swings,
         "t1_oi_wall_count": len(target_walls),
+        "window_atm": float(window_meta["atm_strike"]),
+        "window_lower_bound": float(window_low),
+        "window_upper_bound": float(window_high),
     }
     return float(t1), float(t2), float(stop_u), meta
 
@@ -4477,16 +4654,34 @@ def dynamic_oi_stop_after_t1(
 ) -> tuple[float, str, float]:
     """Use the CURRENT opposing OI wall as the post-T1 structural stop."""
     direction = str(direction).upper()
-    rows = chain_rows(chain)
-    step = strike_step(sorted(rows))
-    swings = _price_action_swings(price_session)
+    decision_chain, window_meta = option_chain_atm_window(chain, spot)
+    rows = chain_rows(decision_chain)
+    step = max(safe_float(window_meta.get("strike_step"), strike_step(sorted(rows))), 1.0)
+    window_low = safe_float(window_meta.get("lower_bound"), float("nan"))
+    window_high = safe_float(window_meta.get("upper_bound"), float("nan"))
+    swings = restrict_price_action_swings(
+        _price_action_swings(price_session), window_low, window_high
+    )
 
     walls = _rank_current_oi_walls(
-        chain, spot,
+        decision_chain, spot,
         side="resistance" if direction == "BEARISH" else "support",
         change_oi_by_strike=change_oi_by_strike,
     )
     meaningful = [x for x in walls if bool(x["meaningful"])] or walls
+
+    def validated_stop(value: float, source: str) -> tuple[float, str, float]:
+        if not math.isfinite(value) or not (window_low - 0.01 <= value <= window_high + 0.01):
+            raise ScannerError(
+                f"Dynamic {direction} stop unavailable inside current ATM window "
+                f"[{window_low:.2f},{window_high:.2f}]."
+            )
+        if direction == "BEARISH" and value <= spot:
+            raise ScannerError(f"Dynamic bearish stop {value:.2f} must be above spot {spot:.2f}.")
+        if direction == "BULLISH" and value >= spot:
+            raise ScannerError(f"Dynamic bullish stop {value:.2f} must be below spot {spot:.2f}.")
+        return float(value), source, float(step)
+
     if direction == "BEARISH":
         entry_u = safe_float(entry_underlying, float("nan"))
         favorable = [
@@ -4502,9 +4697,9 @@ def dynamic_oi_stop_after_t1(
         oi_stop = float(oi_pool[0]["strike"]) if oi_pool else float("nan")
         pa_stop = min([x for x in swings.get("highs", []) if x > spot], default=float("nan"))
         if math.isfinite(oi_stop):
-            return float(oi_stop), "CURRENT_OI_RESISTANCE", float(step)
+            return validated_stop(oi_stop, "CURRENT_OI_RESISTANCE")
         if math.isfinite(pa_stop):
-            return float(pa_stop), "CURRENT_PRICE_ACTION_SWING_HIGH", float(step)
+            return validated_stop(pa_stop, "CURRENT_PRICE_ACTION_SWING_HIGH")
     else:
         entry_u = safe_float(entry_underlying, float("nan"))
         favorable = [
@@ -4520,9 +4715,9 @@ def dynamic_oi_stop_after_t1(
         oi_stop = float(oi_pool[0]["strike"]) if oi_pool else float("nan")
         pa_stop = max([x for x in swings.get("lows", []) if x < spot], default=float("nan"))
         if math.isfinite(oi_stop):
-            return float(oi_stop), "CURRENT_OI_SUPPORT", float(step)
+            return validated_stop(oi_stop, "CURRENT_OI_SUPPORT")
         if math.isfinite(pa_stop):
-            return float(pa_stop), "CURRENT_PRICE_ACTION_SWING_LOW", float(step)
+            return validated_stop(pa_stop, "CURRENT_PRICE_ACTION_SWING_LOW")
     raise ScannerError("Unable to derive a dynamic post-T1 OI/price-action stop.")
 
 
@@ -6500,7 +6695,7 @@ def _synthetic_candles(
 
 
 def self_test() -> None:
-    """Deterministic regression tests for V35 OI dominance, opening fallback, break guards and exits."""
+    """Deterministic regression tests for V37 ATM-window, OI structure, execution gates and exits."""
     global get_historical_candles
     def mk_candles(values: list[float], oi: Optional[list[float]] = None) -> pd.DataFrame:
         return _synthetic_candles(values, oi=oi)
@@ -7152,16 +7347,17 @@ def self_test() -> None:
     assert not gap_stagnant and "not consecutive" in gap_reason
 
     # PA/OI T1/T2/SL must be underlying structural levels, not option-premium targets.
-    trade_chain, trade_flow = _synthetic_structure_chain(22250.0, 22000.0, 22500.0, 3000000.0, -2000000.0)
-    # Add a distinct second OI wall below T1.
+    trade_chain, trade_flow = _synthetic_structure_chain(22250.0, 22200.0, 22400.0, 3000000.0, -2000000.0)
+    # The active window contains both a primary support and a lower secondary OI wall.
     for row in trade_chain:
-        if abs(float(row["strike_price"]) - 21900.0) < 0.01:
+        if abs(float(row["strike_price"]) - 22150.0) < 0.01:
             row["put_options"]["market_data"]["oi"] = 2500000
             break
-    target_structure = type("S", (), {"direction":"BEARISH", "support_1":22000.0, "support_2":21900.0, "resistance_1":22500.0, "resistance_2":22600.0, "vwap":22350.0})()
+    target_structure = type("S", (), {"direction":"BEARISH", "support_1":22200.0, "support_2":22150.0, "resistance_1":22400.0, "resistance_2":22450.0, "vwap":22350.0})()
     t1, t2, sl, meta = determine_structural_trade_levels(trade_chain, 22250.0, target_structure, down, change_oi_by_strike=trade_flow)
-    assert t1 == 22000.0 and t2 < t1 and sl > 22250.0
+    assert t1 == 22200.0 and t2 < t1 and sl > 22250.0
     assert meta["t1_source"] == "OPTION_OI_SUPPORT"
+    assert all(meta["window_lower_bound"] <= level <= meta["window_upper_bound"] for level in (t1, t2, sl))
 
     # Post-T1 dynamic OI stop must be recalculated from current opposing OI and ratchet favorably.
     dyn_chain, dyn_flow = _synthetic_structure_chain(22050.0, 21900.0, 22200.0, 3000000.0, -1500000.0)
@@ -7170,19 +7366,19 @@ def self_test() -> None:
     assert source.startswith("CURRENT_OI_")
 
     # Symmetric bullish PA/OI target structure: T1/T2 above spot and SL below spot.
-    bull_chain, bull_flow = _synthetic_structure_chain(22250.0, 22000.0, 22500.0, -2000000.0, 3000000.0)
-    # Under the V35 direct-dominance rule, a second target wall must actually
-    # have Call OI > Put OI; the previous balanced 22550 row was not a wall.
+    bull_chain, bull_flow = _synthetic_structure_chain(22250.0, 22200.0, 22400.0, -2000000.0, 3000000.0)
+    # The second target must be an in-window strike whose Call OI dominates Put OI.
     for row in bull_chain:
-        if abs(float(row["strike_price"]) - 22550.0) < 0.01:
+        if abs(float(row["strike_price"]) - 22450.0) < 0.01:
             row["call_options"]["market_data"]["oi"] = 2500000.0
             break
-    bullish_structure = type("S", (), {"direction":"BULLISH", "support_1":22000.0, "support_2":21950.0, "resistance_1":22500.0, "resistance_2":22550.0, "vwap":22150.0})()
+    bullish_structure = type("S", (), {"direction":"BULLISH", "support_1":22200.0, "support_2":22150.0, "resistance_1":22400.0, "resistance_2":22450.0, "vwap":22300.0})()
     bt1, bt2, bsl, bmeta = determine_structural_trade_levels(
         bull_chain, 22250.0, bullish_structure, up, change_oi_by_strike=bull_flow
     )
-    assert bt1 == 22500.0 and bt2 > bt1 and bsl < 22250.0
+    assert bt1 == 22400.0 and bt2 > bt1 and bsl < 22250.0
     assert bmeta["t1_source"] == "OPTION_OI_RESISTANCE"
+    assert all(bmeta["window_lower_bound"] <= level <= bmeta["window_upper_bound"] for level in (bt1, bt2, bsl))
 
     # Post-T1 bullish dynamic stop must use current OI and ratchet upward only.
     dyn_bull_chain_1, dyn_bull_flow_1 = _synthetic_structure_chain(22050.0, 22000.0, 22200.0, 3000000.0, -1500000.0)
@@ -7200,10 +7396,10 @@ def self_test() -> None:
     assert changed_2 is False and dyn_stop_2 == 22000.0 and dyn_source_2 == "CURRENT_OI_SUPPORT"
 
     # Migration must ignore stale legacy option-premium T1 flags and recompute from NIFTY PA/OI.
-    legacy = {"direction":"BEARISH", "target_engine_version":"V22", "target_1":307.45, "target_2":314.31, "stop_loss":137.73, "underlying_target_1":22200.0, "underlying_target_2":22000.0, "underlying_stop":22385.0, "t1_hit":True, "entry_underlying":22250.0, "trading_symbol":"NIFTY PE", "entry":160.0}
+    legacy = {"direction":"BEARISH", "target_engine_version":"V22", "target_1":307.45, "target_2":314.31, "stop_loss":137.73, "underlying_target_1":22200.0, "underlying_target_2":22150.0, "underlying_stop":22385.0, "t1_hit":True, "entry_underlying":22250.0, "trading_symbol":"NIFTY PE", "entry":160.0}
     migrated = migrate_active_trade_to_v25(legacy, chain=trade_chain, spot=22250.0, structure=target_structure, price_session=down, change_oi_by_strike=trade_flow)
     assert migrated and legacy["target_engine_version"] == OPTION_TARGET_ENGINE_VERSION
-    assert legacy["underlying_target_1"] == 22000.0 and legacy["t1_hit"] is False
+    assert legacy["underlying_target_1"] == 22200.0 and legacy["t1_hit"] is False
 
     # V35 scenario matrix regression: the four price/OI combinations stay explicit.
     assert classify_price_oi_scenario(+10, +100) == "LONG_BUILDUP"
@@ -7211,11 +7407,39 @@ def self_test() -> None:
     assert classify_price_oi_scenario(+10, -100) == "SHORT_COVERING"
     assert classify_price_oi_scenario(-10, -100) == "LONG_UNWINDING"
 
+    # V37 strike-step/window regression: infer 50-point steps despite sparse gaps;
+    # a full chain is reduced to no more than nine local strikes at the current ATM.
+    assert strike_step([21950, 22000, 22250, 22500, 22550]) == 50.0
+    wide_test_chain = []
+    for strike in range(22000, 23001, 50):
+        wide_test_chain.append({
+            "strike_price": float(strike),
+            "call_options": {"market_data": {"oi": 100000.0, "prev_oi": 99000.0, "ltp": 100.0, "volume": 1000}},
+            "put_options": {"market_data": {"oi": 110000.0, "prev_oi": 100000.0, "ltp": 100.0, "volume": 1000}},
+        })
+    local_window, local_window_meta = option_chain_atm_window(wide_test_chain, 22511.0)
+    assert local_window_meta["atm_strike"] == 22500.0
+    assert local_window_meta["window_count"] == 9
+    assert min(float(x["strike_price"]) for x in local_window) == 22300.0
+    assert max(float(x["strike_price"]) for x in local_window) == 22700.0
+    shifted_window, shifted_meta = option_chain_atm_window(wide_test_chain, 22682.0)
+    assert shifted_meta["atm_strike"] == 22700.0
+    assert shifted_meta["window_count"] == 9
+    assert min(float(x["strike_price"]) for x in shifted_window) == 22500.0
+    assert max(float(x["strike_price"]) for x in shifted_window) == 22900.0
+    local_levels = chain_oi_support_resistance(wide_test_chain, 22511.0, expiry="2026-10-13")
+    assert len(local_levels["oi_structure_by_strike"]) == 9
+    assert all(22300.0 <= float(k) <= 22700.0 for k in local_levels["oi_structure_by_strike"])
+
     # V35 per-strike dominance regression: raw same-strike OI dominance controls role.
     assert classify_strike_oi_state(22500, 22520, 900000, 500000, 1000, 500, 0, 50)["dominant_role"] == "RESISTANCE"
     assert classify_strike_oi_state(22500, 22520, 500000, 900000, 500, 1000, 0, 50)["dominant_role"] == "SUPPORT"
-    assert classify_strike_oi_state(22500, 22520, 900000, 500000, 1000, 500, +10, 50)["scenario"] == "LONG_BUILDUP"
-    assert classify_strike_oi_state(22500, 22520, 900000, 500000, 1000, 500, -10, 50)["scenario"] == "SHORT_BUILDUP"
+    # Dominance by itself is not enough to label a tiny far-OTM concentration reliable.
+    thin_wall = classify_strike_oi_state(23000, 22520, 900, 100, 0, 0, 0, 50, min_call_oi=10000)
+    assert thin_wall["dominant_role"] == "RESISTANCE" and thin_wall["state"] == "RESISTANCE"
+    assert thin_wall["scenario"] == "UNCONFIRMED"
+    assert classify_strike_oi_state(22500, 22520, 900000, 500000, 1000, 500, +10, 50)["scenario"] == "UNCONFIRMED"
+    assert classify_strike_oi_state(22500, 22520, 900000, 500000, 1000, 500, -10, 50)["scenario"] == "UNCONFIRMED"
     assert classify_strike_oi_state(22500, 22505, 900000, 500000, -10000, 0, +20, 50)["scenario"] == "SHORT_COVERING"
     assert classify_strike_oi_state(22500, 22495, 500000, 900000, 0, -10000, -20, 50)["scenario"] == "LONG_UNWINDING"
     breakout_role = classify_strike_oi_state(22500, 22505, 900000, 500000, -10000, 0, +20, 50)
