@@ -1,5 +1,5 @@
 """
-NIFTY 50 Predictive Options Scanner — V40 Breakout-State Machine and Redundancy-Reduced Local COI
+NIFTY 50 Predictive Options Scanner — V42 Structural Break, Target and Risk Guard
 
 What this version fixes:
 - Uses the NIFTY INDEX as the primary market-price/VWAP/intraday structure feed.
@@ -118,7 +118,7 @@ MIN_OPPOSING_WALL_CLEARANCE_STEPS = max(0.5, float(os.getenv("MIN_OPPOSING_WALL_
 OI_DOMINANCE_RELIABILITY_RATIO = max(1.01, float(os.getenv("OI_DOMINANCE_RELIABILITY_RATIO", "1.20")))
 LOCAL_BREAK_MIN_PRESSURE = min(-0.05, float(os.getenv("LOCAL_BREAK_MIN_PRESSURE", "-0.20")))
 # Counter-trend OI-wall rejection entries must still have enough structural runway.
-LOCAL_REJECTION_MIN_REWARD_RISK_RATIO = max(1.0, float(os.getenv("LOCAL_REJECTION_MIN_REWARD_RISK_RATIO", "1.25")))
+MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO = max(1.0, float(os.getenv("MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO", os.getenv("LOCAL_REJECTION_MIN_REWARD_RISK_RATIO", "1.25"))))
 
 # Hard limit for all primary option-strike decisions: ATM plus/minus four strike steps.
 ATM_ANALYSIS_RADIUS_LEVELS = 4
@@ -148,7 +148,7 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-14-STRUCTURE-V41-VALIDATED-LEVELS-REJECTION-RR-ATM4"
+SCANNER_VERSION = "2026-10-14-STRUCTURE-V42-CONFIRMED-BREAK-RR-NEAREST-WALL-STRICT-REJECTION-ATM4"
 # PA/OI target construction is unchanged; keep the V30 target engine identifier so
 # existing live trades are not needlessly re-migrated by entry-filter-only changes.
 OPTION_TARGET_ENGINE_VERSION = "V30_DYNAMIC_COI_MATRIX_PA_OI"
@@ -272,7 +272,6 @@ MIN_VOLUME = 1.0
 # Price-action + OI structural trade levels. These levels are authoritative;
 # option Greeks are not used to manufacture T1/T2/SL prices.
 PA_OI_SWING_LOOKBACK = int(os.getenv("PA_OI_SWING_LOOKBACK", "12"))
-PA_OI_TARGET_MIN_STEPS = float(os.getenv("PA_OI_TARGET_MIN_STEPS", "1.0"))
 PA_OI_STOP_BUFFER_STEPS = float(os.getenv("PA_OI_STOP_BUFFER_STEPS", "0.25"))
 PA_OI_SECONDARY_OI_RATIO = float(os.getenv("PA_OI_SECONDARY_OI_RATIO", "0.30"))
 
@@ -786,7 +785,9 @@ def detect_confirmed_local_oi_rejection(
     atr_series = calculate_atr(work, ATR_PERIOD)
     atr = safe_float(atr_series.iloc[-1], 0.0) if not atr_series.empty else 0.0
     rejection_buffer = max(0.08 * atr, 0.10 * step, spot_value * 0.00005, 2.0)
-    test_tolerance = max(0.20 * atr, 0.15 * step, rejection_buffer)
+    # A wall must be genuinely touched/nearly touched. Cap tolerance below 10% of a
+    # strike step so a high 4+ points below a 50-point OI wall cannot count as a test.
+    test_tolerance = min(max(0.03 * atr, 0.04 * step, 1.0), 0.08 * step)
     pressure = safe_float(pressure_score)
     fut = str(futures_regime or "").upper()
     bearish_futures = fut in {"SHORT_BUILDUP", "LONG_UNWINDING"}
@@ -3071,6 +3072,38 @@ def permitted_strikes_for_regime(
     return [atm - step, atm] if direction == "BULLISH" else [atm, atm + step]
 
 
+def is_confirmed_local_break(event: Optional[dict[str, Any]]) -> bool:
+    """True only for a price-confirmed directional breakout/breakdown event."""
+    if not isinstance(event, dict) or not bool(event.get("confirmed")):
+        return False
+    return (
+        str(event.get("kind", "")).upper() in {"BREAKOUT", "BREAKDOWN"}
+        and str(event.get("direction", "")).upper() in {"BULLISH", "BEARISH"}
+        and math.isfinite(safe_float(event.get("level"), float("nan")))
+    )
+
+
+def structural_reward_risk_ratio(
+    direction: str, spot: float, target_1: float, stop: float
+) -> tuple[float, float, float]:
+    """Return (ratio, reward, risk) using NIFTY structural T1 and stop levels."""
+    side = str(direction or "").upper()
+    price = safe_float(spot, float("nan"))
+    target = safe_float(target_1, float("nan"))
+    stop_value = safe_float(stop, float("nan"))
+    if not all(math.isfinite(v) for v in (price, target, stop_value)):
+        return 0.0, 0.0, 0.0
+    if side == "BEARISH":
+        reward, risk = price - target, stop_value - price
+    elif side == "BULLISH":
+        reward, risk = target - price, price - stop_value
+    else:
+        return 0.0, 0.0, 0.0
+    if reward <= 0 or risk <= 0:
+        return 0.0, max(reward, 0.0), max(risk, 0.0)
+    return reward / risk, reward, risk
+
+
 def opposing_oi_wall_veto(
     direction: str,
     spot: float,
@@ -4896,8 +4929,8 @@ def _rank_current_oi_walls(
 
     for strike, row in rows.items():
         distance_steps = abs(float(strike) - float(spot)) / step
-        if distance_steps < PA_OI_TARGET_MIN_STEPS:
-            continue
+        # Keep the closest OI wall even when spot is less than one strike step away;
+        # omitting it can skip the real T1/obstacle and overstate reward-to-risk.
         ce_oi = max(safe_float(option_side_data(row, "CE").get("oi")), 0.0)
         pe_oi = max(safe_float(option_side_data(row, "PE").get("oi")), 0.0)
         if side == "support":
@@ -5008,35 +5041,17 @@ def determine_structural_trade_levels(
     )
 
     if direction == "BEARISH":
-        target_walls = [x for x in support_walls if bool(x["meaningful"])] or support_walls
-        if not target_walls:
-            raise ScannerError("No meaningful OI support exists for bearish T1/T2.")
-
-        # T1 is the first usable OI support in the direction of travel. If the
-        # scanner's authoritative support_1 has already been broken, it must not
-        # become a stale target; move to the next current OI wall below spot.
-        t1 = safe_float(structure.support_1, float("nan"))
-        if not math.isfinite(t1) or t1 >= spot:
-            ahead = sorted(
-                [x for x in target_walls if float(x["strike"]) < spot],
-                key=lambda x: (float(spot) - float(x["strike"]), -float(x["strength"])),
-            )
-            if not ahead:
-                raise ScannerError("No current OI support below spot for bearish T1.")
-            t1 = float(ahead[0]["strike"])
-        else:
-            # Protect against a malformed structure object that points to a
-            # level absent from the current chain. In that case use the nearest
-            # current OI support rather than inventing a level.
-            matching_t1 = [x for x in target_walls if abs(float(x["strike"]) - t1) <= 0.01]
-            if not matching_t1:
-                ahead = sorted(
-                    [x for x in target_walls if float(x["strike"]) < spot],
-                    key=lambda x: (float(spot) - float(x["strike"]), -float(x["strength"])),
-                )
-                if not ahead:
-                    raise ScannerError("No current OI support below spot for bearish T1.")
-                t1 = float(ahead[0]["strike"])
+        # Every current strike where Put OI dominates Call OI is a potential
+        # downside obstacle. T1 must be the nearest such wall below spot, not
+        # whichever wall had the highest OI or a stale structure-level preference.
+        target_walls = support_walls
+        ahead = [x for x in target_walls if float(x["strike"]) < spot]
+        if not ahead:
+            raise ScannerError("No current OI support below spot for bearish T1.")
+        t1 = float(min(
+            ahead,
+            key=lambda x: (float(spot) - float(x["strike"]), -float(x["strength"])),
+        )["strike"])
 
         # T2 is the next distinct lower OI wall; PA is a fallback only when no
         # second OI wall exists.
@@ -5079,32 +5094,15 @@ def determine_structural_trade_levels(
         }
         return float(t1), float(t2), float(stop_u), meta
 
-    target_walls = [x for x in resistance_walls if bool(x["meaningful"])] or resistance_walls
-    if not target_walls:
-        raise ScannerError("No meaningful OI resistance exists for bullish T1/T2.")
-
-    # T1 is the first usable OI resistance in the direction of travel. If the
-    # authoritative resistance_1 has already been broken, use the next current
-    # OI wall above spot instead of retaining the stale broken level.
-    t1 = safe_float(structure.resistance_1, float("nan"))
-    if not math.isfinite(t1) or t1 <= spot:
-        ahead = sorted(
-            [x for x in target_walls if float(x["strike"]) > spot],
-            key=lambda x: (float(x["strike"]) - float(spot), -float(x["strength"])),
-        )
-        if not ahead:
-            raise ScannerError("No current OI resistance above spot for bullish T1.")
-        t1 = float(ahead[0]["strike"])
-    else:
-        matching_t1 = [x for x in target_walls if abs(float(x["strike"]) - t1) <= 0.01]
-        if not matching_t1:
-            ahead = sorted(
-                [x for x in target_walls if float(x["strike"]) > spot],
-                key=lambda x: (float(x["strike"]) - float(spot), -float(x["strength"])),
-            )
-            if not ahead:
-                raise ScannerError("No current OI resistance above spot for bullish T1.")
-            t1 = float(ahead[0]["strike"])
+    # Symmetric rule: T1 is the nearest current Call-OI-dominant wall above spot.
+    target_walls = resistance_walls
+    ahead = [x for x in target_walls if float(x["strike"]) > spot]
+    if not ahead:
+        raise ScannerError("No current OI resistance above spot for bullish T1.")
+    t1 = float(min(
+        ahead,
+        key=lambda x: (float(x["strike"]) - float(spot), -float(x["strength"])),
+    )["strike"])
 
     # T2 is the next distinct higher OI wall; PA is a fallback only when no
     # second OI wall exists.
@@ -6738,7 +6736,9 @@ def execute_scan(
             safe_float(structure.components.get("structure_change_oi"), 0.0),
             structure.futures_regime,
         )
-    if local_structure_event.get("confirmed") and str(market_regime.get("intensity", "UNKNOWN")).upper() != "SIDEWAYS":
+    classified_intensity = str(market_regime.get("intensity", "UNKNOWN")).upper()
+    confirmed_break_override = is_confirmed_local_break(local_structure_event)
+    if local_structure_event.get("confirmed") and (classified_intensity != "SIDEWAYS" or confirmed_break_override):
         logger.warning(
             "LOCAL OI EVENT CONFIRMED: kind=%s direction=%s level=%.2f reason=%s",
             local_structure_event.get("kind", "BREAK"),
@@ -6747,7 +6747,17 @@ def execute_scan(
             local_structure_event.get("reason", ""),
         )
         market_regime["direction"] = str(local_structure_event["direction"])
-        if str(market_regime.get("intensity", "UNKNOWN")).upper() == "UNKNOWN":
+        if classified_intensity in {"UNKNOWN", "SIDEWAYS"} and confirmed_break_override:
+            # ADX describes trend strength, but a properly confirmed local break
+            # may still be tradable. Keep the original classification in logs/state.
+            market_regime["classified_intensity"] = classified_intensity
+            market_regime["structural_break_override"] = True
+            market_regime["intensity"] = "NORMAL"
+            logger.warning(
+                "STRUCTURAL BREAK OVERRIDE: raw_intensity=%s ADX=%s; trade eligibility will still require valid in-window T1/SL and R/R >= %.2f.",
+                classified_intensity, market_regime.get("adx"), MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO,
+            )
+        elif classified_intensity == "UNKNOWN":
             market_regime["intensity"] = "NORMAL"
         market_regime["reason"] = (
             str(market_regime.get("reason", "")) + "; " + str(local_structure_event.get("reason", ""))
@@ -6875,7 +6885,7 @@ def execute_scan(
     state["option_flow_by_strike"] = option_flow_by_strike
     state["persistent_direction"] = (
         str(local_structure_event.get("direction", "")).upper()
-        if local_structure_event.get("confirmed") and str(market_regime.get("intensity", "UNKNOWN")).upper() != "SIDEWAYS"
+        if local_structure_event.get("confirmed") and (str(market_regime.get("intensity", "UNKNOWN")).upper() != "SIDEWAYS" or confirmed_break_override)
         else structure.direction if structure.direction in {"BULLISH", "BEARISH"} else (seed_direction or "")
     ) or None
     save_state(state)
@@ -6885,7 +6895,7 @@ def execute_scan(
         state.get("persistent_direction") or "NONE",
         previous_direction or "NONE",
     )
-    if local_structure_event.get("confirmed") and str(market_regime.get("intensity", "UNKNOWN")).upper() != "SIDEWAYS":
+    if local_structure_event.get("confirmed") and (str(market_regime.get("intensity", "UNKNOWN")).upper() != "SIDEWAYS" or confirmed_break_override):
         prediction_direction = str(local_structure_event.get("direction", "NEUTRAL")).upper()
         prediction_interpretation = str(local_structure_event.get("reason", "Confirmed local OI event"))
         prediction_score = abs(structure.score) if prediction_direction == "BULLISH" else -abs(structure.score)
@@ -6993,7 +7003,7 @@ def execute_scan(
             regime_direction, coi_guard.get("reason", "PROFIT_BOOKING"),
         )
         return None
-    if tod_window == "MIDDAY" and (not math.isfinite(adx_value) or adx_value < MIDDAY_MIN_ADX):
+    if tod_window == "MIDDAY" and (not math.isfinite(adx_value) or adx_value < MIDDAY_MIN_ADX) and not confirmed_break_override:
         logger.info("NO TRADE: midday momentum gate requires ADX >= %.1f; actual=%s.", MIDDAY_MIN_ADX, adx_value)
         return None
 
@@ -7149,19 +7159,6 @@ def execute_scan(
             )
             return None
 
-    strike_step_for_gate = strike_step(sorted(chain_rows(chain)))
-    wall_veto = opposing_oi_wall_veto(
-        regime_direction, spot, entry_structure.support_1, entry_structure.resistance_1,
-        strike_step_for_gate,
-        confirmed_local_rejection=bool(
-            local_event_entry
-            and str(local_structure_event.get("kind", "")).upper() in {"RESISTANCE_REJECTION", "SUPPORT_BOUNCE"}
-        ),
-    )
-    if wall_veto:
-        logger.warning("NO TRADE: %s; do not buy into the opposing OI wall without a confirmed break.", wall_veto)
-        return None
-
     volatility_unit = max(safe_float(structure.components.get("volatility_unit"), 50.0), 1.0)
     vwap_distance_atr = abs(float(spot) - float(structure.vwap)) / volatility_unit
     latest_3m_move_atr = abs(float(structure.components.get("recent3_movement_atr", 0.0)))
@@ -7217,36 +7214,61 @@ def execute_scan(
         else "STRUCTURAL_CONTINUATION"
     )
 
-    target_u1, target_u2, stop_u, level_meta = determine_structural_trade_levels(
-        chain,
-        spot,
-        entry_structure,
-        index_session,
-        change_oi_by_strike=option_flow_by_strike,
-    )
+    try:
+        target_u1, target_u2, stop_u, level_meta = determine_structural_trade_levels(
+            chain,
+            spot,
+            entry_structure,
+            index_session,
+            change_oi_by_strike=option_flow_by_strike,
+        )
+    except ScannerError as exc:
+        logger.warning("NO TRADE: current ATM-window PA/OI targets or structural stop are invalid: %s", exc)
+        save_state(state)
+        return None
+
     logger.info(
         "ENTRY PA/OI LEVELS: T1=%.2f(%s) T2=%.2f(%s) SL=%.2f(%s)",
         target_u1, level_meta.get("t1_source", ""),
         target_u2, level_meta.get("t2_source", ""),
         stop_u, level_meta.get("sl_source", ""),
     )
-    if local_event_entry and str(local_structure_event.get("kind", "")).upper() in {"RESISTANCE_REJECTION", "SUPPORT_BOUNCE"}:
-        structural_risk = abs(float(stop_u) - float(spot))
-        structural_reward = abs(float(spot) - float(target_u1))
-        rr_ratio = structural_reward / structural_risk if structural_risk > 0 else 0.0
-        logger.info(
-            "LOCAL OI REVERSAL RISK CHECK: kind=%s reward=%.2f risk=%.2f R/R=%.2f required>=%.2f",
-            local_structure_event.get("kind", ""), structural_reward, structural_risk,
-            rr_ratio, LOCAL_REJECTION_MIN_REWARD_RISK_RATIO,
+    rr_ratio, structural_reward, structural_risk = structural_reward_risk_ratio(
+        regime_direction, float(spot), float(target_u1), float(stop_u)
+    )
+    local_event_kind = str(local_structure_event.get("kind", "")).upper() if local_event_entry else ""
+    logger.info(
+        "STRUCTURAL ENTRY RISK CHECK: direction=%s event=%s reward=%.2f risk=%.2f R/R=%.2f required>=%.2f T1=%.2f SL=%.2f",
+        regime_direction, local_event_kind or "CONTINUATION", structural_reward, structural_risk,
+        rr_ratio, MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO, target_u1, stop_u,
+    )
+    if (not math.isfinite(rr_ratio) or structural_reward <= 0 or structural_risk <= 0
+            or rr_ratio < MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO):
+        logger.warning(
+            "NO TRADE: structural reward/risk is insufficient or invalid; direction=%s event=%s R/R=%.2f required>=%.2f.",
+            regime_direction, local_event_kind or "CONTINUATION", rr_ratio,
+            MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO,
         )
-        if (not math.isfinite(rr_ratio) or structural_risk <= 0
-                or rr_ratio < LOCAL_REJECTION_MIN_REWARD_RISK_RATIO):
-            logger.warning(
-                "NO TRADE: confirmed OI-wall reversal lacks structural reward/risk; kind=%s R/R=%.2f required>=%.2f.",
-                local_structure_event.get("kind", ""), rr_ratio, LOCAL_REJECTION_MIN_REWARD_RISK_RATIO,
-            )
-            save_state(state)
-            return None
+        save_state(state)
+        return None
+
+    # A fixed distance veto remains for ordinary continuation setups. Only an
+    # actual completed-bar break or wall rejection/bounce that has already passed
+    # the nearest-wall target and structural R/R checks may bypass it.
+    local_break_risk_valid = bool(local_event_entry and local_event_kind in {"BREAKDOWN", "BREAKOUT"})
+    local_rejection_risk_valid = bool(local_event_entry and local_event_kind in {"RESISTANCE_REJECTION", "SUPPORT_BOUNCE"})
+    strike_step_for_gate = strike_step(sorted(chain_rows(option_chain_atm_window(chain, spot)[0])))
+    guard_support = target_u1 if regime_direction == "BEARISH" else entry_structure.support_1
+    guard_resistance = target_u1 if regime_direction == "BULLISH" else entry_structure.resistance_1
+    wall_veto = opposing_oi_wall_veto(
+        regime_direction, spot, guard_support, guard_resistance,
+        strike_step_for_gate,
+        confirmed_local_break=local_break_risk_valid,
+        confirmed_local_rejection=local_rejection_risk_valid,
+    )
+    if wall_veto:
+        logger.warning("NO TRADE: %s; nearest structural target/stop were validated, but runway remains insufficient without a confirmed matching local event.", wall_veto)
+        return None
 
     option_micro_metrics = collect_option_premium_vwaps(
         chain, spot, regime_direction, intensity,
@@ -8079,6 +8101,24 @@ def self_test() -> None:
     assert meta["t1_source"] == "OPTION_OI_SUPPORT"
     assert all(meta["window_lower_bound"] <= level <= meta["window_upper_bound"] for level in (t1, t2, sl))
 
+    # V42: nearest dominant OI support less than one strike step away cannot be skipped.
+    near_wall_chain = []
+    for k in range(22400, 22801, 50):
+        call_oi = 200000.0 if k >= 22600 else 100000.0
+        put_oi = 200000.0 if k <= 22550 else 100000.0
+        near_wall_chain.append({
+            "strike_price": float(k),
+            "call_options": {"market_data": {"oi": call_oi, "prev_oi": call_oi, "ltp": 100.0, "close_price": 99.0, "volume": 1000}},
+            "put_options": {"market_data": {"oi": put_oi, "prev_oi": put_oi, "ltp": 100.0, "close_price": 99.0, "volume": 1000}},
+        })
+    near_wall_structure = type("S", (), {"direction":"BEARISH", "support_1":22500.0, "support_2":22450.0, "resistance_1":22600.0, "resistance_2":22650.0, "vwap":22600.0})()
+    near_pa = _synthetic_candles([22580.0, 22577.0, 22574.0, 22570.0], start="2026-10-12 10:00")
+    near_t1, near_t2, near_sl, near_meta = determine_structural_trade_levels(
+        near_wall_chain, 22586.65, near_wall_structure, near_pa,
+    )
+    assert near_t1 == 22550.0, (near_t1, near_t2, near_sl, near_meta)
+    assert 0.0 < 22586.65 - near_t1 < 50.0
+
     # Post-T1 dynamic OI stop must be recalculated from current opposing OI and ratchet favorably.
     dyn_chain, dyn_flow = _synthetic_structure_chain(22050.0, 21900.0, 22200.0, 3000000.0, -1500000.0)
     dynamic, source = dynamic_oi_stop_after_t1(dyn_chain, 22050.0, "BEARISH", down, entry_underlying=22250.0, change_oi_by_strike=dyn_flow)
@@ -8223,6 +8263,8 @@ def self_test() -> None:
     )
     assert watch["armed"] and not watch["confirmed"] and math.isclose(watch["distance"], 20.55, abs_tol=0.01)
     assert opposing_oi_wall_veto("BULLISH", 22579.45, 22550.0, 22600.0, 50.0).startswith("NEAR_RESISTANCE_VETO")
+    # V42 runway check must use the nearest T1 wall, not a more distant primary structure level.
+    assert opposing_oi_wall_veto("BEARISH", 22589.70, 22550.0, 22700.0, 50.0).startswith("NEAR_SUPPORT_VETO")
 
     # V41: a stale, weak prior support must not authorize a PE while the current support remains intact.
     weak_prior_break_df = _synthetic_candles([22710.0, 22703.0, 22696.30, 22688.10])
@@ -8267,6 +8309,27 @@ def self_test() -> None:
         futures_regime="SHORT_BUILDUP", pressure_score=-0.35, strike_step_value=50.0,
     )
     assert resistance_rejection["confirmed"] and resistance_rejection["direction"] == "BEARISH", resistance_rejection
+
+    # V42: a near-miss 4.25 points below resistance is not a valid wall test.
+    near_miss_df = rejection_df.copy()
+    near_miss_df.loc[near_miss_df.index[-1], ["open", "high", "low", "close"]] = [22746.0, 22745.75, 22734.0, 22739.0]
+    near_miss_rejection = detect_confirmed_local_oi_rejection(
+        near_miss_df, spot=22739.0, support=22700.0, resistance=22750.0,
+        chain_levels={"window_lower_bound": 22550.0, "window_upper_bound": 22950.0},
+        oi_structure_by_strike={"22750": {"state": "RELIABLE_RESISTANCE", "dominant_role": "RESISTANCE", "reliability": "HIGH"}},
+        futures_regime="SHORT_BUILDUP", pressure_score=-0.35, strike_step_value=50.0,
+    )
+    assert not near_miss_rejection["confirmed"] and "tested=False" in near_miss_rejection["reason"], near_miss_rejection
+
+    # V42: only confirmed local breaks can use the low-ADX/sideways entry exception.
+    assert is_confirmed_local_break({"confirmed": True, "kind": "BREAKDOWN", "direction": "BEARISH", "level": 22600.0})
+    assert not is_confirmed_local_break({"confirmed": True, "kind": "RESISTANCE_REJECTION", "direction": "BEARISH", "level": 22600.0})
+    assert not is_confirmed_local_break({"confirmed": False, "kind": "BREAKDOWN", "direction": "BEARISH", "level": 22600.0})
+    bear_rr, bear_reward, bear_risk = structural_reward_risk_ratio("BEARISH", 22589.70, 22550.0, 22602.30)
+    assert bear_rr > 1.25 and math.isclose(bear_reward, 39.70, abs_tol=0.01) and math.isclose(bear_risk, 12.60, abs_tol=0.01)
+    bull_rr, _, _ = structural_reward_risk_ratio("BULLISH", 22589.70, 22650.0, 22550.0)
+    assert math.isclose(bull_rr, (22650.0 - 22589.70) / (22589.70 - 22550.0), rel_tol=1e-9)
+    assert structural_reward_risk_ratio("BEARISH", 22589.70, 22600.0, 22602.30)[0] == 0.0
 
     # V41: support bounce is symmetric, while bullish derivatives alone at resistance cannot trigger a PE.
     bounce_df = _synthetic_candles([22720.0, 22715.0, 22708.0, 22718.0])
