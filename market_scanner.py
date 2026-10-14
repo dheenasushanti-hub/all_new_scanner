@@ -1,5 +1,5 @@
 """
-NIFTY 50 Predictive Options Scanner — V42 Structural Break, Target and Risk Guard
+NIFTY 50 Predictive Options Scanner — V43 Structural Rejection, Target and Risk Guard
 
 What this version fixes:
 - Uses the NIFTY INDEX as the primary market-price/VWAP/intraday structure feed.
@@ -43,8 +43,8 @@ What this version fixes:
   older v2 intraday candle API is deprecated.
 
 Run:
-    python market_scanner_v40_breakout_state_machine.py --self-test
-    python market_scanner_v40_breakout_state_machine.py
+    python market_scanner_v43_structural_entry_risk_guard.py --self-test
+    python market_scanner_v43_structural_entry_risk_guard.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -74,7 +74,7 @@ import sys
 import time as time_module
 import traceback
 import urllib.parse
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -148,7 +148,7 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-14-STRUCTURE-V42-CONFIRMED-BREAK-RR-NEAREST-WALL-STRICT-REJECTION-ATM4"
+SCANNER_VERSION = "2026-10-14-STRUCTURE-V43-REJECTION-VOLUME-VWAP-BANDS-SOFT-FUTURES-ATM4"
 # PA/OI target construction is unchanged; keep the V30 target engine identifier so
 # existing live trades are not needlessly re-migrated by entry-filter-only changes.
 OPTION_TARGET_ENGINE_VERSION = "V30_DYNAMIC_COI_MATRIX_PA_OI"
@@ -442,8 +442,310 @@ class Signal:
     market_intensity: str = "NORMAL"
 
 
+@dataclass
+class MarketSnapshot:
+    """Typed view of a persisted market snapshot with unknown fields preserved."""
+    timestamp: str = ""
+    spot: Optional[float] = None
+    direction: str = "NEUTRAL"
+    market_phase: str = ""
+    persistent_direction: Optional[str] = None
+    latest_completed_3m_bar: str = ""
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
+    present_keys: set[str] = field(default_factory=set, repr=False)
+    raw_spot_value: Any = field(default=None, repr=False)
+
+    @classmethod
+    def from_mapping(cls, raw: Any) -> "MarketSnapshot":
+        data = raw if isinstance(raw, dict) else {}
+        known = {"timestamp", "spot", "direction", "market_phase", "persistent_direction", "latest_completed_3m_bar"}
+        raw_spot = data.get("spot")
+        spot_value: Optional[float]
+        try:
+            spot_value = float(raw_spot) if raw_spot is not None and math.isfinite(float(raw_spot)) else None
+        except (TypeError, ValueError, OverflowError):
+            spot_value = None
+        return cls(
+            timestamp=str(data.get("timestamp", "")), spot=spot_value,
+            direction=str(data.get("direction", "NEUTRAL")),
+            market_phase=str(data.get("market_phase", "")),
+            persistent_direction=(str(data["persistent_direction"]) if data.get("persistent_direction") is not None else None),
+            latest_completed_3m_bar=str(data.get("latest_completed_3m_bar", "")),
+            extra={key: value for key, value in data.items() if key not in known},
+            present_keys=set(data), raw_spot_value=raw_spot,
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        # Preserve malformed historical values byte-for-byte at the JSON-value
+        # level; scanners still consume the typed finite value (None on failure).
+        spot_output = self.spot
+        if self.spot is None and "spot" in self.present_keys:
+            spot_output = self.raw_spot_value
+        values = {
+            "timestamp": self.timestamp, "spot": spot_output, "direction": self.direction,
+            "market_phase": self.market_phase, "persistent_direction": self.persistent_direction,
+            "latest_completed_3m_bar": self.latest_completed_3m_bar,
+        }
+        result = dict(self.extra)
+        defaults = {"timestamp": "", "spot": None, "direction": "NEUTRAL", "market_phase": "", "persistent_direction": None, "latest_completed_3m_bar": ""}
+        for key, value in values.items():
+            if key in self.present_keys or value != defaults[key]:
+                result[key] = value
+        return result
+
+
+@dataclass
+class ActiveTradeState:
+    """Typed view of an active trade; extra keys preserve older/newer state versions."""
+    status: str = ""
+    trade_date: str = ""
+    opened_at: str = ""
+    direction: str = ""
+    instrument_key: str = ""
+    trading_symbol: str = ""
+    entry: Optional[float] = None
+    target_1: Optional[float] = None
+    target_2: Optional[float] = None
+    stop_loss: Optional[float] = None
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
+    present_keys: set[str] = field(default_factory=set, repr=False)
+    raw_numeric_values: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_mapping(cls, raw: Any) -> "ActiveTradeState":
+        data = raw if isinstance(raw, dict) else {}
+        known = {"status", "trade_date", "opened_at", "direction", "instrument_key", "trading_symbol", "entry", "target_1", "target_2", "stop_loss"}
+        def optional_number(key: str) -> Optional[float]:
+            try:
+                value = float(data[key])
+                return value if math.isfinite(value) else None
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return None
+        numeric_keys = {"entry", "target_1", "target_2", "stop_loss"}
+        parsed_numeric = {key: optional_number(key) for key in numeric_keys}
+        raw_numeric = {
+            key: data[key] for key in numeric_keys
+            if key in data and parsed_numeric[key] is None and data[key] is not None
+        }
+        return cls(
+            status=str(data.get("status", "")), trade_date=str(data.get("trade_date", "")),
+            opened_at=str(data.get("opened_at", "")), direction=str(data.get("direction", "")),
+            instrument_key=str(data.get("instrument_key", "")), trading_symbol=str(data.get("trading_symbol", "")),
+            entry=parsed_numeric["entry"], target_1=parsed_numeric["target_1"],
+            target_2=parsed_numeric["target_2"], stop_loss=parsed_numeric["stop_loss"],
+            extra={key: value for key, value in data.items() if key not in known},
+            present_keys=set(data), raw_numeric_values=raw_numeric,
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        values = {
+            "status": self.status, "trade_date": self.trade_date, "opened_at": self.opened_at,
+            "direction": self.direction, "instrument_key": self.instrument_key,
+            "trading_symbol": self.trading_symbol, "entry": self.entry,
+            "target_1": self.target_1, "target_2": self.target_2, "stop_loss": self.stop_loss,
+        }
+        result = dict(self.extra)
+        for key, value in values.items():
+            if key in self.raw_numeric_values and value is None:
+                result[key] = self.raw_numeric_values[key]
+            elif key in self.present_keys or value not in (None, ""):
+                result[key] = value
+        return result
+
+
+@dataclass
+class MarketMemory:
+    """Typed view of persistent direction and rolling market history."""
+    market_history: list[dict[str, Any]] = field(default_factory=list)
+    persistent_direction: Optional[str] = None
+    continuation_phase: str = ""
+    continuation_count: int = 0
+    continuation_last_bar: str = ""
+    scanner_version: str = ""
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> "MarketMemory":
+        history_raw = state.get("market_history")
+        history = [dict(item) for item in history_raw if isinstance(item, dict)] if isinstance(history_raw, list) else []
+        try:
+            count = max(0, int(state.get("continuation_count", 0)))
+        except (TypeError, ValueError, OverflowError):
+            count = 0
+        direction = str(state.get("persistent_direction", "")).upper() or None
+        return cls(
+            market_history=history, persistent_direction=direction,
+            continuation_phase=str(state.get("continuation_phase", "")),
+            continuation_count=count, continuation_last_bar=str(state.get("continuation_last_bar", "")),
+            scanner_version=str(state.get("scanner_version", "")),
+        )
+
+    def append_history(self, item: dict[str, Any], limit: int = STATE_HISTORY_LIMIT) -> None:
+        self.market_history.append(dict(item))
+        self.market_history = self.market_history[-max(1, int(limit)):]
+
+
 class ScannerError(Exception):
     """Expected scanner/API failure."""
+
+
+class UpstoxDataProvider:
+    """Owns HTTP access and response normalization for Upstox data endpoints."""
+
+    def __init__(
+        self,
+        token: Optional[str] = None,
+        *,
+        session: Optional[requests.Session] = None,
+        timeout: int = REQUEST_TIMEOUT,
+    ) -> None:
+        self.token = (UPSTOX_TOKEN if token is None else token).strip()
+        self.session = session if session is not None else HTTP_SESSION
+        self.timeout = max(1, int(timeout))
+
+    def api_headers(self) -> dict[str, str]:
+        if not self.token:
+            raise ScannerError("UPSTOX_ANALYTICS_TOKEN is missing. Set it in the environment.")
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.token}",
+        }
+
+    def api_get(
+        self,
+        url: str,
+        params: Optional[dict[str, Any]] = None,
+        retries: int = 3,
+    ) -> dict[str, Any]:
+        last_error = "Unknown Upstox error."
+        attempts = max(1, int(retries))
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self.session.get(
+                    url, params=params, headers=self.api_headers(), timeout=self.timeout
+                )
+            except requests.RequestException as exc:
+                last_error = f"Network error: {exc}"
+                if attempt < attempts:
+                    time_module.sleep(attempt)
+                    continue
+                raise ScannerError(last_error) from exc
+            if response.status_code == 200:
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    raise ScannerError(f"Upstox returned invalid JSON from {url}") from exc
+                if not isinstance(payload, dict):
+                    raise ScannerError(f"Unexpected Upstox payload from {url}.")
+                if str(payload.get("status", "")).lower() == "error":
+                    raise ScannerError(json.dumps(payload)[:2000])
+                return payload
+            last_error = f"Upstox HTTP {response.status_code} | {url} | {response.text[:1500]}"
+            if response.status_code in {429, 500, 502, 503, 504} and attempt < attempts:
+                time_module.sleep(min(2 * attempt, 6))
+                continue
+            raise ScannerError(last_error)
+        raise ScannerError(last_error)
+
+    def get_quote(self, instrument_key: str) -> dict[str, Any]:
+        payload = self.api_get(MARKET_QUOTE_URL, {"instrument_key": instrument_key}, retries=3)
+        data = payload.get("data", {})
+        if not isinstance(data, dict):
+            raise ScannerError("Upstox quote data is not an object.")
+        if instrument_key in data:
+            return data[instrument_key]
+        colon_key = instrument_key.replace("|", ":", 1)
+        if colon_key in data:
+            return data[colon_key]
+        if len(data) == 1:
+            only_quote = next(iter(data.values()))
+            if isinstance(only_quote, dict):
+                return only_quote
+        raise ScannerError(f"Quote not found for {instrument_key}.")
+
+    def get_intraday_candles(
+        self,
+        instrument_key: str,
+        interval_minutes: int,
+        *,
+        strict: bool = True,
+    ) -> pd.DataFrame:
+        interval = int(interval_minutes)
+        if interval <= 0:
+            raise ValueError("interval_minutes must be positive")
+        encoded = urllib.parse.quote(instrument_key, safe="")
+        url = f"{HISTORICAL_V3_URL}/intraday/{encoded}/minutes/{interval}"
+        try:
+            payload = self.api_get(url, retries=3)
+        except ScannerError:
+            if strict:
+                raise
+            return pd.DataFrame()
+        data = payload.get("data", {})
+        df = _parse_candles(data.get("candles", []) if isinstance(data, dict) else [])
+        if df.empty:
+            if strict:
+                raise ScannerError(f"No intraday {interval}m candles for {instrument_key}.")
+            return pd.DataFrame()
+        session_date = now_ist().date()
+        local_dates = df["timestamp"].dt.tz_convert(IST).dt.date
+        df = df.loc[local_dates == session_date].reset_index(drop=True)
+        if df.empty and strict:
+            raise ScannerError(f"No current-session {interval}m candles for {instrument_key}.")
+        return df
+
+    def _nearest_active_option_expiry(self) -> str:
+        payload = self.api_get(OPTION_CONTRACT_URL, {"instrument_key": NIFTY_KEY}, retries=4)
+        contracts = payload.get("data", [])
+        if not isinstance(contracts, list) or not contracts:
+            raise ScannerError("No active NIFTY option contracts returned by Upstox.")
+        today = now_ist().date()
+        expiries: list[date] = []
+        for contract in contracts:
+            if not isinstance(contract, dict):
+                continue
+            expiry = parse_date(str(contract.get("expiry", "")))
+            if expiry is not None and expiry >= today:
+                expiries.append(expiry)
+        if not expiries:
+            raise ScannerError(f"No active NIFTY option expiry found on or after {today.isoformat()}.")
+        selected = min(expiries).isoformat()
+        logger.info("Selected nearest active NIFTY option expiry: %s", selected)
+        return selected
+
+    def get_option_chain(
+        self,
+        state: Optional[dict[str, Any]] = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        expiry: Optional[str] = None
+        today = now_ist().date()
+        if isinstance(state, dict):
+            cached_expiry = parse_date(str(state.get("option_expiry", "")))
+            if cached_expiry and cached_expiry >= today:
+                expiry = cached_expiry.isoformat()
+        if not expiry:
+            expiry = self._nearest_active_option_expiry()
+            if isinstance(state, dict):
+                state["option_expiry"] = expiry
+        payload = self.api_get(
+            OPTION_CHAIN_URL,
+            {"instrument_key": NIFTY_KEY, "expiry_date": expiry},
+            retries=4,
+        )
+        data = payload.get("data", [])
+        if not isinstance(data, list) or not data:
+            raise ScannerError(f"NIFTY option chain is empty for active expiry {expiry}.")
+        filtered = [
+            row for row in data
+            if isinstance(row, dict) and str(row.get("expiry", ""))[:10] == expiry[:10]
+        ]
+        if filtered:
+            data = filtered
+        logger.info("Loaded option chain: expiry=%s rows=%d", expiry, len(data))
+        return expiry, data
+
+
+DEFAULT_DATA_PROVIDER = UpstoxDataProvider()
 
 
 # =============================================================================
@@ -752,13 +1054,15 @@ def detect_confirmed_local_oi_rejection(
     futures_regime: str,
     pressure_score: float,
     strike_step_value: float = 50.0,
+    futures_oi_strength: float = 0.0,
 ) -> dict[str, Any]:
     """Detect a completed-candle rejection of an OI wall or bounce off OI support.
 
     Merely approaching a wall is not a signal. The last completed candle must test
-    the wall, close back away from it, and show a directional candle. A separate
-    local COI or futures confirmation is required, and strongly aligned opposing
-    derivatives block the counter-trend trigger.
+    the wall, close back away from it, and show a directional candle with volume at
+    least equal to the trailing 21-bar median. Strong option Change-OI confirmation
+    can outweigh a conflicting futures regime; only an extreme futures conflict
+    remains a hard veto.
     """
     empty = {
         "confirmed": False, "direction": "NEUTRAL", "level": float("nan"),
@@ -785,17 +1089,49 @@ def detect_confirmed_local_oi_rejection(
     atr_series = calculate_atr(work, ATR_PERIOD)
     atr = safe_float(atr_series.iloc[-1], 0.0) if not atr_series.empty else 0.0
     rejection_buffer = max(0.08 * atr, 0.10 * step, spot_value * 0.00005, 2.0)
-    # A wall must be genuinely touched/nearly touched. Cap tolerance below 10% of a
-    # strike step so a high 4+ points below a 50-point OI wall cannot count as a test.
-    test_tolerance = min(max(0.03 * atr, 0.04 * step, 1.0), 0.08 * step)
+
+    # Wall-test tolerance responds to live dispersion around VWAP's 1-sigma bands,
+    # but remains tightly capped relative to the strike step to avoid accepting
+    # shallow near-misses as institutional wall tests.
+    vwap_now, vwap_upper_1sd, vwap_lower_1sd = calculate_vwap_bands(work)
+    upper_sigma = abs(vwap_upper_1sd - vwap_now) if all(
+        math.isfinite(value) for value in (vwap_now, vwap_upper_1sd)
+    ) else float("nan")
+    lower_sigma = abs(vwap_now - vwap_lower_1sd) if all(
+        math.isfinite(value) for value in (vwap_now, vwap_lower_1sd)
+    ) else float("nan")
+    valid_sigmas = [value for value in (upper_sigma, lower_sigma) if math.isfinite(value) and value >= 0.0]
+    vwap_sigma = max(valid_sigmas) if valid_sigmas else 0.0
+    vwap_tolerance_component = 0.10 * vwap_sigma
+    test_tolerance = min(max(0.03 * atr, 0.04 * step, vwap_tolerance_component, 1.0), 0.08 * step)
+
+    # Use the median of the previous 21 completed candles; exclude the rejection
+    # candle itself so an unusually large candle cannot inflate its own threshold.
+    volume_series = pd.to_numeric(work.get("volume", pd.Series(dtype=float)), errors="coerce")
+    prior_volumes = volume_series.iloc[-22:-1].dropna().clip(lower=0.0)
+    median_volume = safe_float(prior_volumes.median(), 0.0) if not prior_volumes.empty else 0.0
+    current_volume = safe_float(last.get("volume"), 0.0)
+    volume_confirmed = median_volume > 0.0 and current_volume >= median_volume
+
     pressure = safe_float(pressure_score)
     fut = str(futures_regime or "").upper()
+    futures_strength = min(1.0, max(0.0, safe_float(futures_oi_strength, 0.0)))
     bearish_futures = fut in {"SHORT_BUILDUP", "LONG_UNWINDING"}
     bullish_futures = fut in {"LONG_BUILDUP", "SHORT_COVERING"}
-    bearish_flow = pressure <= min(LOCAL_BREAK_MIN_PRESSURE, -0.20)
-    bullish_flow = pressure >= abs(min(LOCAL_BREAK_MIN_PRESSURE, -0.20))
-    strong_bullish_conflict = pressure >= 0.45 and bullish_futures
-    strong_bearish_conflict = pressure <= -0.45 and bearish_futures
+    flow_threshold = abs(min(LOCAL_BREAK_MIN_PRESSURE, -0.20))
+    bearish_flow = pressure <= -flow_threshold
+    bullish_flow = pressure >= flow_threshold
+    bearish_flow_strong = pressure <= -0.45
+    bullish_flow_strong = pressure >= 0.45
+
+    # Strong options COI alignment is primary. A conflicting futures state warns
+    # and reduces confidence; only a near-maximal futures conflict without extreme
+    # aligned COI retains a hard veto.
+    extreme_futures_conflict_strength = max(0.95, STRUCTURE_FUTURES_CONFLICT_STRENGTH + 0.40)
+    extreme_bullish_conflict = bullish_futures and futures_strength >= extreme_futures_conflict_strength and not bearish_flow_strong
+    extreme_bearish_conflict = bearish_futures and futures_strength >= extreme_futures_conflict_strength and not bullish_flow_strong
+    bearish_soft_futures_conflict = bearish_flow and bullish_futures and not extreme_bullish_conflict
+    bullish_soft_futures_conflict = bullish_flow and bearish_futures and not extreme_bearish_conflict
 
     window_low = safe_float(chain_levels.get("window_lower_bound"), float("nan"))
     window_high = safe_float(chain_levels.get("window_upper_bound"), float("nan"))
@@ -810,19 +1146,32 @@ def detect_confirmed_local_oi_rejection(
         valid_wall = str(row.get("dominant_role", "")).upper() == "RESISTANCE"
         tested = high >= resistance_value - test_tolerance
         rejected = close <= resistance_value - rejection_buffer and close < opn and close < prev_close
-        bearish_confirmation = (bearish_flow or bearish_futures) and not strong_bullish_conflict
-        if valid_wall and tested and rejected and bearish_confirmation:
+        bearish_confirmation = (bearish_flow or bearish_futures) and not extreme_bullish_conflict
+        if valid_wall and tested and rejected and volume_confirmed and bearish_confirmation:
+            conflict_note = (
+                f" FUTURES_CONFLICT_SOFTENED strength={futures_strength:.3f} confidence_penalty=8"
+                if bearish_soft_futures_conflict else ""
+            )
             return {
                 "confirmed": True, "direction": "BEARISH", "level": resistance_value,
                 "kind": "RESISTANCE_REJECTION",
+                "confidence_penalty": 8.0 if bearish_soft_futures_conflict else 0.0,
+                "warnings": ["CONFLICTING_FUTURES_CONTEXT"] if bearish_soft_futures_conflict else [],
+                "volume": current_volume, "median_volume": median_volume,
+                "vwap": vwap_now, "vwap_upper_1sd": vwap_upper_1sd,
+                "vwap_lower_1sd": vwap_lower_1sd, "test_tolerance": test_tolerance,
                 "reason": f"CONFIRMED_RESISTANCE_REJECTION level={resistance_value:.2f} high={high:.2f} "
                           f"close={close:.2f} rejection={resistance_value-close:.2f} "
-                          f"pressure={pressure:+.3f} futures={fut}",
+                          f"volume={current_volume:.0f} median21={median_volume:.0f} "
+                          f"vwap_sigma={vwap_sigma:.3f} tolerance={test_tolerance:.2f} "
+                          f"pressure={pressure:+.3f} futures={fut}{conflict_note}",
             }
         resistance_check = (
             f"RESISTANCE_REJECTION_NOT_CONFIRMED level={resistance_value:.2f} "
             f"valid_wall={valid_wall} tested={tested} bearish_candle_rejection={rejected} "
-            f"derivatives_confirm={bearish_confirmation} pressure={pressure:+.3f} futures={fut}"
+            f"volume_confirmed={volume_confirmed} volume={current_volume:.0f} median21={median_volume:.0f} "
+            f"derivatives_confirm={bearish_confirmation} extreme_futures_conflict={extreme_bullish_conflict} "
+            f"pressure={pressure:+.3f} futures={fut}"
         )
     else:
         resistance_check = "RESISTANCE_REJECTION_NOT_CHECKED: no current in-window resistance near spot"
@@ -835,19 +1184,32 @@ def detect_confirmed_local_oi_rejection(
         valid_wall = str(row.get("dominant_role", "")).upper() == "SUPPORT"
         tested = low <= support_value + test_tolerance
         bounced = close >= support_value + rejection_buffer and close > opn and close > prev_close
-        bullish_confirmation = (bullish_flow or bullish_futures) and not strong_bearish_conflict
-        if valid_wall and tested and bounced and bullish_confirmation:
+        bullish_confirmation = (bullish_flow or bullish_futures) and not extreme_bearish_conflict
+        if valid_wall and tested and bounced and volume_confirmed and bullish_confirmation:
+            conflict_note = (
+                f" FUTURES_CONFLICT_SOFTENED strength={futures_strength:.3f} confidence_penalty=8"
+                if bullish_soft_futures_conflict else ""
+            )
             return {
                 "confirmed": True, "direction": "BULLISH", "level": support_value,
                 "kind": "SUPPORT_BOUNCE",
+                "confidence_penalty": 8.0 if bullish_soft_futures_conflict else 0.0,
+                "warnings": ["CONFLICTING_FUTURES_CONTEXT"] if bullish_soft_futures_conflict else [],
+                "volume": current_volume, "median_volume": median_volume,
+                "vwap": vwap_now, "vwap_upper_1sd": vwap_upper_1sd,
+                "vwap_lower_1sd": vwap_lower_1sd, "test_tolerance": test_tolerance,
                 "reason": f"CONFIRMED_SUPPORT_BOUNCE level={support_value:.2f} low={low:.2f} "
                           f"close={close:.2f} reclaim={close-support_value:.2f} "
-                          f"pressure={pressure:+.3f} futures={fut}",
+                          f"volume={current_volume:.0f} median21={median_volume:.0f} "
+                          f"vwap_sigma={vwap_sigma:.3f} tolerance={test_tolerance:.2f} "
+                          f"pressure={pressure:+.3f} futures={fut}{conflict_note}",
             }
         support_check = (
             f"SUPPORT_BOUNCE_NOT_CONFIRMED level={support_value:.2f} "
             f"valid_wall={valid_wall} tested={tested} bullish_candle_bounce={bounced} "
-            f"derivatives_confirm={bullish_confirmation} pressure={pressure:+.3f} futures={fut}"
+            f"volume_confirmed={volume_confirmed} volume={current_volume:.0f} median21={median_volume:.0f} "
+            f"derivatives_confirm={bullish_confirmation} extreme_futures_conflict={extreme_bearish_conflict} "
+            f"pressure={pressure:+.3f} futures={fut}"
         )
     else:
         support_check = "SUPPORT_BOUNCE_NOT_CHECKED: no current in-window support near spot"
@@ -936,15 +1298,8 @@ def market_window_open() -> bool:
 # =============================================================================
 
 def api_headers() -> dict[str, str]:
-    if not UPSTOX_TOKEN:
-        raise ScannerError(
-            "UPSTOX_ANALYTICS_TOKEN is missing. Set it in the environment."
-        )
-    return {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {UPSTOX_TOKEN}",
-    }
+    """Compatibility adapter to the default provider's authorization headers."""
+    return DEFAULT_DATA_PROVIDER.api_headers()
 
 
 def api_get(
@@ -952,50 +1307,8 @@ def api_get(
     params: Optional[dict[str, Any]] = None,
     retries: int = 3,
 ) -> dict[str, Any]:
-    last_error = "Unknown Upstox error."
-
-    for attempt in range(1, retries + 1):
-        try:
-            response = HTTP_SESSION.get(
-                url,
-                params=params,
-                headers=api_headers(),
-                timeout=REQUEST_TIMEOUT,
-            )
-        except requests.RequestException as exc:
-            last_error = f"Network error: {exc}"
-            if attempt < retries:
-                time_module.sleep(attempt)
-                continue
-            raise ScannerError(last_error) from exc
-
-        if response.status_code == 200:
-            try:
-                payload = response.json()
-            except ValueError as exc:
-                raise ScannerError(
-                    f"Upstox returned invalid JSON from {url}"
-                ) from exc
-
-            if not isinstance(payload, dict):
-                raise ScannerError(f"Unexpected Upstox payload from {url}.")
-            if str(payload.get("status", "")).lower() == "error":
-                raise ScannerError(json.dumps(payload)[:2000])
-            return payload
-
-        last_error = (
-            f"Upstox HTTP {response.status_code} | "
-            f"{url} | {response.text[:1500]}"
-        )
-
-        transient = response.status_code in {429, 500, 502, 503, 504}
-        if transient and attempt < retries:
-            time_module.sleep(min(2 * attempt, 6))
-            continue
-
-        raise ScannerError(last_error)
-
-    raise ScannerError(last_error)
+    """Compatibility adapter; HTTP and retry handling live in UpstoxDataProvider."""
+    return DEFAULT_DATA_PROVIDER.api_get(url, params=params, retries=retries)
 
 
 # =============================================================================
@@ -1023,24 +1336,9 @@ def get_market_status() -> str:
 # =============================================================================
 
 def get_quote(instrument_key: str) -> dict[str, Any]:
-    payload = api_get(
-        MARKET_QUOTE_URL,
-        {"instrument_key": instrument_key},
-        retries=3,
-    )
-    data = payload.get("data", {})
-    if not isinstance(data, dict):
-        raise ScannerError("Upstox quote data is not an object.")
-    if instrument_key in data:
-        return data[instrument_key]
-    # Full Market Quotes V3 uses a colon-delimited response key in some cases
-    # (for example NSE_INDEX:NIFTY) even when the request used the pipe key.
-    colon_key = instrument_key.replace("|", ":", 1)
-    if colon_key in data:
-        return data[colon_key]
-    if len(data) == 1:
-        return next(iter(data.values()))
-    raise ScannerError(f"Quote not found for {instrument_key}.")
+    """Fetch a quote using the configured Upstox provider."""
+    return DEFAULT_DATA_PROVIDER.get_quote(instrument_key)
+
 
 
 def extract_ltp(quote: dict[str, Any]) -> float:
@@ -1255,30 +1553,11 @@ def get_intraday_candles(
     *,
     strict: bool = True,
 ) -> pd.DataFrame:
-    """Fetch today's intraday candles without turning normal opening-data lag into a fatal error."""
-    encoded = urllib.parse.quote(instrument_key, safe="")
-    url = f"{HISTORICAL_V3_URL}/intraday/{encoded}/minutes/{interval_minutes}"
+    """Fetch current-session candles using the configured Upstox provider."""
+    return DEFAULT_DATA_PROVIDER.get_intraday_candles(
+        instrument_key, interval_minutes, strict=strict
+    )
 
-    try:
-        payload = api_get(url, retries=3)
-    except ScannerError:
-        if strict:
-            raise
-        return pd.DataFrame()
-
-    data = payload.get("data", {})
-    df = _parse_candles(data.get("candles", []) if isinstance(data, dict) else [])
-    if df.empty:
-        if strict:
-            raise ScannerError(f"No intraday {interval_minutes}m candles for {instrument_key}.")
-        return pd.DataFrame()
-
-    session_date = now_ist().date()
-    local_dates = df["timestamp"].dt.tz_convert(IST).dt.date
-    df = df.loc[local_dates == session_date].reset_index(drop=True)
-    if df.empty and strict:
-        raise ScannerError(f"No current-session {interval_minutes}m candles for {instrument_key}.")
-    return df
 
 
 def _resample_one_minute_to_three(df: pd.DataFrame) -> pd.DataFrame:
@@ -2264,59 +2543,9 @@ def _nearest_active_option_expiry() -> str:
 
 
 def get_option_chain(state: Optional[dict[str, Any]] = None) -> tuple[str, list[dict[str, Any]]]:
-    """
-    Load the nearest active NIFTY option expiry and then request its chain.
+    """Fetch and validate the current NIFTY option chain using the provider."""
+    return DEFAULT_DATA_PROVIDER.get_option_chain(state)
 
-    We intentionally do not use Upstox's relative ``current_week`` keyword
-    here. On the trading day immediately after a weekly expiry, that keyword
-    can resolve to a completed week and the chain may be empty. Resolving the
-    nearest active expiry from the option-contract endpoint makes the scanner
-    roll automatically from (for example) 17-Sep to 24-Sep.
-    """
-    expiry = None
-    today = now_ist().date()
-    if isinstance(state, dict):
-        cached_expiry = parse_date(str(state.get("option_expiry", "")))
-        if cached_expiry and cached_expiry >= today:
-            expiry = cached_expiry.isoformat()
-    if not expiry:
-        expiry = _nearest_active_option_expiry()
-        if isinstance(state, dict):
-            state["option_expiry"] = expiry
-
-    payload = api_get(
-        OPTION_CHAIN_URL,
-        {
-            "instrument_key": NIFTY_KEY,
-            "expiry_date": expiry,
-        },
-        retries=4,
-    )
-    data = payload.get("data", [])
-
-    if not isinstance(data, list) or not data:
-        raise ScannerError(
-            f"NIFTY option chain is empty for active expiry {expiry}."
-        )
-
-    # Guard against an unexpected mixed-expiry response.
-    normalized_expiry = expiry[:10]
-    filtered = [
-        row
-        for row in data
-        if isinstance(row, dict)
-        and str(row.get("expiry", ""))[:10] == normalized_expiry
-    ]
-
-    if filtered:
-        data = filtered
-
-    logger.info(
-        "Loaded option chain: expiry=%s rows=%d",
-        expiry,
-        len(data),
-    )
-    return expiry, data
 
 
 def chain_rows(chain: list[dict[str, Any]]) -> dict[float, dict[str, Any]]:
@@ -3081,6 +3310,23 @@ def is_confirmed_local_break(event: Optional[dict[str, Any]]) -> bool:
         and str(event.get("direction", "")).upper() in {"BULLISH", "BEARISH"}
         and math.isfinite(safe_float(event.get("level"), float("nan")))
     )
+
+
+
+def is_confirmed_local_rejection(event: Optional[dict[str, Any]]) -> bool:
+    """True for a completed-bar support bounce or resistance rejection with a valid level."""
+    if not isinstance(event, dict) or not bool(event.get("confirmed")):
+        return False
+    return (
+        str(event.get("kind", "")).upper() in {"SUPPORT_BOUNCE", "RESISTANCE_REJECTION"}
+        and str(event.get("direction", "")).upper() in {"BULLISH", "BEARISH"}
+        and math.isfinite(safe_float(event.get("level"), float("nan")))
+    )
+
+
+def is_confirmed_local_directional_event(event: Optional[dict[str, Any]]) -> bool:
+    """True for a fully confirmed local break or wall rejection/bounce event."""
+    return is_confirmed_local_break(event) or is_confirmed_local_rejection(event)
 
 
 def structural_reward_risk_ratio(
@@ -5341,6 +5587,10 @@ def load_state() -> dict[str, Any]:
         if not isinstance(data, dict):
             logger.warning("State file did not contain a JSON object: %s", state_path.resolve())
             return {}
+        if isinstance(data.get("market_snapshot"), dict) and data["market_snapshot"]:
+            data["market_snapshot"] = MarketSnapshot.from_mapping(data["market_snapshot"]).to_mapping()
+        if isinstance(data.get("active_trade"), dict) and data["active_trade"]:
+            data["active_trade"] = ActiveTradeState.from_mapping(data["active_trade"]).to_mapping()
         logger.info(
             "STATE LOADED: source=%s option_oi_history_snapshots=%d legacy_oi_snapshot=%s active_trade=%s",
             state_path.resolve(),
@@ -5410,22 +5660,14 @@ def reset_intraday_memory_if_needed(state: dict[str, Any], today_iso: str) -> tu
 def active_trade_from_state(
     state: dict[str, Any],
 ) -> Optional[dict[str, Any]]:
-    trade = state.get("active_trade")
-    if not isinstance(trade, dict):
+    raw_trade = state.get("active_trade")
+    if not isinstance(raw_trade, dict):
         return None
-
-    if str(trade.get("status", "")).upper() != "ACTIVE":
+    model = ActiveTradeState.from_mapping(raw_trade)
+    trade = model.to_mapping()
+    if model.status.upper() != "ACTIVE":
         return None
-
-    required = {
-        "instrument_key",
-        "trading_symbol",
-        "direction",
-        "entry",
-        "target_1",
-        "target_2",
-        "stop_loss",
-    }
+    required = {"instrument_key", "trading_symbol", "direction", "entry", "target_1", "target_2", "stop_loss"}
     return trade if required.issubset(trade) else None
 
 
@@ -6392,57 +6634,28 @@ def _active_trade_intrabar_exit(
     return None, None, "NO_NIFTY_STRUCTURAL_LEVEL_BREACH"
 
 
-def execute_scan(
-    state: Optional[dict[str, Any]] = None,
-) -> Optional[Signal]:
-    state = state if isinstance(state, dict) else load_state()
-    current_time = now_ist()
-    today_iso = current_time.date().isoformat()
-    # The 15:15 cutoff is evaluated before ordinary market-hours returns, so an
-    # active intraday trade still receives its exit routine if a scan starts late.
-    if current_time.weekday() < 5 and current_time.time() >= NEW_ENTRY_CUTOFF:
-        active = active_trade_from_state(state)
-        if active:
-            if str(active.get("trade_date", ""))[:10] == today_iso:
-                force_close_active_trade_at_cutoff(state, "TIME_CUTOFF_15_15")
-            else:
-                # Do not let an expired prior-session position remain active in
-                # scanner state if its old instrument no longer has a live quote.
-                closed = dict(active)
-                closed.update({
-                    "status": "CLOSED", "outcome": "SESSION_END_CLEANUP",
-                    "closed_at": current_time.isoformat(),
-                    "exit_reason": "stale position state from a prior trading date",
-                })
-                state["active_trade"] = None
-                state["last_completed_trade"] = closed
-                save_state(state)
-                logger.warning("STALE ACTIVE TRADE STATE CLEARED for prior session: %s", active.get("trading_symbol", ""))
-        logger.info("NEW ENTRY CUTOFF: %s IST; no new positions after %s.", current_time.strftime("%H:%M:%S"), NEW_ENTRY_CUTOFF.strftime("%H:%M"))
-        return None
+@dataclass
+class MarketDataBundle:
+    """Typed result of one market-data ingestion stage."""
+    now_time: time
+    future: FuturesContract
+    index_session: pd.DataFrame
+    index_live_quote: dict[str, Any]
+    spot: float
+    futures_session: pd.DataFrame
+    futures_live_quote: dict[str, Any]
+    futures_ltp_now: float
+    futures_quote_check: dict[str, Any]
+    futures_quote_status: str
+    futures_analysis_quote: Optional[dict[str, Any]]
+    completed_index_3m: pd.DataFrame
+    regime_indicator_history: pd.DataFrame
+    historical_completed: pd.DataFrame
+    futures_3m: pd.DataFrame
 
-    if not market_window_open():
-        logger.info("Outside NSE market hours.")
-        return None
 
-    status = get_market_status()
-    logger.info("NSE status=%s", status)
-    if status != "OPEN":
-        return None
-
-    # Directional memory is version-scoped, but compatible same-day OI history
-    # is data, not strategy state: preserve it across code upgrades. On a new date,
-    # reset both intraday memory and the OI ring because yesterday's OI cannot be
-    # used as an intraday velocity baseline.
-    state_reset, reset_reason = reset_intraday_memory_if_needed(state, today_iso)
-    if state_reset:
-        oi_history_count = len(state.get("option_oi_history", [])) if isinstance(state.get("option_oi_history"), list) else 0
-        logger.info(
-            "STATE RESET: reason=%s; directional memory reset; preserved_OI_history_snapshots=%d; state_file=%s",
-            reset_reason, oi_history_count, STATE_FILE.resolve(),
-        )
-        save_state(state)
-
+def ingest_market_data(state: dict[str, Any], current_time: datetime) -> MarketDataBundle:
+    """Fetch index/futures candles, live quotes, indicator history and selected future."""
     now_time = now_ist().time()
     future = get_current_nifty_future(state)
 
@@ -6582,6 +6795,311 @@ def execute_scan(
                 .reset_index(drop=True)
             )
 
+    return MarketDataBundle(
+        now_time=now_time, future=future, index_session=index_session,
+        index_live_quote=index_live_quote, spot=spot, futures_session=futures_session,
+        futures_live_quote=futures_live_quote, futures_ltp_now=futures_ltp_now,
+        futures_quote_check=futures_quote_check, futures_quote_status=futures_quote_status,
+        futures_analysis_quote=futures_analysis_quote, completed_index_3m=completed_index_3m,
+        regime_indicator_history=regime_indicator_history,
+        historical_completed=historical_completed, futures_3m=futures_3m,
+    )
+
+
+@dataclass
+class MarketEvaluation:
+    """Typed output of structure/regime/local-event evaluation."""
+    structure: StructureResult
+    market_regime: dict[str, Any]
+    local_oi_break: dict[str, Any]
+    local_oi_rejection: dict[str, Any]
+    local_structure_event: dict[str, Any]
+    breakout_watch: dict[str, Any]
+    confirmed_local_event_override: bool
+
+
+def evaluate_market_structure(
+    *,
+    spot: float,
+    index_session: pd.DataFrame,
+    futures_3m: pd.DataFrame,
+    futures_session: pd.DataFrame,
+    chain: list[dict[str, Any]],
+    chain_levels: dict[str, Any],
+    change_oi_score: float,
+    futures_analysis_quote: Optional[dict[str, Any]],
+    seed_direction: Optional[str],
+    previous_phase: Optional[str],
+    previous_snapshot: dict[str, Any],
+    regime_indicator_history: pd.DataFrame,
+) -> MarketEvaluation:
+    """Evaluate the PA/VWAP/Change-OI regime and completed local OI events."""
+    structure = build_market_structure(
+        spot=spot,
+        futures_3m=futures_3m,
+        futures_session=futures_session,
+        chain_levels=chain_levels,
+        change_oi_score=change_oi_score,
+        futures_live_quote=futures_analysis_quote,
+        previous_direction=seed_direction,
+        previous_phase=previous_phase,
+        price_session=index_session,
+    )
+    market_regime = classify_market_regime(
+        index_session, spot, structure.vwap, structure.direction,
+        structure.support_1, structure.resistance_1,
+        indicator_history=regime_indicator_history,
+    )
+    current_oi_structure = chain_levels.get("oi_structure_by_strike", {})
+    decision_step = strike_step(sorted(chain_rows(option_chain_atm_window(chain, spot)[0])))
+    local_oi_break = detect_confirmed_local_oi_break(
+        index_session,
+        spot=spot,
+        support=structure.support_1,
+        resistance=structure.resistance_1,
+        previous_snapshot=previous_snapshot,
+        chain_levels=chain_levels,
+        futures_regime=structure.futures_regime,
+        pressure_score=safe_float(chain_levels.get("pressure_score"), 0.0),
+        oi_structure_by_strike=current_oi_structure,
+        strike_step_value=decision_step,
+    )
+    local_oi_rejection = detect_confirmed_local_oi_rejection(
+        index_session,
+        spot=spot,
+        support=structure.support_1,
+        resistance=structure.resistance_1,
+        chain_levels=chain_levels,
+        oi_structure_by_strike=current_oi_structure,
+        futures_regime=structure.futures_regime,
+        pressure_score=safe_float(chain_levels.get("pressure_score"), 0.0),
+        strike_step_value=decision_step,
+        futures_oi_strength=structure.futures_oi_strength,
+    )
+    # A confirmed directional break takes priority; otherwise consider a separately
+    # confirmed rejection/bounce event. A mere near-wall watch is never an entry.
+    local_structure_event = (
+        local_oi_break if local_oi_break.get("confirmed") else local_oi_rejection
+    )
+    if not local_structure_event.get("confirmed"):
+        logger.info("LOCAL OI REVERSAL CHECK: %s", local_oi_rejection.get("reason", "NO_CONFIRMED_REVERSAL"))
+    completed_for_watch = filter_completed_candles(index_session, 3)
+    current_completed_close = (
+        safe_float(completed_for_watch["close"].iloc[-1], float("nan"))
+        if not completed_for_watch.empty else float("nan")
+    )
+    breakout_watch = evaluate_local_breakout_watch(
+        direction=structure.direction,
+        spot=spot,
+        current_close=current_completed_close,
+        vwap=structure.vwap,
+        support=structure.support_1,
+        resistance=structure.resistance_1,
+        strike_step_value=strike_step(sorted(chain_rows(chain))),
+        structure_phase=structure.market_phase,
+        structure_entry_confirmed=structure.entry_confirmed,
+        effective_change_oi=safe_float(structure.components.get("structure_change_oi"), 0.0),
+        futures_regime=structure.futures_regime,
+        oi_structure_by_strike=chain_levels.get("oi_structure_by_strike", {}),
+        market_intensity=str(market_regime.get("intensity", "UNKNOWN")),
+    )
+    if breakout_watch.get("armed") and not local_structure_event.get("confirmed"):
+        logger.warning(
+            "BREAKOUT WATCH ARMED (NOT AN ENTRY): direction=%s wall=%.2f spot=%.2f distance=%.2f "
+            "wall_state=%s COI=%+.3f futures=%s; price has not confirmed a close through the wall. "
+            "Wait for a completed-bar breakout/hold; the opposing-wall veto remains active.",
+            breakout_watch.get("direction", "NEUTRAL"),
+            safe_float(breakout_watch.get("level"), float("nan")),
+            safe_float(spot), safe_float(breakout_watch.get("distance"), float("nan")),
+            breakout_watch.get("wall_state", "UNKNOWN"),
+            safe_float(structure.components.get("structure_change_oi"), 0.0),
+            structure.futures_regime,
+        )
+    classified_intensity = str(market_regime.get("intensity", "UNKNOWN")).upper()
+    confirmed_local_event_override = is_confirmed_local_directional_event(local_structure_event)
+    if local_structure_event.get("confirmed") and (classified_intensity != "SIDEWAYS" or confirmed_local_event_override):
+        if local_structure_event.get("warnings"):
+            logger.warning("LOCAL OI EVENT WARNING: %s", ",".join(map(str, local_structure_event.get("warnings", []))))
+        logger.warning(
+            "LOCAL OI EVENT CONFIRMED: kind=%s direction=%s level=%.2f reason=%s",
+            local_structure_event.get("kind", "BREAK"),
+            local_structure_event.get("direction", "NEUTRAL"),
+            safe_float(local_structure_event.get("level"), float("nan")),
+            local_structure_event.get("reason", ""),
+        )
+        market_regime["direction"] = str(local_structure_event["direction"])
+        if classified_intensity in {"UNKNOWN", "SIDEWAYS"} and confirmed_local_event_override:
+            # ADX describes trend strength, but a properly confirmed local break
+            # may still be tradable. Keep the original classification in logs/state.
+            market_regime["classified_intensity"] = classified_intensity
+            market_regime["structural_break_override"] = True
+            market_regime["intensity"] = "NORMAL"
+            logger.warning(
+                "STRUCTURAL EVENT OVERRIDE: raw_intensity=%s ADX=%s; trade eligibility will still require valid in-window T1/SL and R/R >= %.2f.",
+                classified_intensity, market_regime.get("adx"), MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO,
+            )
+        elif classified_intensity == "UNKNOWN":
+            market_regime["intensity"] = "NORMAL"
+        market_regime["reason"] = (
+            str(market_regime.get("reason", "")) + "; " + str(local_structure_event.get("reason", ""))
+        ).strip("; ")
+
+    return MarketEvaluation(
+        structure=structure, market_regime=market_regime,
+        local_oi_break=local_oi_break, local_oi_rejection=local_oi_rejection,
+        local_structure_event=local_structure_event, breakout_watch=breakout_watch,
+        confirmed_local_event_override=confirmed_local_event_override,
+    )
+
+
+def manage_active_trades(
+    state: dict[str, Any],
+    *,
+    chain: list[dict[str, Any]],
+    spot: float,
+    structure: StructureResult,
+    price_session: pd.DataFrame,
+    option_flow_by_strike: dict[str, Any],
+) -> bool:
+    """Service an existing trade and return True when new-entry evaluation must stop."""
+    active_trade = active_trade_from_state(state)
+    if active_trade is not None:
+        migrated = migrate_active_trade_to_v25(
+            active_trade,
+            chain=chain,
+            spot=spot,
+            structure=structure,
+            price_session=price_session,
+            change_oi_by_strike=option_flow_by_strike,
+        )
+        if migrated:
+            state["active_trade"] = active_trade
+            save_state(state)
+        monitor_active_trade(
+            state,
+            structure,
+            chain=chain,
+            price_session=price_session,
+        )
+        return True
+
+    return False
+
+
+def generate_signals(
+    *,
+    state: dict[str, Any],
+    chain: list[dict[str, Any]],
+    spot: float,
+    regime_direction: str,
+    intensity: str,
+    is_expiry_day: bool,
+    entry_structure: StructureResult,
+    option_flow_by_strike: dict[str, Any],
+    oi_velocity_by_strike: dict[str, Any],
+) -> Optional[OptionCandidate]:
+    """Rank local option candidates and apply every existing execution validation."""
+    option_micro_metrics = collect_option_premium_vwaps(
+        chain, spot, regime_direction, intensity,
+        is_expiry_day=is_expiry_day, now=now_ist(),
+    )
+    try:
+        option = select_directional_option(
+            chain=chain,
+            direction=regime_direction,
+            spot=spot,
+            change_oi_by_strike=option_flow_by_strike,
+            market_intensity=intensity,
+            is_expiry_day=is_expiry_day,
+            now=now_ist(),
+            option_metrics_by_instrument=option_micro_metrics,
+            oi_velocity_by_strike=oi_velocity_by_strike,
+        )
+        validate_continuous_option_entry(
+            option=option,
+            chain=chain,
+            direction=regime_direction,
+            market_phase=entry_structure.market_phase,
+            spot=spot,
+            market_intensity=intensity,
+            is_expiry_day=is_expiry_day,
+            now=now_ist(),
+        )
+    except ScannerError as exc:
+        logger.warning("NO TRADE: option strike selection rejected all candidates: %s", exc)
+        save_state(state)
+        return None
+    return option
+
+
+def execute_scan(
+    state: Optional[dict[str, Any]] = None,
+) -> Optional[Signal]:
+    state = state if isinstance(state, dict) else load_state()
+    current_time = now_ist()
+    today_iso = current_time.date().isoformat()
+    # The 15:15 cutoff is evaluated before ordinary market-hours returns, so an
+    # active intraday trade still receives its exit routine if a scan starts late.
+    if current_time.weekday() < 5 and current_time.time() >= NEW_ENTRY_CUTOFF:
+        active = active_trade_from_state(state)
+        if active:
+            if str(active.get("trade_date", ""))[:10] == today_iso:
+                force_close_active_trade_at_cutoff(state, "TIME_CUTOFF_15_15")
+            else:
+                # Do not let an expired prior-session position remain active in
+                # scanner state if its old instrument no longer has a live quote.
+                closed = dict(active)
+                closed.update({
+                    "status": "CLOSED", "outcome": "SESSION_END_CLEANUP",
+                    "closed_at": current_time.isoformat(),
+                    "exit_reason": "stale position state from a prior trading date",
+                })
+                state["active_trade"] = None
+                state["last_completed_trade"] = closed
+                save_state(state)
+                logger.warning("STALE ACTIVE TRADE STATE CLEARED for prior session: %s", active.get("trading_symbol", ""))
+        logger.info("NEW ENTRY CUTOFF: %s IST; no new positions after %s.", current_time.strftime("%H:%M:%S"), NEW_ENTRY_CUTOFF.strftime("%H:%M"))
+        return None
+
+    if not market_window_open():
+        logger.info("Outside NSE market hours.")
+        return None
+
+    status = get_market_status()
+    logger.info("NSE status=%s", status)
+    if status != "OPEN":
+        return None
+
+    # Directional memory is version-scoped, but compatible same-day OI history
+    # is data, not strategy state: preserve it across code upgrades. On a new date,
+    # reset both intraday memory and the OI ring because yesterday's OI cannot be
+    # used as an intraday velocity baseline.
+    state_reset, reset_reason = reset_intraday_memory_if_needed(state, today_iso)
+    if state_reset:
+        oi_history_count = len(state.get("option_oi_history", [])) if isinstance(state.get("option_oi_history"), list) else 0
+        logger.info(
+            "STATE RESET: reason=%s; directional memory reset; preserved_OI_history_snapshots=%d; state_file=%s",
+            reset_reason, oi_history_count, STATE_FILE.resolve(),
+        )
+        save_state(state)
+
+    market_data = ingest_market_data(state, current_time)
+    now_time = market_data.now_time
+    future = market_data.future
+    index_session = market_data.index_session
+    index_live_quote = market_data.index_live_quote
+    spot = market_data.spot
+    futures_session = market_data.futures_session
+    futures_live_quote = market_data.futures_live_quote
+    futures_ltp_now = market_data.futures_ltp_now
+    futures_quote_check = market_data.futures_quote_check
+    futures_quote_status = market_data.futures_quote_status
+    futures_analysis_quote = market_data.futures_analysis_quote
+    completed_index_3m = market_data.completed_index_3m
+    regime_indicator_history = market_data.regime_indicator_history
+    historical_completed = market_data.historical_completed
+    futures_3m = market_data.futures_3m
+
     # Build the option-chain structure directly from current OI and Change-OI.
     expiry, chain = get_option_chain(state)
     api_change_oi_by_strike = fetch_change_oi_by_strike(expiry)
@@ -6656,112 +7174,21 @@ def execute_scan(
 
     seed_direction = persistent_direction or previous_direction
 
-    structure = build_market_structure(
-        spot=spot,
-        futures_3m=futures_3m,
-        futures_session=futures_session,
-        chain_levels=chain_levels,
-        change_oi_score=change_oi_score,
-        futures_live_quote=futures_analysis_quote,
-        previous_direction=seed_direction,
-        previous_phase=previous_phase,
-        price_session=index_session,
-    )
-    market_regime = classify_market_regime(
-        index_session, spot, structure.vwap, structure.direction,
-        structure.support_1, structure.resistance_1,
-        indicator_history=regime_indicator_history,
-    )
-    current_oi_structure = chain_levels.get("oi_structure_by_strike", {})
-    decision_step = strike_step(sorted(chain_rows(option_chain_atm_window(chain, spot)[0])))
-    local_oi_break = detect_confirmed_local_oi_break(
-        index_session,
-        spot=spot,
-        support=structure.support_1,
-        resistance=structure.resistance_1,
+    evaluation = evaluate_market_structure(
+        spot=spot, index_session=index_session, futures_3m=futures_3m,
+        futures_session=futures_session, chain=chain, chain_levels=chain_levels,
+        change_oi_score=change_oi_score, futures_analysis_quote=futures_analysis_quote,
+        seed_direction=seed_direction, previous_phase=previous_phase,
         previous_snapshot=previous_snapshot,
-        chain_levels=chain_levels,
-        futures_regime=structure.futures_regime,
-        pressure_score=safe_float(chain_levels.get("pressure_score"), 0.0),
-        oi_structure_by_strike=current_oi_structure,
-        strike_step_value=decision_step,
+        regime_indicator_history=regime_indicator_history,
     )
-    local_oi_rejection = detect_confirmed_local_oi_rejection(
-        index_session,
-        spot=spot,
-        support=structure.support_1,
-        resistance=structure.resistance_1,
-        chain_levels=chain_levels,
-        oi_structure_by_strike=current_oi_structure,
-        futures_regime=structure.futures_regime,
-        pressure_score=safe_float(chain_levels.get("pressure_score"), 0.0),
-        strike_step_value=decision_step,
-    )
-    # A confirmed directional break takes priority; otherwise consider a separately
-    # confirmed rejection/bounce event. A mere near-wall watch is never an entry.
-    local_structure_event = (
-        local_oi_break if local_oi_break.get("confirmed") else local_oi_rejection
-    )
-    if not local_structure_event.get("confirmed"):
-        logger.info("LOCAL OI REVERSAL CHECK: %s", local_oi_rejection.get("reason", "NO_CONFIRMED_REVERSAL"))
-    completed_for_watch = filter_completed_candles(index_session, 3)
-    current_completed_close = (
-        safe_float(completed_for_watch["close"].iloc[-1], float("nan"))
-        if not completed_for_watch.empty else float("nan")
-    )
-    breakout_watch = evaluate_local_breakout_watch(
-        direction=structure.direction,
-        spot=spot,
-        current_close=current_completed_close,
-        vwap=structure.vwap,
-        support=structure.support_1,
-        resistance=structure.resistance_1,
-        strike_step_value=strike_step(sorted(chain_rows(chain))),
-        structure_phase=structure.market_phase,
-        structure_entry_confirmed=structure.entry_confirmed,
-        effective_change_oi=safe_float(structure.components.get("structure_change_oi"), 0.0),
-        futures_regime=structure.futures_regime,
-        oi_structure_by_strike=chain_levels.get("oi_structure_by_strike", {}),
-        market_intensity=str(market_regime.get("intensity", "UNKNOWN")),
-    )
-    if breakout_watch.get("armed") and not local_structure_event.get("confirmed"):
-        logger.warning(
-            "BREAKOUT WATCH ARMED (NOT AN ENTRY): direction=%s wall=%.2f spot=%.2f distance=%.2f "
-            "wall_state=%s COI=%+.3f futures=%s; price has not confirmed a close through the wall. "
-            "Wait for a completed-bar breakout/hold; the opposing-wall veto remains active.",
-            breakout_watch.get("direction", "NEUTRAL"),
-            safe_float(breakout_watch.get("level"), float("nan")),
-            safe_float(spot), safe_float(breakout_watch.get("distance"), float("nan")),
-            breakout_watch.get("wall_state", "UNKNOWN"),
-            safe_float(structure.components.get("structure_change_oi"), 0.0),
-            structure.futures_regime,
-        )
-    classified_intensity = str(market_regime.get("intensity", "UNKNOWN")).upper()
-    confirmed_break_override = is_confirmed_local_break(local_structure_event)
-    if local_structure_event.get("confirmed") and (classified_intensity != "SIDEWAYS" or confirmed_break_override):
-        logger.warning(
-            "LOCAL OI EVENT CONFIRMED: kind=%s direction=%s level=%.2f reason=%s",
-            local_structure_event.get("kind", "BREAK"),
-            local_structure_event.get("direction", "NEUTRAL"),
-            safe_float(local_structure_event.get("level"), float("nan")),
-            local_structure_event.get("reason", ""),
-        )
-        market_regime["direction"] = str(local_structure_event["direction"])
-        if classified_intensity in {"UNKNOWN", "SIDEWAYS"} and confirmed_break_override:
-            # ADX describes trend strength, but a properly confirmed local break
-            # may still be tradable. Keep the original classification in logs/state.
-            market_regime["classified_intensity"] = classified_intensity
-            market_regime["structural_break_override"] = True
-            market_regime["intensity"] = "NORMAL"
-            logger.warning(
-                "STRUCTURAL BREAK OVERRIDE: raw_intensity=%s ADX=%s; trade eligibility will still require valid in-window T1/SL and R/R >= %.2f.",
-                classified_intensity, market_regime.get("adx"), MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO,
-            )
-        elif classified_intensity == "UNKNOWN":
-            market_regime["intensity"] = "NORMAL"
-        market_regime["reason"] = (
-            str(market_regime.get("reason", "")) + "; " + str(local_structure_event.get("reason", ""))
-        ).strip("; ")
+    structure = evaluation.structure
+    market_regime = evaluation.market_regime
+    local_oi_break = evaluation.local_oi_break
+    local_oi_rejection = evaluation.local_oi_rejection
+    local_structure_event = evaluation.local_structure_event
+    breakout_watch = evaluation.breakout_watch
+    confirmed_local_event_override = evaluation.confirmed_local_event_override
 
     logger.info(
         "REGIME INDICATOR READINESS: history_3m=%d total_seeded_3m=%d current_15m=%d "
@@ -6787,9 +7214,7 @@ def execute_scan(
         market_regime.get("divergence"), market_regime.get("reason"),
     )
 
-    state_history = state.get("market_history")
-    if not isinstance(state_history, list):
-        state_history = []
+    market_memory = MarketMemory.from_state(state)
     history_item = {
         "timestamp": now_ist().isoformat(),
         "spot": round(spot, 2),
@@ -6801,10 +7226,10 @@ def execute_scan(
         "confirmation_state": structure.confirmation_state,
         "reversal_confirmations": structure.reversal_confirmations,
     }
-    state_history.append(history_item)
-    state["market_history"] = state_history[-STATE_HISTORY_LIMIT:]
+    market_memory.append_history(history_item, STATE_HISTORY_LIMIT)
+    state["market_history"] = market_memory.market_history
 
-    state["market_snapshot"] = {
+    state["market_snapshot"] = MarketSnapshot.from_mapping({
         "timestamp": now_ist().isoformat(),
         "spot": round(spot, 2),
         "futures_ltp": round(futures_ltp_now, 2),
@@ -6880,12 +7305,12 @@ def execute_scan(
         "local_oi_rejection": local_oi_rejection,
         "local_structure_event": local_structure_event,
         "breakout_watch": breakout_watch,
-    }
+    }).to_mapping()
     state["option_oi_snapshot"] = build_option_oi_snapshot(chain, expiry, now=oi_snapshot_time, spot=spot)
     state["option_flow_by_strike"] = option_flow_by_strike
     state["persistent_direction"] = (
         str(local_structure_event.get("direction", "")).upper()
-        if local_structure_event.get("confirmed") and (str(market_regime.get("intensity", "UNKNOWN")).upper() != "SIDEWAYS" or confirmed_break_override)
+        if local_structure_event.get("confirmed") and (str(market_regime.get("intensity", "UNKNOWN")).upper() != "SIDEWAYS" or confirmed_local_event_override)
         else structure.direction if structure.direction in {"BULLISH", "BEARISH"} else (seed_direction or "")
     ) or None
     save_state(state)
@@ -6895,7 +7320,7 @@ def execute_scan(
         state.get("persistent_direction") or "NONE",
         previous_direction or "NONE",
     )
-    if local_structure_event.get("confirmed") and (str(market_regime.get("intensity", "UNKNOWN")).upper() != "SIDEWAYS" or confirmed_break_override):
+    if local_structure_event.get("confirmed") and (str(market_regime.get("intensity", "UNKNOWN")).upper() != "SIDEWAYS" or confirmed_local_event_override):
         prediction_direction = str(local_structure_event.get("direction", "NEUTRAL")).upper()
         prediction_interpretation = str(local_structure_event.get("reason", "Confirmed local OI event"))
         prediction_score = abs(structure.score) if prediction_direction == "BULLISH" else -abs(structure.score)
@@ -6910,25 +7335,10 @@ def execute_scan(
         prediction_direction, prediction_interpretation, prediction_confidence, prediction_score,
     )
 
-    active_trade = active_trade_from_state(state)
-    if active_trade is not None:
-        migrated = migrate_active_trade_to_v25(
-            active_trade,
-            chain=chain,
-            spot=spot,
-            structure=structure,
-            price_session=index_session,
-            change_oi_by_strike=option_flow_by_strike,
-        )
-        if migrated:
-            state["active_trade"] = active_trade
-            save_state(state)
-        monitor_active_trade(
-            state,
-            structure,
-            chain=chain,
-            price_session=index_session,
-        )
+    if manage_active_trades(
+        state, chain=chain, spot=spot, structure=structure,
+        price_session=index_session, option_flow_by_strike=option_flow_by_strike,
+    ):
         return None
 
     # Prevent stop/exit -> immediate re-entry churn. A fresh 3m candle and a
@@ -7003,7 +7413,7 @@ def execute_scan(
             regime_direction, coi_guard.get("reason", "PROFIT_BOOKING"),
         )
         return None
-    if tod_window == "MIDDAY" and (not math.isfinite(adx_value) or adx_value < MIDDAY_MIN_ADX) and not confirmed_break_override:
+    if tod_window == "MIDDAY" and (not math.isfinite(adx_value) or adx_value < MIDDAY_MIN_ADX) and not confirmed_local_event_override:
         logger.info("NO TRADE: midday momentum gate requires ADX >= %.1f; actual=%s.", MIDDAY_MIN_ADX, adx_value)
         return None
 
@@ -7035,7 +7445,7 @@ def execute_scan(
     local_event_matches_regime = bool(
         local_structure_event.get("confirmed")
         and str(local_structure_event.get("direction", "")).upper() == regime_direction
-        and intensity != "SIDEWAYS"
+        and (intensity != "SIDEWAYS" or confirmed_local_event_override)
     )
     if intensity == "EXHAUSTION" and not exhaustion_entry and not local_event_matches_regime:
         logger.info(
@@ -7079,7 +7489,10 @@ def execute_scan(
             structure,
             direction=local_direction,
             score=abs(structure.score) if local_direction == "BULLISH" else -abs(structure.score),
-            confidence=min(max(structure.confidence, 60.0), 82.0),
+            confidence=min(max(
+                structure.confidence - safe_float(local_structure_event.get("confidence_penalty"), 0.0),
+                50.0 if safe_float(local_structure_event.get("confidence_penalty"), 0.0) > 0.0 else 60.0,
+            ), 82.0),
             interpretation=f"CONFIRMED LOCAL OI {local_direction} {event_kind} — PRICE BAR + DERIVATIVES CONFIRMATION",
             market_phase=local_phase,
             entry_confirmed=True,
@@ -7270,35 +7683,12 @@ def execute_scan(
         logger.warning("NO TRADE: %s; nearest structural target/stop were validated, but runway remains insufficient without a confirmed matching local event.", wall_veto)
         return None
 
-    option_micro_metrics = collect_option_premium_vwaps(
-        chain, spot, regime_direction, intensity,
-        is_expiry_day=is_expiry_day, now=now_ist(),
+    option = generate_signals(
+        state=state, chain=chain, spot=spot, regime_direction=regime_direction,
+        intensity=intensity, is_expiry_day=is_expiry_day, entry_structure=entry_structure,
+        option_flow_by_strike=option_flow_by_strike, oi_velocity_by_strike=oi_velocity_by_strike,
     )
-    try:
-        option = select_directional_option(
-            chain=chain,
-            direction=regime_direction,
-            spot=spot,
-            change_oi_by_strike=option_flow_by_strike,
-            market_intensity=intensity,
-            is_expiry_day=is_expiry_day,
-            now=now_ist(),
-            option_metrics_by_instrument=option_micro_metrics,
-            oi_velocity_by_strike=oi_velocity_by_strike,
-        )
-        validate_continuous_option_entry(
-            option=option,
-            chain=chain,
-            direction=regime_direction,
-            market_phase=entry_structure.market_phase,
-            spot=spot,
-            market_intensity=intensity,
-            is_expiry_day=is_expiry_day,
-            now=now_ist(),
-        )
-    except ScannerError as exc:
-        logger.warning("NO TRADE: option strike selection rejected all candidates: %s", exc)
-        save_state(state)
+    if option is None:
         return None
     target1, target2, stop_loss = target_u1, target_u2, stop_u
     underlying_stop, underlying_target1, underlying_target2 = stop_u, target_u1, target_u2
@@ -7353,1062 +7743,67 @@ def execute_scan(
         market_intensity=intensity,
     )
 
-def _synthetic_structure_chain(
-    spot: float,
-    support: float,
-    resistance: float,
-    put_change: float = 1000000.0,
-    call_change: float = -1000000.0,
-) -> tuple[list[dict[str, Any]], dict[float, dict[str, float]]]:
-    strikes = sorted(set([support, spot, resistance, support - 50, resistance + 50]))
-    chain: list[dict[str, Any]] = []
-    changes: dict[float, dict[str, float]] = {}
-    for k in strikes:
-        chain.append({
-            "strike_price": float(k),
-            "expiry": "2026-10-13",
-            "call_options": {
-                "instrument_key": f"CE{k}",
-                "market_data": {
-                    "ltp": 110.0 if k < spot else 90.0,
-                    "close_price": 100.0,
-                    "oi": 1000000.0 if abs(k - resistance) < 1 else 500000.0,
-                    "prev_oi": 500000.0,
-                    "volume": 10000,
-                    "bid_price": 109.5,
-                    "ask_price": 110.5,
-                    "bid_qty": 100,
-                    "ask_qty": 100,
-                },
-                "option_greeks": {"delta": 0.55, "gamma": 0.01, "theta": -2.0, "iv": 20.0},
-            },
-            "put_options": {
-                "instrument_key": f"PE{k}",
-                "market_data": {
-                    "ltp": 110.0 if k >= spot else 90.0,
-                    "close_price": 100.0,
-                    "oi": 1000000.0 if abs(k - support) < 1 else 500000.0,
-                    "prev_oi": 500000.0,
-                    "volume": 10000,
-                    "bid_price": 109.5,
-                    "ask_price": 110.5,
-                    "bid_qty": 100,
-                    "ask_qty": 100,
-                },
-                "option_greeks": {"delta": -0.55, "gamma": 0.01, "theta": -2.0, "iv": 20.0},
-            },
-        })
-        call_delta = call_change if k >= spot else 0.0
-        put_delta = put_change if k <= spot else 0.0
-        changes[float(k)] = {
-            "call_oi_change": call_delta,
-            "put_oi_change": put_delta,
-            "call_change": call_delta,
-            "put_change": put_delta,
-        }
-    return chain, changes
-
-
-def _synthetic_candles(
-    values: list[float],
-    oi: Optional[list[float]] = None,
-    start: str = "2026-09-10 09:15",
-) -> pd.DataFrame:
-    index = pd.date_range(start, periods=len(values), freq="3min", tz="Asia/Kolkata")
-    df = pd.DataFrame(
-        {
-            "timestamp": index.tz_convert("UTC"),
-            "open": values,
-            "high": [x + 2 for x in values],
-            "low": [x - 2 for x in values],
-            "close": values,
-            "volume": [1000.0] * len(values),
-            "oi": oi if oi is not None else [np.nan] * len(values),
-        }
-    )
-    return df
-
-
-def self_test() -> None:
-    """Deterministic regression tests for ATM-window scope, OI structure, execution gates and exits."""
-    global get_historical_candles
-    def mk_candles(values: list[float], oi: Optional[list[float]] = None) -> pd.DataFrame:
-        return _synthetic_candles(values, oi=oi)
-
-    # V32 regression: an opening session with only 11 completed 3m candles must
-    # get ADX and both RSI timeframes from prior-session index warm-up candles.
-    indicator_history_test = _synthetic_candles(
-        [100.0 + 0.18 * i + (0.7 if i % 4 in {0, 1} else -0.35) for i in range(100)],
-        start="2026-10-09 09:15",
-    )
-    opening_session_test = _synthetic_candles(
-        [118.0, 118.3, 118.1, 118.7, 118.9, 119.2, 119.0, 119.5, 119.8, 120.0, 120.3],
-        start="2026-10-12 09:15",
-    )
-    seeded_regime_test = classify_market_regime(
-        opening_session_test, current_spot=121.0, current_vwap=119.0,
-        proposed_direction="BULLISH", support=118.0, resistance=122.0,
-        indicator_history=indicator_history_test,
-    )
-    assert seeded_regime_test["indicator_history_bars"] == len(indicator_history_test)
-    assert math.isfinite(seeded_regime_test["adx"]), seeded_regime_test
-    assert math.isfinite(seeded_regime_test["rsi_3m"]), seeded_regime_test
-    assert math.isfinite(seeded_regime_test["rsi_15m"]), seeded_regime_test
-
-    # Without prior history, 11 current-session bars must not fabricate ADX.
-    # A clearly aligned opening tape can still use the explicit NORMAL fallback.
-    unseeded_regime_test = classify_market_regime(
-        opening_session_test, current_spot=121.0, current_vwap=119.0,
-        proposed_direction="BULLISH", support=118.0, resistance=122.0,
-    )
-    assert not math.isfinite(unseeded_regime_test["adx"])
-    assert unseeded_regime_test["direction"] == "BULLISH", unseeded_regime_test
-    assert unseeded_regime_test["intensity"] == "NORMAL", unseeded_regime_test
-    assert "OPENING_TAPE_FALLBACK" in unseeded_regime_test["reason"]
-
-    # V32 regression: historical candle seeding is cached for the trading date,
-    # preventing repeat historical API calls on every scheduled scan.
-    cache_test_state: dict[str, Any] = {}
-    indicator_test_now = datetime(2026, 10, 12, 9, 50, tzinfo=IST)
-    original_get_historical = get_historical_candles
-    historical_fetch_calls = {"count": 0}
-    def fake_historical_index_fetch(instrument_key: str, interval_minutes: int) -> pd.DataFrame:
-        historical_fetch_calls["count"] += 1
-        assert instrument_key == NIFTY_KEY and interval_minutes == 3
-        return indicator_history_test.copy()
-    try:
-        get_historical_candles = fake_historical_index_fetch
-        cached_history_first = get_regime_indicator_history(
-            cache_test_state, NIFTY_KEY, now=indicator_test_now
-        )
-        get_historical_candles = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("historical cache was not reused"))
-        cached_history_second = get_regime_indicator_history(
-            cache_test_state, NIFTY_KEY, now=indicator_test_now
-        )
-    finally:
-        get_historical_candles = original_get_historical
-    assert historical_fetch_calls["count"] == 1
-    assert len(cached_history_first) == len(cached_history_second) > 0
-
-    # V33 regression: prior-session futures candles are cached by date and contract.
-    futures_cache_state: dict[str, Any] = {}
-    futures_history_calls = {"count": 0}
-    futures_instrument_test = "NSE_FO|NIFTY_FUT_TEST"
-    def fake_historical_futures_fetch(instrument_key: str, interval_minutes: int) -> pd.DataFrame:
-        futures_history_calls["count"] += 1
-        assert instrument_key == futures_instrument_test and interval_minutes == 3
-        result = indicator_history_test.copy()
-        result["oi"] = np.linspace(100000.0, 101000.0, len(result))
-        return result
-    try:
-        get_historical_candles = fake_historical_futures_fetch
-        cached_futures_first = get_cached_futures_oi_history(
-            futures_cache_state, futures_instrument_test, now=indicator_test_now
-        )
-        get_historical_candles = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("futures historical cache was not reused"))
-        cached_futures_second = get_cached_futures_oi_history(
-            futures_cache_state, futures_instrument_test, now=indicator_test_now
-        )
-    finally:
-        get_historical_candles = original_get_historical
-    assert futures_history_calls["count"] == 1
-    assert len(cached_futures_first) == len(cached_futures_second) > 0
-    assert "oi" in cached_futures_second.columns and cached_futures_second["oi"].notna().all()
-
-    # V33 regression: a confirmed two-bars-vs-two-bars current-session 15m RSI
-    # divergence is detectable earlier; prior-session swings are not silently joined.
-    divergence_frame = pd.DataFrame({
-        "timestamp": pd.date_range("2026-10-12 09:15", periods=4, freq="15min", tz="Asia/Kolkata").tz_convert("UTC"),
-        "open": [102.0, 101.0, 100.0, 99.0],
-        "high": [103.0, 102.0, 101.0, 100.0],
-        "low": [100.0, 99.0, 98.0, 97.0],
-        "close": [101.0, 100.0, 99.0, 98.0],
-        "volume": [1000.0] * 4,
-    })
-    early_divergence = detect_rsi_divergence(
-        divergence_frame, window=2, rsi_values=pd.Series([30.0, 35.0, 40.0, 42.0])
-    )
-    assert early_divergence == "BULLISH", early_divergence
-
-    # V33 regression: score is calibrated to [0,1] so the +0.500 veto is meaningful.
-    assert 0.0 <= normalized_execution_score(1.0, 1.0, 3.5, 1.0) <= 1.0
-    assert normalized_execution_score(1.0, 1.0, 3.5, 1.0) == 1.0
-    weak_score = normalized_execution_score(0.1, 0.5, 0.0, 0.5)
-    assert weak_score < MIN_EXECUTION_SCORE, weak_score
-    assert math.isclose(normalized_execution_score(1.0, 1.0, 0.0, 1.0), 0.80)
-    assert normalized_execution_score(1.0, 1.0, 0.0, 1.0, coi_available=False) == 0.80
-    assert normalized_execution_score(0.1, 0.75, 0.0, 0.667, coi_available=False) < MIN_EXECUTION_SCORE
-    score_without_coi = normalized_execution_score(0.6, 0.7, 0.0, 0.7, coi_available=False)
-    score_with_positive_coi = normalized_execution_score(0.6, 0.7, 1.0, 0.7, coi_available=True)
-    assert score_with_positive_coi > score_without_coi
-
-    # Regression: a weak intraday snapshot must not override the clearly bullish
-    # session Change-OI score seen around 09:25 IST on 2026-10-09.
-    eff, bias, source, conflict = resolve_change_oi_flow(-0.155, +0.760, "INTRADAY_SNAPSHOT")
-    assert eff == 0.0 and bias == 0 and conflict and source == "INTRADAY_DAY_CONFLICT"
-    # A valid rolling/opening local-window velocity that is neutral must not be
-    # overridden by the day-total Change-OI score.
-    eff_neutral, bias_neutral, source_neutral, conflict_neutral = resolve_change_oi_flow(
-        +0.01, +0.80, "ROLLING_15_30"
-    )
-    assert eff_neutral == 0.0 and bias_neutral == 0 and not conflict_neutral
-    assert source_neutral == "ROLLING_15_30_NEUTRAL"
-
-    # V29 regression: a same-session scanner version upgrade resets directional
-    # memory but preserves the compatible OI baseline ring and legacy snapshot.
-    preserved_oi_state = {
-        "scanner_version": "OLDER_SCANNER_VERSION",
-        "market_snapshot": {"timestamp": "2026-10-09T10:00:00+05:30"},
-        "market_history": [{"direction": "BEARISH"}],
-        "persistent_direction": "BEARISH",
-        "option_oi_history": [{"timestamp": "2026-10-09T10:00:00+05:30", "expiry": "2026-10-13"}],
-        "option_oi_snapshot": {"timestamp": "2026-10-09T10:00:00+05:30", "expiry": "2026-10-13"},
+def dispatch_alerts(state: dict[str, Any], signal: Signal) -> None:
+    """Persist the signal lock and active-trade record, then print/email alerts."""
+    active_trade = {
+        "status": "ACTIVE",
+        "trade_date": now_ist().date().isoformat(),
+        "opened_at": signal.timestamp,
+        "direction": signal.direction,
+        "regime": signal.regime,
+        "market_intensity": signal.market_intensity,
+        "confidence": signal.confidence,
+        "instrument_key": signal.instrument_key,
+        "trading_symbol": signal.trading_symbol,
+        "option_type": signal.option_type,
+        "strike": signal.strike,
+        "entry": signal.entry,
+        "entry_underlying": signal.spot,
+        "t1_hit": False,
+        "t1_hit_at": "",
+        "post_t1_dynamic_stop": None,
+        "post_t1_dynamic_stop_source": "",
+        "post_t1_dynamic_stop_updated_at": "",
+        "target_1": signal.target_1,
+        "target_2": signal.target_2,
+        "stop_loss": signal.stop_loss,
+        "underlying_stop": signal.underlying_stop,
+        "underlying_target_1": signal.underlying_target_1,
+        "underlying_target_2": signal.underlying_target_2,
+        "delta": signal.delta,
+        "theta": signal.theta,
+        "target_engine_version": OPTION_TARGET_ENGINE_VERSION,
+        "reversal_confirmations": 0,
+        "market_alignment_failures": 0,
+        "last_market_direction": signal.direction,
+        "last_market_confidence": signal.confidence,
+        "last_ltp": signal.entry,
+        "entry_3m_bar": str((state.get("market_snapshot") or {}).get("latest_completed_3m_bar", "")),
+        "underlying_stop_armed_bar": str((state.get("market_snapshot") or {}).get("latest_completed_3m_bar", "")),
+        "intrabar_last_checked_at": signal.timestamp,
     }
-    did_reset, reset_reason = reset_intraday_memory_if_needed(preserved_oi_state, "2026-10-09")
-    assert did_reset and reset_reason == "SCANNER_VERSION_CHANGE_PRESERVED_OI_HISTORY"
-    assert len(preserved_oi_state["option_oi_history"]) == 1
-    assert preserved_oi_state["option_oi_snapshot"]["expiry"] == "2026-10-13"
-    assert preserved_oi_state["persistent_direction"] is None
 
-    # A true new trading date must clear prior-session OI history and snapshots.
-    new_day_state = {
-        "scanner_version": SCANNER_VERSION,
-        "market_snapshot": {"timestamp": "2026-10-08T15:20:00+05:30"},
-        "option_oi_history": [{"timestamp": "2026-10-08T15:00:00+05:30"}],
-        "option_oi_snapshot": {"timestamp": "2026-10-08T15:00:00+05:30"},
-    }
-    did_reset_day, reset_day_reason = reset_intraday_memory_if_needed(new_day_state, "2026-10-09")
-    assert did_reset_day and reset_day_reason == "NEW_TRADING_SESSION"
-    assert "option_oi_history" not in new_day_state and "option_oi_snapshot" not in new_day_state
+    state["active_trade"] = ActiveTradeState.from_mapping(active_trade).to_mapping()
+    state["last_signal"] = asdict(signal)
+    state["last_signal_hash"] = signal_hash(signal)
+    state["last_signal_timestamp"] = signal.timestamp
+    save_state(state)
 
-    # Continuation requires two distinct completed 3m bars, not repeated scans of
-    # the same bar and not a single early-market classification.
-    persistence_state: dict[str, Any] = {}
-    ready1, count1 = update_continuation_persistence(
-        persistence_state, "CONTINUOUS_BULLISH", "2026-10-09T03:30:00+00:00"
+    print(format_engine_output(signal))
+
+    send_email(
+        f"NIFTY {signal.direction} {signal.trading_symbol}",
+        signal_email_body(signal),
     )
-    ready_same, count_same = update_continuation_persistence(
-        persistence_state, "CONTINUOUS_BULLISH", "2026-10-09T03:30:00+00:00"
+
+    logger.info(
+        "NEW SIGNAL LOCKED: %s | entry_option=%.2f NIFTY_T1=%.2f NIFTY_T2=%.2f NIFTY_SL=%.2f",
+        signal.trading_symbol,
+        signal.entry,
+        signal.underlying_target_1,
+        signal.underlying_target_2,
+        signal.underlying_stop,
     )
-    ready2, count2 = update_continuation_persistence(
-        persistence_state, "CONTINUOUS_BULLISH", "2026-10-09T03:33:00+00:00"
-    )
-    assert not ready1 and count1 == 1
-    assert not ready_same and count_same == 1
-    assert ready2 and count2 == 2
-
-    # Exhaustion reversal setups also require distinct completed-bar persistence.
-    exhaustion_state: dict[str, Any] = {}
-    exhaustion_ready1, exhaustion_count1 = update_continuation_persistence(
-        exhaustion_state, "EXHAUSTION_BULLISH", "2026-10-09T03:45:00+00:00", required_confirmations=2
-    )
-    exhaustion_ready2, exhaustion_count2 = update_continuation_persistence(
-        exhaustion_state, "EXHAUSTION_BULLISH", "2026-10-09T03:48:00+00:00", required_confirmations=2
-    )
-    assert not exhaustion_ready1 and exhaustion_count1 == 1
-    assert exhaustion_ready2 and exhaustion_count2 == 2
-
-    # Basic price-action volatility and completed-bar behavior.
-    down = mk_candles([100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85])
-    up = mk_candles([85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100])
-    assert calculate_atr(down, ATR_PERIOD).iloc[-1] > 0
-    assert calculate_atr(up, ATR_PERIOD).iloc[-1] > 0
-
-    fut_bear = mk_candles([100, 99.5, 99, 98.5, 98, 97.5, 97, 96.5, 96], [1000, 1020, 1045, 1070, 1100, 1130, 1160, 1190, 1220])
-    fut_info = futures_oi_structure(fut_bear)
-    assert fut_info["regime"] == "SHORT_BUILDUP"
-    assert fut_info["bias"] == -1
-
-    bearish_levels = _synthetic_structure_chain(96.5, 95.0, 105.0, 1000000.0, -900000.0)
-    bearish_chain, bearish_flow = bearish_levels
-    chain_map = chain_oi_support_resistance(
-        bearish_chain, 96.5, bearish_flow, expiry="2026-10-13"
-    )
-    assert math.isfinite(chain_map["support_1"]) and math.isfinite(chain_map["resistance_1"])
-
-    conflict_levels = dict(chain_map)
-    conflict_levels.update({
-        "support_1": 80.0, "support_2": 70.0,
-        "resistance_1": 90.0, "resistance_2": 100.0,
-        "support_source": "OPTION_OI", "resistance_source": "OPTION_OI",
-        "flow_mode": "INTRADAY_SNAPSHOT", "change_flow_score": -0.155,
-    })
-    conflicted_structure = build_market_structure(
-        85.0, up, up, conflict_levels, +0.760,
-        previous_direction=None, previous_phase=None, price_session=down,
-    )
-    assert not conflicted_structure.entry_confirmed
-    assert conflicted_structure.confirmation_state == "FLOW_CONFLICT"
-
-    # Continuous bearish: below VWAP + sustained bearish PA + bearish Change-OI.
-    # Recompute the same synthetic chain around spot=85 so its OI-dominant
-    # support/resistance are actually below/above the test price.
-    bearish_levels_85 = _synthetic_structure_chain(85.0, 80.0, 90.0, 1000000.0, -900000.0)
-    bearish_chain_85, bearish_flow_85 = bearish_levels_85
-    chain_map_85 = chain_oi_support_resistance(
-        bearish_chain_85, 85.0, bearish_flow_85, expiry="2026-10-13"
-    )
-    assert chain_map_85["support_1"] < 85.0 < chain_map_85["resistance_1"], chain_map_85
-    chain_map_85.update({"flow_mode": "INTRADAY_SNAPSHOT", "change_flow_score": -0.40, "change_flow_bias": -1})
-    structure = build_market_structure(
-        85.0, fut_bear, fut_bear, chain_map_85, -0.40,
-        previous_direction=None, previous_phase=None, price_session=down
-    )
-    assert structure.direction == "BEARISH"
-    assert structure.market_phase == "CONTINUOUS_BEARISH"
-    assert structure.entry_confirmed
-
-    # Pullback regression: a small bounce must not erase an established bearish trend.
-    pullback = mk_candles([120, 118, 116, 114, 111, 109, 110, 111])
-    pull_levels = dict(chain_map)
-    pull_levels.update({"support_1": 105.0, "support_2": 100.0, "resistance_1": 125.0, "resistance_2": 130.0, "flow_mode": "INTRADAY_SNAPSHOT", "change_flow_score": -0.70, "change_flow_bias": -1})
-    pull = build_market_structure(
-        111.0, fut_bear, fut_bear, pull_levels, -0.40,
-        previous_direction="BEARISH", previous_phase="CONTINUOUS_BEARISH", price_session=pullback
-    )
-    assert pull.direction == "BEARISH" and pull.market_phase == "CONTINUOUS_BEARISH" and pull.entry_confirmed
-
-    # The trend may remain continuous above support; support break is not mandatory.
-    above_support = mk_candles([120, 118, 116, 114, 111, 109, 110, 112])
-    above_levels = dict(pull_levels)
-    above_levels.update({"support_1": 105.0, "support_2": 100.0})
-    cont = build_market_structure(
-        112.0, fut_bear, fut_bear, above_levels, -0.35,
-        previous_direction="BEARISH", previous_phase="CONTINUOUS_BEARISH", price_session=above_support
-    )
-    assert cont.market_phase == "CONTINUOUS_BEARISH" and cont.entry_confirmed
-
-    # V16 regression: structural support/resistance must remain distinct.
-    v16 = dict(pull_levels)
-    v16.update({"support_1": 92.0, "resistance_1": 100.0, "flow_mode": "INTRADAY_SNAPSHOT", "change_flow_score": -0.45, "change_flow_bias": -1})
-    v16r = build_market_structure(96.0, fut_bear, fut_bear, v16, -0.45, price_session=mk_candles([104,102,100,99,98,97,96]))
-    assert v16r.support_1 < v16r.resistance_1
-
-    # Regression: a previous resistance that price has broken must never be
-    # returned as the current resistance below price (the 09-Oct 09:40 defect).
-    broken_resistance_levels = dict(pull_levels)
-    broken_resistance_levels.update({
-        "support_1": 22400.0, "support_2": 22350.0,
-        "resistance_1": 22450.0, "resistance_2": 22500.0,
-        "previous_support_1": 22350.0, "previous_resistance_1": 22400.0,
-        "support_source": "OPTION_OI", "resistance_source": "OPTION_OI",
-        "flow_mode": "INTRADAY_SNAPSHOT", "change_flow_score": 0.75,
-    })
-    rising_levels_candles = mk_candles([22320, 22340, 22360, 22380, 22400, 22417])
-    broken_resistance_result = build_market_structure(
-        22417.0, up, up, broken_resistance_levels, 0.75,
-        previous_direction="BULLISH", previous_phase="CONTINUOUS_BULLISH",
-        price_session=rising_levels_candles,
-    )
-    assert broken_resistance_result.support_1 < 22417.0
-    assert broken_resistance_result.resistance_1 > 22417.0
-    assert broken_resistance_result.support_1 < broken_resistance_result.resistance_1
-
-    # Regression: strong opposing futures OI blocks an otherwise-bullish entry.
-    future_conflict_result = build_market_structure(
-        22417.0, fut_bear, fut_bear, broken_resistance_levels, 0.75,
-        previous_direction="BULLISH", previous_phase="CONTINUOUS_BULLISH",
-        price_session=rising_levels_candles,
-    )
-    assert not future_conflict_result.entry_confirmed
-    assert future_conflict_result.confirmation_state == "FUTURES_CONFLICT"
-
-    # Regime routing regression: expiry override, time-of-day and intensity arrays.
-    test_now = datetime(2026, 10, 9, 14, 0, tzinfo=IST)
-    assert permitted_strikes_for_regime(74100, 50, "BULLISH", "NORMAL", now=test_now) == [74050, 74100]
-    assert permitted_strikes_for_regime(74100, 50, "BEARISH", "NORMAL", now=test_now) == [74100, 74150]
-    assert permitted_strikes_for_regime(74100, 50, "BULLISH", "STRONG", now=test_now) == [74100, 74150, 74200]
-    assert permitted_strikes_for_regime(74100, 50, "BEARISH", "STRONG", now=test_now) == [74000, 74050, 74100]
-    assert permitted_strikes_for_regime(74100, 50, "BULLISH", "STRONG", is_expiry_day=True, now=test_now) == [74000, 74050, 74100]
-    assert permitted_strikes_for_regime(22550, 50, "BEARISH", "NORMAL", is_expiry_day=True, now=test_now) == [22550, 22600, 22650]
-    assert permitted_strikes_for_regime(74100, 50, "BEARISH", "SIDEWAYS", now=test_now) == []
-    cutoff_test = datetime(2026, 10, 9, 15, 15, tzinfo=IST)
-    assert permitted_strikes_for_regime(74100, 50, "BULLISH", "STRONG", is_expiry_day=True, now=cutoff_test) == []
-    midday_now = datetime(2026, 10, 9, 11, 0, tzinfo=IST)
-    assert permitted_strikes_for_regime(74100, 50, "BULLISH", "STRONG", now=midday_now) == [74050, 74100]
-    assert permitted_strikes_for_regime(74100, 50, "BULLISH", "EXHAUSTION", now=test_now) == [74000, 73950]
-
-    # Option direction, strict option VWAP/COI velocity, delta and strike-universe regression.
-    simple_chain = []
-    flow = {}
-    for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]:
-        simple_chain.append({
-            "strike_price": strike, "expiry": "2026-10-13",
-            "call_options": {"instrument_key": f"CE{strike}", "market_data": {"ltp": 100.0, "oi": 50000, "prev_oi": 49000, "volume": 10000, "bid_price": 99.5, "ask_price": 100.5, "bid_qty": 100, "ask_qty": 100}, "option_greeks": {"delta": 0.75 if strike <= 74000 else 0.55, "theta": -2.0}},
-            "put_options": {"instrument_key": f"PE{strike}", "market_data": {"ltp": 100.0, "oi": 50000, "prev_oi": 49000, "volume": 10000, "bid_price": 99.5, "ask_price": 100.5, "bid_qty": 100, "ask_qty": 100}, "option_greeks": {"delta": -0.75 if strike >= 74200 else -0.55, "theta": -2.0}},
-        })
-        flow[strike] = {
-            "call_bias": 1,
-            "put_bias": -1,
-            "call_oi_change": -1000,
-            "put_oi_change": 1000,
-        }
-    option_vwaps = {
-        f"{side}{strike}": {"premium_vwap": 90.0}
-        for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]
-        for side in ("CE", "PE")
-    }
-    bull_velocity = {
-        float(strike): {
-            "available": True, "call_oi_change_pct": -0.02, "put_oi_change_pct": 0.02,
-            "call_ltp_change_pct": 0.025, "put_ltp_change_pct": -0.025,
-            "underlying_change_pct": 0.003, "baseline_minutes": 20.0,
-            "baseline_mode": "ROLLING_15_30",
-        }
-        for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]
-    }
-    bear_velocity = {
-        float(strike): {
-            "available": True, "call_oi_change_pct": 0.02, "put_oi_change_pct": -0.02,
-            "call_ltp_change_pct": -0.025, "put_ltp_change_pct": 0.025,
-            "underlying_change_pct": -0.003, "baseline_minutes": 20.0,
-            "baseline_mode": "ROLLING_15_30",
-        }
-        for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]
-    }
-    ce = select_directional_option(
-        simple_chain, "BULLISH", 74100.0,
-        change_oi_by_strike=flow, market_intensity="NORMAL", now=test_now,
-        option_metrics_by_instrument=option_vwaps, oi_velocity_by_strike=bull_velocity,
-    )
-    pe = select_directional_option(
-        simple_chain, "BEARISH", 74100.0,
-        change_oi_by_strike=flow, market_intensity="NORMAL", now=test_now,
-        option_metrics_by_instrument=option_vwaps, oi_velocity_by_strike=bear_velocity,
-    )
-    assert ce.option_type == "CE" and ce.strike in {74050.0, 74100.0}
-    assert pe.option_type == "PE" and pe.strike in {74100.0, 74150.0}
-    assert ce.premium_vwap < ce.ltp and ce.oi_momentum_score > 0.9
-
-    # V30 regression: a missing COI baseline must not block a valid candidate;
-    # missing OI velocity contributes zero score, never fabricated confirmation.
-    ce_without_velocity = select_directional_option(
-        simple_chain, "BULLISH", 74100.0,
-        change_oi_by_strike=flow, market_intensity="NORMAL", now=test_now,
-        option_metrics_by_instrument=option_vwaps, oi_velocity_by_strike={},
-    )
-    assert ce_without_velocity.option_type == "CE"
-    assert ce_without_velocity.oi_momentum_score == 0.0
-    assert math.isnan(ce_without_velocity.oi_velocity_baseline_minutes)
-
-    # V33 end-to-end regression: normalized score makes the +0.500 veto
-    # effective for a premium-VWAP marginal, inverse-flow, no-COI candidate.
-    weak_chain = json.loads(json.dumps(simple_chain))
-    for row in weak_chain:
-        row["call_options"]["option_greeks"]["delta"] = 0.50
-    weak_flow = {
-        float(row["strike_price"]): {"call_bias": -1, "put_bias": 0}
-        for row in weak_chain
-    }
-    weak_vwaps = {
-        str(side["instrument_key"]): {"premium_vwap": 99.99}
-        for row in weak_chain
-        for side in (row["call_options"], row["put_options"])
-    }
-    try:
-        select_directional_option(
-            weak_chain, "BULLISH", 74100.0, change_oi_by_strike=weak_flow,
-            market_intensity="NORMAL", now=test_now,
-            option_metrics_by_instrument=weak_vwaps, oi_velocity_by_strike={},
-        )
-        raise AssertionError("normalized minimum-quality veto must reject weak candidate")
-    except ScannerError as exc:
-        assert "MINIMUM_QUALITY_SCORE_VETO" in str(exc), str(exc)
-
-    validate_continuous_option_entry(
-        ce, simple_chain, "BULLISH", "CONTINUOUS_BULLISH", 74100.0,
-        market_intensity="NORMAL", now=test_now,
-    )
-    validate_continuous_option_entry(
-        pe, simple_chain, "BEARISH", "CONTINUOUS_BEARISH", 74100.0,
-        market_intensity="NORMAL", now=test_now,
-    )
-    try:
-        validate_continuous_option_entry(
-            replace(ce, total_score=0.499), simple_chain, "BULLISH",
-            "CONTINUOUS_BULLISH", 74100.0, market_intensity="NORMAL", now=test_now,
-        )
-        raise AssertionError("pre-email validation must reject total score below +0.500")
-    except ScannerError as exc:
-        assert "MINIMUM_QUALITY_SCORE_VETO" in str(exc)
-
-    # Strict option premium VWAP filter must reject a candidate with LTP below VWAP.
-    bad_vwap_map = {key: {"premium_vwap": 101.0} for key in option_vwaps}
-    try:
-        select_directional_option(
-            simple_chain, "BULLISH", 74100.0, change_oi_by_strike=flow,
-            market_intensity="NORMAL", now=test_now, option_metrics_by_instrument=bad_vwap_map,
-            oi_velocity_by_strike=bull_velocity,
-        )
-        raise AssertionError("LTP <= premium VWAP should be rejected")
-    except ScannerError as exc:
-        assert "premium VWAP" in str(exc) or "VWAP" in str(exc)
-
-    # Normal regimes enforce the live delta floor rather than fabricating a delta.
-    low_delta_chain = json.loads(json.dumps(simple_chain))
-    for row in low_delta_chain:
-        row["call_options"]["option_greeks"]["delta"] = 0.45
-    try:
-        select_directional_option(
-            low_delta_chain, "BULLISH", 74100.0, change_oi_by_strike=flow,
-            market_intensity="NORMAL", now=test_now, option_metrics_by_instrument=option_vwaps,
-            oi_velocity_by_strike=bull_velocity,
-        )
-        raise AssertionError("Delta below 0.50 should be rejected in NORMAL regime")
-    except ScannerError as exc:
-        assert "delta" in str(exc).lower()
-
-    # V31 execution-veto regression: any candidate with an active opposing OI wall is hard-rejected.
-    wall_velocity = {
-        float(strike): {
-            "available": True, "call_oi_change_pct": 0.02, "put_oi_change_pct": 0.0,
-            "call_ltp_change_pct": -0.02, "put_ltp_change_pct": 0.0,
-            "underlying_change_pct": 0.003, "baseline_minutes": 20.0,
-            "baseline_mode": "ROLLING_15_30",
-        } for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]
-    }
-    try:
-        select_directional_option(
-            simple_chain, "BULLISH", 74100.0,
-            change_oi_by_strike=flow, market_intensity="NORMAL", now=test_now,
-            option_metrics_by_instrument=option_vwaps, oi_velocity_by_strike=wall_velocity,
-        )
-        raise AssertionError("all candidate Wall Penalties must be vetoed")
-    except ScannerError as exc:
-        assert "WALL_PENALTY_VETO" in str(exc) or "No eligible" in str(exc)
-
-    pin_velocity = {
-        float(strike): {
-            "available": True, "call_oi_change_pct": 0.02, "put_oi_change_pct": 0.025,
-            "call_ltp_change_pct": 0.01, "put_ltp_change_pct": 0.01,
-            "underlying_change_pct": 0.003, "baseline_minutes": 20.0,
-            "baseline_mode": "ROLLING_15_30",
-        } for strike in [73950, 74000, 74050, 74100, 74150, 74200, 74250]
-    }
-    try:
-        select_directional_option(
-            simple_chain, "BULLISH", 74100.0,
-            change_oi_by_strike=flow, market_intensity="NORMAL", now=test_now,
-            option_metrics_by_instrument=option_vwaps, oi_velocity_by_strike=pin_velocity,
-        )
-        raise AssertionError("all candidate Pin Disqualifications must be vetoed")
-    except ScannerError as exc:
-        assert "PIN_DISQUALIFICATION" in str(exc) or "No eligible" in str(exc)
-
-    # V30 COI matrix: Push, Floor, Roll, Wall and Pin are independent and deterministic.
-    matrix_map = {
-        74100.0: {"available": True, "call_oi_change_pct": -0.02, "put_oi_change_pct": 0.00,
-                  "call_ltp_change_pct": 0.03, "put_ltp_change_pct": -0.01,
-                  "baseline_minutes": 20.0, "baseline_mode": "ROLLING_15_30"},
-        74150.0: {"available": True, "call_oi_change_pct": -0.005, "put_oi_change_pct": 0.00,
-                  "call_ltp_change_pct": 0.01, "put_ltp_change_pct": -0.01,
-                  "baseline_minutes": 20.0, "baseline_mode": "ROLLING_15_30"},
-        74200.0: {"available": True, "call_oi_change_pct": 0.025, "put_oi_change_pct": 0.00,
-                  "call_ltp_change_pct": -0.01, "put_ltp_change_pct": -0.01,
-                  "baseline_minutes": 20.0, "baseline_mode": "ROLLING_15_30"},
-    }
-    push_floor = score_coi_matrix_for_strike("BULLISH", 74100.0, 74100.0, 50.0, {
-        **matrix_map,
-        74100.0: {**matrix_map[74100.0], "put_oi_change_pct": 0.02},
-    }, now=datetime(2026, 10, 9, 10, 0, tzinfo=IST))
-    assert push_floor["push"] == COI_PUSH_MAX_POINTS
-    assert push_floor["floor"] == COI_FLOOR_MAX_POINTS
-    roll = score_coi_matrix_for_strike("BULLISH", 74150.0, 74100.0, 50.0, matrix_map,
-                                       now=datetime(2026, 10, 9, 10, 0, tzinfo=IST))
-    assert roll["roll"] == COI_ROLL_MAX_POINTS
-    wall = score_coi_matrix_for_strike("BULLISH", 74200.0, 74100.0, 50.0, matrix_map,
-                                       now=datetime(2026, 10, 9, 10, 0, tzinfo=IST))
-    assert wall["wall_penalty"] > 0 and wall["score"] < 0
-    assert wall["wall_penalty"] == COI_WALL_MAX_PENALTY and wall["score"] < 0
-    assert execution_veto_reason(None, coi_label=wall["label"], wall_penalty=wall["wall_penalty"]) == "WALL_PENALTY_VETO"
-    assert execution_veto_reason(0.499).startswith("MINIMUM_QUALITY_SCORE_VETO")
-    assert execution_veto_reason(0.500) == ""
-    pin_map = {float(k): {**v, "call_oi_change_pct": 0.02, "put_oi_change_pct": 0.025}
-               for k, v in matrix_map.items()}
-    pin = score_coi_matrix_for_strike("BULLISH", 74100.0, 74100.0, 50.0, pin_map,
-                                      now=datetime(2026, 10, 9, 10, 0, tzinfo=IST))
-    assert pin["disqualified"] and pin["label"] == "PIN_DISQUALIFICATION"
-    assert execution_veto_reason(None, coi_label=pin["label"], disqualified=True) == "PIN_DISQUALIFICATION"
-    cold_push = score_coi_matrix_for_strike("BULLISH", 74100.0, 74100.0, 50.0, matrix_map,
-                                            now=datetime(2026, 10, 9, 9, 30, tzinfo=IST))
-    standard_push = score_coi_matrix_for_strike("BULLISH", 74100.0, 74100.0, 50.0, matrix_map,
-                                                now=datetime(2026, 10, 9, 10, 0, tzinfo=IST))
-    assert math.isclose(cold_push["score"], standard_push["score"] * COI_COLD_START_WEIGHT)
-
-    # Cold-start COI is cumulative from the earliest observed snapshot after the open.
-    cold_state = {"option_oi_history": [{
-        "date": "2026-10-09", "expiry": "2026-10-13",
-        "timestamp": "2026-10-09T09:15:00+05:30", "spot": 100.0,
-        "oi_by_instrument": {
-            **{f"CE{k}": {"strike": float(k), "side": "CE", "oi": 50000.0, "ltp": 100.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
-            **{f"PE{k}": {"strike": float(k), "side": "PE", "oi": 50000.0, "ltp": 100.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
-        },
-    }]}
-    cold_chain = json.loads(json.dumps(simple_chain))
-    for row in cold_chain:
-        row["call_options"]["market_data"]["oi"] = 49000.0
-        row["call_options"]["market_data"]["ltp"] = 95.0
-        row["put_options"]["market_data"]["oi"] = 52000.0
-        row["put_options"]["market_data"]["ltp"] = 95.0
-    cold_velocity = update_option_oi_velocity_history(
-        cold_state, cold_chain, "2026-10-13", now=datetime(2026, 10, 9, 9, 30, tzinfo=IST), spot=100.4
-    )
-    assert cold_velocity[74100.0]["baseline_mode"] == "COLD_START_CUMULATIVE"
-    assert cold_velocity[74100.0]["baseline_minutes"] == 15.0
-    assert math.isclose(cold_velocity[74100.0]["call_oi_change_pct"], -0.02)
-
-    # Profit-booking in calls while the underlying falls blocks counter-trend CE entries,
-    # and fresh put writing clears the guard.
-    guard_state = {"option_oi_history": [{
-        "date": "2026-10-09", "expiry": "2026-10-13",
-        "timestamp": "2026-10-09T09:15:00+05:30", "spot": 74100.0,
-        "oi_by_instrument": {
-            **{f"CE{k}": {"strike": float(k), "side": "CE", "oi": 50000.0, "ltp": 100.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
-            **{f"PE{k}": {"strike": float(k), "side": "PE", "oi": 50000.0, "ltp": 100.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
-        },
-    }]}
-    guard_chain = json.loads(json.dumps(simple_chain))
-    for row in guard_chain:
-        row["call_options"]["market_data"]["oi"] = 49000.0
-        row["call_options"]["market_data"]["ltp"] = 95.0
-        row["put_options"]["market_data"]["oi"] = 50000.0
-        row["put_options"]["market_data"]["ltp"] = 100.0
-    update_option_oi_velocity_history(
-        guard_state, guard_chain, "2026-10-13", now=datetime(2026, 10, 9, 9, 30, tzinfo=IST), spot=74000.0
-    )
-    assert guard_state.get("coi_market_guard", {}).get("blocked_direction") == "BULLISH"
-    for row in guard_chain:
-        row["put_options"]["market_data"]["oi"] = 52000.0
-        row["put_options"]["market_data"]["ltp"] = 95.0
-    update_option_oi_velocity_history(
-        guard_state, guard_chain, "2026-10-13", now=datetime(2026, 10, 9, 9, 35, tzinfo=IST), spot=73980.0
-    )
-    assert "coi_market_guard" not in guard_state
-
-    # Rolling 15-30 minute COI is measured against persisted snapshots, not daily prev_oi.
-    oi_state = {"option_oi_history": [{
-        "date": "2026-10-09", "expiry": "2026-10-13",
-        "timestamp": "2026-10-09T09:40:00+05:30",
-        "oi_by_instrument": {
-            **{f"CE{k}": {"strike": float(k), "side": "CE", "oi": 50000.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
-            **{f"PE{k}": {"strike": float(k), "side": "PE", "oi": 50000.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
-        },
-    }]}
-    oi_velocity = update_option_oi_velocity_history(
-        oi_state, simple_chain, "2026-10-13", now=datetime(2026, 10, 9, 10, 0, tzinfo=IST)
-    )
-    assert oi_velocity[74100.0]["available"] is True
-    assert oi_velocity[74100.0]["baseline_minutes"] == 20.0
-
-    # OI velocity must survive API instrument-key changes by matching strike + side.
-    remapped_state = {"option_oi_history": [{
-        "date": "2026-10-09", "expiry": "2026-10-13",
-        "timestamp": "2026-10-09T09:40:00+05:30",
-        "oi_by_instrument": {
-            **{f"OLDCE{k}": {"strike": float(k), "side": "CE", "oi": 50000.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
-            **{f"OLDPE{k}": {"strike": float(k), "side": "PE", "oi": 50000.0} for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
-        },
-    }]}
-    remapped = update_option_oi_velocity_history(
-        remapped_state, simple_chain, "2026-10-13", now=datetime(2026, 10, 9, 10, 0, tzinfo=IST)
-    )
-    assert remapped[74100.0]["available"] is True
-    assert remapped[74100.0]["baseline_minutes"] == 20.0
-
-    # Legacy single-snapshot state is migrated if it is a compatible 15–30m baseline.
-    legacy_oi_state = {"option_oi_snapshot": {
-        "date": "2026-10-09", "expiry": "2026-10-13",
-        "timestamp": "2026-10-09T09:40:00+05:30",
-        "strikes": {str(float(k)): {"call_oi": 50000.0, "put_oi": 50000.0}
-                    for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
-    }}
-    legacy_velocity = update_option_oi_velocity_history(
-        legacy_oi_state, simple_chain, "2026-10-13", now=datetime(2026, 10, 9, 10, 0, tzinfo=IST)
-    )
-    assert legacy_velocity[74100.0]["available"] is True
-    assert legacy_velocity[74100.0]["baseline_minutes"] == 20.0
-    assert len(legacy_oi_state["option_oi_history"]) == 2
-
-    # Future-dated snapshots must never be treated as valid baselines.
-    future_state = {"option_oi_history": [{
-        "date": "2026-10-09", "expiry": "2026-10-13",
-        "timestamp": "2026-10-09T10:01:00+05:30",
-        "oi_by_instrument": {f"CE{k}": {"strike": float(k), "side": "CE", "oi": 50000.0}
-                              for k in [73950, 74000, 74050, 74100, 74150, 74200, 74250]},
-    }]}
-    future_velocity = update_option_oi_velocity_history(
-        future_state, simple_chain, "2026-10-13", now=datetime(2026, 10, 9, 10, 0, tzinfo=IST)
-    )
-    assert not future_velocity[74100.0]["available"]
-
-    # Stagnation breaker requires 3 completed 5-minute candles after entry.
-    flat5 = pd.DataFrame({
-        "timestamp": pd.date_range("2026-09-10 09:20", periods=3, freq="5min", tz="Asia/Kolkata").tz_convert("UTC"),
-        "open": [100.0, 100.0, 100.0], "high": [100.04, 100.03, 100.04],
-        "low": [99.96, 99.97, 99.96], "close": [100.0, 100.0, 100.0], "volume": [1000, 1000, 1000],
-    })
-    stagnant, _ = stagnation_exit_trigger({"opened_at": "2026-09-10 09:15:00 IST"}, flat5)
-    assert stagnant
-    # V34 regression: a tight but steadily advancing 5m range must not trigger
-    # theta stagnation while the active trade, index VWAP and Change-OI remain aligned.
-    rising5 = pd.DataFrame({
-        "timestamp": pd.date_range("2026-09-10 09:20", periods=3, freq="5min", tz="Asia/Kolkata").tz_convert("UTC"),
-        "open": [100.00, 100.02, 100.04], "high": [100.025, 100.045, 100.065],
-        "low": [99.995, 100.015, 100.035], "close": [100.02, 100.04, 100.06],
-        "volume": [1000, 1000, 1000],
-    })
-    aligned_bullish_structure = type("AlignedStructure", (), {
-        "direction": "BULLISH", "market_phase": "CONTINUOUS_BULLISH", "entry_confirmed": True,
-        "vwap": 99.50,
-        "components": {"structure_vwap": 1.0, "structure_change_oi": 0.45,
-                       "structure_change_oi_conflict": 0.0},
-    })()
-    aligned_result, aligned_reason = stagnation_exit_trigger(
-        {"direction": "BULLISH", "opened_at": "2026-09-10 09:15:00 IST"},
-        rising5, market_structure=aligned_bullish_structure,
-    )
-    assert not aligned_result and "SUPPRESSED_ALIGNED_CONTINUATION" in aligned_reason, aligned_reason
-    # Exactly 0.10% must trigger (inclusive <= threshold).
-    exact_flat5 = pd.DataFrame({
-        "timestamp": pd.date_range("2026-09-10 09:20", periods=3, freq="5min", tz="Asia/Kolkata").tz_convert("UTC"),
-        "open": [100.0, 100.0, 100.0], "high": [100.05, 100.05, 100.05],
-        "low": [99.95, 99.95, 99.95], "close": [100.0, 100.0, 100.0], "volume": [1000, 1000, 1000],
-    })
-    exact_stagnant, _ = stagnation_exit_trigger({"opened_at": "2026-09-10 09:15:00 IST"}, exact_flat5)
-    assert exact_stagnant
-    # A bar that started before entry cannot count, even if it closes afterwards.
-    partial_pre_entry = flat5.iloc[:3].copy()
-    pre_entry_result, pre_entry_reason = stagnation_exit_trigger(
-        {"opened_at": "2026-09-10 09:22:00 IST"}, partial_pre_entry
-    )
-    assert not pre_entry_result and "only 2 eligible" in pre_entry_reason, pre_entry_reason
-    # Missing a 5m interval must not be misrepresented as three consecutive bars.
-    gap5 = flat5.copy()
-    gap5.loc[2, "timestamp"] = gap5.loc[2, "timestamp"] + pd.Timedelta(minutes=5)
-    gap_stagnant, gap_reason = stagnation_exit_trigger({"opened_at": "2026-09-10 09:15:00 IST"}, gap5)
-    assert not gap_stagnant and "not consecutive" in gap_reason
-
-    # PA/OI T1/T2/SL must be underlying structural levels, not option-premium targets.
-    trade_chain, trade_flow = _synthetic_structure_chain(22250.0, 22200.0, 22400.0, 3000000.0, -2000000.0)
-    # The active window contains both a primary support and a lower secondary OI wall.
-    for row in trade_chain:
-        if abs(float(row["strike_price"]) - 22150.0) < 0.01:
-            row["put_options"]["market_data"]["oi"] = 2500000
-            break
-    target_structure = type("S", (), {"direction":"BEARISH", "support_1":22200.0, "support_2":22150.0, "resistance_1":22400.0, "resistance_2":22450.0, "vwap":22350.0})()
-    t1, t2, sl, meta = determine_structural_trade_levels(trade_chain, 22250.0, target_structure, down, change_oi_by_strike=trade_flow)
-    assert t1 == 22200.0 and t2 < t1 and sl > 22250.0
-    assert meta["t1_source"] == "OPTION_OI_SUPPORT"
-    assert all(meta["window_lower_bound"] <= level <= meta["window_upper_bound"] for level in (t1, t2, sl))
-
-    # V42: nearest dominant OI support less than one strike step away cannot be skipped.
-    near_wall_chain = []
-    for k in range(22400, 22801, 50):
-        call_oi = 200000.0 if k >= 22600 else 100000.0
-        put_oi = 200000.0 if k <= 22550 else 100000.0
-        near_wall_chain.append({
-            "strike_price": float(k),
-            "call_options": {"market_data": {"oi": call_oi, "prev_oi": call_oi, "ltp": 100.0, "close_price": 99.0, "volume": 1000}},
-            "put_options": {"market_data": {"oi": put_oi, "prev_oi": put_oi, "ltp": 100.0, "close_price": 99.0, "volume": 1000}},
-        })
-    near_wall_structure = type("S", (), {"direction":"BEARISH", "support_1":22500.0, "support_2":22450.0, "resistance_1":22600.0, "resistance_2":22650.0, "vwap":22600.0})()
-    near_pa = _synthetic_candles([22580.0, 22577.0, 22574.0, 22570.0], start="2026-10-12 10:00")
-    near_t1, near_t2, near_sl, near_meta = determine_structural_trade_levels(
-        near_wall_chain, 22586.65, near_wall_structure, near_pa,
-    )
-    assert near_t1 == 22550.0, (near_t1, near_t2, near_sl, near_meta)
-    assert 0.0 < 22586.65 - near_t1 < 50.0
-
-    # Post-T1 dynamic OI stop must be recalculated from current opposing OI and ratchet favorably.
-    dyn_chain, dyn_flow = _synthetic_structure_chain(22050.0, 21900.0, 22200.0, 3000000.0, -1500000.0)
-    dynamic, source = dynamic_oi_stop_after_t1(dyn_chain, 22050.0, "BEARISH", down, entry_underlying=22250.0, change_oi_by_strike=dyn_flow)
-    assert dynamic == 22100.0 or dynamic == 22200.0
-    assert source.startswith("CURRENT_OI_")
-
-    # Symmetric bullish PA/OI target structure: T1/T2 above spot and SL below spot.
-    bull_chain, bull_flow = _synthetic_structure_chain(22250.0, 22200.0, 22400.0, -2000000.0, 3000000.0)
-    # The second target must be an in-window strike whose Call OI dominates Put OI.
-    for row in bull_chain:
-        if abs(float(row["strike_price"]) - 22450.0) < 0.01:
-            row["call_options"]["market_data"]["oi"] = 2500000.0
-            break
-    bullish_structure = type("S", (), {"direction":"BULLISH", "support_1":22200.0, "support_2":22150.0, "resistance_1":22400.0, "resistance_2":22450.0, "vwap":22300.0})()
-    bt1, bt2, bsl, bmeta = determine_structural_trade_levels(
-        bull_chain, 22250.0, bullish_structure, up, change_oi_by_strike=bull_flow
-    )
-    assert bt1 == 22400.0 and bt2 > bt1 and bsl < 22250.0
-    assert bmeta["t1_source"] == "OPTION_OI_RESISTANCE"
-    assert all(bmeta["window_lower_bound"] <= level <= bmeta["window_upper_bound"] for level in (bt1, bt2, bsl))
-
-    # Post-T1 bullish dynamic stop must use current OI and ratchet upward only.
-    dyn_bull_chain_1, dyn_bull_flow_1 = _synthetic_structure_chain(22050.0, 22000.0, 22200.0, 3000000.0, -1500000.0)
-    dyn_trade = {"direction":"BULLISH", "entry_underlying":21900.0, "post_t1_dynamic_stop":None}
-    changed_1, dyn_stop_1, dyn_source_1 = apply_dynamic_oi_stop_to_trade(
-        dyn_trade, chain=dyn_bull_chain_1, spot=22050.0, price_session=up,
-        latest_bar="2026-10-08T10:00:00+00:00", change_oi_by_strike=dyn_bull_flow_1
-    )
-    assert changed_1 and dyn_stop_1 == 22000.0 and dyn_source_1 == "CURRENT_OI_SUPPORT"
-    dyn_bull_chain_2, dyn_bull_flow_2 = _synthetic_structure_chain(22050.0, 21950.0, 22200.0, 3000000.0, -1500000.0)
-    changed_2, dyn_stop_2, dyn_source_2 = apply_dynamic_oi_stop_to_trade(
-        dyn_trade, chain=dyn_bull_chain_2, spot=22050.0, price_session=up,
-        latest_bar="2026-10-08T10:03:00+00:00", change_oi_by_strike=dyn_bull_flow_2
-    )
-    assert changed_2 is False and dyn_stop_2 == 22000.0 and dyn_source_2 == "CURRENT_OI_SUPPORT"
-
-    # Migration must ignore stale legacy option-premium T1 flags and recompute from NIFTY PA/OI.
-    legacy = {"direction":"BEARISH", "target_engine_version":"V22", "target_1":307.45, "target_2":314.31, "stop_loss":137.73, "underlying_target_1":22200.0, "underlying_target_2":22150.0, "underlying_stop":22385.0, "t1_hit":True, "entry_underlying":22250.0, "trading_symbol":"NIFTY PE", "entry":160.0}
-    migrated = migrate_active_trade_to_v25(legacy, chain=trade_chain, spot=22250.0, structure=target_structure, price_session=down, change_oi_by_strike=trade_flow)
-    assert migrated and legacy["target_engine_version"] == OPTION_TARGET_ENGINE_VERSION
-    assert legacy["underlying_target_1"] == 22200.0 and legacy["t1_hit"] is False
-
-    # V35 scenario matrix regression: the four price/OI combinations stay explicit.
-    assert classify_price_oi_scenario(+10, +100) == "LONG_BUILDUP"
-    assert classify_price_oi_scenario(-10, +100) == "SHORT_BUILDUP"
-    assert classify_price_oi_scenario(+10, -100) == "SHORT_COVERING"
-    assert classify_price_oi_scenario(-10, -100) == "LONG_UNWINDING"
-
-    # V37 strike-step/window regression: infer 50-point steps despite sparse gaps;
-    # a full chain is reduced to no more than nine local strikes at the current ATM.
-    assert strike_step([21950, 22000, 22250, 22500, 22550]) == 50.0
-    wide_test_chain = []
-    for strike in range(22000, 23001, 50):
-        wide_test_chain.append({
-            "strike_price": float(strike),
-            "call_options": {"market_data": {"oi": 100000.0, "prev_oi": 99000.0, "ltp": 100.0, "volume": 1000}},
-            "put_options": {"market_data": {"oi": 110000.0, "prev_oi": 100000.0, "ltp": 100.0, "volume": 1000}},
-        })
-    local_window, local_window_meta = option_chain_atm_window(wide_test_chain, 22511.0)
-    assert local_window_meta["atm_strike"] == 22500.0
-    assert local_window_meta["window_count"] == 9
-    assert min(float(x["strike_price"]) for x in local_window) == 22300.0
-    assert max(float(x["strike_price"]) for x in local_window) == 22700.0
-    shifted_window, shifted_meta = option_chain_atm_window(wide_test_chain, 22682.0)
-    assert shifted_meta["atm_strike"] == 22700.0
-    assert shifted_meta["window_count"] == 9
-    assert min(float(x["strike_price"]) for x in shifted_window) == 22500.0
-    assert max(float(x["strike_price"]) for x in shifted_window) == 22900.0
-    local_levels = chain_oi_support_resistance(wide_test_chain, 22511.0, expiry="2026-10-13")
-    assert len(local_levels["oi_structure_by_strike"]) == 9
-    assert all(22300.0 <= float(k) <= 22700.0 for k in local_levels["oi_structure_by_strike"])
-
-    # V35 per-strike dominance regression: raw same-strike OI dominance controls role.
-    assert classify_strike_oi_state(22500, 22520, 900000, 500000, 1000, 500, 0, 50)["dominant_role"] == "RESISTANCE"
-    assert classify_strike_oi_state(22500, 22520, 500000, 900000, 500, 1000, 0, 50)["dominant_role"] == "SUPPORT"
-    # Dominance by itself is not enough to label a tiny far-OTM concentration reliable.
-    thin_wall = classify_strike_oi_state(23000, 22520, 900, 100, 0, 0, 0, 50, min_call_oi=10000)
-    assert thin_wall["dominant_role"] == "RESISTANCE" and thin_wall["state"] == "RESISTANCE"
-    assert thin_wall["scenario"] == "UNCONFIRMED"
-    assert classify_strike_oi_state(22500, 22520, 900000, 500000, 1000, 500, +10, 50)["scenario"] == "UNCONFIRMED"
-    assert classify_strike_oi_state(22500, 22520, 900000, 500000, 1000, 500, -10, 50)["scenario"] == "UNCONFIRMED"
-    assert classify_strike_oi_state(22500, 22505, 900000, 500000, -10000, 0, +20, 50)["scenario"] == "SHORT_COVERING"
-    assert classify_strike_oi_state(22500, 22495, 500000, 900000, 0, -10000, -20, 50)["scenario"] == "LONG_UNWINDING"
-    breakout_role = classify_strike_oi_state(22500, 22505, 900000, 500000, -10000, 0, +20, 50)
-    assert breakout_role["state"] == "POTENTIAL_BREAKOUT_SHORT_COVERING"
-    breakdown_role = classify_strike_oi_state(22500, 22495, 500000, 900000, 0, -10000, -20, 50)
-    assert breakdown_role["state"] == "POTENTIAL_BREAKDOWN_LONG_UNWINDING"
-
-    # V35 opposing-wall guard must veto a call whose upside runway is too short.
-    assert opposing_oi_wall_veto("BULLISH", 22533, 22500, 22600, 50).startswith("NEAR_RESISTANCE_VETO")
-    assert opposing_oi_wall_veto("BULLISH", 22500, 22450, 22650, 50) == ""
-    assert opposing_oi_wall_veto("BULLISH", 22533, 22500, 22600, 50, confirmed_local_break=True) == ""
-
-    # V35 confirmed local level break: a closed bearish candle crossing OI level
-    # plus Long Unwinding can qualify despite a price still above session VWAP.
-    local_break_df = _synthetic_candles([22580, 22575, 22570, 22562, 22542])
-    local_break_df.loc[local_break_df.index[-1], "open"] = 22560.0
-    local_break_df.loc[local_break_df.index[-1], "high"] = 22564.0
-    local_break_df.loc[local_break_df.index[-1], "low"] = 22538.0
-    local_break_df.loc[local_break_df.index[-1], "close"] = 22542.0
-    local_break = detect_confirmed_local_oi_break(
-        local_break_df, spot=22542.0, support=22500.0, resistance=22550.0,
-        previous_snapshot={"support_1": 22550.0, "resistance_1": 22600.0},
-        chain_levels={"previous_support_1": 22550.0, "previous_resistance_1": 22600.0,
-                      "window_lower_bound": 22300.0, "window_upper_bound": 22700.0},
-        futures_regime="LONG_UNWINDING", pressure_score=0.0,
-        oi_structure_by_strike={"22550": {"state": "RELIABLE_SUPPORT", "dominant_role": "SUPPORT", "reliability": "HIGH"}},
-        strike_step_value=50.0,
-    )
-    assert local_break["confirmed"] and local_break["direction"] == "BEARISH" and local_break["level"] == 22550.0
-
-    # V40 regression: do not miss a valid breakout merely because the scan ran
-    # after the crossover candle. Two completed rising closes holding above the
-    # previous scan's OI resistance, current spot above that wall, and aligned
-    # flow/futures can confirm the held breakout.
-    held_break_df = _synthetic_candles([22570.0, 22582.0, 22608.0, 22618.0])
-    held_break_df.loc[held_break_df.index[-1], "open"] = 22610.0
-    held_break_df.loc[held_break_df.index[-1], "high"] = 22622.0
-    held_break_df.loc[held_break_df.index[-1], "low"] = 22606.0
-    held_break_df.loc[held_break_df.index[-1], "close"] = 22618.0
-    held_break = detect_confirmed_local_oi_break(
-        held_break_df, spot=22618.0, support=22550.0, resistance=22650.0,
-        previous_snapshot={"support_1": 22550.0, "resistance_1": 22600.0},
-        chain_levels={"previous_support_1": 22550.0, "previous_resistance_1": 22600.0,
-                      "window_lower_bound": 22400.0, "window_upper_bound": 22800.0},
-        futures_regime="SHORT_COVERING", pressure_score=0.50,
-        oi_structure_by_strike={"22600": {"state": "RELIABLE_RESISTANCE", "dominant_role": "RESISTANCE", "reliability": "HIGH"}},
-        strike_step_value=50.0,
-    )
-    assert held_break["confirmed"] and held_break["direction"] == "BULLISH", held_break
-    assert held_break["level"] == 22600.0 and "HOLD_ABOVE_VALID_PRIOR_RESISTANCE" in held_break["reason"]
-
-    # A wall-erosion watch is informative only: it does not label a not-yet-crossed
-    # resistance as a confirmed breakout or disable the near-wall safety veto.
-    watch = evaluate_local_breakout_watch(
-        direction="BULLISH", spot=22579.45, current_close=22584.90, vwap=22504.92,
-        support=22550.0, resistance=22600.0, strike_step_value=50.0,
-        structure_phase="CONTINUOUS_BULLISH", structure_entry_confirmed=True,
-        effective_change_oi=1.0, futures_regime="SHORT_COVERING",
-        oi_structure_by_strike={22600.0: {"state": "POTENTIAL_BREAKOUT_SHORT_COVERING"}},
-        market_intensity="NORMAL",
-    )
-    assert watch["armed"] and not watch["confirmed"] and math.isclose(watch["distance"], 20.55, abs_tol=0.01)
-    assert opposing_oi_wall_veto("BULLISH", 22579.45, 22550.0, 22600.0, 50.0).startswith("NEAR_RESISTANCE_VETO")
-    # V42 runway check must use the nearest T1 wall, not a more distant primary structure level.
-    assert opposing_oi_wall_veto("BEARISH", 22589.70, 22550.0, 22700.0, 50.0).startswith("NEAR_SUPPORT_VETO")
-
-    # V41: a stale, weak prior support must not authorize a PE while the current support remains intact.
-    weak_prior_break_df = _synthetic_candles([22710.0, 22703.0, 22696.30, 22688.10])
-    weak_prior_break_df.loc[weak_prior_break_df.index[-2], ["open", "high", "low", "close"]] = [22701.0, 22704.0, 22694.0, 22696.30]
-    weak_prior_break_df.loc[weak_prior_break_df.index[-1], ["open", "high", "low", "close"]] = [22695.0, 22698.0, 22685.0, 22688.10]
-    stale_support_event = detect_confirmed_local_oi_break(
-        weak_prior_break_df, spot=22693.75, support=22650.0, resistance=22750.0,
-        previous_snapshot={"support_1": 22700.0, "resistance_1": 22800.0},
-        chain_levels={"previous_support_1": 22700.0, "previous_resistance_1": 22800.0,
-                      "window_lower_bound": 22500.0, "window_upper_bound": 22900.0},
-        futures_regime="SHORT_BUILDUP", pressure_score=-1.0,
-        oi_structure_by_strike={
-            "22700": {"state": "SUPPORT", "dominant_role": "SUPPORT", "reliability": "MODERATE"},
-            "22800": {"state": "RELIABLE_RESISTANCE", "dominant_role": "RESISTANCE", "reliability": "HIGH"},
-        },
-        strike_step_value=50.0,
-    )
-    assert not stale_support_event["confirmed"], stale_support_event
-
-    # V41: a clearly displaced, validated prior support can still confirm a real breakdown.
-    strong_prior_break_df = _synthetic_candles([22720.0, 22705.0, 22690.0, 22682.0])
-    strong_prior_break_df.loc[strong_prior_break_df.index[-2], ["open", "high", "low", "close"]] = [22704.0, 22706.0, 22687.0, 22690.0]
-    strong_prior_break_df.loc[strong_prior_break_df.index[-1], ["open", "high", "low", "close"]] = [22688.0, 22691.0, 22678.0, 22682.0]
-    strong_prior_break = detect_confirmed_local_oi_break(
-        strong_prior_break_df, spot=22682.0, support=22650.0, resistance=22750.0,
-        previous_snapshot={"support_1": 22700.0},
-        chain_levels={"previous_support_1": 22700.0, "window_lower_bound": 22500.0, "window_upper_bound": 22900.0},
-        futures_regime="SHORT_BUILDUP", pressure_score=-0.8,
-        oi_structure_by_strike={"22700": {"state": "RELIABLE_SUPPORT", "dominant_role": "SUPPORT", "reliability": "HIGH"}},
-        strike_step_value=50.0,
-    )
-    assert strong_prior_break["confirmed"] and strong_prior_break["direction"] == "BEARISH", strong_prior_break
-
-    # V41: confirmed resistance rejection may reverse a previously bullish structure, but only after price and derivatives confirm.
-    rejection_df = _synthetic_candles([22728.0, 22735.0, 22744.0, 22739.0])
-    rejection_df.loc[rejection_df.index[-2], ["open", "high", "low", "close"]] = [22734.0, 22746.0, 22731.0, 22744.0]
-    rejection_df.loc[rejection_df.index[-1], ["open", "high", "low", "close"]] = [22746.0, 22754.0, 22734.0, 22739.0]
-    resistance_rejection = detect_confirmed_local_oi_rejection(
-        rejection_df, spot=22739.0, support=22700.0, resistance=22750.0,
-        chain_levels={"window_lower_bound": 22550.0, "window_upper_bound": 22950.0},
-        oi_structure_by_strike={"22750": {"state": "RELIABLE_RESISTANCE", "dominant_role": "RESISTANCE", "reliability": "HIGH"}},
-        futures_regime="SHORT_BUILDUP", pressure_score=-0.35, strike_step_value=50.0,
-    )
-    assert resistance_rejection["confirmed"] and resistance_rejection["direction"] == "BEARISH", resistance_rejection
-
-    # V42: a near-miss 4.25 points below resistance is not a valid wall test.
-    near_miss_df = rejection_df.copy()
-    near_miss_df.loc[near_miss_df.index[-1], ["open", "high", "low", "close"]] = [22746.0, 22745.75, 22734.0, 22739.0]
-    near_miss_rejection = detect_confirmed_local_oi_rejection(
-        near_miss_df, spot=22739.0, support=22700.0, resistance=22750.0,
-        chain_levels={"window_lower_bound": 22550.0, "window_upper_bound": 22950.0},
-        oi_structure_by_strike={"22750": {"state": "RELIABLE_RESISTANCE", "dominant_role": "RESISTANCE", "reliability": "HIGH"}},
-        futures_regime="SHORT_BUILDUP", pressure_score=-0.35, strike_step_value=50.0,
-    )
-    assert not near_miss_rejection["confirmed"] and "tested=False" in near_miss_rejection["reason"], near_miss_rejection
-
-    # V42: only confirmed local breaks can use the low-ADX/sideways entry exception.
-    assert is_confirmed_local_break({"confirmed": True, "kind": "BREAKDOWN", "direction": "BEARISH", "level": 22600.0})
-    assert not is_confirmed_local_break({"confirmed": True, "kind": "RESISTANCE_REJECTION", "direction": "BEARISH", "level": 22600.0})
-    assert not is_confirmed_local_break({"confirmed": False, "kind": "BREAKDOWN", "direction": "BEARISH", "level": 22600.0})
-    bear_rr, bear_reward, bear_risk = structural_reward_risk_ratio("BEARISH", 22589.70, 22550.0, 22602.30)
-    assert bear_rr > 1.25 and math.isclose(bear_reward, 39.70, abs_tol=0.01) and math.isclose(bear_risk, 12.60, abs_tol=0.01)
-    bull_rr, _, _ = structural_reward_risk_ratio("BULLISH", 22589.70, 22650.0, 22550.0)
-    assert math.isclose(bull_rr, (22650.0 - 22589.70) / (22589.70 - 22550.0), rel_tol=1e-9)
-    assert structural_reward_risk_ratio("BEARISH", 22589.70, 22600.0, 22602.30)[0] == 0.0
-
-    # V41: support bounce is symmetric, while bullish derivatives alone at resistance cannot trigger a PE.
-    bounce_df = _synthetic_candles([22720.0, 22715.0, 22708.0, 22718.0])
-    bounce_df.loc[bounce_df.index[-2], ["open", "high", "low", "close"]] = [22712.0, 22716.0, 22704.0, 22708.0]
-    bounce_df.loc[bounce_df.index[-1], ["open", "high", "low", "close"]] = [22705.0, 22721.0, 22696.0, 22718.0]
-    support_bounce = detect_confirmed_local_oi_rejection(
-        bounce_df, spot=22718.0, support=22700.0, resistance=22750.0,
-        chain_levels={"window_lower_bound": 22550.0, "window_upper_bound": 22950.0},
-        oi_structure_by_strike={"22700": {"state": "RELIABLE_SUPPORT", "dominant_role": "SUPPORT", "reliability": "HIGH"}},
-        futures_regime="LONG_BUILDUP", pressure_score=0.30, strike_step_value=50.0,
-    )
-    assert support_bounce["confirmed"] and support_bounce["direction"] == "BULLISH", support_bounce
-
-    no_short_from_bullish_wall = detect_confirmed_local_oi_rejection(
-        rejection_df, spot=22740.80, support=22700.0, resistance=22750.0,
-        chain_levels={"window_lower_bound": 22550.0, "window_upper_bound": 22950.0},
-        oi_structure_by_strike={"22750": {"state": "POTENTIAL_BREAKOUT_SHORT_COVERING", "dominant_role": "RESISTANCE", "reliability": "BREAKOUT_WATCH"}},
-        futures_regime="LONG_BUILDUP", pressure_score=0.892, strike_step_value=50.0,
-    )
-    assert not no_short_from_bullish_wall["confirmed"], no_short_from_bullish_wall
-
-    # V39: Change-OI used for a trading decision must be scoped to ATM +/-4;
-    # large signals outside the window must not override the local window score.
-    oi_scope_chain = []
-    oi_scope_changes: dict[float, dict[str, float]] = {}
-    for strike in range(22000, 23001, 50):
-        oi_scope_chain.append({
-            "strike_price": float(strike),
-            "call_options": {"market_data": {"oi": 100000.0, "prev_oi": 99000.0, "ltp": 100.0, "close_price": 99.0}},
-            "put_options": {"market_data": {"oi": 100000.0, "prev_oi": 99000.0, "ltp": 100.0, "close_price": 99.0}},
-        })
-        # Outside ATM +/-4 intentionally has a much larger opposite signal.
-        if abs(strike - 22500) > 200:
-            oi_scope_changes[float(strike)] = {"call_oi_change": 10000000.0, "put_oi_change": -10000000.0}
-        else:
-            oi_scope_changes[float(strike)] = {"call_oi_change": 1000.0, "put_oi_change": 5000.0}
-    local_score, local_change_map, local_change_meta = local_change_oi_confirmation(
-        oi_scope_chain, 22511.0, oi_scope_changes,
-        now=datetime(2026, 10, 13, 9, 30, tzinfo=IST),
-    )
-    assert len(local_change_map) == 9
-    assert set(local_change_map).issubset(set(local_change_meta["window_strikes"]))
-    assert local_change_meta["source"] == "ATM_WINDOW_PER_STRIKE_API"
-    assert local_change_meta["raw_score"] > 0.0 and local_score > 0.0
-    assert math.isclose(local_score, local_change_meta["raw_score"] * COI_COLD_START_WEIGHT, rel_tol=1e-9)
-
-    # V39: aggregate rolling/cumulative velocity ignores strikes outside the active window.
-    velocity_test = {}
-    for strike in range(22000, 23001, 50):
-        velocity_test[float(strike)] = {
-            "available": True, "call_available": True, "put_available": True,
-            "call_oi_change": 1000.0 if abs(strike - 22500) <= 200 else 10000000.0,
-            "put_oi_change": 4000.0 if abs(strike - 22500) <= 200 else 0.0,
-            "baseline_mode": "ROLLING_15_30", "baseline_minutes": 20.0,
-        }
-    local_velocity = aggregate_atm_window_coi_velocity(
-        oi_scope_chain, 22511.0, velocity_test,
-        now=datetime(2026, 10, 13, 10, 15, tzinfo=IST),
-    )
-    assert local_velocity["available"] and local_velocity["coverage"] == 9
-    assert local_velocity["score"] > 0.0
-    assert local_velocity["window_strikes"] == [22300.0, 22350.0, 22400.0, 22450.0, 22500.0, 22550.0, 22600.0, 22650.0, 22700.0]
-
-    # V39: quote age validation is deterministic; unknown timestamps are not falsely called stale.
-    quote_now = datetime(2026, 10, 13, 10, 0, tzinfo=IST)
-    fresh_quote = quote_freshness_status(
-        {"last_trade_time": str(int(pd.Timestamp(quote_now - pd.Timedelta(seconds=30)).timestamp() * 1000))},
-        now=quote_now,
-    )
-    stale_quote = quote_freshness_status(
-        {"last_trade_time": str(int(pd.Timestamp(quote_now - pd.Timedelta(minutes=10)).timestamp() * 1000))},
-        now=quote_now,
-    )
-    unknown_quote = quote_freshness_status({"last_price": 22500}, now=quote_now)
-    assert fresh_quote["status"] == "FRESH", fresh_quote
-    assert stale_quote["status"] == "STALE", stale_quote
-    assert unknown_quote["status"] == "UNVERIFIED", unknown_quote
-
-    print("SELF-TEST PASSED.")
 
 
 def main() -> int:
@@ -8417,7 +7812,8 @@ def main() -> int:
     logger.info("STATE STORE: %s (exists=%s)", STATE_FILE, STATE_FILE.exists())
 
     if "--self-test" in sys.argv:
-        self_test()
+        from test_market_scanner_v43 import run_self_tests
+        run_self_tests()
         return 0
 
     try:
@@ -8428,65 +7824,7 @@ def main() -> int:
             logger.info("No actionable setup on this scan.")
             return 0
 
-        active_trade = {
-            "status": "ACTIVE",
-            "trade_date": now_ist().date().isoformat(),
-            "opened_at": signal.timestamp,
-            "direction": signal.direction,
-            "regime": signal.regime,
-            "market_intensity": signal.market_intensity,
-            "confidence": signal.confidence,
-            "instrument_key": signal.instrument_key,
-            "trading_symbol": signal.trading_symbol,
-            "option_type": signal.option_type,
-            "strike": signal.strike,
-            "entry": signal.entry,
-            "entry_underlying": signal.spot,
-            "t1_hit": False,
-            "t1_hit_at": "",
-            "post_t1_dynamic_stop": None,
-            "post_t1_dynamic_stop_source": "",
-            "post_t1_dynamic_stop_updated_at": "",
-            "target_1": signal.target_1,
-            "target_2": signal.target_2,
-            "stop_loss": signal.stop_loss,
-            "underlying_stop": signal.underlying_stop,
-            "underlying_target_1": signal.underlying_target_1,
-            "underlying_target_2": signal.underlying_target_2,
-            "delta": signal.delta,
-            "theta": signal.theta,
-            "target_engine_version": OPTION_TARGET_ENGINE_VERSION,
-            "reversal_confirmations": 0,
-            "market_alignment_failures": 0,
-            "last_market_direction": signal.direction,
-            "last_market_confidence": signal.confidence,
-            "last_ltp": signal.entry,
-            "entry_3m_bar": str((state.get("market_snapshot") or {}).get("latest_completed_3m_bar", "")),
-            "underlying_stop_armed_bar": str((state.get("market_snapshot") or {}).get("latest_completed_3m_bar", "")),
-            "intrabar_last_checked_at": signal.timestamp,
-        }
-
-        state["active_trade"] = active_trade
-        state["last_signal"] = asdict(signal)
-        state["last_signal_hash"] = signal_hash(signal)
-        state["last_signal_timestamp"] = signal.timestamp
-        save_state(state)
-
-        print(format_engine_output(signal))
-
-        send_email(
-            f"NIFTY {signal.direction} {signal.trading_symbol}",
-            signal_email_body(signal),
-        )
-
-        logger.info(
-            "NEW SIGNAL LOCKED: %s | entry_option=%.2f NIFTY_T1=%.2f NIFTY_T2=%.2f NIFTY_SL=%.2f",
-            signal.trading_symbol,
-            signal.entry,
-            signal.underlying_target_1,
-            signal.underlying_target_2,
-            signal.underlying_stop,
-        )
+        dispatch_alerts(state, signal)
         return 0
 
     except ScannerError as exc:
