@@ -1,5 +1,5 @@
 """
-NIFTY 50 Predictive Options Scanner — V45 Structure-Authoritative Regime and Entry Guard
+NIFTY 50 Predictive Options Scanner — V46 PA/OI, Momentum, Target/RR and State Guard
 
 What this version fixes:
 - Uses the NIFTY INDEX as the primary market-price/VWAP/intraday structure feed.
@@ -43,8 +43,8 @@ What this version fixes:
   older v2 intraday candle API is deprecated.
 
 Run:
-    python market_scanner_v45_structural_entry_risk_guard.py --self-test
-    python market_scanner_v45_structural_entry_risk_guard.py
+    python market_scanner_v46_structural_entry_risk_guard.py --self-test
+    python market_scanner_v46_structural_entry_risk_guard.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -114,7 +114,7 @@ REGIME_SIDEWAYS_VWAP_DISTANCE_ATR = float(os.getenv("REGIME_SIDEWAYS_VWAP_DISTAN
 REGIME_SIDEWAYS_ALTERNATION = float(os.getenv("REGIME_SIDEWAYS_ALTERNATION", "0.35"))
 MIN_ENTRY_TIME = time(9, 18)
 OPENING_MIN_COMPLETED_BARS = max(4, int(os.getenv("OPENING_MIN_COMPLETED_BARS", "5")))
-MIN_OPPOSING_WALL_CLEARANCE_STEPS = max(0.5, float(os.getenv("MIN_OPPOSING_WALL_CLEARANCE_STEPS", "1.5")))
+MIN_OPPOSING_WALL_CLEARANCE_STEPS = min(0.75, max(0.20, float(os.getenv("MIN_OPPOSING_WALL_CLEARANCE_STEPS", "0.35"))))
 OI_DOMINANCE_RELIABILITY_RATIO = max(1.01, float(os.getenv("OI_DOMINANCE_RELIABILITY_RATIO", "1.20")))
 LOCAL_BREAK_MIN_PRESSURE = min(-0.05, float(os.getenv("LOCAL_BREAK_MIN_PRESSURE", "-0.20")))
 # Counter-trend OI-wall rejection entries must still have enough structural runway.
@@ -148,10 +148,12 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-15-STRUCTURE-V45-ADX-STRENGTH-ONLY-PERSISTENCE-REGIME-ALIGNMENT-ATM4"
-# PA/OI target construction is unchanged; keep the V30 target engine identifier so
-# existing live trades are not needlessly re-migrated by entry-filter-only changes.
-OPTION_TARGET_ENGINE_VERSION = "V30_DYNAMIC_COI_MATRIX_PA_OI"
+SCANNER_VERSION = "2026-10-15-STRUCTURE-V46-PA-OI-MOMENTUM-DYNAMIC-TARGET-RR-STATE-PRESERVATION-ATM4"
+# V46 updates target selection, so newly created trades must carry this engine ID.
+# V30 trades already use underlying PA/OI levels and must keep their existing levels
+# while active; migrate_active_trade_to_v25 treats them as compatible legacy structural trades.
+OPTION_TARGET_ENGINE_VERSION = "V46_DYNAMIC_PA_OI_MOMENTUM_TARGETS"
+LEGACY_STRUCTURAL_TARGET_ENGINE_VERSIONS = {"V30_DYNAMIC_COI_MATRIX_PA_OI"}
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -768,6 +770,26 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def previous_completed_volume_median(
+    frame: Optional[pd.DataFrame], lookback: int = 21,
+) -> tuple[float, float, int]:
+    """Return (current volume, median of up to ``lookback`` prior rows, sample count).
+
+    The current candle is excluded from its own reference distribution. Both the
+    regime-volume filter and the OI-wall rejection detector use this exact window.
+    Missing/non-numeric observations are ignored; no valid baseline returns 0.
+    """
+    if not isinstance(frame, pd.DataFrame) or frame.empty or "volume" not in frame.columns:
+        return 0.0, 0.0, 0
+    volumes = pd.to_numeric(frame["volume"], errors="coerce")
+    current = safe_float(volumes.iloc[-1], 0.0) if len(volumes) else 0.0
+    period = max(1, int(lookback))
+    start = max(0, len(volumes) - period - 1)
+    prior = volumes.iloc[start:-1].dropna().clip(lower=0.0)
+    median = safe_float(prior.median(), 0.0) if not prior.empty else 0.0
+    return current, median, int(len(prior))
+
+
 def classify_price_oi_scenario(price_delta: Any, oi_delta: Any) -> str:
     """Map directional price/OI changes to the standard four derivatives scenarios."""
     p = safe_float(price_delta, 0.0)
@@ -1111,11 +1133,9 @@ def detect_confirmed_local_oi_rejection(
 
     # Use the median of the previous 21 completed candles; exclude the rejection
     # candle itself so an unusually large candle cannot inflate its own threshold.
-    volume_series = pd.to_numeric(work.get("volume", pd.Series(dtype=float)), errors="coerce")
-    prior_volumes = volume_series.iloc[-22:-1].dropna().clip(lower=0.0)
-    median_volume = safe_float(prior_volumes.median(), 0.0) if not prior_volumes.empty else 0.0
-    current_volume = safe_float(last.get("volume"), 0.0)
-    volume_confirmed = median_volume > 0.0 and current_volume >= median_volume
+    current_volume, median_volume, volume_reference_count = previous_completed_volume_median(work, 21)
+    volume_reference_ready = volume_reference_count >= 21
+    volume_confirmed = volume_reference_ready and median_volume > 0.0 and current_volume >= median_volume
 
     pressure = safe_float(pressure_score)
     fut = str(futures_regime or "").upper()
@@ -1162,18 +1182,22 @@ def detect_confirmed_local_oi_rejection(
                 "confidence_penalty": 8.0 if bearish_soft_futures_conflict else 0.0,
                 "warnings": ["CONFLICTING_FUTURES_CONTEXT"] if bearish_soft_futures_conflict else [],
                 "volume": current_volume, "median_volume": median_volume,
+                "volume_reference_count": volume_reference_count,
+                "volume_reference_ready": volume_reference_ready,
                 "vwap": vwap_now, "vwap_upper_1sd": vwap_upper_1sd,
                 "vwap_lower_1sd": vwap_lower_1sd, "test_tolerance": test_tolerance,
                 "reason": f"CONFIRMED_RESISTANCE_REJECTION level={resistance_value:.2f} high={high:.2f} "
                           f"close={close:.2f} rejection={resistance_value-close:.2f} "
-                          f"volume={current_volume:.0f} median21={median_volume:.0f} "
+                          f"volume={current_volume:.0f} median21={median_volume:.0f} volume_reference_count={volume_reference_count} "
+                          f"volume_reference_ready={volume_reference_ready} "
                           f"vwap_sigma={vwap_sigma:.3f} tolerance={test_tolerance:.2f} "
                           f"pressure={pressure:+.3f} futures={fut}{conflict_note}",
             }
         resistance_check = (
             f"RESISTANCE_REJECTION_NOT_CONFIRMED level={resistance_value:.2f} "
             f"valid_wall={valid_wall} tested={tested} bearish_candle_rejection={rejected} "
-            f"volume_confirmed={volume_confirmed} volume={current_volume:.0f} median21={median_volume:.0f} "
+            f"volume_confirmed={volume_confirmed} volume={current_volume:.0f} median21={median_volume:.0f} volume_reference_count={volume_reference_count} "
+            f"volume_reference_ready={volume_reference_ready} "
             f"derivatives_confirm={bearish_confirmation} extreme_futures_conflict={extreme_bullish_conflict} "
             f"pressure={pressure:+.3f} futures={fut}"
         )
@@ -1200,18 +1224,22 @@ def detect_confirmed_local_oi_rejection(
                 "confidence_penalty": 8.0 if bullish_soft_futures_conflict else 0.0,
                 "warnings": ["CONFLICTING_FUTURES_CONTEXT"] if bullish_soft_futures_conflict else [],
                 "volume": current_volume, "median_volume": median_volume,
+                "volume_reference_count": volume_reference_count,
+                "volume_reference_ready": volume_reference_ready,
                 "vwap": vwap_now, "vwap_upper_1sd": vwap_upper_1sd,
                 "vwap_lower_1sd": vwap_lower_1sd, "test_tolerance": test_tolerance,
                 "reason": f"CONFIRMED_SUPPORT_BOUNCE level={support_value:.2f} low={low:.2f} "
                           f"close={close:.2f} reclaim={close-support_value:.2f} "
-                          f"volume={current_volume:.0f} median21={median_volume:.0f} "
+                          f"volume={current_volume:.0f} median21={median_volume:.0f} volume_reference_count={volume_reference_count} "
+                          f"volume_reference_ready={volume_reference_ready} "
                           f"vwap_sigma={vwap_sigma:.3f} tolerance={test_tolerance:.2f} "
                           f"pressure={pressure:+.3f} futures={fut}{conflict_note}",
             }
         support_check = (
             f"SUPPORT_BOUNCE_NOT_CONFIRMED level={support_value:.2f} "
             f"valid_wall={valid_wall} tested={tested} bullish_candle_bounce={bounced} "
-            f"volume_confirmed={volume_confirmed} volume={current_volume:.0f} median21={median_volume:.0f} "
+            f"volume_confirmed={volume_confirmed} volume={current_volume:.0f} median21={median_volume:.0f} volume_reference_count={volume_reference_count} "
+            f"volume_reference_ready={volume_reference_ready} "
             f"derivatives_confirm={bullish_confirmation} extreme_futures_conflict={extreme_bearish_conflict} "
             f"pressure={pressure:+.3f} futures={fut}"
         )
@@ -2248,6 +2276,8 @@ def classify_market_regime(
         "structural_direction_override_applied": False,
         "structural_direction_override_reason": "Not evaluated: insufficient completed current-session candles.",
         "session_completed_bars": 0,
+        "volume_reference_count": 0,
+        "volume_reference_ready": False,
         "adx_role": "TREND_STRENGTH_ONLY",
         "reason": "Insufficient completed current-session candles.",
     }
@@ -2339,10 +2369,14 @@ def classify_market_regime(
             f"LH={lower_high}, LL={lower_low}; price/VWAP plus matching swing structure required"
         )
 
-    current_volume = safe_float(work["volume"].iloc[-1], 0.0)
-    reference_volume = work["volume"].iloc[-21:-1] if len(work) > 2 else work["volume"].iloc[:-1]
-    median_volume = safe_float(reference_volume.median(), 0.0) if not reference_volume.empty else 0.0
-    volume_confirmed = median_volume > 0 and current_volume >= median_volume * STRONG_VOLUME_MULTIPLIER
+    current_volume, median_volume, volume_reference_count = previous_completed_volume_median(work, 21)
+    volume_reference_ready = volume_reference_count >= 21
+    volume_confirmed = (
+        volume_reference_ready and median_volume > 0
+        and current_volume >= median_volume * STRONG_VOLUME_MULTIPLIER
+    )
+    result["volume_reference_count"] = volume_reference_count
+    result["volume_reference_ready"] = volume_reference_ready
     divergence_3m = detect_rsi_divergence(work, window=5, rsi_values=current_rsi3)
     # Use only today's completed 15m price swings for divergence; prior-session
     # bars seed RSI but are never paired with today's price pivots across the gap.
@@ -3448,29 +3482,36 @@ def permitted_strikes_for_regime(
     *,
     is_expiry_day: bool = False,
     now: Optional[datetime] = None,
+    confirmed_breakout: bool = False,
+    directional_momentum_atr: float = 0.0,
 ) -> list[float]:
-    """Return the single authoritative strike-routing array for all call sites."""
-    direction = str(direction).upper()
-    intensity = str(intensity).upper()
-    if direction not in {"BULLISH", "BEARISH"} or step <= 0 or intensity in {"SIDEWAYS", "UNKNOWN"}:
+    """Return regime-aware candidates; preserve delta safety and restrict OTM to confirmed momentum breaks.
+
+    Normal/opening/midday scans compare three ITM/ATM alternatives so the option ranker
+    can select on live delta, premium VWAP, liquidity, COI and spread instead of a fixed
+    two-contract list. One OTM-side candidate is admitted only after 13:30 for a
+    confirmed breakout with at least 0.75 ATR of aligned recent momentum.
+    """
+    side = str(direction).upper()
+    regime = str(intensity).upper()
+    step_value = safe_float(step, 0.0)
+    if side not in {"BULLISH", "BEARISH"} or step_value <= 0 or regime in {"SIDEWAYS", "UNKNOWN"}:
         return []
-    # The 15:15 hard cutoff overrides every regime, including expiry-day routing.
     window = time_of_day_window(now)
     if window == "CUTOFF":
         return []
     if is_expiry_day:
-        # On expiry, evaluate a second ITM strike as well. Deep(er) ITM options
-        # may offer a better delta/continuation profile when the move is strong.
-        # The score/liquidity/COI gates still choose the contract; this is not a
-        # guarantee that a specific strike is the future maximum-return choice.
-        return [atm - 2 * step, atm - step, atm] if direction == "BULLISH" else [atm, atm + step, atm + 2 * step]
-    if intensity == "EXHAUSTION":
-        return [atm - 2 * step, atm - 3 * step] if direction == "BULLISH" else [atm + 2 * step, atm + 3 * step]
-    # OTM candidates are only allowed after 13:30 and only for a confirmed STRONG regime.
-    if intensity == "STRONG" and window == "AFTERNOON":
-        return [atm, atm + step, atm + 2 * step] if direction == "BULLISH" else [atm - 2 * step, atm - step, atm]
-    # Opening and normal/midday conditions keep the candidate set ATM/ITM only.
-    return [atm - step, atm] if direction == "BULLISH" else [atm, atm + step]
+        return [atm - 2 * step_value, atm - step_value, atm] if side == "BULLISH" else [atm, atm + step_value, atm + 2 * step_value]
+    if regime == "EXHAUSTION":
+        return [atm - 2 * step_value, atm - 3 * step_value] if side == "BULLISH" else [atm + 2 * step_value, atm + 3 * step_value]
+    high_velocity_breakout = bool(
+        window == "AFTERNOON" and regime == "STRONG" and confirmed_breakout
+        and safe_float(directional_momentum_atr, 0.0) >= 0.75
+    )
+    if high_velocity_breakout:
+        # CE: ATM-step is ITM and ATM+step is OTM; PE is symmetric by moneyness.
+        return [atm - step_value, atm, atm + step_value]
+    return [atm - 2 * step_value, atm - step_value, atm] if side == "BULLISH" else [atm, atm + step_value, atm + 2 * step_value]
 
 
 def is_confirmed_local_break(event: Optional[dict[str, Any]]) -> bool:
@@ -3499,6 +3540,33 @@ def is_confirmed_local_rejection(event: Optional[dict[str, Any]]) -> bool:
 def is_confirmed_local_directional_event(event: Optional[dict[str, Any]]) -> bool:
     """True for a fully confirmed local break or wall rejection/bounce event."""
     return is_confirmed_local_break(event) or is_confirmed_local_rejection(event)
+
+
+def midday_momentum_gate_decision(
+    *, tod_window: str, adx_value: float, minimum_adx: float,
+    structure_direction: str, structure_phase: str, structure_entry_confirmed: bool,
+    regime_direction: str, confirmed_local_event_override: bool,
+) -> tuple[bool, str]:
+    """ADX is not an independent veto for a direction already confirmed by PA/OI structure."""
+    if str(tod_window).upper() != "MIDDAY":
+        return True, "not the midday window"
+    if confirmed_local_event_override:
+        return True, "confirmed local PA/OI event override"
+    side = str(regime_direction or "").upper()
+    structure_side = str(structure_direction or "").upper()
+    phase = str(structure_phase or "").upper()
+    continuous_confirmed = bool(
+        side in {"BULLISH", "BEARISH"}
+        and structure_side == side
+        and phase == f"CONTINUOUS_{side}"
+        and structure_entry_confirmed
+    )
+    adx = safe_float(adx_value, float("nan"))
+    if continuous_confirmed:
+        return True, f"confirmed continuous {side} PA/OI structure; ADX={adx:.2f} refines strength, not direction" if math.isfinite(adx) else f"confirmed continuous {side} PA/OI structure; ADX unavailable but not a directional veto"
+    if not math.isfinite(adx) or adx < safe_float(minimum_adx, 23.0):
+        return False, f"midday momentum gate requires ADX >= {safe_float(minimum_adx, 23.0):.1f} without a confirmed continuous PA/OI structure; actual={adx}"
+    return True, f"ADX={adx:.2f} meets midday strength threshold"
 
 
 def cold_start_entry_gate_passed(
@@ -3549,6 +3617,42 @@ def structural_reward_risk_ratio(
     return reward / risk, reward, risk
 
 
+def structural_reward_risk_profile(
+    direction: str, spot: float, target_1: float, target_2: float, stop: float,
+) -> dict[str, float]:
+    """Report RR to T1 and T2 separately; T2 never bypasses an invalid T1 entry.
+
+    A breakout naturally advances T1 because target selection is relative to live spot;
+    before the break, the nearest valid obstacle remains T1.
+    """
+    rr1, reward1, risk1 = structural_reward_risk_ratio(direction, spot, target_1, stop)
+    rr2, reward2, risk2 = structural_reward_risk_ratio(direction, spot, target_2, stop)
+    return {
+        "rr_t1": float(rr1), "reward_t1": float(reward1), "risk_t1": float(risk1),
+        "rr_t2": float(rr2), "reward_t2": float(reward2), "risk_t2": float(risk2),
+    }
+
+
+def dynamic_wall_clearance_steps(
+    *, strike_step_value: float, atr_points: float, directional_momentum_atr: float, wall_strength: float,
+) -> float:
+    """Calculate a bounded wall buffer from volatility, aligned momentum and wall strength.
+
+    The clear-space guard is secondary to target/RR validation and no longer uses a
+    blanket 1.5-strike-step veto for a wall already represented by T1.
+    """
+    step = max(safe_float(strike_step_value, 50.0), 1.0)
+    atr_steps = max(0.0, safe_float(atr_points, 0.0)) / step
+    strength = min(1.0, max(0.0, safe_float(wall_strength, 0.0)))
+    momentum = safe_float(directional_momentum_atr, 0.0)
+    clearance = 0.20 + min(0.25, 0.25 * atr_steps) + 0.15 * strength
+    if momentum >= 0.75:
+        clearance -= 0.10
+    elif momentum < 0.25:
+        clearance += 0.10
+    return float(min(0.75, max(0.20, clearance)))
+
+
 def opposing_oi_wall_veto(
     direction: str,
     spot: float,
@@ -3559,23 +3663,47 @@ def opposing_oi_wall_veto(
     confirmed_local_break: bool = False,
     confirmed_local_rejection: bool = False,
     clearance_steps: Optional[float] = None,
+    target_level: Optional[float] = None,
+    target_rr_validated: bool = False,
+    target_is_meaningful_oi_wall: bool = False,
 ) -> str:
-    """Block entries near an opposing OI wall, except validated breaks/rejections."""
+    """Guard a nearby *unaccounted* opposing wall without duplicating the RR gate."""
     direction = str(direction or "").upper()
+    price = safe_float(spot, float("nan"))
     step = max(safe_float(strike_step_value, 50.0), 1.0)
-    clearance = max(0.5, safe_float(clearance_steps, MIN_OPPOSING_WALL_CLEARANCE_STEPS)) * step
+    if direction not in {"BULLISH", "BEARISH"} or not math.isfinite(price):
+        return "INVALID_WALL_GUARD_INPUT"
     if confirmed_local_break or confirmed_local_rejection:
         return ""
-    if direction == "BULLISH" and math.isfinite(safe_float(resistance, float("nan"))):
+    target = safe_float(target_level, float("nan"))
+    tolerance = max(0.5, 0.10 * step)
+
+    if direction == "BULLISH":
         wall = safe_float(resistance, float("nan"))
-        gap = wall - safe_float(spot)
-        if gap >= -0.20 * step and gap < clearance:
-            return f"NEAR_RESISTANCE_VETO wall={wall:.2f} spot={spot:.2f} runway={max(gap,0.0):.2f} required={clearance:.2f}"
-    if direction == "BEARISH" and math.isfinite(safe_float(support, float("nan"))):
+        if not math.isfinite(wall) or wall <= price:
+            return ""
+        gap = wall - price
+        if target_rr_validated and math.isfinite(target) and target_is_meaningful_oi_wall and abs(wall - target) <= tolerance:
+            return ""  # This wall is already T1 and has passed the directional RR check.
+        if target_rr_validated and math.isfinite(target) and wall >= target + tolerance:
+            return ""  # Wall lies beyond the currently planned target, not in front of it.
+        required = min(0.75, max(0.20, safe_float(clearance_steps, MIN_OPPOSING_WALL_CLEARANCE_STEPS))) * step
+        if gap < required:
+            return (f"NEAR_RESISTANCE_VETO wall={wall:.2f} spot={price:.2f} runway={gap:.2f} "
+                    f"required_dynamic={required:.2f} target={target:.2f} target_rr_validated={target_rr_validated}")
+    else:
         wall = safe_float(support, float("nan"))
-        gap = safe_float(spot) - wall
-        if gap >= -0.20 * step and gap < clearance:
-            return f"NEAR_SUPPORT_VETO wall={wall:.2f} spot={spot:.2f} runway={max(gap,0.0):.2f} required={clearance:.2f}"
+        if not math.isfinite(wall) or wall >= price:
+            return ""
+        gap = price - wall
+        if target_rr_validated and math.isfinite(target) and target_is_meaningful_oi_wall and abs(wall - target) <= tolerance:
+            return ""
+        if target_rr_validated and math.isfinite(target) and wall <= target - tolerance:
+            return ""
+        required = min(0.75, max(0.20, safe_float(clearance_steps, MIN_OPPOSING_WALL_CLEARANCE_STEPS))) * step
+        if gap < required:
+            return (f"NEAR_SUPPORT_VETO wall={wall:.2f} spot={price:.2f} runway={gap:.2f} "
+                    f"required_dynamic={required:.2f} target={target:.2f} target_rr_validated={target_rr_validated}")
     return ""
 
 
@@ -3587,6 +3715,8 @@ def collect_option_premium_vwaps(
     *,
     is_expiry_day: bool,
     now: Optional[datetime] = None,
+    confirmed_breakout: bool = False,
+    directional_momentum_atr: float = 0.0,
 ) -> dict[str, dict[str, float]]:
     """Fetch completed 1-minute option candles and calculate each contract's own VWAP."""
     decision_chain, window_meta = option_chain_atm_window(chain, spot)
@@ -3596,7 +3726,8 @@ def collect_option_premium_vwaps(
     atm = safe_float(window_meta.get("atm_strike"), nearest_strike(spot, strikes))
     option_type = "CE" if direction == "BULLISH" else "PE"
     targets = permitted_strikes_for_regime(
-        atm, step, direction, intensity, is_expiry_day=is_expiry_day, now=now
+        atm, step, direction, intensity, is_expiry_day=is_expiry_day, now=now,
+        confirmed_breakout=confirmed_breakout, directional_momentum_atr=directional_momentum_atr,
     )
     result: dict[str, dict[str, float]] = {}
     for target in targets:
@@ -4507,12 +4638,34 @@ def build_market_structure(
     # support. The old implementation overwrote a fresh resistance with the
     # prior resistance and could report resistance below spot (e.g. 22400 while
     # NIFTY was trading near 22417 on 09-Oct).
-    price_reference = max(
-        x for x in (safe_float(spot, float("nan")), current_close)
-        if math.isfinite(x)
-    )
+    live_spot = safe_float(spot, current_close)
+    price_reference = live_spot if math.isfinite(live_spot) else current_close
     original_supports = [support_1, support_2]
     original_resistances = [resistance_1, resistance_2]
+    intrabar_support_breach_unconfirmed = any(
+        math.isfinite(safe_float(level, float("nan")))
+        and live_spot < float(level) - break_buffer
+        and current_close >= float(level) - break_buffer
+        for level in original_supports
+    )
+    intrabar_resistance_clear_unconfirmed = any(
+        math.isfinite(safe_float(level, float("nan")))
+        and live_spot > float(level) + break_buffer
+        and current_close <= float(level) + break_buffer
+        for level in original_resistances
+    )
+    if intrabar_support_breach_unconfirmed:
+        logger.warning(
+            "INTRABAR SUPPORT BREACH NOT CONFIRMED: live_spot=%.2f latest_completed_close=%.2f buffer=%.2f; "
+            "do not label as a completed-bar breakdown until close/structure confirms.",
+            live_spot, current_close, break_buffer,
+        )
+    if intrabar_resistance_clear_unconfirmed:
+        logger.warning(
+            "INTRABAR RESISTANCE CLEAR NOT CONFIRMED: live_spot=%.2f latest_completed_close=%.2f buffer=%.2f; "
+            "do not label as a completed-bar breakout until close/structure confirms.",
+            live_spot, current_close, break_buffer,
+        )
     live_supports = sorted(
         {float(x) for x in original_supports if math.isfinite(safe_float(x, float("nan"))) and float(x) < price_reference},
         reverse=True,
@@ -4738,6 +4891,10 @@ def build_market_structure(
         f"ENTRY GATES: bearish_level_ok={bearish_level_ok}; bullish_level_ok={bullish_level_ok}; minimum_entry_change_oi={STRUCTURE_CHANGE_OI_STRONG:.3f}.",
         f"PCR CONTEXT: value={pcr:.3f}; bias={pcr_bias:+d}." if math.isfinite(pcr) else "PCR CONTEXT: unavailable from current chain.",
     ]
+    if intrabar_support_breach_unconfirmed:
+        reasons.append("Live spot temporarily breached an OI support but latest completed close has not confirmed breakdown.")
+    if intrabar_resistance_clear_unconfirmed:
+        reasons.append("Live spot temporarily cleared an OI resistance but latest completed close has not confirmed breakout.")
 
     logger.info(
         "STRUCTURE ENGINE: phase=%s direction=%s price=%.2f VWAP=%.2f support=%s resistance=%s ChangeOI=%+.3f "
@@ -4771,6 +4928,8 @@ def build_market_structure(
         "vwap_distance_atr": float(abs(current_close - vwap) / volatility_unit) if math.isfinite(vwap) else float("inf"),
         "volatility_unit": float(volatility_unit),
         "active_structure_level": float(support_1 if direction == "BEARISH" else resistance_1 if direction == "BULLISH" else float("nan")),
+        "intrabar_support_breach_unconfirmed": 1.0 if intrabar_support_breach_unconfirmed else 0.0,
+        "intrabar_resistance_clear_unconfirmed": 1.0 if intrabar_resistance_clear_unconfirmed else 0.0,
     }
 
     return StructureResult(
@@ -4907,6 +5066,8 @@ def select_directional_option(
     now: Optional[datetime] = None,
     option_metrics_by_instrument: Optional[dict[str, dict[str, float]]] = None,
     oi_velocity_by_strike: Optional[dict[float, dict[str, Any]]] = None,
+    confirmed_breakout: bool = False,
+    directional_momentum_atr: float = 0.0,
 ) -> OptionCandidate:
     """Select a strike using regime routing + strict option VWAP/COI/delta gates."""
     direction = str(direction).upper()
@@ -4934,7 +5095,8 @@ def select_directional_option(
         )
 
     permitted_list = [round(float(x), 2) for x in permitted_strikes_for_regime(
-        atm, step, direction, intensity, is_expiry_day=is_expiry_day, now=now
+        atm, step, direction, intensity, is_expiry_day=is_expiry_day, now=now,
+        confirmed_breakout=confirmed_breakout, directional_momentum_atr=directional_momentum_atr,
     )]
     lower_bound = safe_float(window_meta.get("lower_bound"), atm - ATM_ANALYSIS_RADIUS_LEVELS * step)
     upper_bound = safe_float(window_meta.get("upper_bound"), atm + ATM_ANALYSIS_RADIUS_LEVELS * step)
@@ -4986,12 +5148,16 @@ def select_directional_option(
             rejection_log.append(f"{option_type} {row_key:.0f}: valid live delta unavailable")
             continue
         delta_abs = abs(delta)
+        is_otm_candidate = (option_type == "CE" and float(row_key) > atm + 0.01) or (option_type == "PE" and float(row_key) < atm - 0.01)
+        if is_otm_candidate and not (confirmed_breakout and directional_momentum_atr >= 0.75 and tod == "AFTERNOON" and intensity == "STRONG"):
+            rejection_log.append(f"{option_type} {row_key:.0f}: OTM contract requires a confirmed high-momentum afternoon breakout")
+            continue
         if intensity == "EXHAUSTION":
             delta_floor = 0.75
-        elif is_expiry_day or intensity != "STRONG":
-            delta_floor = 0.50
+        elif is_otm_candidate:
+            delta_floor = 0.35
         else:
-            delta_floor = 0.0
+            delta_floor = 0.50
         if delta_abs < delta_floor:
             rejection_log.append(f"{option_type} {row_key:.0f}: delta {delta_abs:.3f} below floor {delta_floor:.2f}")
             continue
@@ -5236,6 +5402,8 @@ def validate_continuous_option_entry(
     market_intensity: str = "NORMAL",
     is_expiry_day: bool = False,
     now: Optional[datetime] = None,
+    confirmed_breakout: bool = False,
+    directional_momentum_atr: float = 0.0,
 ) -> None:
     """Final pre-signal invariant for contract type, regime routing and hard risk filters."""
     phase = str(market_phase or "").upper()
@@ -5255,7 +5423,8 @@ def validate_continuous_option_entry(
     atm = safe_float(window_meta.get("atm_strike"), nearest_strike(spot, strikes))
     permitted = {
         round(float(x), 2) for x in permitted_strikes_for_regime(
-            atm, step, direction, market_intensity, is_expiry_day=is_expiry_day, now=now
+            atm, step, direction, market_intensity, is_expiry_day=is_expiry_day, now=now,
+            confirmed_breakout=confirmed_breakout, directional_momentum_atr=directional_momentum_atr,
         )
     }
     selected_strike = round(float(option.strike), 2)
@@ -5277,7 +5446,10 @@ def validate_continuous_option_entry(
     live_ltp = safe_float(side.get("ltp"), 0.0)
     if live_ltp <= 0 or not math.isfinite(option.premium_vwap) or live_ltp <= option.premium_vwap:
         raise ScannerError("PRE-EMAIL PREMIUM VWAP VALIDATION FAILED: live LTP must be above valid option VWAP.")
-    delta_floor = 0.75 if market_intensity == "EXHAUSTION" else 0.50 if (is_expiry_day or market_intensity != "STRONG") else 0.0
+    is_otm_selected = (expected_type == "CE" and selected_strike > atm + 0.01) or (expected_type == "PE" and selected_strike < atm - 0.01)
+    if is_otm_selected and not (confirmed_breakout and directional_momentum_atr >= 0.75 and time_of_day_window(now) == "AFTERNOON" and market_intensity == "STRONG"):
+        raise ScannerError("PRE-EMAIL MONEINESS VALIDATION FAILED: OTM options require a confirmed high-momentum afternoon breakout.")
+    delta_floor = 0.75 if market_intensity == "EXHAUSTION" else 0.35 if is_otm_selected else 0.50
     if abs(option.delta) < delta_floor:
         raise ScannerError(f"PRE-EMAIL DELTA VALIDATION FAILED: |delta|={abs(option.delta):.3f} < {delta_floor:.2f}.")
     logger.info(
@@ -5457,6 +5629,106 @@ def _initial_structural_stop(
     raise ScannerError("No bullish PA/OI invalidation level available.")
 
 
+def _ordered_structural_target_pair(
+    direction: str,
+    spot: float,
+    oi_walls: list[dict[str, Any]],
+    price_action_levels: list[float],
+    window_low: float,
+    window_high: float,
+    strike_step_value: float,
+) -> tuple[float, float, dict[str, Any], dict[str, Any]]:
+    """Select the nearest two distinct, in-window obstacles from meaningful OI walls and PA swings.
+
+    Weak OI-dominant rows are not promoted to hard targets merely because one side's
+    OI is numerically larger. Confirmed PA swing levels remain valid target context.
+    Nearby PA/OI references are clustered to avoid counting the same obstacle twice.
+    """
+    side = str(direction or "").upper()
+    price = safe_float(spot, float("nan"))
+    lo = safe_float(window_low, float("nan"))
+    hi = safe_float(window_high, float("nan"))
+    step = max(safe_float(strike_step_value, 50.0), 1.0)
+    if side not in {"BULLISH", "BEARISH"} or not all(math.isfinite(x) for x in (price, lo, hi)) or lo > hi:
+        raise ScannerError("Cannot rank structural targets: direction, spot, or ATM-window bounds are invalid.")
+
+    candidates: list[dict[str, Any]] = []
+    wall_role = "RESISTANCE" if side == "BULLISH" else "SUPPORT"
+    wall_source = "OPTION_OI_RESISTANCE" if side == "BULLISH" else "OPTION_OI_SUPPORT"
+    pa_source = "PRICE_ACTION_SWING_HIGH" if side == "BULLISH" else "PRICE_ACTION_SWING_LOW"
+
+    for wall in oi_walls:
+        level = safe_float(wall.get("strike"), float("nan"))
+        if (not bool(wall.get("meaningful")) or not math.isfinite(level)
+                or not (lo - 0.01 <= level <= hi + 0.01)):
+            continue
+        if (side == "BULLISH" and level <= price + 0.01) or (side == "BEARISH" and level >= price - 0.01):
+            continue
+        candidates.append({
+            "level": float(level), "source": wall_source, "oi": safe_float(wall.get("oi"), 0.0),
+            "strength": safe_float(wall.get("strength"), 0.0), "is_oi": True,
+            "meaningful": True, "role": wall_role,
+        })
+
+    for raw in price_action_levels:
+        level = safe_float(raw, float("nan"))
+        if (not math.isfinite(level) or not (lo - 0.01 <= level <= hi + 0.01)):
+            continue
+        if (side == "BULLISH" and level <= price + 0.01) or (side == "BEARISH" and level >= price - 0.01):
+            continue
+        candidates.append({
+            "level": float(level), "source": pa_source, "oi": 0.0, "strength": 0.0,
+            "is_oi": False, "meaningful": True, "role": "PRICE_ACTION",
+        })
+
+    if side == "BULLISH":
+        candidates.sort(key=lambda item: (float(item["level"]) - price, -float(item["strength"]), float(item["level"])))
+    else:
+        candidates.sort(key=lambda item: (price - float(item["level"]), -float(item["strength"]), -float(item["level"])))
+
+    merge_tolerance = max(1.0, 0.10 * step)
+    clusters: list[list[dict[str, Any]]] = []
+    for item in candidates:
+        if not clusters:
+            clusters.append([item])
+            continue
+        previous_levels = [safe_float(existing.get("level"), float("nan")) for existing in clusters[-1]]
+        if any(abs(float(item["level"]) - old_level) <= merge_tolerance for old_level in previous_levels if math.isfinite(old_level)):
+            clusters[-1].append(item)
+        else:
+            clusters.append([item])
+
+    if len(clusters) < 2:
+        raise ScannerError(
+            f"Insufficient distinct valid {side.lower()} target obstacles inside ATM window "
+            f"[{lo:.2f},{hi:.2f}]: found {len(clusters)}, require 2."
+        )
+
+    def describe(cluster: list[dict[str, Any]]) -> tuple[float, dict[str, Any]]:
+        levels = [float(item["level"]) for item in cluster]
+        # The level nearest spot is conservative when a swing and an OI wall cluster.
+        level = min(levels) if side == "BULLISH" else max(levels)
+        ordered_sources = [source for source in (wall_source, pa_source) if any(item["source"] == source for item in cluster)]
+        source = "+".join(ordered_sources)
+        oi_items = [item for item in cluster if bool(item.get("is_oi"))]
+        return level, {
+            "source": source or pa_source,
+            "oi": max((safe_float(item.get("oi"), 0.0) for item in oi_items), default=0.0),
+            "strength": max((safe_float(item.get("strength"), 0.0) for item in oi_items), default=0.0),
+            "oi_wall": bool(oi_items),
+            "price_action": any(item["source"] == pa_source for item in cluster),
+            "cluster_levels": sorted(set(levels)),
+        }
+
+    t1, meta1 = describe(clusters[0])
+    t2, meta2 = describe(clusters[1])
+    if side == "BULLISH" and not (price < t1 < t2):
+        raise ScannerError(f"Invalid bullish target ordering: spot={price:.2f}, T1={t1:.2f}, T2={t2:.2f}.")
+    if side == "BEARISH" and not (t2 < t1 < price):
+        raise ScannerError(f"Invalid bearish target ordering: T2={t2:.2f}, T1={t1:.2f}, spot={price:.2f}.")
+    return float(t1), float(t2), meta1, meta2
+
+
 def determine_structural_trade_levels(
     chain: list[dict[str, Any]],
     spot: float,
@@ -5464,126 +5736,84 @@ def determine_structural_trade_levels(
     price_session: Optional[pd.DataFrame],
     change_oi_by_strike: Optional[dict[float, dict[str, float]]] = None,
 ) -> tuple[float, float, float, dict[str, Any]]:
-    """Determine authoritative NIFTY T1/T2/SL strictly from price action + OI."""
+    """Determine authoritative NIFTY T1/T2/SL from the nearest valid PA/OI obstacles.
+
+    Targets must be directional, distinct, meaningful and inside the current ATM
+    analysis window. OI concentration is authoritative when meaningful; completed
+    price-action swings supplement it and are safer than promoting a weak OI wall.
+    """
     direction = str(structure.direction).upper()
+    price = safe_float(spot, float("nan"))
     if direction not in {"BULLISH", "BEARISH"}:
         raise ScannerError("Structural trade levels require BULLISH or BEARISH direction.")
+    if not math.isfinite(price) or price <= 0:
+        raise ScannerError("Structural trade levels require a valid positive NIFTY spot.")
 
-    decision_chain, window_meta = option_chain_atm_window(chain, spot)
+    decision_chain, window_meta = option_chain_atm_window(chain, price)
     rows = chain_rows(decision_chain)
     step = max(safe_float(window_meta.get("strike_step"), strike_step(sorted(rows))), 1.0)
     window_low = safe_float(window_meta.get("lower_bound"), float("nan"))
     window_high = safe_float(window_meta.get("upper_bound"), float("nan"))
+    if not all(math.isfinite(value) for value in (window_low, window_high)) or window_low > window_high:
+        raise ScannerError("Current ATM-window bounds are invalid; refusing distant/stale structural levels.")
+
     swings = restrict_price_action_swings(
         _price_action_swings(price_session), window_low, window_high
     )
-
     support_walls = _rank_current_oi_walls(
-        decision_chain, spot, side="support", change_oi_by_strike=change_oi_by_strike,
+        decision_chain, price, side="support", change_oi_by_strike=change_oi_by_strike,
     )
     resistance_walls = _rank_current_oi_walls(
-        decision_chain, spot, side="resistance", change_oi_by_strike=change_oi_by_strike,
+        decision_chain, price, side="resistance", change_oi_by_strike=change_oi_by_strike,
     )
 
-    if direction == "BEARISH":
-        # Every current strike where Put OI dominates Call OI is a potential
-        # downside obstacle. T1 must be the nearest such wall below spot, not
-        # whichever wall had the highest OI or a stale structure-level preference.
+    if direction == "BULLISH":
+        target_walls = resistance_walls
+        t1, t2, t1_meta, t2_meta = _ordered_structural_target_pair(
+            direction, price, target_walls, swings.get("highs", []), window_low, window_high, step,
+        )
+        stop_walls = [wall for wall in support_walls if bool(wall.get("meaningful"))]
+        stop_u, stop_source = _initial_structural_stop(price, direction, swings, stop_walls, step)
+        if not (stop_u < price < t1 < t2):
+            raise ScannerError(
+                f"Invalid bullish PA/OI ordering: SL={stop_u:.2f}, spot={price:.2f}, T1={t1:.2f}, T2={t2:.2f}."
+            )
+    else:
         target_walls = support_walls
-        ahead = [x for x in target_walls if float(x["strike"]) < spot]
-        if not ahead:
-            raise ScannerError("No current OI support below spot for bearish T1.")
-        t1 = float(min(
-            ahead,
-            key=lambda x: (float(spot) - float(x["strike"]), -float(x["strength"])),
-        )["strike"])
-
-        # T2 is the next distinct lower OI wall; PA is a fallback only when no
-        # second OI wall exists.
-        deeper = [x for x in support_walls if float(x["strike"]) < t1]
-        pa_lows = sorted([x for x in swings.get("lows", []) if x < t1 - 0.01], reverse=True)
-        oi_t2 = sorted([float(x["strike"]) for x in deeper], reverse=True)
-        if oi_t2:
-            t2 = oi_t2[0]
-        elif pa_lows:
-            t2 = pa_lows[0]
-        else:
-            raise ScannerError("No second price-action/OI downside objective exists for bearish trade.")
-        current_resistance_matches = [x for x in resistance_walls if abs(float(x["strike"]) - safe_float(structure.resistance_1, float("nan"))) <= 0.01]
-        stop_walls = current_resistance_matches[:1] if safe_float(structure.resistance_1, float("nan")) > spot and current_resistance_matches else resistance_walls
-        stop_u, stop_source = _initial_structural_stop(
-            spot, direction, swings, stop_walls, step,
+        t1, t2, t1_meta, t2_meta = _ordered_structural_target_pair(
+            direction, price, target_walls, swings.get("lows", []), window_low, window_high, step,
         )
-        if not all(math.isfinite(x) and window_low - 0.01 <= x <= window_high + 0.01 for x in (t1, t2, stop_u)):
+        stop_walls = [wall for wall in resistance_walls if bool(wall.get("meaningful"))]
+        stop_u, stop_source = _initial_structural_stop(price, direction, swings, stop_walls, step)
+        if not (t2 < t1 < price < stop_u):
             raise ScannerError(
-                f"Bearish PA/OI levels outside current ATM window [{window_low:.2f},{window_high:.2f}]; "
-                "entry rejected rather than using a distant/stale reference."
+                f"Invalid bearish PA/OI ordering: T2={t2:.2f}, T1={t1:.2f}, spot={price:.2f}, SL={stop_u:.2f}."
             )
-        if not (t2 < t1 < spot < stop_u):
-            raise ScannerError(
-                f"Invalid bearish structural ordering: T2={t2:.2f}, T1={t1:.2f}, spot={spot:.2f}, SL={stop_u:.2f}."
-            )
-        t1_wall = next((x for x in target_walls if abs(float(x["strike"]) - t1) <= 0.01), {})
-        t2_wall = next((x for x in deeper if abs(float(x["strike"]) - t2) <= 0.01), {})
-        meta = {
-            "t1_source": "OPTION_OI_SUPPORT",
-            "t2_source": "OPTION_OI_SUPPORT" if t2_wall else "PRICE_ACTION_SWING_LOW",
-            "sl_source": stop_source,
-            "t1_oi": safe_float(t1_wall.get("oi"), 0.0),
-            "t2_oi": safe_float(t2_wall.get("oi"), 0.0),
-            "price_action_swing": swings,
-            "t1_oi_wall_count": len(target_walls),
-            "window_atm": float(window_meta["atm_strike"]),
-            "window_lower_bound": float(window_low),
-            "window_upper_bound": float(window_high),
-        }
-        return float(t1), float(t2), float(stop_u), meta
 
-    # Symmetric rule: T1 is the nearest current Call-OI-dominant wall above spot.
-    target_walls = resistance_walls
-    ahead = [x for x in target_walls if float(x["strike"]) > spot]
-    if not ahead:
-        raise ScannerError("No current OI resistance above spot for bullish T1.")
-    t1 = float(min(
-        ahead,
-        key=lambda x: (float(x["strike"]) - float(spot), -float(x["strength"])),
-    )["strike"])
+    if not all(math.isfinite(value) and window_low - 0.01 <= value <= window_high + 0.01 for value in (t1, t2, stop_u)):
+        raise ScannerError(
+            f"PA/OI target or stop outside current ATM window [{window_low:.2f},{window_high:.2f}]; "
+            "entry rejected rather than using distant/stale references."
+        )
 
-    # T2 is the next distinct higher OI wall; PA is a fallback only when no
-    # second OI wall exists.
-    higher = [x for x in resistance_walls if float(x["strike"]) > t1]
-    pa_highs = sorted([x for x in swings.get("highs", []) if x > t1 + 0.01])
-    oi_t2 = sorted([float(x["strike"]) for x in higher])
-    t2 = oi_t2[0] if oi_t2 else (pa_highs[0] if pa_highs else float("nan"))
-    if not math.isfinite(t2):
-        raise ScannerError("No second price-action/OI upside objective exists for bullish trade.")
-    current_support_matches = [x for x in support_walls if abs(float(x["strike"]) - safe_float(structure.support_1, float("nan"))) <= 0.01]
-    stop_walls = current_support_matches[:1] if safe_float(structure.support_1, float("nan")) < spot and current_support_matches else support_walls
-    stop_u, stop_source = _initial_structural_stop(
-        spot, direction, swings, stop_walls, step,
-    )
-    if not all(math.isfinite(x) and window_low - 0.01 <= x <= window_high + 0.01 for x in (t1, t2, stop_u)):
-        raise ScannerError(
-            f"Bullish PA/OI levels outside current ATM window [{window_low:.2f},{window_high:.2f}]; "
-            "entry rejected rather than using a distant/stale reference."
-        )
-    if not (stop_u < spot < t1 < t2):
-        raise ScannerError(
-            f"Invalid bullish structural ordering: SL={stop_u:.2f}, spot={spot:.2f}, T1={t1:.2f}, T2={t2:.2f}."
-        )
-    t1_wall = next((x for x in target_walls if abs(float(x["strike"]) - t1) <= 0.01), {})
-    t2_wall = next((x for x in higher if abs(float(x["strike"]) - t2) <= 0.01), {})
+    weak_target_walls = sum(1 for wall in target_walls if not bool(wall.get("meaningful")))
     meta = {
-        "t1_source": "OPTION_OI_RESISTANCE",
-        "t2_source": "OPTION_OI_RESISTANCE" if t2_wall else "PRICE_ACTION_SWING_HIGH",
+        "t1_source": str(t1_meta.get("source", "PRICE_ACTION")),
+        "t2_source": str(t2_meta.get("source", "PRICE_ACTION")),
         "sl_source": stop_source,
-        "t1_oi": safe_float(t1_wall.get("oi"), 0.0),
-        "t2_oi": safe_float(t2_wall.get("oi"), 0.0),
+        "t1_oi": safe_float(t1_meta.get("oi"), 0.0),
+        "t2_oi": safe_float(t2_meta.get("oi"), 0.0),
+        "t1_wall_strength": safe_float(t1_meta.get("strength"), 0.0),
+        "t2_wall_strength": safe_float(t2_meta.get("strength"), 0.0),
+        "t1_is_meaningful_oi_wall": bool(t1_meta.get("oi_wall")),
+        "t2_is_meaningful_oi_wall": bool(t2_meta.get("oi_wall")),
         "price_action_swing": swings,
-        "t1_oi_wall_count": len(target_walls),
-        "window_atm": float(window_meta["atm_strike"]),
+        "t1_oi_wall_count": sum(1 for wall in target_walls if bool(wall.get("meaningful"))),
+        "weak_oi_walls_not_used_as_targets": weak_target_walls,
+        "window_atm": safe_float(window_meta.get("atm_strike"), float("nan")),
         "window_lower_bound": float(window_low),
         "window_upper_bound": float(window_high),
+        "target_selection_method": "NEAREST_MEANINGFUL_OI_AND_COMPLETED_PA_SWINGS",
     }
     return float(t1), float(t2), float(stop_u), meta
 
@@ -5681,7 +5911,9 @@ def migrate_active_trade_to_v25(
     then recomputes whether the new structural T1 has actually been reached.
     """
     engine = str(trade.get("target_engine_version", "")).strip()
-    if engine == OPTION_TARGET_ENGINE_VERSION:
+    if engine == OPTION_TARGET_ENGINE_VERSION or engine in LEGACY_STRUCTURAL_TARGET_ENGINE_VERSIONS:
+        # Existing structural PA/OI levels remain pinned during a live position.
+        # Do not rebase stop/targets mid-trade just because the entry engine improved.
         return False
 
     direction = str(trade.get("direction", structure.direction)).upper()
@@ -5822,38 +6054,48 @@ def save_state(state: dict[str, Any]) -> None:
 
 
 def reset_intraday_memory_if_needed(state: dict[str, Any], today_iso: str) -> tuple[bool, str]:
-    """Reset directional memory on session/version changes without discarding compatible same-day OI history."""
+    """Reset intraday memory only at a trading-date boundary, not for a code-only upgrade.
+
+    Same-session market context, continuation observations and signal de-duplication are
+    preserved when the scanner version changes. OI snapshots are also preserved intraday;
+    their timestamp/expiry/overlap normalization remains responsible for baseline safety.
+    """
     snapshot = state.get("market_snapshot")
     snapshot_ts = str(snapshot.get("timestamp", ""))[:10] if isinstance(snapshot, dict) else ""
     stored_version = str(state.get("scanner_version", ""))
-    new_session = bool(snapshot_ts and snapshot_ts != today_iso)
+    last_bar = str(state.get("continuation_last_bar", ""))[:10]
+    last_signal_ts = str(state.get("last_signal_timestamp", ""))[:10]
+    stored_session_date = str(state.get("state_session_date", ""))[:10]
+    known_date = next((value for value in (snapshot_ts, stored_session_date, last_bar, last_signal_ts)
+                       if len(value) == 10 and value[:4].isdigit() and value[4] == "-" and value[7] == "-"), "")
+    new_session = bool(known_date and known_date != today_iso)
     version_changed = bool(stored_version and stored_version != SCANNER_VERSION)
-    if not (new_session or version_changed):
-        state["scanner_version"] = SCANNER_VERSION
-        return False, ""
 
-    state["market_history"] = []
-    state["market_snapshot"] = {}
-    state["persistent_direction"] = None
-    state["continuation_phase"] = ""
-    state["continuation_count"] = 0
-    state["continuation_last_bar"] = ""
-    state["scanner_version"] = SCANNER_VERSION
-    state.pop("last_signal", None)
-    state.pop("last_signal_hash", None)
-    state.pop("last_signal_timestamp", None)
-
-    # OI velocity is intraday and expiry-specific. Preserve it on a code-version
-    # upgrade during the SAME trading date; the history normalizer validates each
-    # timestamp/date/expiry and contract overlap before allowing it into a baseline.
-    # A new trading date must start with a clean OI ring and legacy snapshot.
     if new_session:
+        state["market_history"] = []
+        state["market_snapshot"] = {}
+        state["persistent_direction"] = None
+        state["continuation_phase"] = ""
+        state["continuation_count"] = 0
+        state["continuation_last_bar"] = ""
+        state.pop("last_signal", None)
+        state.pop("last_signal_hash", None)
+        state.pop("last_signal_timestamp", None)
         state.pop("option_oi_snapshot", None)
         state.pop("option_oi_history", None)
-        reason = "NEW_TRADING_SESSION"
-    else:
-        reason = "SCANNER_VERSION_CHANGE_PRESERVED_OI_HISTORY"
-    return True, reason
+        state["scanner_version"] = SCANNER_VERSION
+        state["state_session_date"] = today_iso
+        return True, "NEW_TRADING_SESSION_RESET_INTRADAY_AND_OI_HISTORY"
+
+    state["state_session_date"] = today_iso
+    if version_changed:
+        # Do not throw away today's actual market state just because the source changed.
+        # The latest completed-bar timestamp still prevents duplicate confirmations.
+        state["scanner_version"] = SCANNER_VERSION
+        return True, "SCANNER_VERSION_CHANGE_PRESERVED_INTRADAY_MEMORY_AND_OI"
+
+    state["scanner_version"] = SCANNER_VERSION
+    return False, ""
 
 
 def active_trade_from_state(
@@ -7277,11 +7519,14 @@ def generate_signals(
     entry_structure: StructureResult,
     option_flow_by_strike: dict[str, Any],
     oi_velocity_by_strike: dict[str, Any],
+    confirmed_breakout: bool = False,
+    directional_momentum_atr: float = 0.0,
 ) -> Optional[OptionCandidate]:
     """Rank local option candidates and apply every existing execution validation."""
     option_micro_metrics = collect_option_premium_vwaps(
         chain, spot, regime_direction, intensity,
         is_expiry_day=is_expiry_day, now=now_ist(),
+        confirmed_breakout=confirmed_breakout, directional_momentum_atr=directional_momentum_atr,
     )
     try:
         option = select_directional_option(
@@ -7294,6 +7539,8 @@ def generate_signals(
             now=now_ist(),
             option_metrics_by_instrument=option_micro_metrics,
             oi_velocity_by_strike=oi_velocity_by_strike,
+            confirmed_breakout=confirmed_breakout,
+            directional_momentum_atr=directional_momentum_atr,
         )
         validate_continuous_option_entry(
             option=option,
@@ -7304,6 +7551,8 @@ def generate_signals(
             market_intensity=intensity,
             is_expiry_day=is_expiry_day,
             now=now_ist(),
+            confirmed_breakout=confirmed_breakout,
+            directional_momentum_atr=directional_momentum_atr,
         )
     except ScannerError as exc:
         logger.warning("NO TRADE: option strike selection rejected all candidates: %s", exc)
@@ -7358,8 +7607,10 @@ def execute_scan(
     if state_reset:
         oi_history_count = len(state.get("option_oi_history", [])) if isinstance(state.get("option_oi_history"), list) else 0
         logger.info(
-            "STATE RESET: reason=%s; directional memory reset; preserved_OI_history_snapshots=%d; state_file=%s",
-            reset_reason, oi_history_count, STATE_FILE.resolve(),
+            "STATE TRANSITION: reason=%s; persistent_direction=%s continuation_phase=%s continuation_count=%s "
+            "preserved_OI_history_snapshots=%d; state_file=%s",
+            reset_reason, state.get("persistent_direction"), state.get("continuation_phase", ""),
+            state.get("continuation_count", 0), oi_history_count, STATE_FILE.resolve(),
         )
         save_state(state)
 
@@ -7730,9 +7981,17 @@ def execute_scan(
             regime_direction, coi_guard.get("reason", "PROFIT_BOOKING"),
         )
         return None
-    if tod_window == "MIDDAY" and (not math.isfinite(adx_value) or adx_value < MIDDAY_MIN_ADX) and not confirmed_local_event_override:
-        logger.info("NO TRADE: midday momentum gate requires ADX >= %.1f; actual=%s.", MIDDAY_MIN_ADX, adx_value)
+    midday_gate_passed, midday_gate_reason = midday_momentum_gate_decision(
+        tod_window=tod_window, adx_value=adx_value, minimum_adx=MIDDAY_MIN_ADX,
+        structure_direction=structure.direction, structure_phase=structure.market_phase,
+        structure_entry_confirmed=structure.entry_confirmed, regime_direction=regime_direction,
+        confirmed_local_event_override=confirmed_local_event_override,
+    )
+    if not midday_gate_passed:
+        logger.info("NO TRADE: %s", midday_gate_reason)
         return None
+    if tod_window == "MIDDAY" and midday_gate_reason:
+        logger.info("MIDDAY MOMENTUM GATE: %s", midday_gate_reason)
 
     # Exhaustion is the only controlled counter-trend exception. RSI divergence
     # near the matching structural wall is insufficient by itself: the latest
@@ -7985,14 +8244,20 @@ def execute_scan(
         target_u2, level_meta.get("t2_source", ""),
         stop_u, level_meta.get("sl_source", ""),
     )
-    rr_ratio, structural_reward, structural_risk = structural_reward_risk_ratio(
-        regime_direction, float(spot), float(target_u1), float(stop_u)
+    rr_profile = structural_reward_risk_profile(
+        regime_direction, float(spot), float(target_u1), float(target_u2), float(stop_u)
     )
+    rr_ratio = rr_profile["rr_t1"]
+    structural_reward = rr_profile["reward_t1"]
+    structural_risk = rr_profile["risk_t1"]
     local_event_kind = str(local_structure_event.get("kind", "")).upper() if local_event_entry else ""
     logger.info(
-        "STRUCTURAL ENTRY RISK CHECK: direction=%s event=%s reward=%.2f risk=%.2f R/R=%.2f required>=%.2f T1=%.2f SL=%.2f",
+        "STRUCTURAL ENTRY RISK CHECK: direction=%s event=%s reward_T1=%.2f risk=%.2f RR_T1=%.2f "
+        "reward_T2=%.2f RR_T2=%.2f required_T1>=%.2f T1=%.2f T2=%.2f SL=%.2f "
+        "T2_is_diagnostic_only=True",
         regime_direction, local_event_kind or "CONTINUATION", structural_reward, structural_risk,
-        rr_ratio, MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO, target_u1, stop_u,
+        rr_ratio, rr_profile["reward_t2"], rr_profile["rr_t2"],
+        MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO, target_u1, target_u2, stop_u,
     )
     if (not math.isfinite(rr_ratio) or structural_reward <= 0 or structural_risk <= 0
             or rr_ratio < MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO):
@@ -8004,28 +8269,55 @@ def execute_scan(
         save_state(state)
         return None
 
-    # A fixed distance veto remains for ordinary continuation setups. Only an
-    # actual completed-bar break or wall rejection/bounce that has already passed
-    # the nearest-wall target and structural R/R checks may bypass it.
+    # Dynamic clear-space guard for ordinary continuation setups. A confirmed
+    # completed-bar event may bypass this secondary distance filter, but never the
+    # structural target/stop or minimum reward-to-risk checks above.
     local_break_risk_valid = bool(local_event_entry and local_event_kind in {"BREAKDOWN", "BREAKOUT"})
     local_rejection_risk_valid = bool(local_event_entry and local_event_kind in {"RESISTANCE_REJECTION", "SUPPORT_BOUNCE"})
     strike_step_for_gate = strike_step(sorted(chain_rows(option_chain_atm_window(chain, spot)[0])))
-    guard_support = target_u1 if regime_direction == "BEARISH" else entry_structure.support_1
-    guard_resistance = target_u1 if regime_direction == "BULLISH" else entry_structure.resistance_1
+    guard_support = entry_structure.support_1
+    guard_resistance = entry_structure.resistance_1
+    volatility_for_gate = max(0.0, safe_float(entry_structure.components.get("volatility_unit"), 0.0))
+    raw_momentum_for_gate = safe_float(entry_structure.components.get("recent3_movement_atr"), 0.0)
+    directional_momentum_for_gate = raw_momentum_for_gate if regime_direction == "BULLISH" else -raw_momentum_for_gate
+    wall_strength_for_gate = entry_structure.resistance_strength if regime_direction == "BULLISH" else entry_structure.support_strength
+    dynamic_clearance_steps = dynamic_wall_clearance_steps(
+        strike_step_value=strike_step_for_gate, atr_points=volatility_for_gate,
+        directional_momentum_atr=directional_momentum_for_gate, wall_strength=wall_strength_for_gate,
+    )
     wall_veto = opposing_oi_wall_veto(
-        regime_direction, spot, guard_support, guard_resistance,
-        strike_step_for_gate,
-        confirmed_local_break=local_break_risk_valid,
-        confirmed_local_rejection=local_rejection_risk_valid,
+        regime_direction, spot, guard_support, guard_resistance, strike_step_for_gate,
+        confirmed_local_break=local_break_risk_valid, confirmed_local_rejection=local_rejection_risk_valid,
+        clearance_steps=dynamic_clearance_steps, target_level=target_u1, target_rr_validated=True,
+        target_is_meaningful_oi_wall=bool(level_meta.get("t1_is_meaningful_oi_wall", False)),
     )
     if wall_veto:
-        logger.warning("NO TRADE: %s; nearest structural target/stop were validated, but runway remains insufficient without a confirmed matching local event.", wall_veto)
+        logger.warning(
+            "NO TRADE: %s; dynamic wall clearance=%.2f strike steps; target/RR and structural stops were already checked.",
+            wall_veto, dynamic_clearance_steps,
+        )
+        save_state(state)
         return None
+    logger.info(
+        "STRUCTURAL WALL CLEARANCE: direction=%s atr_points=%.2f directional_momentum_atr=%+.2f "
+        "wall_strength=%.3f required_clearance=%.2f steps target=%s target_rr_validated=True veto=%s",
+        regime_direction, volatility_for_gate, directional_momentum_for_gate,
+        safe_float(wall_strength_for_gate, 0.0), dynamic_clearance_steps,
+        f"{target_u1:.2f}", wall_veto or "NONE",
+    )
 
+    confirmed_breakout_for_routing = bool(
+        local_event_entry and local_event_kind in {"BREAKOUT", "BREAKDOWN"}
+        and str(local_structure_event.get("direction", "")).upper() == regime_direction
+    )
+    raw_routing_momentum = safe_float(entry_structure.components.get("recent3_movement_atr"), 0.0)
+    directional_momentum_for_routing = raw_routing_momentum if regime_direction == "BULLISH" else -raw_routing_momentum
     option = generate_signals(
         state=state, chain=chain, spot=spot, regime_direction=regime_direction,
         intensity=intensity, is_expiry_day=is_expiry_day, entry_structure=entry_structure,
         option_flow_by_strike=option_flow_by_strike, oi_velocity_by_strike=oi_velocity_by_strike,
+        confirmed_breakout=confirmed_breakout_for_routing,
+        directional_momentum_atr=directional_momentum_for_routing,
     )
     if option is None:
         return None
@@ -8042,7 +8334,7 @@ def execute_scan(
         f"Setup type: {setup_label}.",
         f"Entry timing: {timing_state}; index VWAP distance={vwap_distance_atr:.2f} ATR; latest 3m move={latest_3m_move_atr:.2f} ATR; completed index 3m bars={completed_session_bars}.",
         f"Regime matrix: {regime_direction}/{intensity}; ADX={adx_value:.2f}; RSI3m={safe_float(market_regime.get('rsi_3m'), float('nan')):.2f}; time window={tod_window}; {market_regime.get('reason', '')}.",
-        f"Permitted strikes={permitted_strikes_for_regime(nearest_strike(spot, sorted(chain_rows(chain))), strike_step(sorted(chain_rows(chain))), regime_direction, intensity, is_expiry_day=is_expiry_day, now=now_ist())}.",
+        f"Permitted strikes={permitted_strikes_for_regime(nearest_strike(spot, sorted(chain_rows(chain))), strike_step(sorted(chain_rows(chain))), regime_direction, intensity, is_expiry_day=is_expiry_day, now=now_ist(), confirmed_breakout=confirmed_breakout_for_routing, directional_momentum_atr=directional_momentum_for_routing)}.",
         f"Index spot used for option ATM selection={spot:.2f}; futures LTP={futures_ltp_now:.2f}; futures/index basis={futures_ltp_now - spot:+.2f}; futures quote status={futures_quote_status}; contract={future.trading_symbol} expiry={future.expiry}.",
         f"Selected option metrics: LTP={option.ltp:.2f}, premium VWAP={option.premium_vwap:.2f}, spread={option.spread_pct:.2%}, theta burden={option.theta_burden_pct_day:.2%}/day, volume={option.volume:.0f}, OI={option.oi:.0f}, delta={option.delta:.3f}, flow={option.flow_score:.3f}, VWAP={option.vwap_score:.3f}, COI matrix={option.coi_matrix_label} score={option.oi_momentum_score:+.3f} (push={option.coi_push_score:.3f}, floor={option.coi_floor_score:.3f}, roll={option.coi_roll_score:.3f}, wall penalty={option.coi_wall_penalty:.3f}), call COI={option.call_oi_change_pct_15m:+.2f}%, put COI={option.put_oi_change_pct_15m:+.2f}% (baseline {option.oi_velocity_baseline_minutes:.1f}m, mode={option.coi_baseline_mode}).",
         f"PA/OI structural levels: NIFTY T1={underlying_target1:.2f}, T2={underlying_target2:.2f}, SL={underlying_stop:.2f}; option exit uses live LTP at the structural trigger.",
@@ -8146,7 +8438,7 @@ def dispatch_alerts(state: dict[str, Any], signal: Signal) -> None:
 
 
 def run_self_tests() -> None:
-    """Run deterministic V45 smoke/regression checks without network access."""
+    """Run deterministic V46 smoke/regression checks without network access."""
     self_test_flow = max(STRUCTURE_CHANGE_OI_CONFIRM, 0.25) + 0.05
     scenarios = [
         ("BULLISH", "CONTINUOUS_BULLISH", 101.0, 100.0, 100.8, 0.8, self_test_flow, True, "NONE", False),
@@ -8183,10 +8475,34 @@ def run_self_tests() -> None:
     bearish_strikes = permitted_strikes_for_regime(
         22800.0, 50.0, "BEARISH", "NORMAL", now=datetime(2026, 10, 15, 10, 0, tzinfo=IST),
     )
-    assert bullish_strikes == [22750.0, 22800.0], bullish_strikes
-    assert bearish_strikes == [22800.0, 22850.0], bearish_strikes
+    assert bullish_strikes == [22700.0, 22750.0, 22800.0], bullish_strikes
+    assert bearish_strikes == [22800.0, 22850.0, 22900.0], bearish_strikes
     assert not permitted_strikes_for_regime(
         22800.0, 50.0, "BULLISH", "SIDEWAYS", now=datetime(2026, 10, 15, 10, 0, tzinfo=IST),
+    )
+
+    # V46: a confirmed continuous PA/OI trend is not vetoed by low/absent midday ADX.
+    midday_ok, midday_reason = midday_momentum_gate_decision(
+        tod_window="MIDDAY", adx_value=18.0, minimum_adx=23.0,
+        structure_direction="BULLISH", structure_phase="CONTINUOUS_BULLISH",
+        structure_entry_confirmed=True, regime_direction="BULLISH",
+        confirmed_local_event_override=False,
+    )
+    assert midday_ok and "PA/OI structure" in midday_reason, (midday_ok, midday_reason)
+    midday_blocked, _ = midday_momentum_gate_decision(
+        tod_window="MIDDAY", adx_value=18.0, minimum_adx=23.0,
+        structure_direction="BULLISH", structure_phase="BULLISH",
+        structure_entry_confirmed=False, regime_direction="BULLISH",
+        confirmed_local_event_override=False,
+    )
+    assert not midday_blocked
+
+    rr_profile = structural_reward_risk_profile("BULLISH", 100.0, 103.0, 106.0, 98.0)
+    assert math.isclose(rr_profile["rr_t1"], 1.5) and math.isclose(rr_profile["rr_t2"], 3.0), rr_profile
+    assert dynamic_wall_clearance_steps(
+        strike_step_value=50.0, atr_points=20.0, directional_momentum_atr=1.0, wall_strength=0.2
+    ) < dynamic_wall_clearance_steps(
+        strike_step_value=50.0, atr_points=20.0, directional_momentum_atr=0.1, wall_strength=0.9
     )
 
     assert cold_start_entry_gate_passed(
@@ -8240,7 +8556,7 @@ def run_self_tests() -> None:
         previous_direction="BULLISH", local_event_entry=True,
     )[0] == 1
 
-    print("V45 SELF-TEST PASSED.")
+    print("V46 SELF-TEST PASSED.")
 
 
 def main() -> int:
@@ -8253,7 +8569,7 @@ def main() -> int:
             run_self_tests()
             return 0
         except Exception:
-            logger.error("V45 self-test failed:\n%s", traceback.format_exc())
+            logger.error("V46 self-test failed:\n%s", traceback.format_exc())
             return 1
 
     try:
