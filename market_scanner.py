@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 Predictive Market Scanner & Strike Router — V59.
+"""NIFTY 50 Predictive Market Scanner & Strike Router — V60.
 
 Clean, modular redesign of the supplied V52–V58 scanner lineage. This version has
 one market-scenario engine, one strike router, one structural risk engine, one state
@@ -10,7 +10,15 @@ Core behavior
 * Uses the NIFTY index as the price-action source and V3 minute candles for early
   intraday structure. Historical 1-minute candles seed ATR/ADX so the scanner need
   not wait for five completed 3-minute bars.
-* Uses Upstox V2 option-chain/contract APIs plus V3 live quotes and candles.
+* Uses Upstox V2 option-chain/contract APIs plus V3 live quotes and candles. The V2
+  interval-in-days Change-OI endpoint is a validated wall/session fallback, never 1m velocity.
+* Detects 1m support bounces and resistance rejections at intact structural OI walls.
+* Monitors complete 1m OHLC ranges for virtual T1/T2/SL crossings, with stop-first
+  handling when a bar's internal order cannot be known from OHLC alone.
+* Guards ordinary opposite-direction flips using distinct 1m evidence, while strong
+  aligned tactical COI/momentum can override; no prior direction is latched.
+* Issues stagnation-risk warnings after tight completed 5m ranges only when aligned
+  VWAP/COI/progress has deteriorated; the warning is not an exit or invalidation.
 * Gives valid tactical OI velocity (1m first, then 3m/5m/15m) priority over session
   aggregate bias. It never invents tactical velocity when no historical snapshot exists.
 * Finds weakening/building OI walls; can report a predictive pre-breakout watch before
@@ -36,8 +44,8 @@ Core behavior
 * Outputs a structured JSON scan report on each invocation / minute loop.
 
 Run:
-    python market_scanner_v59.py
-    python market_scanner_v59.py --loop
+    python market_scanner_v60.py
+    python market_scanner_v60.py --loop
 
 Required environment:
     UPSTOX_ANALYTICS_TOKEN
@@ -46,7 +54,10 @@ Optional environment:
     NIFTY_INSTRUMENT_KEY, STATE_FILE, REQUEST_TIMEOUT, API_RETRIES,
     MIN_SCORE (default 0.650; calibratable for research), MIN_DIRECTIONAL_DELTA (0.55),
     MIN_EXHAUSTION_DELTA (0.75), MAX_QUOTE_AGE_SECONDS, MAX_SPREAD_RATIO, RISK_FREE_RATE,
-    FALLBACK_IV, EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER, SMTP_HOST, SMTP_PORT.
+    FALLBACK_IV, CHANGE_OI_FALLBACK_ENABLED, MIN_OPPOSING_WALL_CLEARANCE_STEPS,
+    DIRECTION_FLIP_CONFIRMATIONS, INTRABAR_MONITOR_LOOKBACK, STAGNATION_RANGE_PCT,
+    STAGNATION_MIN_FAVORABLE_PROGRESS_PCT, STAGNATION_WARNING_COOLDOWN_MINUTES,
+    EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER, SMTP_HOST, SMTP_PORT.
 
 API sources checked during design (official Upstox docs):
     /v2/option/contract, /v2/option/chain, /v2/market/status/:exchange,
@@ -57,7 +68,7 @@ API sources checked during design (official Upstox docs):
 Important measurement limitation: the option-chain endpoint returns OI snapshots, not a
 continuous OI time series. Intraday COI velocity is therefore computed from this scanner's
 own timestamped snapshots. For 09:16 velocity availability, schedule the first scan at
-09:15. If a process starts later with no same-session baseline, V59 reports COI as
+09:15. If a process starts later with no same-session baseline, V60 reports COI as
 unavailable/session-proxy and will not describe the proxy as tactical velocity.
 """
 from __future__ import annotations
@@ -75,7 +86,7 @@ import tempfile
 import time as time_module
 import traceback
 import urllib.parse
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -93,7 +104,7 @@ import requests
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com"
-SCANNER_VERSION = "2026-10-15-V59-PRODUCTION-STATE-MIGRATION-EXACT-QUOTE-MAPPING"
+SCANNER_VERSION = "2026-10-15-V60-STRUCTURAL-REACTIONS-COI-FALLBACK-INTRABAR-RISK"
 MARKET_START = time(9, 15)
 ENTRY_START = time(9, 16)
 MORNING_END = time(10, 30)
@@ -103,7 +114,7 @@ MARKET_END = time(15, 30)
 DEFAULT_NIFTY_KEY = "NSE_INDEX|Nifty 50"
 DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-LOGGER = logging.getLogger("nifty_v59")
+LOGGER = logging.getLogger("nifty_v60")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(message)s",
                     stream=sys.stderr)
@@ -147,6 +158,13 @@ class Config:
     monitor_quote_alert_cooldown_minutes: int = field(default_factory=lambda: min(120, max(1, _env_int("MONITOR_QUOTE_ALERT_COOLDOWN_MINUTES", 10))))
     max_active_trackers: int = field(default_factory=lambda: min(12, max(1, _env_int("MAX_ACTIVE_RECOMMENDATION_TRACKERS", 5))))
     reentry_cooldown_minutes: int = field(default_factory=lambda: min(60, max(1, _env_int("REENTRY_COOLDOWN_MINUTES", 6))))
+    opposing_wall_clearance_steps: float = field(default_factory=lambda: min(1.0, max(0.10, _env_float("MIN_OPPOSING_WALL_CLEARANCE_STEPS", 0.35))))
+    direction_flip_confirmations: int = field(default_factory=lambda: min(3, max(2, _env_int("DIRECTION_FLIP_CONFIRMATIONS", 2))))
+    intrabar_monitor_lookback: int = field(default_factory=lambda: min(240, max(5, _env_int("INTRABAR_MONITOR_LOOKBACK", 60))))
+    stagnation_warning_cooldown_minutes: int = field(default_factory=lambda: min(120, max(5, _env_int("STAGNATION_WARNING_COOLDOWN_MINUTES", 15))))
+    stagnation_range_pct: float = field(default_factory=lambda: min(0.005, max(0.0001, _env_float("STAGNATION_RANGE_PCT", 0.001))))
+    stagnation_min_progress_pct: float = field(default_factory=lambda: min(0.01, max(0.0, _env_float("STAGNATION_MIN_FAVORABLE_PROGRESS_PCT", 0.0001))))
+    change_oi_fallback_enabled: bool = field(default_factory=lambda: _env_bool("CHANGE_OI_FALLBACK_ENABLED", True))
 
     def validate(self, require_token: bool = True) -> None:
         if require_token and not self.token:
@@ -468,6 +486,9 @@ class OIAnalysis:
     call_coi_acceleration_pct: float = float("nan")
     put_coi_acceleration_pct: float = float("nan")
     acceleration_available: bool = False
+    wall_change_source: str = "OI_CONCENTRATION_ONLY"
+    change_oi_fallback_available: bool = False
+    change_oi_fallback_interval_days: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -527,7 +548,7 @@ def _infer_state_session_date(state: Mapping[str, Any]) -> str:
 
 
 def _normalize_legacy_chain_snapshot(raw: Any) -> Optional[dict[str, Any]]:
-    """Normalize supported historical OI snapshot layouts to the V59 chain schema."""
+    """Normalize supported historical OI snapshot layouts to the V60 chain schema."""
     if not isinstance(raw, dict):
         return None
     stamp = parse_timestamp(raw.get("timestamp"))
@@ -613,7 +634,7 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
             if active_expiry and expiry != active_expiry:
                 continue
             # Multiple legacy stores sometimes contain the same minute; prefer the
-            # canonical V59 snapshot when it was present first, but keep valid rows.
+            # canonical V60 snapshot when it was present first, but keep valid rows.
             minute_key = str(item["timestamp"])[:16]
             collected.setdefault(minute_key, item)
     snapshots = sorted(collected.values(), key=lambda item: str(item.get("timestamp", "")))
@@ -641,10 +662,10 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
         state["session_oi_baseline_source"] = "MIGRATED_EXISTING_SAME_SESSION_BASELINE"
     else:
         state.setdefault("session_oi_baseline_source", "UNAVAILABLE")
-    state["schema_version"] = 59
+    state["schema_version"] = 60
     state["scanner_version"] = SCANNER_VERSION
     state["session_date"] = today_iso
-    # Remove legacy directional latches so V59 always classifies live structure afresh.
+    # Remove legacy directional latches so V60 always classifies live structure afresh.
     for key in ("persistent_direction", "continuation_phase", "continuation_count", "continuation_last_bar"):
         state.pop(key, None)
 
@@ -686,7 +707,7 @@ class StateStore:
                           if isinstance(x, dict) and str(x.get("status", "PENDING")).upper() == "PENDING"] if isinstance(self.state.get("alert_outbox"), list) else []
             old_dedupe = self.state.get("alert_dedupe", {}) if isinstance(self.state.get("alert_dedupe"), dict) else {}
             self.state = {
-                "schema_version": 59,
+                "schema_version": 60,
                 "scanner_version": SCANNER_VERSION,
                 "session_date": today_iso,
                 "chain_snapshots": [],
@@ -717,7 +738,7 @@ class StateStore:
             self.state.setdefault("alert_outbox", [])
             self.state.setdefault("alert_dedupe", {})
 
-        # Migrate the pre-V59 singular tracker into the canonical tracker list.
+        # Migrate the pre-V60 singular tracker into the canonical tracker list.
         trackers_raw = self.state.get("recommendation_trackers")
         trackers = [dict(item) for item in trackers_raw if isinstance(item, dict)] if isinstance(trackers_raw, list) else []
         primary = self.state.get("recommendation_tracker")
@@ -930,6 +951,55 @@ class UpstoxClient:
             raise ScannerError(f"NIFTY option chain is empty for expiry {expiry}.")
         filtered = [r for r in rows if isinstance(r, dict) and str(r.get("expiry", expiry))[:10] == expiry[:10]]
         return filtered or [r for r in rows if isinstance(r, dict)]
+
+    def change_oi_by_strike(self, expiry: str, session_date: date) -> dict[str, Any]:
+        """Fetch Upstox's documented interval-in-days COI for structural/session context.
+
+        This endpoint does not provide 1-minute velocity. Its result is only a fallback
+        for wall classification and session context when locally timestamped snapshots
+        are unavailable; it is never substituted for tactical COI in entry scoring.
+        """
+        payload = self.get("/v2/market/change-oi", {
+            "instrument_key": self.config.nifty_key,
+            "expiry": expiry,
+            "date": session_date.isoformat(),
+            "interval": 1,
+        })
+        data = payload.get("data", {})
+        if not isinstance(data, dict):
+            raise ScannerError("Upstox Change-OI endpoint returned an invalid data object.")
+        response_expiry = str(data.get("expiry", expiry))[:10]
+        if response_expiry and response_expiry != str(expiry)[:10]:
+            raise ScannerError(
+                f"Upstox Change-OI expiry mismatch: requested={str(expiry)[:10]} response={response_expiry}."
+            )
+        items = data.get("call_put_oi_data_list", [])
+        if not isinstance(items, list):
+            raise ScannerError("Upstox Change-OI endpoint returned an invalid per-strike list.")
+        by_strike: dict[float, dict[str, float]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            strike = safe_float(item.get("strike_price"), float("nan"))
+            call_change = safe_float(item.get("call_change_oi"), float("nan"))
+            put_change = safe_float(item.get("put_change_oi"), float("nan"))
+            if not finite(strike) or strike <= 0:
+                continue
+            by_strike[float(strike)] = {
+                "call_change_oi": call_change,
+                "put_change_oi": put_change,
+            }
+        if not by_strike:
+            raise ScannerError("Upstox Change-OI endpoint contained no valid strike rows.")
+        return {
+            "by_strike": by_strike,
+            "total_call_change_oi": safe_float(data.get("total_call_change_oi"), float("nan")),
+            "total_put_change_oi": safe_float(data.get("total_put_change_oi"), float("nan")),
+            "interval_days": 1,
+            "date": session_date.isoformat(),
+            "expiry": str(data.get("expiry", expiry))[:10],
+            "source": "UPSTOX_CHANGE_OI_INTERVAL_1_DAY",
+        }
 
     def nearest_future(self, state: dict[str, Any], today: date) -> Optional[dict[str, str]]:
         cached = state.get("nifty_future")
@@ -1317,6 +1387,25 @@ def build_indicators(
     )
 
 
+def unavailable_current_session_indicators(spot: float, previous_close: float) -> IndicatorSet:
+    """Represent missing current-session candles explicitly while allowing quote-based monitoring.
+
+    Indicator-derived entries and trailing-stop changes are disabled when the current
+    session's 1m price series is unavailable; live NIFTY/option quotes can still check
+    already-persisted virtual T1/T2/SL levels.
+    """
+    missing = float("nan")
+    return IndicatorSet(
+        spot=spot, vwap=missing, vwap_slope=missing, stddev=missing,
+        upper_1sd=missing, lower_1sd=missing, upper_2sd=missing, lower_2sd=missing,
+        atr=missing, adx=missing, plus_di=missing, minus_di=missing, rsi=missing,
+        momentum_3m_pct=missing, recent_range=missing, prior_range=missing,
+        compressed=False, swing_low=missing, swing_high=missing,
+        previous_close=previous_close, session_open=missing, candles_count=0,
+        indicators_seeded=False, volume_source="CURRENT_SESSION_1M_UNAVAILABLE",
+    )
+
+
 def _estimate_strike_step_from_price(spot: float) -> float:
     # Only a compression-normalization fallback; actual option strike step is inferred from chain.
     if spot >= 30000:
@@ -1414,6 +1503,58 @@ def _find_snapshot_baseline(snapshots: Sequence[dict[str, Any]], now: datetime,
     return snap, age
 
 
+def _snapshot_baseline_has_coverage(
+    current_rows: Mapping[float, Mapping[str, Any]],
+    snapshot: Optional[Mapping[str, Any]],
+    minimum_fraction: float = 0.60,
+) -> bool:
+    """Verify a snapshot represents enough of the current chain before computing COI.
+
+    Coverage is checked independently for calls and puts. A stale/different-expiry or
+    partial-chain snapshot must not produce a deceptively precise aggregate velocity.
+    """
+    if not isinstance(snapshot, Mapping) or not current_rows:
+        return False
+    prior_rows = _snapshot_map(dict(snapshot))
+    if not prior_rows:
+        return False
+    fraction = min(1.0, max(0.10, float(minimum_fraction)))
+    for side_key in ("call_oi", "put_oi"):
+        eligible = 0
+        matched = 0
+        for strike, current in current_rows.items():
+            current_oi = safe_float(current.get(side_key), float("nan"))
+            if not finite(current_oi) or current_oi <= 0:
+                continue
+            eligible += 1
+            previous = prior_rows.get(float(strike))
+            if previous is None:
+                continue
+            previous_oi = safe_float(previous.get(side_key), float("nan"))
+            if finite(previous_oi) and previous_oi > 0:
+                matched += 1
+        if eligible == 0 or matched / eligible < fraction:
+            return False
+    return True
+
+
+def has_usable_tactical_snapshot_baseline(
+    chain: Sequence[dict[str, Any]], snapshots: Sequence[dict[str, Any]], now: datetime,
+) -> bool:
+    """Return true only if a recent same-session snapshot has valid chain coverage."""
+    chain_map = chain_rows_by_strike(chain)
+    current_rows: dict[float, dict[str, Any]] = {}
+    for strike, row in chain_map.items():
+        call = parse_option_side(row, "CE")
+        put = parse_option_side(row, "PE")
+        current_rows[float(strike)] = {"call_oi": call["oi"], "put_oi": put["oi"]}
+    for horizon in (1.0, 2.0, 3.0, 5.0, 15.0):
+        baseline = _find_snapshot_baseline(snapshots, now, horizon)
+        if baseline and _snapshot_baseline_has_coverage(current_rows, baseline[0]):
+            return True
+    return False
+
+
 def _pct_change(current: float, baseline: float) -> float:
     if not finite(current) or not finite(baseline) or baseline <= 0:
         return float("nan")
@@ -1450,7 +1591,8 @@ def classify_wall_state(change_pct: float, threshold: float, available: bool = T
 
 
 def _wall_candidates(rows: dict[float, dict[str, Any]], changes: dict[float, float], spot: float,
-                     side: str, step: float, threshold: float) -> list[StructuralWall]:
+                     side: str, step: float, threshold: float,
+                     change_source: str = "TACTICAL_OI_SNAPSHOT") -> list[StructuralWall]:
     side = side.upper()
     oi_key = "call_oi" if side == "CALL" else "put_oi"
     valid = [(k, safe_float(r.get(oi_key), 0.0)) for k, r in rows.items()
@@ -1479,7 +1621,7 @@ def _wall_candidates(rows: dict[float, dict[str, Any]], changes: dict[float, flo
         state = classify_wall_state(change, threshold, finite(change))
         walls.append(StructuralWall(strike=strike, side=side, oi=oi,
                                     change_pct=change if finite(change) else None,
-                                    state=state, source="TACTICAL_OI_SNAPSHOT" if finite(change) else "OI_CONCENTRATION_ONLY",
+                                    state=state, source=change_source if finite(change) else "OI_CONCENTRATION_ONLY",
                                     distance=abs(strike - spot)))
     # Ensure a wall is available if the local-peak filter eliminated all levels.
     if not walls:
@@ -1487,14 +1629,15 @@ def _wall_candidates(rows: dict[float, dict[str, Any]], changes: dict[float, flo
         change = changes.get(k, float("nan"))
         walls.append(StructuralWall(k, side, oi, change if finite(change) else None,
                                     classify_wall_state(change, threshold, finite(change)),
-                                    "TACTICAL_OI_SNAPSHOT" if finite(change) else "OI_CONCENTRATION_ONLY", abs(k - spot)))
+                                    change_source if finite(change) else "OI_CONCENTRATION_ONLY", abs(k - spot)))
     return sorted(walls, key=lambda wall: wall.strike if side == "CALL" else -wall.strike)
 
 
 def analyze_option_oi(chain: Sequence[dict[str, Any]], prior_snapshots: Sequence[dict[str, Any]],
                       now: datetime, spot: float, config: Config,
                       session_baseline: Optional[dict[str, Any]] = None,
-                      session_baseline_source: str = "UNAVAILABLE") -> OIAnalysis:
+                      session_baseline_source: str = "UNAVAILABLE",
+                      api_change_oi: Optional[Mapping[str, Any]] = None) -> OIAnalysis:
     chain_map = chain_rows_by_strike(chain)
     if not chain_map:
         raise ScannerError("Option chain has no valid strikes.")
@@ -1509,11 +1652,17 @@ def analyze_option_oi(chain: Sequence[dict[str, Any]], prior_snapshots: Sequence
         put_total += put["oi"]
     pcr = put_total / call_total if call_total > 0 else float("nan")
     snapshots = sorted([s for s in prior_snapshots if isinstance(s, dict)], key=lambda x: str(x.get("timestamp", "")))
-    b1 = _find_snapshot_baseline(snapshots, now, 1.0)
-    b2 = _find_snapshot_baseline(snapshots, now, 2.0)
-    b3 = _find_snapshot_baseline(snapshots, now, 3.0)
-    b5 = _find_snapshot_baseline(snapshots, now, 5.0)
-    b15 = _find_snapshot_baseline(snapshots, now, 15.0)
+    def checked_baseline(horizon: float) -> Optional[tuple[dict[str, Any], float]]:
+        candidate = _find_snapshot_baseline(snapshots, now, horizon)
+        if candidate and _snapshot_baseline_has_coverage(current, candidate[0]):
+            return candidate
+        return None
+
+    b1 = checked_baseline(1.0)
+    b2 = checked_baseline(2.0)
+    b3 = checked_baseline(3.0)
+    b5 = checked_baseline(5.0)
+    b15 = checked_baseline(15.0)
     selected_baseline = None
     selected_age = None
     selected_source = "UNAVAILABLE"
@@ -1546,12 +1695,14 @@ def analyze_option_oi(chain: Sequence[dict[str, Any]], prior_snapshots: Sequence
     session_base = session_baseline if isinstance(session_baseline, dict) else None
     session_base_ts = parse_timestamp(session_base.get("timestamp")) if session_base else None
     if (session_base_ts is None or session_base_ts.date() != now.astimezone(IST).date()
-            or session_base_ts > now + timedelta(seconds=5)):
+            or session_base_ts > now + timedelta(seconds=5)
+            or not _snapshot_baseline_has_coverage(current, session_base)):
         session_base = None
     actual_session_source = session_baseline_source if session_base else "UNAVAILABLE"
     if session_base is not None:
         session_call, _ = _oi_change_for_side(current, session_base, "call_oi")
         session_put, _ = _oi_change_for_side(current, session_base, "put_oi")
+    prev_oi_context_used = False
     if not finite(call_pct) or not finite(put_pct):
         # Upstox prev_oi is useful context but not equivalent to a same-session velocity window.
         # Keep this explicitly labelled so the predictor cannot confuse it with 1m/3m COI.
@@ -1565,8 +1716,51 @@ def analyze_option_oi(chain: Sequence[dict[str, Any]], prior_snapshots: Sequence
                 put_num += p - pp; put_den += pp
         if not finite(session_call) and call_den > 0:
             session_call = call_num / call_den
+            prev_oi_context_used = True
         if not finite(session_put) and put_den > 0:
             session_put = put_num / put_den
+            prev_oi_context_used = True
+        if actual_session_source == "UNAVAILABLE" and prev_oi_context_used:
+            actual_session_source = "UPSTOX_PREVIOUS_OI_CONTEXT_NOT_TACTICAL"
+    change_fallback_available = False
+    wall_change_source = "TACTICAL_OI_SNAPSHOT" if selected_baseline else "OI_CONCENTRATION_ONLY"
+    wall_call_changes = dict(call_changes)
+    wall_put_changes = dict(put_changes)
+    change_data = api_change_oi if isinstance(api_change_oi, Mapping) else {}
+    fallback_rows = change_data.get("by_strike", {}) if isinstance(change_data, Mapping) else {}
+    if not selected_baseline and isinstance(fallback_rows, Mapping) and fallback_rows:
+        # Convert raw interval change into a percentage against the implied baseline.
+        # This is session/wall context only; call_pct/put_pct remain NaN for tactical scoring.
+        for strike, row in current.items():
+            api_row = fallback_rows.get(strike, fallback_rows.get(str(round(strike, 2)), {}))
+            if not isinstance(api_row, Mapping):
+                continue
+            call_change = safe_float(api_row.get("call_change_oi"), float("nan"))
+            put_change = safe_float(api_row.get("put_change_oi"), float("nan"))
+            current_call = safe_float(row.get("call_oi"), float("nan"))
+            current_put = safe_float(row.get("put_oi"), float("nan"))
+            implied_call_base = current_call - call_change if finite(call_change) and finite(current_call) else float("nan")
+            implied_put_base = current_put - put_change if finite(put_change) and finite(current_put) else float("nan")
+            if finite(implied_call_base) and implied_call_base > 0:
+                wall_call_changes[strike] = call_change / implied_call_base
+            if finite(implied_put_base) and implied_put_base > 0:
+                wall_put_changes[strike] = put_change / implied_put_base
+        change_fallback_available = bool(wall_call_changes or wall_put_changes)
+        if change_fallback_available:
+            wall_change_source = "UPSTOX_CHANGE_OI_SESSION_FALLBACK"
+            # Where no local session baseline survived a restart, the documented API's
+            # interval-in-days totals may provide session context, never tactical velocity.
+            total_call_delta = safe_float(change_data.get("total_call_change_oi"), float("nan"))
+            total_put_delta = safe_float(change_data.get("total_put_change_oi"), float("nan"))
+            call_base = call_total - total_call_delta if finite(total_call_delta) else float("nan")
+            put_base = put_total - total_put_delta if finite(total_put_delta) else float("nan")
+            if not finite(session_call) and finite(call_base) and call_base > 0:
+                session_call = total_call_delta / call_base
+            if not finite(session_put) and finite(put_base) and put_base > 0:
+                session_put = total_put_delta / put_base
+            if actual_session_source == "UNAVAILABLE":
+                actual_session_source = str(change_data.get("source", "UPSTOX_CHANGE_OI_INTERVAL_1_DAY"))
+
     tactical_available = bool(selected_baseline and finite(call_pct) and finite(put_pct))
     if not tactical_available:
         selected_source = "UNAVAILABLE"
@@ -1593,11 +1787,15 @@ def analyze_option_oi(chain: Sequence[dict[str, Any]], prior_snapshots: Sequence
                           (not finite(put_pct) or abs(call_pct) > abs(min(put_pct, 0.0))))
     put_dominates = bool(finite(put_pct) and put_pct < 0 and
                          (not finite(call_pct) or abs(put_pct) > abs(min(call_pct, 0.0))))
-    resistance = _wall_candidates(current, call_changes, spot, "CALL", infer_strike_step(list(current)), config.oi_velocity_trigger)
-    support = _wall_candidates(current, put_changes, spot, "PUT", infer_strike_step(list(current)), config.oi_velocity_trigger)
+    resistance = _wall_candidates(current, wall_call_changes, spot, "CALL", infer_strike_step(list(current)),
+                                  config.oi_velocity_trigger, wall_change_source)
+    support = _wall_candidates(current, wall_put_changes, spot, "PUT", infer_strike_step(list(current)),
+                               config.oi_velocity_trigger, wall_change_source)
     reasons = []
     reasons.append(f"PCR={pcr:.3f}" if finite(pcr) else "PCR=UNAVAILABLE")
     reasons.append(f"tactical_COI={selected_source}" if tactical_available else "tactical_COI=UNAVAILABLE; session proxy not relabelled as velocity")
+    if change_fallback_available:
+        reasons.append("Upstox interval-in-days Change-OI used for structural wall/session context only; not used as tactical velocity or entry score")
     if acceleration_available:
         reasons.append(f"COI_acceleration_call={call_acceleration*100:+.3f}% put={put_acceleration*100:+.3f}%")
     else:
@@ -1620,6 +1818,9 @@ def analyze_option_oi(chain: Sequence[dict[str, Any]], prior_snapshots: Sequence
         call_coi_acceleration_pct=call_acceleration,
         put_coi_acceleration_pct=put_acceleration,
         acceleration_available=acceleration_available,
+        wall_change_source=wall_change_source,
+        change_oi_fallback_available=change_fallback_available,
+        change_oi_fallback_interval_days=1 if change_fallback_available else None,
     )
 
 
@@ -1818,6 +2019,232 @@ def detect_scenario(now: datetime, indicators: IndicatorSet, oi: OIAnalysis,
                     None, "", False, None,
                     {"above_vwap": above_vwap, "below_vwap": below_vwap, "compressed": indicators.compressed,
                      "call_coi_pct": call_pct, "put_coi_pct": put_pct, "pcr_spiking": oi.pcr_spiking})
+
+
+def completed_one_minute_candles(frame: Optional[pd.DataFrame], now: datetime) -> pd.DataFrame:
+    """Return current-session 1m bars whose full minute has elapsed, oldest first."""
+    if frame is None or frame.empty or "timestamp" not in frame.columns:
+        return pd.DataFrame()
+    work = frame.copy()
+    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
+    work = work.dropna(subset=["timestamp"]).sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    for column in ("open", "high", "low", "close", "volume"):
+        if column in work.columns:
+            work[column] = pd.to_numeric(work[column], errors="coerce")
+    current = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
+    local_ts = work["timestamp"].dt.tz_convert(IST)
+    complete_mask = (local_ts + pd.to_timedelta(1, unit="m") <= current) & (local_ts.dt.date == current.date())
+    work = work.loc[complete_mask].dropna(subset=["open", "high", "low", "close"])
+    return work.reset_index(drop=True)
+
+
+def detect_structural_wall_reaction(
+    frame: pd.DataFrame, indicators: IndicatorSet, oi: OIAnalysis,
+    now: datetime, config: Config,
+) -> Optional[Scenario]:
+    """Detect a completed 1m bounce/rejection at an intact OI wall without waiting for a 3m close.
+
+    Wall reaction may bypass a low-ADX *classification* only when the global
+    sideways/pinning hard veto is not active. Without valid tactical COI it is a
+    watch, not an executable setup.
+    """
+    bars = completed_one_minute_candles(frame, now).tail(5)
+    if len(bars) < 2 or not finite(indicators.atr) or indicators.atr <= 0:
+        return None
+    if not finite(indicators.spot) or indicators.spot <= 0:
+        return None
+    step = infer_strike_step(list(oi.rows))
+    touch_tolerance = min(max(0.06 * indicators.atr, 0.08 * step, 1.0), 0.15 * step)
+    displacement = max(0.05 * indicators.atr, 1.0)
+    recent = bars.tail(3)
+    previous, last = bars.iloc[-2], bars.iloc[-1]
+    close = safe_float(last.get("close"), float("nan"))
+    opn = safe_float(last.get("open"), float("nan"))
+    high = safe_float(last.get("high"), float("nan"))
+    low = safe_float(last.get("low"), float("nan"))
+    prev_close = safe_float(previous.get("close"), float("nan"))
+    if not all(finite(v) for v in (close, opn, high, low, prev_close)):
+        return None
+
+    reactions: list[Scenario] = []
+    for wall in oi.walls_support:
+        if wall.state not in {"BUILDING", "STABLE"} or wall.strike >= indicators.spot + touch_tolerance:
+            continue
+        if indicators.spot - wall.strike > max(1.5 * step, 1.5 * indicators.atr):
+            continue
+        tested = float(recent["low"].min()) <= wall.strike + touch_tolerance
+        held = close >= wall.strike + displacement and indicators.spot >= wall.strike
+        price_turn = close > opn or close > prev_close
+        flow_ok = oi.tactical_available and finite(oi.put_coi_pct) and oi.put_coi_pct > -config.oi_velocity_trigger
+        vwap_ok = (finite(indicators.vwap) and indicators.spot >= indicators.vwap) or (
+            finite(indicators.vwap) and finite(indicators.vwap_slope) and indicators.vwap_slope > 0
+            and indicators.spot >= indicators.vwap - 0.15 * indicators.atr
+        )
+        if tested and held and price_turn:
+            confidence = min(89.0, 61.0 + (8.0 if wall.state == "BUILDING" else 4.0)
+                             + (8.0 if flow_ok else 0.0) + (5.0 if vwap_ok else 0.0))
+            executable = bool(flow_ok and vwap_ok)
+            reactions.append(Scenario(
+                "STRUCTURAL_SUPPORT_BOUNCE", "BULLISH", confidence,
+                f"1m support bounce at intact Put-OI wall {wall.strike:.0f}: recent low tested within {touch_tolerance:.2f} points and latest completed 1m close held {close:.2f}; wall={wall.state}; tactical flow={'confirmed' if flow_ok else 'unavailable/uncorroborated'}; VWAP alignment={'passed' if vwap_ok else 'watch only'}.",
+                wall.strike, wall.state, executable, None,
+                {"reaction": "SUPPORT_BOUNCE", "wall_strike": wall.strike, "wall_state": wall.state,
+                 "touch_tolerance": touch_tolerance, "tactical_flow_confirmed": flow_ok,
+                 "vwap_alignment": vwap_ok, "adx": indicators.adx},
+            ))
+            break
+
+    for wall in oi.walls_resistance:
+        if wall.state not in {"BUILDING", "STABLE"} or wall.strike <= indicators.spot - touch_tolerance:
+            continue
+        if wall.strike - indicators.spot > max(1.5 * step, 1.5 * indicators.atr):
+            continue
+        tested = float(recent["high"].max()) >= wall.strike - touch_tolerance
+        rejected = close <= wall.strike - displacement and indicators.spot <= wall.strike
+        price_turn = close < opn or close < prev_close
+        flow_ok = oi.tactical_available and (
+            (finite(oi.call_coi_pct) and oi.call_coi_pct >= config.oi_velocity_trigger)
+            or (finite(oi.put_coi_pct) and oi.put_coi_pct <= -config.oi_velocity_trigger)
+        )
+        vwap_ok = (finite(indicators.vwap) and indicators.spot <= indicators.vwap) or (
+            finite(indicators.vwap) and finite(indicators.vwap_slope) and indicators.vwap_slope < 0
+            and indicators.spot <= indicators.vwap + 0.15 * indicators.atr
+        )
+        if tested and rejected and price_turn:
+            confidence = min(89.0, 61.0 + (8.0 if wall.state == "BUILDING" else 4.0)
+                             + (8.0 if flow_ok else 0.0) + (5.0 if vwap_ok else 0.0))
+            executable = bool(flow_ok and vwap_ok)
+            reactions.append(Scenario(
+                "STRUCTURAL_RESISTANCE_REJECTION", "BEARISH", confidence,
+                f"1m resistance rejection at intact Call-OI wall {wall.strike:.0f}: recent high tested within {touch_tolerance:.2f} points and latest completed 1m close rejected to {close:.2f}; wall={wall.state}; tactical flow={'confirmed' if flow_ok else 'unavailable/uncorroborated'}; VWAP alignment={'passed' if vwap_ok else 'watch only'}.",
+                wall.strike, wall.state, executable, None,
+                {"reaction": "RESISTANCE_REJECTION", "wall_strike": wall.strike, "wall_state": wall.state,
+                 "touch_tolerance": touch_tolerance, "tactical_flow_confirmed": flow_ok,
+                 "vwap_alignment": vwap_ok, "adx": indicators.adx},
+            ))
+            break
+    if not reactions:
+        return None
+    return max(reactions, key=lambda item: (item.confidence, item.executable_candidate))
+
+
+def apply_direction_flip_guard(
+    state: dict[str, Any], scenario: Scenario, oi: OIAnalysis,
+    indicators: IndicatorSet, index_candles: pd.DataFrame, now: datetime,
+    config: Config,
+) -> tuple[Scenario, list[dict[str, Any]]]:
+    """Require distinct 1m evidence before ordinary opposite-direction churn; tactical flips can override.
+
+    This is not a sticky bias: it never changes the direction label to the old direction.
+    It converts an unconfirmed reversal into a watch-only setup and allows strong fresh
+    tactical COI + price momentum to override the confirmation delay.
+    """
+    if scenario.direction not in {"BULLISH", "BEARISH"} or scenario.hard_veto:
+        state.pop("direction_flip_pending", None)
+        return scenario, []
+    today = now.astimezone(IST).date().isoformat()
+    trackers = state.get("recommendation_trackers", [])
+    active = [x for x in trackers if isinstance(x, dict)
+              and str(x.get("status", "")).upper() == "TRACKING"
+              and str(x.get("session_date", x.get("created_at", "")))[:10] == today]
+    opposing = [x for x in active if str(x.get("direction", "")).upper() != scenario.direction]
+    if not opposing:
+        state.pop("direction_flip_pending", None)
+        return scenario, []
+
+    bars = completed_one_minute_candles(index_candles, now)
+    bar_stamp = ist_iso(parse_timestamp(bars.iloc[-1]["timestamp"])) if not bars.empty and parse_timestamp(bars.iloc[-1]["timestamp"]) else ""
+    if not bar_stamp:
+        guarded = replace(scenario, executable_candidate=False,
+                          trigger_reason=scenario.trigger_reason + " Direction flip remains watch-only because no completed 1m bar timestamp is available.",
+                          features={**scenario.features, "direction_flip_guard": "NO_COMPLETED_1M_BAR"})
+        return guarded, []
+
+    trigger = config.oi_velocity_trigger
+    momentum = indicators.momentum_3m_pct
+    strong_flow = False
+    if oi.tactical_available and finite(momentum):
+        if scenario.direction == "BULLISH":
+            strong_flow = finite(oi.call_coi_pct) and finite(oi.put_coi_pct) and oi.call_coi_pct <= -1.5 * trigger and oi.put_coi_pct >= -0.25 * trigger and momentum > 0.0002
+        else:
+            strong_flow = finite(oi.put_coi_pct) and finite(oi.call_coi_pct) and oi.put_coi_pct <= -1.5 * trigger and oi.call_coi_pct >= -0.25 * trigger and momentum < -0.0002
+    structural_override = scenario.state in {"PREDICTIVE_BULLISH_BREAKOUT", "PREDICTIVE_BEARISH_BREAKDOWN", "GAMMA_SQUEEZE", "MORNING_GAP_GO", "EXHAUSTION_REVERSAL"} and strong_flow
+    pending = state.get("direction_flip_pending") if isinstance(state.get("direction_flip_pending"), dict) else {}
+    if structural_override:
+        confirmed = True
+        confirm_reason = "STRONG_TACTICAL_COI_PRICE_ALIGNMENT_OVERRIDE"
+        count = config.direction_flip_confirmations
+    else:
+        same_pending = str(pending.get("direction", "")).upper() == scenario.direction
+        count = int(pending.get("count", 0) or 0) if same_pending else 0
+        last_counted = str(pending.get("last_bar_timestamp", "")) if same_pending else ""
+        if bar_stamp != last_counted:
+            count += 1
+        confirm_reason = "DISTINCT_COMPLETED_1M_BAR_CONFIRMATION"
+        confirmed = count >= config.direction_flip_confirmations and oi.tactical_available and scenario.executable_candidate
+        state["direction_flip_pending"] = {
+            "direction": scenario.direction, "count": count,
+            "last_bar_timestamp": bar_stamp,
+            "started_at": pending.get("started_at", ist_iso(now)) if same_pending else ist_iso(now),
+            "source": confirm_reason,
+        }
+    if not confirmed:
+        guarded = replace(
+            scenario, executable_candidate=False,
+            trigger_reason=(scenario.trigger_reason +
+                           f" Direction-flip guard: {scenario.direction} is opposite to an active virtual recommendation; "
+                           f"{count}/{config.direction_flip_confirmations} distinct completed 1m confirmations, or stronger tactical COI, required. Live direction is reported unchanged; entry is watch-only."),
+            features={**scenario.features, "direction_flip_guard": "PENDING", "flip_confirmation_count": count,
+                      "flip_confirmations_required": config.direction_flip_confirmations,
+                      "strong_tactical_override": strong_flow},
+        )
+        return guarded, []
+
+    state.pop("direction_flip_pending", None)
+    events: list[dict[str, Any]] = []
+    for tracker in opposing:
+        tracker["status"] = "INVALIDATED_STATE"
+        tracker["completed_at"] = ist_iso(now)
+        tracker["completion_reason"] = f"Opposite {scenario.direction} structure confirmed by {confirm_reason}; virtual recommendation is no longer active."
+        events.append({
+            "event_type": "VIRTUAL_RECOMMENDATION_INVALIDATED_BY_STRUCTURE",
+            "event_at": ist_iso(now), "tracker_fingerprint": tracker.get("signal_fingerprint", ""),
+            "direction": tracker.get("direction"), "scenario": tracker.get("scenario", ""),
+            "instrument_key": tracker.get("instrument_key", ""), "trading_symbol": tracker.get("trading_symbol", ""),
+            "option_type": tracker.get("option_type", ""), "strike": tracker.get("strike"),
+            "spot": indicators.spot, "option_ltp": tracker.get("last_option_ltp_observed"),
+            "T1": tracker.get("target_1"), "T2": tracker.get("target_2"),
+            "SL": tracker.get("stop_loss"), "trailing_SL": tracker.get("trailing_stop", tracker.get("stop_loss")),
+            "message": f"Opposite {scenario.direction} structure confirmed via {confirm_reason}. Previous recommendation monitoring ended; no order was placed.",
+        })
+    state["recommendation_trackers"] = trackers
+    primary_fp = str(state.get("recommendation_tracker", {}).get("signal_fingerprint", "")) if isinstance(state.get("recommendation_tracker"), dict) else ""
+    state["recommendation_tracker"] = next((x for x in reversed(trackers) if x.get("signal_fingerprint") == primary_fp), None)
+    return scenario, events
+
+
+def opposing_wall_clearance_reason(scenario: Scenario, spot: float,
+                                   indicators: IndicatorSet, oi: OIAnalysis,
+                                   config: Config) -> str:
+    """Avoid entries into an intact opposing wall while allowing a weakening wall to be bypassed."""
+    if scenario.direction not in {"BULLISH", "BEARISH"}:
+        return ""
+    step = infer_strike_step(list(oi.rows))
+    atr_distance = 0.20 * indicators.atr if finite(indicators.atr) and indicators.atr > 0 else 0.0
+    required = max(config.opposing_wall_clearance_steps * step, atr_distance)
+    walls = oi.walls_resistance if scenario.direction == "BULLISH" else oi.walls_support
+    if scenario.direction == "BULLISH":
+        intact = [w for w in walls if w.state in {"BUILDING", "STABLE"} and w.strike > spot]
+        nearest = min(intact, key=lambda w: w.strike - spot) if intact else None
+        gap = nearest.strike - spot if nearest else float("inf")
+    else:
+        intact = [w for w in walls if w.state in {"BUILDING", "STABLE"} and w.strike < spot]
+        nearest = max(intact, key=lambda w: w.strike) if intact else None
+        gap = spot - nearest.strike if nearest else float("inf")
+    if nearest is not None and gap < required:
+        return (f"INSUFFICIENT_RUNWAY_TO_INTACT_OPPOSING_WALL level={nearest.strike:.2f} "
+                f"clearance={gap:.2f} required={required:.2f}; weakening walls were excluded from this check")
+    return ""
 
 
 def futures_regime_from_snapshots(quote: Optional[LiveQuote], state: dict[str, Any], now: datetime) -> tuple[str, dict[str, Any]]:
@@ -2211,11 +2638,189 @@ def route_targets_and_stop(scenario: Scenario, spot: float, indicators: Indicato
                     tuple(skipped), f"Valid OI/price-action target and ATR-buffered stop geometry. {target_detail}")
 
 
+def _scan_intrabar_level_crossings(
+    tracker: dict[str, Any], frame: Optional[pd.DataFrame], now: datetime,
+    direction: str, target_1: float, target_2: float, stop_loss: float,
+    *, lookback: int = 60,
+) -> dict[str, Any]:
+    """Inspect newly completed 1m NIFTY OHLC ranges for virtual target/stop crossings.
+
+    If a single candle spans a stop and a target, the stop is processed first because
+    OHLC data cannot establish the exact intraminute order; this is deliberately
+    conservative and is reported as a virtual event, never an actual position exit.
+    """
+    result = {"stop_hit": False, "t1_hit": False, "t2_hit": False,
+              "stop_timestamp": None, "t1_timestamp": None, "t2_timestamp": None,
+              "ambiguous_bar": False, "bars_processed": 0}
+    bars = completed_one_minute_candles(frame, now)
+    if bars.empty:
+        return result
+    bars = bars.tail(max(1, int(lookback)))
+    now_ist_value = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
+    created = parse_timestamp(tracker.get("created_at"))
+    last_processed = parse_timestamp(tracker.get("last_intrabar_bar_timestamp"))
+    if created:
+        created = created.astimezone(IST)
+    if last_processed:
+        last_processed = last_processed.astimezone(IST)
+    existing_t1 = bool(tracker.get("target_1_hit", False))
+    dir_up = str(direction).upper() == "BULLISH"
+    last_seen: Optional[datetime] = None
+    for _, bar in bars.iterrows():
+        stamp = parse_timestamp(bar.get("timestamp"))
+        if stamp is None:
+            continue
+        stamp = stamp.astimezone(IST)
+        if stamp.date() != now_ist_value.date() or stamp + timedelta(minutes=1) > now_ist_value:
+            continue
+        # Exclude the entire minute candle if it started before the recommendation was created.
+        # An OHLC candle cannot separate its pre-entry and post-entry ranges.
+        if created and stamp < created:
+            continue
+        if last_processed and stamp <= last_processed:
+            continue
+        high = safe_float(bar.get("high"), float("nan"))
+        low = safe_float(bar.get("low"), float("nan"))
+        if not finite(high) or not finite(low):
+            last_seen = stamp
+            continue
+        result["bars_processed"] += 1
+        last_seen = stamp
+        stop_cross = low <= stop_loss if dir_up else high >= stop_loss
+        t1_cross = high >= target_1 if dir_up else low <= target_1
+        t2_cross = finite(target_2) and (high >= target_2 if dir_up else low <= target_2)
+        if stop_cross:
+            result["stop_hit"] = True
+            result["stop_timestamp"] = ist_iso(stamp)
+            result["ambiguous_bar"] = bool((t1_cross or t2_cross) and not existing_t1)
+            break
+        if not existing_t1 and t1_cross:
+            result["t1_hit"] = True
+            result["t1_timestamp"] = ist_iso(stamp)
+            existing_t1 = True
+        if t2_cross and existing_t1:
+            result["t2_hit"] = True
+            result["t2_timestamp"] = ist_iso(stamp)
+            break
+    if last_seen:
+        tracker["last_intrabar_bar_timestamp"] = ist_iso(last_seen)
+    return result
+
+
+def completed_resampled_candles(
+    frame: Optional[pd.DataFrame], interval_minutes: int, now: datetime,
+) -> pd.DataFrame:
+    """Build complete intraday OHLCV bars from completed 1m candles on IST boundaries."""
+    if frame is None or frame.empty or interval_minutes < 2:
+        return pd.DataFrame()
+    one_min = completed_one_minute_candles(frame, now)
+    if one_min.empty:
+        return pd.DataFrame()
+    work = one_min.copy()
+    local = pd.to_datetime(work["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST)
+    work["timestamp"] = local.dt.tz_localize(None)
+    work = work.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+    expected = int(interval_minutes)
+    resampled = work.resample(
+        f"{expected}min", origin="start_day", offset="9h15min", label="left", closed="left"
+    ).agg(
+        open=("open", "first"), high=("high", "max"), low=("low", "min"),
+        close=("close", "last"), volume=("volume", "sum"), observed_minutes=("close", "count"),
+    )
+    current = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
+    valid = resampled["observed_minutes"].eq(expected)
+    valid &= (resampled.index + pd.to_timedelta(expected, unit="m") <= current.replace(tzinfo=None))
+    valid &= pd.Index(resampled.index.date) == current.date()
+    result = resampled.loc[valid].dropna(subset=["open", "high", "low", "close"]).reset_index()
+    result["timestamp"] = pd.to_datetime(result["timestamp"]).dt.tz_localize(IST)
+    return result.drop(columns=["observed_minutes"], errors="ignore").reset_index(drop=True)
+
+
+def evaluate_stagnation_watch(
+    tracker: dict[str, Any], index_candles: Optional[pd.DataFrame],
+    spot: float, indicators: IndicatorSet, oi: OIAnalysis, now: datetime,
+    *, range_limit_pct: float = 0.001, min_progress_pct: float = 0.0001,
+    oi_velocity_trigger: float = 0.0015, cooldown_minutes: int = 15,
+) -> dict[str, Any]:
+    """Warn about tight post-entry stagnation only when directional alignment has deteriorated.
+
+    This is diagnostic only: it never closes a recommendation or alters its stop. Three
+    complete, consecutive 5m bars after the recommendation timestamp are required.
+    """
+    neutral = {"status": "INSUFFICIENT_BARS", "warning": None, "range_pct": None,
+               "favorable_progress_pct": None, "flow_aligned": False, "vwap_aligned": False}
+    bars = completed_resampled_candles(index_candles, 5, now)
+    created = parse_timestamp(tracker.get("created_at"))
+    if created is None or bars.empty:
+        return neutral
+    bars = bars.loc[pd.to_datetime(bars["timestamp"], utc=True) >= pd.Timestamp(created.astimezone(IST).astimezone(ZoneInfo("UTC")))].copy()
+    if len(bars) < 3:
+        return neutral
+    recent = bars.tail(3).reset_index(drop=True)
+    stamps = pd.to_datetime(recent["timestamp"], utc=True, errors="coerce")
+    if stamps.isna().any() or any((stamps.iloc[i] - stamps.iloc[i - 1]).total_seconds() != 300 for i in range(1, len(stamps))):
+        return {**neutral, "status": "NONCONSECUTIVE_BARS"}
+    high = safe_float(recent["high"].max(), float("nan"))
+    low = safe_float(recent["low"].min(), float("nan"))
+    ref = safe_float(tracker.get("nifty_entry_reference"), float("nan"))
+    if not all(finite(v) for v in (high, low, ref, spot)) or ref <= 0 or spot <= 0:
+        return {**neutral, "status": "INVALID_REFERENCE"}
+    range_pct = (high - low) / max(float(spot), 1.0)
+    direction = str(tracker.get("direction", "")).upper()
+    last_close = safe_float(recent.iloc[-1]["close"], float("nan"))
+    progress = ((last_close / ref) - 1.0) if direction == "BULLISH" else ((ref / last_close) - 1.0 if last_close > 0 else float("nan"))
+    if direction == "BULLISH":
+        vwap_aligned = finite(indicators.vwap) and spot >= indicators.vwap
+        flow_aligned = bool(oi.tactical_available and finite(oi.call_coi_pct) and finite(oi.put_coi_pct)
+                            and oi.call_coi_pct <= -oi_velocity_trigger and oi.put_coi_pct >= -0.25 * oi_velocity_trigger)
+    elif direction == "BEARISH":
+        vwap_aligned = finite(indicators.vwap) and spot <= indicators.vwap
+        flow_aligned = bool(oi.tactical_available and finite(oi.put_coi_pct) and finite(oi.call_coi_pct)
+                            and oi.put_coi_pct <= -oi_velocity_trigger and oi.call_coi_pct >= -0.25 * oi_velocity_trigger)
+    else:
+        vwap_aligned = flow_aligned = False
+    details = {"range_pct": range_pct, "favorable_progress_pct": progress,
+               "flow_aligned": flow_aligned, "vwap_aligned": bool(vwap_aligned),
+               "bars": [str(stamp) for stamp in stamps]}
+    if range_pct > max(0.0, range_limit_pct):
+        return {**details, "status": "RANGE_NOT_STAGNANT", "warning": None}
+    if progress >= max(0.0, min_progress_pct) and flow_aligned and vwap_aligned:
+        return {**details, "status": "ALIGNED_CONTINUATION_NO_WARNING", "warning": None}
+    last_warning = parse_timestamp(tracker.get("last_stagnation_warning_at"))
+    if last_warning and (now - last_warning).total_seconds() < max(1, int(cooldown_minutes)) * 60:
+        return {**details, "status": "WARNING_COOLDOWN", "warning": None}
+    tracker["last_stagnation_warning_at"] = ist_iso(now)
+    warning = {
+        "event_type": "STAGNATION_RISK_WARNING", "event_at": ist_iso(now),
+        "tracker_fingerprint": tracker.get("signal_fingerprint", ""),
+        "direction": direction, "scenario": tracker.get("scenario", ""),
+        "instrument_key": tracker.get("instrument_key", ""),
+        "trading_symbol": tracker.get("trading_symbol", ""),
+        "option_type": tracker.get("option_type", ""), "strike": tracker.get("strike"),
+        "spot": spot, "option_ltp": tracker.get("last_option_ltp_observed"),
+        "option_quote_status": tracker.get("last_option_quote_status", "UNKNOWN"),
+        "T1": tracker.get("target_1"), "T2": tracker.get("target_2"),
+        "SL": tracker.get("stop_loss"), "trailing_SL": tracker.get("trailing_stop", tracker.get("stop_loss")),
+        "range_pct": range_pct * 100.0, "favorable_progress_pct": progress * 100.0,
+        "flow_aligned": flow_aligned, "vwap_aligned": bool(vwap_aligned),
+        "message": ("Three completed consecutive 5m bars have remained compressed after the recommendation. "
+                    "Directional progress/VWAP/tactical-COI alignment is incomplete; review theta/time-decay exposure. "
+                    "This is a warning only and does not close or invalidate the virtual recommendation."),
+    }
+    return {**details, "status": "STAGNATION_RISK_WARNING", "warning": warning}
+
+
 def update_recommendation_tracker(
     state: dict[str, Any], spot: float, indicators: IndicatorSet,
     oi: OIAnalysis, now: datetime,
     option_quotes: Optional[Mapping[str, LiveQuote]] = None,
     *, quote_alert_cooldown_minutes: int = 10,
+    index_candles: Optional[pd.DataFrame] = None,
+    intrabar_monitor_lookback: int = 60,
+    stagnation_warning_cooldown_minutes: int = 15,
+    stagnation_range_pct: float = 0.001,
+    stagnation_min_progress_pct: float = 0.0001,
+    oi_velocity_trigger: float = 0.0015,
 ) -> dict[str, Any]:
     """Monitor every active virtual recommendation using NIFTY levels and its live option quote.
 
@@ -2238,11 +2843,6 @@ def update_recommendation_tracker(
     quotes = option_quotes or {}
     events: list[dict[str, Any]] = []
     monitor_rows: list[dict[str, Any]] = []
-    terminal = {
-        "VIRTUAL_STOP_LOSS_REACHED", "VIRTUAL_TRAILING_STOP_REACHED", "VIRTUAL_T2_REACHED",
-        "INVALIDATED_STATE", "VIRTUAL_SESSION_ENDED", "VIRTUAL_MONITOR_CAP_REACHED",
-    }
-
     for tracker in trackers:
         status = str(tracker.get("status", "")).upper()
         if status != "TRACKING":
@@ -2319,12 +2919,17 @@ def update_recommendation_tracker(
             })
             continue
 
+        intrabar = _scan_intrabar_level_crossings(
+            tracker, index_candles, now, direction, t1,
+            t2 if finite(t2) else float("nan"), stored_stop,
+            lookback=intrabar_monitor_lookback,
+        )
         was_t1_hit = bool(tracker.get("target_1_hit", False))
         spot_t1_cross = (direction == "BULLISH" and spot >= t1) or (direction == "BEARISH" and spot <= t1)
-        t1_newly_hit = not was_t1_hit and spot_t1_cross
+        t1_newly_hit = not was_t1_hit and (spot_t1_cross or bool(intrabar.get("t1_hit")))
         if t1_newly_hit:
             tracker["target_1_hit"] = True
-            tracker["target_1_hit_at"] = ist_iso(now)
+            tracker["target_1_hit_at"] = intrabar.get("t1_timestamp") or ist_iso(now)
 
         old_stop = stored_stop
         stop = old_stop
@@ -2356,23 +2961,28 @@ def update_recommendation_tracker(
             "SL": tracker.get("stop_loss"), "trailing_SL": stop,
             "entry_reference_ltp": tracker.get("entry_reference_ltp"),
             "option_ltp_change_pct_from_signal": tracker.get("option_ltp_change_pct_from_signal"),
+            "intrabar_bars_processed": intrabar.get("bars_processed", 0),
+            "intrabar_stop_timestamp": intrabar.get("stop_timestamp"),
+            "intrabar_t1_timestamp": intrabar.get("t1_timestamp"),
+            "intrabar_t2_timestamp": intrabar.get("t2_timestamp"),
+            "intrabar_ambiguous_bar": bool(intrabar.get("ambiguous_bar", False)),
         }
         if t1_newly_hit:
             events.append({**common_event, "event_type": "T1_REACHED",
-                           "message": "NIFTY reached T1. The virtual trailing stop is now updated to the current intact structural OI wall where a favorable ratchet is available."})
+                           "message": (f"Completed 1m NIFTY candle reached T1 at {intrabar.get('t1_timestamp')}. " if intrabar.get("t1_hit") else "NIFTY reached T1. ") + "The virtual trailing stop is updated to the current intact structural OI wall where a favorable ratchet is available."})
         elif trailing_changed:
             events.append({**common_event, "event_type": "TRAILING_STOP_UPDATED",
                            "previous_trailing_SL": old_stop, "new_trailing_SL": stop,
                            "message": "NIFTY structural support/resistance changed; the virtual trailing stop moved only in the favorable direction."})
 
-        stop_hit = (direction == "BULLISH" and spot <= stop) or (direction == "BEARISH" and spot >= stop)
-        t2_hit = finite(t2) and ((direction == "BULLISH" and spot >= t2) or (direction == "BEARISH" and spot <= t2))
+        stop_hit = bool(intrabar.get("stop_hit")) or (direction == "BULLISH" and spot <= stop) or (direction == "BEARISH" and spot >= stop)
+        t2_hit = bool(intrabar.get("t2_hit")) or (finite(t2) and ((direction == "BULLISH" and spot >= t2) or (direction == "BEARISH" and spot <= t2)))
         if stop_hit:
             event_type = "TRAILING_STOP_REACHED" if bool(tracker.get("target_1_hit", False)) else "INITIAL_STOP_LOSS_REACHED"
             tracker["status"] = "VIRTUAL_TRAILING_STOP_REACHED" if event_type == "TRAILING_STOP_REACHED" else "VIRTUAL_STOP_LOSS_REACHED"
             tracker["completed_at"] = ist_iso(now)
             events.append({**common_event, "event_type": event_type,
-                           "message": "NIFTY reached the recommendation's structural stop level. This is a virtual signal-monitor event, not an order or actual-position confirmation."})
+                           "message": ("A completed 1m NIFTY candle crossed the recommendation's structural stop; stop is processed before targets when one OHLC bar spans both levels. " if intrabar.get("stop_hit") else "NIFTY reached the recommendation's structural stop level. ") + "This is a virtual signal-monitor event, not an order or actual-position confirmation."})
         elif t2_hit:
             # If a scan gap jumps past T2 and the T1 event was not previously observed,
             # emit T1 before T2 so the alert history follows the proper level sequence.
@@ -2384,10 +2994,28 @@ def update_recommendation_tracker(
             tracker["status"] = "VIRTUAL_T2_REACHED"
             tracker["completed_at"] = ist_iso(now)
             events.append({**common_event, "event_type": "T2_REACHED",
-                           "message": "NIFTY reached T2. Virtual recommendation monitoring is complete."})
+                           "message": (f"Completed 1m NIFTY candle reached T2 at {intrabar.get('t2_timestamp')}. " if intrabar.get("t2_hit") else "NIFTY reached T2. ") + "Virtual recommendation monitoring is complete."})
+
+        if str(tracker.get("status", "TRACKING")).upper() == "TRACKING":
+            stagnation = evaluate_stagnation_watch(
+                tracker, index_candles, spot, indicators, oi, now,
+                range_limit_pct=stagnation_range_pct,
+                min_progress_pct=stagnation_min_progress_pct,
+                oi_velocity_trigger=oi_velocity_trigger,
+                cooldown_minutes=stagnation_warning_cooldown_minutes,
+            )
+            if stagnation.get("warning"):
+                events.append(stagnation["warning"])
+        else:
+            stagnation = {"status": "NOT_APPLICABLE", "warning": None}
 
         monitor_rows.append({
             "status": tracker.get("status", "TRACKING"), "direction": direction,
+            "stagnation_status": stagnation.get("status"),
+            "stagnation_range_pct": (safe_float(stagnation.get("range_pct"), float("nan")) * 100.0
+                                     if finite(stagnation.get("range_pct")) else None),
+            "stagnation_flow_aligned": stagnation.get("flow_aligned"),
+            "stagnation_vwap_aligned": stagnation.get("vwap_aligned"),
             "scenario": tracker.get("scenario", ""), "instrument_key": instrument_key,
             "trading_symbol": tracker.get("trading_symbol", ""), "option_type": tracker.get("option_type", ""),
             "strike": tracker.get("strike"), "option_ltp": option_ltp,
@@ -2563,6 +3191,9 @@ def evaluate_trade_readiness(
             blockers.append("TACTICAL_COI_BASELINE_UNAVAILABLE_NO_COLD_START_VELOCITY_CLAIM")
     else:
         blockers.extend(candidate.vetoes)
+    wall_clearance = opposing_wall_clearance_reason(scenario, indicators.spot, indicators, oi, config)
+    if wall_clearance:
+        blockers.append(wall_clearance)
     blockers = list(dict.fromkeys(blockers))
     ready = not blockers and candidate is not None
     return {
@@ -2673,7 +3304,7 @@ def _alert_body(alert: Mapping[str, Any]) -> str:
     event_type = str(alert.get("event_type", "SCANNER_ALERT"))
     created = str(alert.get("created_at", ""))
     lines = [
-        f"NIFTY Predictive Scanner V59 — {event_type}",
+        f"NIFTY Predictive Scanner V60 — {event_type}",
         f"Timestamp (IST): {created}",
         "",
         "IMPORTANT: This is a scanner recommendation/monitoring alert only. No order was placed and no actual position is inferred.",
@@ -2734,7 +3365,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
             alert["attempts"] = int(alert.get("attempts", 0)) + 1
             try:
                 message = MIMEMultipart("alternative")
-                message["Subject"] = str(alert.get("subject", "NIFTY V59 scanner alert"))
+                message["Subject"] = str(alert.get("subject", "NIFTY V60 scanner alert"))
                 message["From"] = config.email_sender
                 message["To"] = config.email_receiver
                 message.attach(MIMEText(_alert_body(alert), "plain", "utf-8"))
@@ -2804,6 +3435,9 @@ class PredictiveScanner:
             elif event_type in {"SELECTED_OPTION_QUOTE_UNAVAILABLE", "SELECTED_OPTION_QUOTE_RECOVERED"}:
                 identity = f"{tracker_id}|{event_type}"
                 cooldown = self.config.monitor_quote_alert_cooldown_minutes if event_type == "SELECTED_OPTION_QUOTE_UNAVAILABLE" else None
+            elif event_type == "STAGNATION_RISK_WARNING":
+                identity = f"{tracker_id}|{event_type}"
+                cooldown = self.config.stagnation_warning_cooldown_minutes
             else:
                 identity = f"{tracker_id}|{event_type}"
                 cooldown = None
@@ -2813,7 +3447,7 @@ class PredictiveScanner:
             enqueue_email_alert(
                 state, now=now, event_type=event_type,
                 dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{identity}",
-                subject=f"NIFTY V59 {event_type.replace('_', ' ')}{subject_suffix}",
+                subject=f"NIFTY V60 {event_type.replace('_', ' ')}{subject_suffix}",
                 payload=event, cooldown_minutes=cooldown,
             )
 
@@ -2849,14 +3483,14 @@ class PredictiveScanner:
         enqueue_email_alert(
             state, now=now, event_type=error_kind,
             dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{error_kind}|{type(exc).__name__}",
-            subject=f"NIFTY V59 scanner {error_kind.replace('_', ' ').lower()}",
+            subject=f"NIFTY V60 scanner {error_kind.replace('_', ' ').lower()}",
             payload={"timestamp": ist_iso(now), "scanner_version": SCANNER_VERSION,
                      "error_type": type(exc).__name__, "error": str(exc)[:1200],
                      "note": "No new recommendation was produced by the failed scan."},
             cooldown_minutes=15,
         )
 
-    def scan_once(self, now: Optional[datetime] = None, *, skip_market_status: bool = False) -> dict[str, Any]:
+    def scan_once(self, now: Optional[datetime] = None) -> dict[str, Any]:
         current = now or now_ist()
         if current.tzinfo is None:
             current = current.replace(tzinfo=IST)
@@ -2926,20 +3560,19 @@ class PredictiveScanner:
             report["trigger_rationale"] = time_reason
             report["vetoes"] = [time_reason]
             return self._finish(state, report, current)
-        if not skip_market_status:
-            try:
-                status = self.client.market_status()
-                report["market_status"] = status
-                if status != "OPEN":
-                    report["trigger_rationale"] = f"NSE market status is {status}; live entries suppressed."
-                    report["vetoes"] = ["NSE_MARKET_NOT_NORMAL_OPEN"]
-                    return self._finish(state, report, current)
-            except ScannerError as exc:
-                report["market_status"] = "UNVERIFIED"
-                report["trigger_rationale"] = f"Market-status API unavailable; fail-closed: {exc}"
-                report["vetoes"] = ["MARKET_STATUS_UNVERIFIED"]
-                self._queue_scan_error(state, current, exc, "MARKET_STATUS_API_ERROR")
+        try:
+            status = self.client.market_status()
+            report["market_status"] = status
+            if status != "OPEN":
+                report["trigger_rationale"] = f"NSE market status is {status}; live entries suppressed."
+                report["vetoes"] = ["NSE_MARKET_NOT_NORMAL_OPEN"]
                 return self._finish(state, report, current)
+        except ScannerError as exc:
+            report["market_status"] = "UNVERIFIED"
+            report["trigger_rationale"] = f"Market-status API unavailable; fail-closed: {exc}"
+            report["vetoes"] = ["MARKET_STATUS_UNVERIFIED"]
+            self._queue_scan_error(state, current, exc, "MARKET_STATUS_API_ERROR")
+            return self._finish(state, report, current)
 
         try:
             # Fetch index quote first: it is the true spot source and is required to choose ATM.
@@ -3015,9 +3648,25 @@ class PredictiveScanner:
             index_quote = quote_map[self.config.nifty_key]
             futures_quote = quote_map.get(future_key) if future_key else None
 
-            index_session = self.client.candles(self.config.nifty_key, interval=1, historical=False)
-            if index_session.empty:
-                raise ScannerError("NIFTY 1-minute intraday candles unavailable.")
+            try:
+                index_session = self.client.candles(self.config.nifty_key, interval=1, historical=False)
+            except ScannerError as candle_exc:
+                LOGGER.error("NIFTY 1m candle feed unavailable; new entries suppressed, continuing quote-based tracker monitoring: %s", candle_exc)
+                index_session = pd.DataFrame()
+            index_candles_available = not index_session.empty
+            if not index_candles_available:
+                self._queue_scan_error(
+                    state, current,
+                    ScannerError("NIFTY current-session 1-minute candles unavailable; indicator-based entries are disabled for this scan."),
+                    "INDEX_1M_CANDLE_FEED_UNAVAILABLE",
+                )
+                report["market_data_quality"] = {
+                    "index_1m_candles": "UNAVAILABLE",
+                    "new_entries": "SUPPRESSED",
+                    "existing_virtual_monitoring": "LIVE_SPOT_AND_OPTION_QUOTES_ONLY",
+                }
+            else:
+                report["market_data_quality"] = {"index_1m_candles": "AVAILABLE", "new_entries": "ELIGIBLE_FOR_ANALYSIS"}
             futures_session = pd.DataFrame()
             if future_key:
                 try:
@@ -3025,17 +3674,44 @@ class PredictiveScanner:
                 except ScannerError as exc:
                     LOGGER.warning("FUTURES 1m candles unavailable; price regime uses live quote snapshots only: %s", exc)
             historical_seed = load_historical_seed(self.client, state, self.config.nifty_key, current)
-            indicators = build_indicators(current, spot, index_session, futures_session, historical_seed,
-                                          self.config, previous_close=index_quote.previous_close)
-            # Use live NIFTY price as spot; candles calculate the indicators only.
-            indicators = IndicatorSet(**{**asdict(indicators), "spot": spot})
+            if index_candles_available:
+                indicators = build_indicators(current, spot, index_session, futures_session, historical_seed,
+                                              self.config, previous_close=index_quote.previous_close)
+                # Use live NIFTY price as spot; candles calculate the indicators only.
+                indicators = IndicatorSet(**{**asdict(indicators), "spot": spot})
+            else:
+                indicators = unavailable_current_session_indicators(spot, index_quote.previous_close)
 
             prior_snapshots = self.store.recent_chain_snapshots(current)
+            has_tactical_baseline = has_usable_tactical_snapshot_baseline(chain, prior_snapshots, current)
+            api_change_oi: Optional[dict[str, Any]] = None
+            if self.config.change_oi_fallback_enabled and not has_tactical_baseline:
+                try:
+                    api_change_oi = self.client.change_oi_by_strike(expiry, current.date())
+                    LOGGER.info("CHANGE-OI FALLBACK: loaded %d strike rows for structural/session context only; not tactical velocity.",
+                                len(api_change_oi.get("by_strike", {})))
+                except ScannerError as change_exc:
+                    LOGGER.warning("CHANGE-OI fallback unavailable; OI concentration remains structural-only: %s", change_exc)
             oi = analyze_option_oi(chain, prior_snapshots, current, spot, self.config,
                                    session_baseline=state.get("session_oi_baseline"),
-                                   session_baseline_source=str(state.get("session_oi_baseline_source", "UNAVAILABLE")))
+                                   session_baseline_source=str(state.get("session_oi_baseline_source", "UNAVAILABLE")),
+                                   api_change_oi=api_change_oi)
             future_regime, future_detail = futures_regime_from_snapshots(futures_quote, state, current)
-            scenario = detect_scenario(current, indicators, oi, future_regime, self.config)
+            if index_candles_available:
+                scenario = detect_scenario(current, indicators, oi, future_regime, self.config)
+            else:
+                scenario = Scenario(
+                    "INDEX_CANDLE_FEED_UNAVAILABLE", "NEUTRAL", 0.0,
+                    "Fresh index/option quotes are available, but the current-session NIFTY 1m candle feed is unavailable. New entries are suppressed; persisted virtual recommendations continue using live spot and option quotes.",
+                    None, "", False, "INDEX_1M_CANDLE_FEED_UNAVAILABLE",
+                    {"new_entries_blocked": True, "spot_quote_fresh": True},
+                )
+            # A confirmed completed-1m wall reaction may supersede a neutral/watch state,
+            # but never overrides the global dual-side pinning/sideways hard veto.
+            if scenario.hard_veto is None and scenario.direction == "NEUTRAL":
+                wall_reaction = detect_structural_wall_reaction(index_session, indicators, oi, current, self.config)
+                if wall_reaction is not None:
+                    scenario = wall_reaction
             # Fetch 1-minute option candles only for the direction and strikes that can be ranked.
             # The prior design fetched both CE and PE candles at every strike (up to ten requests per scan).
             option_candles: dict[str, pd.DataFrame] = {}
@@ -3059,8 +3735,35 @@ class PredictiveScanner:
             tracked = update_recommendation_tracker(
                 state, spot, indicators, oi, current, quote_map,
                 quote_alert_cooldown_minutes=self.config.monitor_quote_alert_cooldown_minutes,
+                index_candles=index_session,
+                intrabar_monitor_lookback=self.config.intrabar_monitor_lookback,
+                stagnation_warning_cooldown_minutes=self.config.stagnation_warning_cooldown_minutes,
+                stagnation_range_pct=self.config.stagnation_range_pct,
+                stagnation_min_progress_pct=self.config.stagnation_min_progress_pct,
+                oi_velocity_trigger=self.config.oi_velocity_trigger,
             )
             self._queue_monitor_events(state, tracked.get("events", []), current)
+            # Apply the direction-flip guard only after monitoring the prior recommendation
+            # on this scan; this prevents a reversal from suppressing a level event that
+            # was already crossed in the latest completed 1m candle.
+            scenario, flip_events = apply_direction_flip_guard(
+                state, scenario, oi, indicators, index_session, current, self.config
+            )
+            if flip_events:
+                self._queue_monitor_events(state, flip_events, current)
+                status_by_fp = {
+                    str(item.get("signal_fingerprint", "")): str(item.get("status", ""))
+                    for item in state.get("recommendation_trackers", []) if isinstance(item, dict)
+                }
+                for monitor_row in tracked.get("trackers", []):
+                    if isinstance(monitor_row, dict):
+                        fp = str(monitor_row.get("signal_fingerprint", ""))
+                        if fp in status_by_fp:
+                            monitor_row["status"] = status_by_fp[fp]
+                tracked["active_tracker_count"] = sum(
+                    1 for item in state.get("recommendation_trackers", [])
+                    if isinstance(item, dict) and str(item.get("status", "")).upper() == "TRACKING"
+                )
 
             report.update({
                 "scenario": scenario.state,
@@ -3098,6 +3801,9 @@ class PredictiveScanner:
                     "acceleration_available": oi.acceleration_available,
                     "baseline_quality": oi.baseline_quality,
                     "session_baseline_source": oi.session_baseline_source,
+                    "wall_change_source": oi.wall_change_source,
+                    "change_oi_fallback_available": oi.change_oi_fallback_available,
+                    "change_oi_fallback_interval_days": oi.change_oi_fallback_interval_days,
                     "pin_strikes": oi.pin_strikes,
                     "both_sides_building": oi.both_sides_building, "reasons": oi.reasons,
                     "resistance_walls": [asdict(w) for w in oi.walls_resistance[:8]],
@@ -3229,7 +3935,7 @@ class PredictiveScanner:
                     enqueue_email_alert(
                         state, now=current, event_type="TRACKER_MONITOR_CAP_REACHED",
                         dedupe_key=f"{current.date().isoformat()}|TRACKER_MONITOR_CAP_REACHED|{retired_fp}",
-                        subject=f"NIFTY V59 monitor-cap retirement {retired.get('strike', '')}",
+                        subject=f"NIFTY V60 monitor-cap retirement {retired.get('strike', '')}",
                         payload={"timestamp": current.isoformat(), "retired_tracker": retired,
                                  "message": "This older virtual recommendation is no longer monitored because the configured active tracker limit was reached."},
                     )
@@ -3247,7 +3953,7 @@ class PredictiveScanner:
                 enqueue_email_alert(
                     state, now=current, event_type="SIGNAL_READY",
                     dedupe_key=f"{current.date().isoformat()}|SIGNAL_READY|{fingerprint}",
-                    subject=f"NIFTY V59 SIGNAL READY {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
+                    subject=f"NIFTY V60 SIGNAL READY {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
                     payload={**signal_payload, "alert_type": "TRADE_READY_RECOMMENDATION",
                              "execution_mode": "VIRTUAL_SIGNAL_ONLY_NO_ORDER_PLACEMENT",
                              "readiness": readiness,
@@ -3289,7 +3995,7 @@ class PredictiveScanner:
                     enqueue_email_alert(
                         state, now=current, event_type="PREDICTIVE_WATCH",
                         dedupe_key=watch_identity,
-                        subject=f"NIFTY V59 PREDICTIVE WATCH {scenario.direction} {scenario.state}",
+                        subject=f"NIFTY V60 PREDICTIVE WATCH {scenario.direction} {scenario.state}",
                         payload=watch_payload,
                         cooldown_minutes=self.config.watch_alert_cooldown_minutes,
                     )
@@ -3349,10 +4055,9 @@ def scan_exit_code(report: Mapping[str, Any]) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V59")
+    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V60")
     parser.add_argument("--loop", action="store_true", help="Scan approximately once per minute during market hours.")
     parser.add_argument("--interval", type=float, default=60.0, help="Loop interval seconds (minimum 15).")
-    parser.add_argument("--skip-market-status", action="store_true", help="Testing only: skip Upstox NSE market-status check.")
     args = parser.parse_args(argv)
     config = Config()
     try:
@@ -3372,7 +4077,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enqueue_email_alert(
                 state, now=current, event_type="CONFIGURATION_ERROR",
                 dedupe_key=f"{current.date().isoformat()}|CONFIGURATION_ERROR|{type(exc).__name__}",
-                subject="NIFTY V59 scanner configuration error",
+                subject="NIFTY V60 scanner configuration error",
                 payload={"timestamp": current.isoformat(), "scanner_version": SCANNER_VERSION,
                          "error_type": type(exc).__name__, "error": str(exc),
                          "note": "The scan was stopped before market analysis; no recommendation or order was produced."},
@@ -3390,14 +4095,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     scanner = PredictiveScanner(config)
     if not args.loop:
-        report = scanner.scan_once(skip_market_status=args.skip_market_status)
+        report = scanner.scan_once()
         print_report(report)
         return scan_exit_code(report)
     interval = max(15.0, float(args.interval))
-    LOGGER.info("V59 minute loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
+    LOGGER.info("V60 minute loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
     while True:
         cycle_start = time_module.monotonic()
-        report = scanner.scan_once(skip_market_status=args.skip_market_status)
+        report = scanner.scan_once()
         print_report(report)
         elapsed = time_module.monotonic() - cycle_start
         # Default minute loop aligns to the next minute to keep COI snapshot spacing meaningful.
