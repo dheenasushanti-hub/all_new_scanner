@@ -1,5 +1,5 @@
 """
-NIFTY 50 Predictive Options Scanner — V43 Structural Rejection, Target and Risk Guard
+NIFTY 50 Predictive Options Scanner — V45 Structure-Authoritative Regime and Entry Guard
 
 What this version fixes:
 - Uses the NIFTY INDEX as the primary market-price/VWAP/intraday structure feed.
@@ -43,8 +43,8 @@ What this version fixes:
   older v2 intraday candle API is deprecated.
 
 Run:
-    python market_scanner_v43_structural_entry_risk_guard.py --self-test
-    python market_scanner_v43_structural_entry_risk_guard.py
+    python market_scanner_v45_structural_entry_risk_guard.py --self-test
+    python market_scanner_v45_structural_entry_risk_guard.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -148,7 +148,7 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-14-STRUCTURE-V43-REJECTION-VOLUME-VWAP-BANDS-SOFT-FUTURES-ATM4"
+SCANNER_VERSION = "2026-10-15-STRUCTURE-V45-ADX-STRENGTH-ONLY-PERSISTENCE-REGIME-ALIGNMENT-ATM4"
 # PA/OI target construction is unchanged; keep the V30 target engine identifier so
 # existing live trades are not needlessly re-migrated by entry-filter-only changes.
 OPTION_TARGET_ENGINE_VERSION = "V30_DYNAMIC_COI_MATRIX_PA_OI"
@@ -2128,6 +2128,90 @@ def time_of_day_window(now: Optional[datetime] = None) -> str:
     return "AFTERNOON"
 
 
+
+def structural_direction_override_decision(
+    *,
+    direction: str,
+    structure_phase: str,
+    entry_confirmed: bool,
+    spot: float,
+    vwap: float,
+    last_completed_close: float,
+    atr: float,
+    vwap_slope: float,
+    change_oi: float,
+    divergence: str = "NONE",
+    near_structural_level: bool = False,
+) -> tuple[bool, str]:
+    """Assess whether confirmed PA/OI structure should remain directional regardless of ADX.
+
+    ADX is a trend-strength measurement, not a direction veto. This guard is only
+    eligible when the structural engine has already confirmed a continuous phase,
+    spot and the latest completed close remain on the correct side of VWAP (within
+    a small noise buffer), VWAP slope and option Change-OI agree, and there is no
+    confirmed opposing RSI divergence at a structural level. Entry risk, wall,
+    persistence, premium, execution-score and reward/risk checks remain downstream.
+    """
+    side = str(direction or "").strip().upper()
+    phase = str(structure_phase or "").strip().upper()
+    div = str(divergence or "NONE").strip().upper()
+    px = safe_float(spot, float("nan"))
+    vw = safe_float(vwap, float("nan"))
+    close = safe_float(last_completed_close, float("nan"))
+    atr_value = max(0.0, safe_float(atr, 0.0))
+    slope = safe_float(vwap_slope, float("nan"))
+    flow = safe_float(change_oi, float("nan"))
+    reasons: list[str] = []
+
+    phase_aligned = side in {"BULLISH", "BEARISH"} and phase == f"CONTINUOUS_{side}" and bool(entry_confirmed)
+    if not phase_aligned:
+        reasons.append("continuous phase/entry confirmation not aligned")
+
+    if not all(math.isfinite(v) for v in (px, vw, close, slope, flow)) or px <= 0 or vw <= 0:
+        reasons.append("invalid price/VWAP/slope/Change-OI input")
+        price_aligned = slope_aligned = flow_aligned = False
+    else:
+        # Let a latest completed close sit just inside the VWAP by a small,
+        # volatility-scaled noise buffer; live spot must still confirm direction.
+        vwap_noise_buffer = max(0.10 * atr_value, abs(px) * 0.00005, 1.0)
+        if side == "BULLISH":
+            price_aligned = px > vw and close >= vw - vwap_noise_buffer
+            slope_aligned = slope > 0.0
+            flow_aligned = flow >= STRUCTURE_CHANGE_OI_CONFIRM
+        elif side == "BEARISH":
+            price_aligned = px < vw and close <= vw + vwap_noise_buffer
+            slope_aligned = slope < 0.0
+            flow_aligned = flow <= -STRUCTURE_CHANGE_OI_CONFIRM
+        else:
+            price_aligned = slope_aligned = flow_aligned = False
+        if not price_aligned:
+            reasons.append(f"price/VWAP alignment failed (spot={px:.2f}, VWAP={vw:.2f}, close={close:.2f})")
+        if not slope_aligned:
+            reasons.append(f"VWAP slope conflicts with {side or 'NEUTRAL'} direction (slope={slope:+.4f})")
+        if not flow_aligned:
+            reasons.append(f"Change-OI does not confirm {side or 'NEUTRAL'} direction (flow={flow:+.3f})")
+
+    opposing_divergence = bool(
+        side in {"BULLISH", "BEARISH"}
+        and div in {"BULLISH", "BEARISH"}
+        and div != side
+        and near_structural_level
+    )
+    if opposing_divergence:
+        reasons.append(f"confirmed opposing {div} RSI divergence near structural level")
+
+    eligible = bool(
+        phase_aligned and price_aligned and slope_aligned and flow_aligned
+        and not opposing_divergence
+    )
+    if eligible:
+        return True, (
+            f"aligned continuous {side} PA/OI structure: spot/last close aligned with VWAP buffer, "
+            f"VWAP slope aligned, Change-OI={flow:+.3f}; ADX treated as strength only"
+        )
+    return False, "; ".join(reasons) if reasons else "structural alignment not established"
+
+
 def classify_market_regime(
     price_session: pd.DataFrame,
     current_spot: float,
@@ -2136,6 +2220,11 @@ def classify_market_regime(
     support: float,
     resistance: float,
     indicator_history: Optional[pd.DataFrame] = None,
+    *,
+    structure_phase: str = "",
+    structure_change_oi: float = 0.0,
+    structure_vwap_slope: float = float("nan"),
+    structure_entry_confirmed: bool = False,
 ) -> dict[str, Any]:
     """Classify market regime using live-session structure and history-seeded ADX/RSI.
 
@@ -2149,17 +2238,37 @@ def classify_market_regime(
         "rsi_3m": float("nan"), "rsi_15m": float("nan"), "upper_vwap_band": float("nan"),
         "lower_vwap_band": float("nan"), "volume_confirmed": False, "divergence": "NONE",
         "near_structural_level": False, "reversal_price_confirmed": False,
-        "indicator_history_bars": 0, "indicator_3m_bars": 0, "indicator_15m_bars": 0,
+        "indicator_history_bars": int(len(indicator_history)) if isinstance(indicator_history, pd.DataFrame) else 0,
+        "indicator_3m_bars": 0, "indicator_15m_bars": 0,
+        "structural_direction_override": False,
+        "structural_direction_override_applied": False,
+        "structural_direction_override_reason": "Not evaluated: insufficient completed current-session candles.",
+        "session_completed_bars": 0,
+        "adx_role": "TREND_STRENGTH_ONLY",
         "reason": "Insufficient completed current-session candles.",
     }
+    result["session_completed_bars"] = int(len(work))
     if work.empty or len(work) < OPENING_MIN_COMPLETED_BARS or not math.isfinite(current_vwap) or current_spot <= 0:
+        available_history = result["indicator_history_bars"]
+        result["indicator_3m_bars"] = available_history + len(work)
+        result["reason"] = (
+            f"Insufficient completed current-session candles ({len(work)}/{OPENING_MIN_COMPLETED_BARS}); "
+            f"prior-session indicator seed bars available={available_history}."
+        )
         return result
 
     work = (work.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True))
     for column in ("high", "low", "close", "volume"):
         work[column] = pd.to_numeric(work[column], errors="coerce")
     work = work.dropna(subset=["timestamp", "high", "low", "close"]).reset_index(drop=True)
+    result["session_completed_bars"] = int(len(work))
     if len(work) < OPENING_MIN_COMPLETED_BARS:
+        result["indicator_3m_bars"] = result["indicator_history_bars"] + len(work)
+        result["reason"] = (
+            f"Insufficient valid completed current-session candles after OHLC validation "
+            f"({len(work)}/{OPENING_MIN_COMPLETED_BARS}); "
+            f"prior-session indicator seed bars available={result['indicator_history_bars']}."
+        )
         return result
     today = pd.to_datetime(work["timestamp"], utc=True).dt.tz_convert(IST).dt.date.iloc[-1]
 
@@ -2266,6 +2375,36 @@ def classify_market_regime(
         )
     )
 
+    # ADX is strength only. The confirmed PA/OI state machine is the direction
+    # authority; the strict recent HH/HL (or LH/LL) check is supplementary, not a
+    # second independent direction veto when the structure engine is already
+    # continuous and confirmed. This alignment decision is shared and testable.
+    phase_upper = str(structure_phase or "").upper()
+    flow_value = safe_float(structure_change_oi, 0.0)
+    last_completed_close = safe_float(work["close"].iloc[-1], float("nan")) if not work.empty else float("nan")
+    opposing_confirmed_divergence = bool(
+        divergence in {"BULLISH", "BEARISH"} and near_level and divergence != proposed
+    )
+    structural_direction_override, structural_override_reason = structural_direction_override_decision(
+        direction=proposed,
+        structure_phase=phase_upper,
+        entry_confirmed=structure_entry_confirmed,
+        spot=current_spot,
+        vwap=current_vwap,
+        last_completed_close=last_completed_close,
+        atr=atr,
+        vwap_slope=structure_vwap_slope,
+        change_oi=flow_value,
+        divergence=divergence,
+        near_structural_level=near_level,
+    )
+    # Keep the direction consistent across the regime matrix and strike router.
+    # This does not skip downstream persistence, wall, R/R, liquidity, premium,
+    # COI scoring or execution-score vetoes.
+    if structural_direction_override:
+        direction = proposed
+        direction_gate_reason = structural_override_reason
+
     if not math.isfinite(adx):
         # Robust opening fallback: prior-session indicator API outages must not
         # hide live market structure. The fallback is directional only when the
@@ -2300,18 +2439,36 @@ def classify_market_regime(
                 f"swing structure and {len(momentum_window)}-bar movement agree; "
                 f"net_move={net_move:+.2f}, required={required_move:.2f}, vwap_slope={vwap_slope_open:+.3f}."
             )
+        elif structural_direction_override:
+            direction = proposed
+            intensity = "NORMAL"
+            reason = (
+                f"CONFIRMED_STRUCTURAL_CONTINUATION_OVERRIDE: ADX unavailable; {structural_override_reason}."
+            )
         else:
             intensity = "UNKNOWN"
             reason = (
                 f"ADX unavailable after {len(indicator_work)} seeded completed 3m bars "
                 f"(history={len(history)}, current_session={len(work)}); opening fallback did not pass "
-                f"VWAP/swing/momentum alignment (proposed={proposed}, PA={pa_direction}, net_move={net_move:+.2f})."
+                f"VWAP/swing/momentum alignment (proposed={proposed}, PA={pa_direction}, net_move={net_move:+.2f}); "
+                f"continuous-structure override={structural_direction_override}."
             )
             direction = "NEUTRAL"
     elif adx < ADX_SIDEWAYS_THRESHOLD:
-        intensity = "SIDEWAYS"
-        reason = f"ADX {adx:.1f} below {ADX_SIDEWAYS_THRESHOLD:.1f}."
-        direction = "NEUTRAL"
+        if structural_direction_override:
+            direction = proposed
+            intensity = "NORMAL"
+            reason = (
+                f"LOW_ADX_STRUCTURAL_CONTINUATION_OVERRIDE: ADX {adx:.1f} below "
+                f"{ADX_SIDEWAYS_THRESHOLD:.1f}; {structural_override_reason}. "
+                "ADX does not override confirmed directional structure."
+            )
+        else:
+            intensity = "SIDEWAYS"
+            reason = f"ADX {adx:.1f} below {ADX_SIDEWAYS_THRESHOLD:.1f}; continuous-structure override conditions not met."
+            if opposing_confirmed_divergence:
+                reason += f" Opposing {divergence} RSI divergence is confirmed near a structural level."
+            direction = "NEUTRAL"
     elif divergence != "NONE" and near_level:
         intensity = "EXHAUSTION"
         direction = divergence
@@ -2326,7 +2483,13 @@ def classify_market_regime(
         reason = f"ADX {adx:.1f} > {ADX_STRONG_THRESHOLD:.1f}, price at outer VWAP band and volume confirmed."
     else:
         intensity = "NORMAL"
-        if direction in {"BULLISH", "BEARISH"}:
+        if structural_direction_override:
+            direction = proposed
+            reason = (
+                f"CONFIRMED_STRUCTURAL_CONTINUATION: {structural_override_reason}; "
+                f"ADX={adx:.1f} is used for intensity only."
+            )
+        elif direction in {"BULLISH", "BEARISH"}:
             reason = f"Directional structure with ADX {adx:.1f}; strong-breakout confirmation absent."
         else:
             reason = (
@@ -2342,6 +2505,11 @@ def classify_market_regime(
         "reversal_price_confirmed": bool(reversal_price_confirmed),
         "indicator_history_bars": int(len(history)), "indicator_3m_bars": int(len(indicator_work)),
         "indicator_15m_bars": int(len(fifteen_all)),
+        "structural_direction_override": structural_direction_override,
+        "structural_direction_override_applied": bool(structural_direction_override and direction == proposed),
+        "structural_direction_override_reason": structural_override_reason,
+        "session_completed_bars": int(len(work)),
+        "adx_role": "TREND_STRENGTH_ONLY",
         "reason": reason,
     }
 
@@ -3327,6 +3495,33 @@ def is_confirmed_local_rejection(event: Optional[dict[str, Any]]) -> bool:
 def is_confirmed_local_directional_event(event: Optional[dict[str, Any]]) -> bool:
     """True for a fully confirmed local break or wall rejection/bounce event."""
     return is_confirmed_local_break(event) or is_confirmed_local_rejection(event)
+
+
+def cold_start_entry_gate_passed(
+    *,
+    current_time: time,
+    volume_confirmed: bool,
+    directional_break: bool,
+    opening_tape_aligned: bool,
+    local_event_entry: bool,
+    confirmed_local_event_override: bool,
+) -> bool:
+    """Apply the opening-session gate without discarding confirmed structure events.
+
+    A confirmed completed-bar OI breakout/breakdown or wall bounce/rejection is an
+    independent opening trigger. It still must pass downstream wall clearance,
+    structural T1/SL, reward-to-risk, persistence where applicable, and option-quality
+    checks; this helper only avoids rejecting it for unrelated cold-start proxies.
+    """
+    if current_time >= COI_COLD_START_END:
+        return True
+    confirmed_event_trigger = bool(local_event_entry and confirmed_local_event_override)
+    return bool(
+        volume_confirmed
+        or directional_break
+        or opening_tape_aligned
+        or confirmed_event_trigger
+    )
 
 
 def structural_reward_risk_ratio(
@@ -6485,6 +6680,33 @@ def update_continuation_persistence(
     return ready, count
 
 
+
+def observe_confirmed_structure_persistence(
+    state: dict[str, Any],
+    structure: StructureResult,
+    latest_completed_3m_bar: Optional[Any],
+) -> tuple[bool, int]:
+    """Record distinct confirmed structure bars before regime/entry vetoes.
+
+    A low-ADX or early-stage regime veto must not erase the fact that the primary
+    structural engine has seen a continuous confirmed phase for multiple completed
+    candles. This observation never authorizes entry by itself; the caller still
+    applies regime, time, risk, wall, persistence-threshold, and option-quality gates.
+    """
+    direction = str(getattr(structure, "direction", "") or "").upper()
+    phase = str(getattr(structure, "market_phase", "") or "").upper()
+    expected = f"CONTINUOUS_{direction}" if direction in {"BULLISH", "BEARISH"} else ""
+    valid = bool(
+        getattr(structure, "entry_confirmed", False)
+        and expected
+        and phase == expected
+    )
+    observed_phase = phase if valid else ""
+    return update_continuation_persistence(
+        state, observed_phase, latest_completed_3m_bar,
+    )
+
+
 def _set_t1_activation_from_intrabar_reason(
     trade: dict[str, Any],
     reason: str,
@@ -6849,6 +7071,10 @@ def evaluate_market_structure(
         index_session, spot, structure.vwap, structure.direction,
         structure.support_1, structure.resistance_1,
         indicator_history=regime_indicator_history,
+        structure_phase=structure.market_phase,
+        structure_change_oi=safe_float(structure.components.get("structure_change_oi"), 0.0),
+        structure_vwap_slope=structure.vwap_slope,
+        structure_entry_confirmed=structure.entry_confirmed,
     )
     current_oi_structure = chain_levels.get("oi_structure_by_strike", {})
     decision_step = strike_step(sorted(chain_rows(option_chain_atm_window(chain, spot)[0])))
@@ -7205,13 +7431,14 @@ def execute_scan(
     tod_window = time_of_day_window(now_ist())
     logger.info(
         "REGIME MATRIX: direction=%s intensity=%s ADX=%s RSI3m=%s RSI15m=%s TOD=%s expiry_day=%s "
-        "volume_confirmed=%s divergence=%s reason=%s",
+        "volume_confirmed=%s divergence=%s structural_override=%s reason=%s",
         market_regime.get("direction"), market_regime.get("intensity"),
         f"{safe_float(market_regime.get('adx'), float('nan')):.2f}" if math.isfinite(safe_float(market_regime.get("adx"), float("nan"))) else "NA",
         f"{safe_float(market_regime.get('rsi_3m'), float('nan')):.2f}" if math.isfinite(safe_float(market_regime.get("rsi_3m"), float("nan"))) else "NA",
         f"{safe_float(market_regime.get('rsi_15m'), float('nan')):.2f}" if math.isfinite(safe_float(market_regime.get("rsi_15m"), float("nan"))) else "NA",
         tod_window, is_expiry_day, market_regime.get("volume_confirmed"),
-        market_regime.get("divergence"), market_regime.get("reason"),
+        market_regime.get("divergence"), market_regime.get("structural_direction_override", False),
+        market_regime.get("reason"),
     )
 
     market_memory = MarketMemory.from_state(state)
@@ -7308,6 +7535,26 @@ def execute_scan(
     }).to_mapping()
     state["option_oi_snapshot"] = build_option_oi_snapshot(chain, expiry, now=oi_snapshot_time, spot=spot)
     state["option_flow_by_strike"] = option_flow_by_strike
+
+    # Observe structural persistence before saving the snapshot and before the
+    # SIDEWAYS/UNKNOWN/midday entry vetoes. This means a low-ADX scan still records
+    # confirmed structural bars; it never authorizes entry by itself. Avoid counting
+    # pre-entry opening scans before MIN_ENTRY_TIME.
+    if now_time >= MIN_ENTRY_TIME:
+        latest_persistence_bar = (
+            completed_index_3m["timestamp"].iloc[-1]
+            if not completed_index_3m.empty else None
+        )
+        observed_ready, observed_count = observe_confirmed_structure_persistence(
+            state, structure, latest_persistence_bar,
+        )
+        if str(structure.market_phase).upper() in {"CONTINUOUS_BULLISH", "CONTINUOUS_BEARISH"}:
+            logger.info(
+                "STRUCTURAL PERSISTENCE OBSERVED BEFORE REGIME GATES: phase=%s count=%d default_ready=%s bar=%s",
+                structure.market_phase, observed_count, observed_ready,
+                str(latest_persistence_bar or "UNKNOWN"),
+            )
+
     state["persistent_direction"] = (
         str(local_structure_event.get("direction", "")).upper()
         if local_structure_event.get("confirmed") and (str(market_regime.get("intensity", "UNKNOWN")).upper() != "SIDEWAYS" or confirmed_local_event_override)
@@ -7401,6 +7648,21 @@ def execute_scan(
     regime_direction = str(market_regime.get("direction", "NEUTRAL")).upper()
     adx_value = safe_float(market_regime.get("adx"), float("nan"))
     if intensity in {"SIDEWAYS", "UNKNOWN"}:
+        if (
+            structure.direction in {"BULLISH", "BEARISH"}
+            and structure.market_phase == f"CONTINUOUS_{structure.direction}"
+            and structure.entry_confirmed
+        ):
+            logger.warning(
+                "STRUCTURE/REGIME DISAGREEMENT: structure=%s/%s entry_confirmed=%s; "
+                "regime=%s/%s ADX=%s override_eligible=%s override_reason=%s. "
+                "No entry until directional consistency is established; risk gates remain unchanged.",
+                structure.direction, structure.market_phase, structure.entry_confirmed,
+                regime_direction, intensity,
+                f"{adx_value:.2f}" if math.isfinite(adx_value) else "NA",
+                market_regime.get("structural_direction_override", False),
+                market_regime.get("structural_direction_override_reason", market_regime.get("reason", "")),
+            )
         logger.info("NO TRADE: market intensity=%s; reason=%s", intensity, market_regime.get("reason", ""))
         return None
     if regime_direction not in {"BULLISH", "BEARISH"}:
@@ -7564,13 +7826,30 @@ def execute_scan(
             and ((regime_direction == "BULLISH" and spot > entry_structure.vwap and current_vwap_slope > 0)
                  or (regime_direction == "BEARISH" and spot < entry_structure.vwap and current_vwap_slope < 0))
         )
-        if not (volume_confirmed or directional_break or opening_tape_aligned):
+        confirmed_event_trigger = bool(local_event_entry and confirmed_local_event_override)
+        cold_start_passed = cold_start_entry_gate_passed(
+            current_time=now_time,
+            volume_confirmed=volume_confirmed,
+            directional_break=directional_break,
+            opening_tape_aligned=opening_tape_aligned,
+            local_event_entry=local_event_entry,
+            confirmed_local_event_override=confirmed_local_event_override,
+        )
+        if not cold_start_passed:
             logger.info(
-                "NO TRADE: cold-start requires volume, structural breakout, or aligned opening tape; "
-                "volume_confirmed=%s directional_break=%s tape_aligned=%s COI_weight=%.2f.",
-                volume_confirmed, directional_break, opening_tape_aligned, COI_COLD_START_WEIGHT,
+                "NO TRADE: cold-start requires volume, a confirmed structural event, a structural breakout, "
+                "or aligned opening tape; volume_confirmed=%s confirmed_local_event=%s "
+                "directional_break=%s tape_aligned=%s COI_weight=%.2f.",
+                volume_confirmed, confirmed_event_trigger, directional_break,
+                opening_tape_aligned, COI_COLD_START_WEIGHT,
             )
             return None
+        if confirmed_event_trigger:
+            logger.info(
+                "COLD-START GATE PASSED: confirmed local %s in %s direction; "
+                "structural targets, opposing-wall checks, execution quality and minimum R/R remain mandatory.",
+                str(local_structure_event.get("kind", "STRUCTURAL_EVENT")), regime_direction,
+            )
 
     volatility_unit = max(safe_float(structure.components.get("volatility_unit"), 50.0), 1.0)
     vwap_distance_atr = abs(float(spot) - float(structure.vwap)) / volatility_unit
@@ -7806,15 +8085,93 @@ def dispatch_alerts(state: dict[str, Any], signal: Signal) -> None:
     )
 
 
+def run_self_tests() -> None:
+    """Run deterministic V45 smoke/regression checks without network access."""
+    self_test_flow = max(STRUCTURE_CHANGE_OI_CONFIRM, 0.25) + 0.05
+    scenarios = [
+        ("BULLISH", "CONTINUOUS_BULLISH", 101.0, 100.0, 100.8, 0.8, self_test_flow, True, "NONE", False),
+        ("BEARISH", "CONTINUOUS_BEARISH", 99.0, 100.0, 99.2, -0.8, -self_test_flow, True, "NONE", False),
+    ]
+    for (direction, phase, spot_value, vwap_value, close_value, slope, flow,
+         entry_confirmed, divergence, near_level) in scenarios:
+        ok, why = structural_direction_override_decision(
+            direction=direction, structure_phase=phase, entry_confirmed=entry_confirmed,
+            spot=spot_value, vwap=vwap_value, last_completed_close=close_value,
+            atr=2.0, vwap_slope=slope, change_oi=flow,
+            divergence=divergence, near_structural_level=near_level,
+        )
+        assert ok, f"{direction} aligned structural override failed: {why}"
+
+    ok, why = structural_direction_override_decision(
+        direction="BULLISH", structure_phase="CONTINUOUS_BULLISH", entry_confirmed=True,
+        spot=101.0, vwap=100.0, last_completed_close=100.8, atr=2.0,
+        vwap_slope=-0.2, change_oi=self_test_flow,
+    )
+    assert not ok, f"Opposing VWAP slope was incorrectly accepted: {why}"
+
+    ok, why = structural_direction_override_decision(
+        direction="BULLISH", structure_phase="CONTINUOUS_BULLISH", entry_confirmed=True,
+        spot=101.0, vwap=100.0, last_completed_close=100.8, atr=2.0,
+        vwap_slope=0.2, change_oi=self_test_flow,
+        divergence="BEARISH", near_structural_level=True,
+    )
+    assert not ok, f"Opposing confirmed divergence was incorrectly accepted: {why}"
+
+    bullish_strikes = permitted_strikes_for_regime(
+        22800.0, 50.0, "BULLISH", "NORMAL", now=datetime(2026, 10, 15, 10, 0, tzinfo=IST),
+    )
+    bearish_strikes = permitted_strikes_for_regime(
+        22800.0, 50.0, "BEARISH", "NORMAL", now=datetime(2026, 10, 15, 10, 0, tzinfo=IST),
+    )
+    assert bullish_strikes == [22750.0, 22800.0], bullish_strikes
+    assert bearish_strikes == [22800.0, 22850.0], bearish_strikes
+    assert not permitted_strikes_for_regime(
+        22800.0, 50.0, "BULLISH", "SIDEWAYS", now=datetime(2026, 10, 15, 10, 0, tzinfo=IST),
+    )
+
+    assert cold_start_entry_gate_passed(
+        current_time=time(9, 30), volume_confirmed=False, directional_break=False,
+        opening_tape_aligned=False, local_event_entry=True,
+        confirmed_local_event_override=True,
+    )
+    assert not cold_start_entry_gate_passed(
+        current_time=time(9, 30), volume_confirmed=False, directional_break=False,
+        opening_tape_aligned=False, local_event_entry=False,
+        confirmed_local_event_override=False,
+    )
+
+    rr, reward, risk = structural_reward_risk_ratio("BULLISH", 100.0, 103.0, 98.0)
+    assert abs(rr - 1.5) < 1e-9 and reward == 3.0 and risk == 2.0, (rr, reward, risk)
+
+    persistence_state: dict[str, Any] = {}
+    first_ready, first_count = update_continuation_persistence(
+        persistence_state, "CONTINUOUS_BULLISH", "2026-10-15T04:24:00Z", required_confirmations=2,
+    )
+    same_ready, same_count = update_continuation_persistence(
+        persistence_state, "CONTINUOUS_BULLISH", "2026-10-15T04:24:00Z", required_confirmations=2,
+    )
+    second_ready, second_count = update_continuation_persistence(
+        persistence_state, "CONTINUOUS_BULLISH", "2026-10-15T04:27:00Z", required_confirmations=2,
+    )
+    assert (first_ready, first_count) == (False, 1)
+    assert (same_ready, same_count) == (False, 1), (same_ready, same_count)
+    assert (second_ready, second_count) == (True, 2), (second_ready, second_count)
+
+    print("V45 SELF-TEST PASSED.")
+
+
 def main() -> int:
     logger.info("NIFTY SCANNER VERSION: %s", SCANNER_VERSION)
     logger.info("RUNNING SOURCE FILE: %s", Path(__file__).resolve())
     logger.info("STATE STORE: %s (exists=%s)", STATE_FILE, STATE_FILE.exists())
 
     if "--self-test" in sys.argv:
-        from test_market_scanner_v43 import run_self_tests
-        run_self_tests()
-        return 0
+        try:
+            run_self_tests()
+            return 0
+        except Exception:
+            logger.error("V45 self-test failed:\n%s", traceback.format_exc())
+            return 1
 
     try:
         state = load_state()
