@@ -169,6 +169,10 @@ FUTURES_HISTORY_CACHE_BARS = 60
 ADX_SIDEWAYS_THRESHOLD = float(os.getenv("ADX_SIDEWAYS_THRESHOLD", "20"))
 ADX_STRONG_THRESHOLD = float(os.getenv("ADX_STRONG_THRESHOLD", "25"))
 MIDDAY_MIN_ADX = float(os.getenv("MIDDAY_MIN_ADX", "23"))
+# Retained as a backward-compatible environment setting for older deployments.
+# It is intentionally not used as an extra hard veto for a PA/OI-confirmed
+# continuous trend; structural confirmation is authoritative and direction flips
+# use a separate, explicit two-bar confirmation policy below.
 MIDDAY_MIN_PERSISTENCE = int(os.getenv("MIDDAY_MIN_PERSISTENCE", "3"))
 STRONG_VOLUME_MULTIPLIER = float(os.getenv("STRONG_VOLUME_MULTIPLIER", "1.20"))
 OPTION_OI_MIN_AGE_MINUTES = int(os.getenv("OPTION_OI_MIN_AGE_MINUTES", "15"))
@@ -6688,10 +6692,12 @@ def observe_confirmed_structure_persistence(
 ) -> tuple[bool, int]:
     """Record distinct confirmed structure bars before regime/entry vetoes.
 
-    A low-ADX or early-stage regime veto must not erase the fact that the primary
-    structural engine has seen a continuous confirmed phase for multiple completed
-    candles. This observation never authorizes entry by itself; the caller still
-    applies regime, time, risk, wall, persistence-threshold, and option-quality gates.
+    This is observational bookkeeping, not a second entry gate. The primary
+    structure engine has already required aligned price action, VWAP, and material
+    option Change-OI before setting ``entry_confirmed``. Count the current confirmed
+    bar as observed immediately; the entry policy separately asks for an additional
+    completed bar only when the setup is a genuine direction change or exhaustion
+    reversal. Re-running the scan on the same candle never increments the count.
     """
     direction = str(getattr(structure, "direction", "") or "").upper()
     phase = str(getattr(structure, "market_phase", "") or "").upper()
@@ -6703,7 +6709,55 @@ def observe_confirmed_structure_persistence(
     )
     observed_phase = phase if valid else ""
     return update_continuation_persistence(
-        state, observed_phase, latest_completed_3m_bar,
+        state, observed_phase, latest_completed_3m_bar, required_confirmations=1,
+    )
+
+
+def entry_persistence_policy(
+    *,
+    direction: str,
+    market_phase: str,
+    entry_confirmed: bool,
+    previous_direction: Optional[str],
+    local_event_entry: bool = False,
+    exhaustion_entry: bool = False,
+    opening_fast_track: bool = False,
+) -> tuple[int, str]:
+    """Return the entry-bar requirement without double-gating confirmed structure.
+
+    A continuous PA/OI-confirmed trend in the same or an unknown prior direction
+    needs no extra persistence delay: ``entry_confirmed`` already represents the
+    structural engine's multi-factor confirmation. A non-event switch against the
+    last known directional state and a counter-trend exhaustion scalp still require
+    two distinct completed bars to reduce CE/PE flip-flopping. Confirmed local OI
+    breaks/rejections may act immediately because their own completed-bar, flow,
+    wall, target/stop, and reward/risk gates are stricter and explicit.
+    """
+    side = str(direction or "").strip().upper()
+    phase = str(market_phase or "").strip().upper()
+    prior = str(previous_direction or "").strip().upper()
+
+    if local_event_entry:
+        return 1, "confirmed local OI event; event-specific structure and risk gates remain mandatory"
+    if exhaustion_entry:
+        return max(2, CONTINUATION_CONFIRMATIONS_REQUIRED), "counter-trend exhaustion requires two distinct completed bars"
+
+    continuous_confirmed = bool(
+        side in {"BULLISH", "BEARISH"}
+        and phase == f"CONTINUOUS_{side}"
+        and entry_confirmed
+    )
+    if continuous_confirmed:
+        if prior in {"BULLISH", "BEARISH"} and prior != side:
+            return max(2, CONTINUATION_CONFIRMATIONS_REQUIRED), (
+                f"confirmed structural direction changed from {prior} to {side}; require two distinct completed bars"
+            )
+        return 1, "PA/OI engine already confirmed continuous structure; no duplicate persistence delay"
+
+    if opening_fast_track:
+        return 1, "confirmed aligned opening structure with strong Change-OI"
+    return max(2, CONTINUATION_CONFIRMATIONS_REQUIRED), (
+        "fallback persistence policy; structure is not eligible for the continuous-trend fast path"
     )
 
 
@@ -7550,7 +7604,8 @@ def execute_scan(
         )
         if str(structure.market_phase).upper() in {"CONTINUOUS_BULLISH", "CONTINUOUS_BEARISH"}:
             logger.info(
-                "STRUCTURAL PERSISTENCE OBSERVED BEFORE REGIME GATES: phase=%s count=%d default_ready=%s bar=%s",
+                "STRUCTURAL BAR OBSERVED BEFORE REGIME GATES: phase=%s distinct_bars=%d "
+                "observed=%s entry_requirement_is_evaluated_separately bar=%s",
                 structure.market_phase, observed_count, observed_ready,
                 str(latest_persistence_bar or "UNKNOWN"),
             )
@@ -7866,11 +7921,14 @@ def execute_scan(
         and entry_structure.entry_confirmed
         and abs(safe_float(entry_structure.components.get("structure_change_oi"), 0.0)) >= STRUCTURE_CHANGE_OI_STRONG
     )
-    required_persistence = (
-        1 if local_event_entry or opening_fast_track
-        else MIDDAY_MIN_PERSISTENCE if tod_window == "MIDDAY"
-        else max(2, CONTINUATION_CONFIRMATIONS_REQUIRED) if exhaustion_entry
-        else CONTINUATION_CONFIRMATIONS_REQUIRED
+    required_persistence, persistence_policy_reason = entry_persistence_policy(
+        direction=entry_structure.direction,
+        market_phase=persistence_phase,
+        entry_confirmed=entry_structure.entry_confirmed,
+        previous_direction=previous_direction,
+        local_event_entry=local_event_entry,
+        exhaustion_entry=exhaustion_entry,
+        opening_fast_track=opening_fast_track,
     )
     persistence_ok, persistence_count = update_continuation_persistence(
         state,
@@ -7879,22 +7937,24 @@ def execute_scan(
         required_confirmations=required_persistence,
     )
     logger.info(
-        "STRUCTURAL ENTRY CHECK: phase=%s persistence=%d/%d support=%.2f resistance=%.2f "
-        "ChangeOI=%+.3f VWAP=%.2f; regime=%s/%s.",
+        "STRUCTURAL ENTRY CHECK: phase=%s persistence=%d/%d policy=%s support=%.2f resistance=%.2f "
+        "ChangeOI=%+.3f VWAP=%.2f; regime=%s/%s prior_direction=%s.",
         persistence_phase,
         persistence_count,
         required_persistence,
+        persistence_policy_reason,
         entry_structure.support_1,
         entry_structure.resistance_1,
         flow_value,
         entry_structure.vwap,
         regime_direction,
         intensity,
+        previous_direction or "NONE",
     )
     if not persistence_ok:
         logger.info(
-            "No entry: structural persistence requires %d distinct completed-bar confirmation(s); got %d.",
-            max(required_persistence, 1), persistence_count,
+            "No entry: %s; requires %d distinct completed-bar confirmation(s), got %d.",
+            persistence_policy_reason, max(required_persistence, 1), persistence_count,
         )
         save_state(state)
         return None
@@ -8156,6 +8216,29 @@ def run_self_tests() -> None:
     assert (first_ready, first_count) == (False, 1)
     assert (same_ready, same_count) == (False, 1), (same_ready, same_count)
     assert (second_ready, second_count) == (True, 2), (second_ready, second_count)
+
+    # PA/OI-confirmed continuation must not be delayed by a duplicate midday gate.
+    assert entry_persistence_policy(
+        direction="BULLISH", market_phase="CONTINUOUS_BULLISH", entry_confirmed=True,
+        previous_direction="BULLISH",
+    )[0] == 1
+    assert entry_persistence_policy(
+        direction="BULLISH", market_phase="CONTINUOUS_BULLISH", entry_confirmed=True,
+        previous_direction=None,
+    )[0] == 1
+    # A non-event direction flip and counter-trend exhaustion still use two distinct bars.
+    assert entry_persistence_policy(
+        direction="BEARISH", market_phase="CONTINUOUS_BEARISH", entry_confirmed=True,
+        previous_direction="BULLISH",
+    )[0] >= 2
+    assert entry_persistence_policy(
+        direction="BULLISH", market_phase="EXHAUSTION_BULLISH", entry_confirmed=True,
+        previous_direction="BEARISH", exhaustion_entry=True,
+    )[0] >= 2
+    assert entry_persistence_policy(
+        direction="BEARISH", market_phase="CONTINUOUS_BEARISH", entry_confirmed=True,
+        previous_direction="BULLISH", local_event_entry=True,
+    )[0] == 1
 
     print("V45 SELF-TEST PASSED.")
 
