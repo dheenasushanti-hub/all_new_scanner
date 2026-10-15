@@ -43,8 +43,8 @@ What this version fixes:
   older v2 intraday candle API is deprecated.
 
 Run:
-    python market_scanner_v46_structural_entry_risk_guard.py --self-test
-    python market_scanner_v46_structural_entry_risk_guard.py
+    python market_scanner_v47_structural_entry_risk_guard.py --self-test
+    python market_scanner_v47_structural_entry_risk_guard.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -148,7 +148,7 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-15-STRUCTURE-V46-PA-OI-MOMENTUM-DYNAMIC-TARGET-RR-STATE-PRESERVATION-ATM4"
+SCANNER_VERSION = "2026-10-15-STRUCTURE-V47-OI-UNWINDING-DIRECTION-ATM4"
 # V46 updates target selection, so newly created trades must carry this engine ID.
 # V30 trades already use underlying PA/OI levels and must keep their existing levels
 # while active; migrate_active_trade_to_v25 treats them as compatible legacy structural trades.
@@ -183,6 +183,10 @@ OPTION_OI_HISTORY_KEEP_MINUTES = int(os.getenv("OPTION_OI_HISTORY_KEEP_MINUTES",
 COI_COLD_START_END = time(9, 45)
 COI_COLD_START_WEIGHT = float(os.getenv("COI_COLD_START_WEIGHT", "0.35"))
 COI_STRONG_CHANGE_PCT = float(os.getenv("COI_STRONG_CHANGE_PCT", "0.01"))
+# V47: directional movement is primarily driven by relative call/put OI unwinding.
+# The pct is measured against current ATM-window OI, with cold-start scores down-weighted.
+OI_UNWINDING_MIN_CHANGE_PCT = max(0.0001, float(os.getenv("OI_UNWINDING_MIN_CHANGE_PCT", "0.0015")))
+OI_UNWINDING_DOMINANCE_RATIO = max(1.0, float(os.getenv("OI_UNWINDING_DOMINANCE_RATIO", "1.20")))
 COI_PUSH_MAX_POINTS = float(os.getenv("COI_PUSH_MAX_POINTS", "1.0"))
 COI_FLOOR_MAX_POINTS = float(os.getenv("COI_FLOOR_MAX_POINTS", "1.0"))
 COI_ROLL_MAX_POINTS = float(os.getenv("COI_ROLL_MAX_POINTS", "1.5"))
@@ -2199,29 +2203,30 @@ def structural_direction_override_decision(
     if not phase_aligned:
         reasons.append("continuous phase/entry confirmation not aligned")
 
-    if not all(math.isfinite(v) for v in (px, vw, close, slope, flow)) or px <= 0 or vw <= 0:
-        reasons.append("invalid price/VWAP/slope/Change-OI input")
-        price_aligned = slope_aligned = flow_aligned = False
+    if not all(math.isfinite(v) for v in (px, vw, close, flow)) or px <= 0 or vw <= 0:
+        reasons.append("invalid price/VWAP/Change-OI input")
+        price_aligned = flow_aligned = False
+        slope_aligned = False
     else:
-        # Let a latest completed close sit just inside the VWAP by a small,
-        # volatility-scaled noise buffer; live spot must still confirm direction.
+        # V47 direction uses side-specific OI unwinding and simple underlying/VWAP
+        # alignment. VWAP slope and RSI divergence are diagnostics, not independent
+        # vetoes of an otherwise confirmed OI-led continuous direction.
         vwap_noise_buffer = max(0.10 * atr_value, abs(px) * 0.00005, 1.0)
         if side == "BULLISH":
             price_aligned = px > vw and close >= vw - vwap_noise_buffer
-            slope_aligned = slope > 0.0
             flow_aligned = flow >= STRUCTURE_CHANGE_OI_CONFIRM
         elif side == "BEARISH":
             price_aligned = px < vw and close <= vw + vwap_noise_buffer
-            slope_aligned = slope < 0.0
             flow_aligned = flow <= -STRUCTURE_CHANGE_OI_CONFIRM
         else:
-            price_aligned = slope_aligned = flow_aligned = False
+            price_aligned = flow_aligned = False
+        slope_aligned = (slope > 0.0) if side == "BULLISH" else (slope < 0.0) if side == "BEARISH" else False
         if not price_aligned:
             reasons.append(f"price/VWAP alignment failed (spot={px:.2f}, VWAP={vw:.2f}, close={close:.2f})")
-        if not slope_aligned:
-            reasons.append(f"VWAP slope conflicts with {side or 'NEUTRAL'} direction (slope={slope:+.4f})")
+        if not slope_aligned and math.isfinite(slope):
+            reasons.append(f"VWAP slope is counter-directional context only (slope={slope:+.4f})")
         if not flow_aligned:
-            reasons.append(f"Change-OI does not confirm {side or 'NEUTRAL'} direction (flow={flow:+.3f})")
+            reasons.append(f"side-specific OI-unwinding direction does not confirm {side or 'NEUTRAL'} (flow={flow:+.3f})")
 
     opposing_divergence = bool(
         side in {"BULLISH", "BEARISH"}
@@ -2230,16 +2235,13 @@ def structural_direction_override_decision(
         and near_structural_level
     )
     if opposing_divergence:
-        reasons.append(f"confirmed opposing {div} RSI divergence near structural level")
+        reasons.append(f"confirmed opposing {div} RSI divergence logged as context; not a primary OI-direction veto")
 
-    eligible = bool(
-        phase_aligned and price_aligned and slope_aligned and flow_aligned
-        and not opposing_divergence
-    )
+    eligible = bool(phase_aligned and price_aligned and flow_aligned)
     if eligible:
         return True, (
-            f"aligned continuous {side} PA/OI structure: spot/last close aligned with VWAP buffer, "
-            f"VWAP slope aligned, Change-OI={flow:+.3f}; ADX treated as strength only"
+            f"OI-led continuous {side} direction: side-specific OI unwinding and NIFTY/VWAP alignment confirmed; "
+            f"VWAP slope/RSI divergence are context; ADX is strength only"
         )
     return False, "; ".join(reasons) if reasons else "structural alignment not established"
 
@@ -2507,7 +2509,7 @@ def classify_market_regime(
             if opposing_confirmed_divergence:
                 reason += f" Opposing {divergence} RSI divergence is confirmed near a structural level."
             direction = "NEUTRAL"
-    elif divergence != "NONE" and near_level:
+    elif divergence != "NONE" and near_level and not structural_direction_override:
         intensity = "EXHAUSTION"
         direction = divergence
         reason = (
@@ -4052,6 +4054,8 @@ def chain_oi_support_resistance(
         "predictive_bias": int(oi_bias), "predictive_strength": float(abs(pressure_score)),
         "level_bias": 0, "pcr": float(pcr) if math.isfinite(pcr) else float("nan"),
         "pcr_bias": int(pcr_bias), "flow_mode": flow_mode,
+        "window_call_oi_total": float(total_call_oi),
+        "window_put_oi_total": float(total_put_oi),
         "change_flow_score": float(pressure_score), "change_flow_bias": int(oi_bias),
         "option_flow_by_strike": flow_map,
         "oi_structure_by_strike": oi_structure_by_strike,
@@ -4511,6 +4515,79 @@ def price_action_regime_snapshot(
 # MARKET STRUCTURE ENGINE
 # =============================================================================
 
+def classify_oi_unwinding_direction(
+    *,
+    call_change_sum: Any,
+    put_change_sum: Any,
+    call_oi_total: Any,
+    put_oi_total: Any,
+    weight: Any = 1.0,
+    min_change_pct: float = OI_UNWINDING_MIN_CHANGE_PCT,
+    dominance_ratio: float = OI_UNWINDING_DOMINANCE_RATIO,
+) -> dict[str, Any]:
+    """Classify direction from actual call/put OI reductions in the ATM window.
+
+    CALL OI reduction is a bullish cue when it is materially large relative to
+    current call OI. PUT OI reduction is a bearish cue because put-side support is
+    being unwound. Put OI does not define resistance: resistance remains a call-OI
+    concentration above spot, while support remains a put-OI concentration below.
+
+    If both sides unwind materially, only the clearly larger normalized reduction
+    wins; near-equal reductions are intentionally neutral rather than guessed.
+    """
+    call_change = safe_float(call_change_sum, float("nan"))
+    put_change = safe_float(put_change_sum, float("nan"))
+    call_total = safe_float(call_oi_total, float("nan"))
+    put_total = safe_float(put_oi_total, float("nan"))
+    sample_weight = safe_float(weight, 1.0)
+    sample_weight = min(1.0, max(0.0, sample_weight))
+    threshold = max(0.0001, safe_float(min_change_pct, OI_UNWINDING_MIN_CHANGE_PCT))
+    dominance = max(1.0, safe_float(dominance_ratio, OI_UNWINDING_DOMINANCE_RATIO))
+
+    valid = all(math.isfinite(value) for value in (call_change, put_change, call_total, put_total)) and call_total > 0 and put_total > 0 and sample_weight > 0
+    if not valid:
+        return {
+            "direction": "NEUTRAL", "valid": False,
+            "call_change_pct": float("nan"), "put_change_pct": float("nan"),
+            "effective_call_change_pct": float("nan"), "effective_put_change_pct": float("nan"),
+            "call_unwinding": False, "put_unwinding": False,
+            "reason": "OI_UNWINDING_DATA_UNAVAILABLE_OR_INVALID",
+        }
+
+    call_pct = call_change / call_total
+    put_pct = put_change / put_total
+    effective_call_pct = call_pct * sample_weight
+    effective_put_pct = put_pct * sample_weight
+    call_unwinding = effective_call_pct <= -threshold
+    put_unwinding = effective_put_pct <= -threshold
+
+    if call_unwinding and not put_unwinding:
+        direction, reason = "BULLISH", "CALL_OI_UNWINDING"
+    elif put_unwinding and not call_unwinding:
+        direction, reason = "BEARISH", "PUT_OI_UNWINDING_SUPPORT_WEAKENING"
+    elif call_unwinding and put_unwinding:
+        call_magnitude = abs(effective_call_pct)
+        put_magnitude = abs(effective_put_pct)
+        if call_magnitude >= put_magnitude * dominance:
+            direction, reason = "BULLISH", "BOTH_SIDES_UNWIND_CALL_REDUCTION_DOMINANT"
+        elif put_magnitude >= call_magnitude * dominance:
+            direction, reason = "BEARISH", "BOTH_SIDES_UNWIND_PUT_REDUCTION_DOMINANT"
+        else:
+            direction, reason = "NEUTRAL", "BOTH_SIDES_UNWIND_WITHOUT_CLEAR_DOMINANCE"
+    else:
+        direction, reason = "NEUTRAL", "NO_MATERIAL_CALL_OR_PUT_OI_UNWINDING"
+
+    return {
+        "direction": direction, "valid": True,
+        "call_change_pct": float(call_pct), "put_change_pct": float(put_pct),
+        "effective_call_change_pct": float(effective_call_pct),
+        "effective_put_change_pct": float(effective_put_pct),
+        "call_unwinding": bool(call_unwinding), "put_unwinding": bool(put_unwinding),
+        "weight": float(sample_weight), "threshold_pct": float(threshold),
+        "dominance_ratio": float(dominance), "reason": reason,
+    }
+
+
 def resolve_change_oi_flow(
     intraday_score: float,
     day_score: float,
@@ -4578,14 +4655,15 @@ def build_market_structure(
 ) -> StructureResult:
     """Authoritative NIFTY market-structure state machine.
 
-    Direction is decided by exactly three primary conditions:
-      1. NIFTY price vs VWAP;
-      2. sustained NIFTY price action (session + recent structure);
-      3. directional Change-OI confirmation.
+    V47's primary direction rule is deliberately simple:
+      - Material CALL OI reduction + NIFTY above VWAP + valid call-OI resistance -> bullish.
+      - Material PUT OI reduction + NIFTY below VWAP + valid put-OI support -> bearish.
+      - If neither side is clearly unwinding, no continuous directional entry is inferred.
 
-    OI support/resistance defines structural levels. A break strengthens the
-    setup but is not required for an already-continuous trend. Futures price/OI
-    and PCR remain descriptive context only.
+    Resistance remains a call-OI concentration above spot; support remains a
+    put-OI concentration below spot. ADX, futures price/OI, RSI, and complex swing
+    scores are context, while the existing target/stop, RR, and option-quality gates
+    continue to protect the eventual candidate selection.
     """
     primary_session = price_session if price_session is not None and not price_session.empty else futures_session
     futures_info = futures_oi_structure(futures_3m, futures_live_quote)
@@ -4710,16 +4788,28 @@ def build_market_structure(
 
     flow_mode = str(chain_levels.get("flow_mode", "DAY_CHANGE_API_WARMUP")).upper()
     raw_intraday_flow = safe_float(chain_levels.get("change_flow_score"), safe_float(change_oi_score))
-    effective_flow, effective_bias, effective_source, flow_conflict = resolve_change_oi_flow(
-        intraday_score=raw_intraday_flow,
-        day_score=change_oi_score,
-        flow_mode=flow_mode,
-    )
-    # Directional option entries require material, not merely marginal, Change-OI.
-    # The lower CONFIRM threshold still detects/report conflicts; the STRONG
-    # threshold is the authorization threshold for actual entries.
-    bearish_flow_ok = effective_flow <= -STRUCTURE_CHANGE_OI_STRONG and not flow_conflict
-    bullish_flow_ok = effective_flow >= STRUCTURE_CHANGE_OI_STRONG and not flow_conflict
+    oi_unwind_direction = str(chain_levels.get("oi_unwind_direction", "NEUTRAL")).upper()
+    oi_unwind_metrics = chain_levels.get("oi_unwind_metrics", {})
+    if not isinstance(oi_unwind_metrics, dict):
+        oi_unwind_metrics = {}
+    # V47 uses the actual ATM-window side reductions as the directional driver.
+    # The prior normalized aggregate score remains logged for diagnostics only; it
+    # cannot overrule a clear side-specific OI unwind.
+    if oi_unwind_direction in {"BULLISH", "BEARISH"}:
+        effective_bias = 1 if oi_unwind_direction == "BULLISH" else -1
+        effective_flow = effective_bias * max(
+            STRUCTURE_CHANGE_OI_STRONG + 0.01,
+            min(1.0, abs(raw_intraday_flow)),
+        )
+        effective_source = "CALL_OI_UNWINDING_PRIMARY" if effective_bias > 0 else "PUT_OI_UNWINDING_PRIMARY"
+        flow_conflict = False
+    else:
+        effective_flow = 0.0
+        effective_bias = 0
+        effective_source = str(oi_unwind_metrics.get("reason", "NO_CONFIRMED_OI_UNWINDING"))
+        flow_conflict = False
+    bearish_flow_ok = oi_unwind_direction == "BEARISH"
+    bullish_flow_ok = oi_unwind_direction == "BULLISH"
 
     futures_conflict_bearish = bool(
         futures_bias > 0 and futures_strength >= STRUCTURE_FUTURES_CONFLICT_STRENGTH
@@ -4791,16 +4881,13 @@ def build_market_structure(
     bearish_level_ok = bool(support_is_authoritative and math.isfinite(support_1) and support_1 < price_reference)
     bullish_level_ok = bool(resistance_is_authoritative and math.isfinite(resistance_1) and resistance_1 > price_reference)
 
-    continuous_bearish = bool(
-        bearish_base and bearish_level_ok and not futures_conflict_bearish
-        and (bearish_movement or carried_bearish or fresh_bearish_break)
-        and not strong_bullish_reversal
-    )
-    continuous_bullish = bool(
-        bullish_base and bullish_level_ok and not futures_conflict_bullish
-        and (bullish_movement or carried_bullish or fresh_bullish_break)
-        and not strong_bearish_reversal
-    )
+    # V47 movement rule is intentionally simple:
+    #   - CALL OI materially weakens + NIFTY remains above VWAP + valid call wall -> bullish.
+    #   - PUT OI materially weakens + NIFTY remains below VWAP + valid put support -> bearish.
+    # ADX, futures regime, multi-window swing labels, and trend-efficiency metrics
+    # are context only; they do not veto this primary OI-unwinding direction.
+    continuous_bearish = bool(bearish_flow_ok and bearish_level_ok and below_vwap)
+    continuous_bullish = bool(bullish_flow_ok and bullish_level_ok and above_vwap)
 
     if continuous_bearish and continuous_bullish:
         if effective_flow < 0:
@@ -4858,24 +4945,24 @@ def build_market_structure(
         interpretation = "BULLISH WATCH — ABOVE VWAP + BULLISH CHANGE-OI, PRICE PERSISTENCE OR OI LEVEL NOT CONFIRMED"
         scenario_trigger = f"Wait for sustained bullish price action and valid OI resistance; resistance={resistance_1:.2f}."
         scenario_invalidation = "Bullish watch weakens on sustained VWAP loss with opposing price structure and Change-OI."
-    elif bearish_environment:
-        direction, market_phase = "BEARISH", "BEARISH"
-        entry_confirmed, confirmation_state = False, "FLOW_WAIT"
-        interpretation = "BEARISH WATCH — PRICE/VWAP STRUCTURE DOWN, CHANGE-OI NOT CONFIRMING"
-        scenario_trigger = f"Wait for bearish Change-OI confirmation; support={support_1:.2f}."
-        scenario_invalidation = "Bearish watch weakens on sustained VWAP reclaim and bullish price structure."
-    elif bullish_environment:
+    elif oi_unwind_direction == "BULLISH":
         direction, market_phase = "BULLISH", "BULLISH"
-        entry_confirmed, confirmation_state = False, "FLOW_WAIT"
-        interpretation = "BULLISH WATCH — PRICE/VWAP STRUCTURE UP, CHANGE-OI NOT CONFIRMING"
-        scenario_trigger = f"Wait for bullish Change-OI confirmation; resistance={resistance_1:.2f}."
-        scenario_invalidation = "Bullish watch weakens on sustained VWAP loss and bearish price structure."
+        entry_confirmed, confirmation_state = False, "CALL_OI_UNWIND_WATCH_PRICE_NOT_ALIGNED"
+        interpretation = "BULLISH WATCH — CALL OI WEAKENING; WAIT FOR NIFTY TO HOLD ABOVE VWAP"
+        scenario_trigger = f"Call OI is unwinding; require NIFTY price confirmation above VWAP and a valid call-OI resistance reference. resistance={resistance_1:.2f}."
+        scenario_invalidation = "Bullish watch invalidates if call OI rebuilds materially or NIFTY confirms below support/VWAP."
+    elif oi_unwind_direction == "BEARISH":
+        direction, market_phase = "BEARISH", "BEARISH"
+        entry_confirmed, confirmation_state = False, "PUT_OI_UNWIND_WATCH_PRICE_NOT_ALIGNED"
+        interpretation = "BEARISH WATCH — PUT OI WEAKENING; SUPPORT IS WEAKENING"
+        scenario_trigger = f"Put OI is unwinding; require NIFTY price confirmation below VWAP. support={support_1:.2f}; resistance remains defined by call OI above spot."
+        scenario_invalidation = "Bearish watch invalidates if put OI rebuilds materially or NIFTY reclaims VWAP/support."
     else:
         direction, market_phase = "NEUTRAL", "SIDEWAYS"
-        entry_confirmed, confirmation_state = False, "NO_TRADE"
-        interpretation = "SIDEWAYS / MIXED — NO STRUCTURAL DIRECTION CONFIRMED"
-        scenario_trigger = f"Wait for VWAP-side alignment + sustained price action + confirming Change-OI; support={support_1:.2f} resistance={resistance_1:.2f}."
-        scenario_invalidation = "No directional entry while VWAP, price action and Change-OI remain mixed."
+        entry_confirmed, confirmation_state = False, "NO_MATERIAL_OI_UNWINDING"
+        interpretation = "NEUTRAL — NO MATERIAL CALL/PUT OI UNWINDING"
+        scenario_trigger = f"Wait for a material call-OI reduction (bullish cue) or put-OI reduction (bearish cue); support={support_1:.2f} resistance={resistance_1:.2f}."
+        scenario_invalidation = "No OI-led directional entry without a clear side-specific OI reduction and matching NIFTY/VWAP context."
 
     pcr = safe_float(chain_levels.get("pcr"), float("nan"))
     pcr_bias = 1 if math.isfinite(pcr) and pcr >= 1.10 else -1 if math.isfinite(pcr) and pcr <= 0.90 else 0
@@ -4885,7 +4972,11 @@ def build_market_structure(
     reasons = [
         f"PRIMARY: NIFTY={current_close:.2f} vs VWAP={vwap:.2f}; below_vwap={below_vwap}; above_vwap={above_vwap}.",
         f"PRICE ACTION: structure={price_structure}; session={session_move:+.2f}vol; recent12={recent12_move:+.2f}vol; recent3={recent3_move:+.2f}vol; down_ratio={down_ratio:.2f}; up_ratio={up_ratio:.2f}; efficiency={efficiency:.2f}.",
-        f"CHANGE-OI: effective={effective_flow:+.3f}; bias={effective_bias:+d}; source={effective_source}; conflict={flow_conflict}.",
+        f"OI UNWINDING: direction={oi_unwind_direction}; call_change_pct={safe_float(oi_unwind_metrics.get('call_change_pct'), float('nan')):+.3%}; "
+        f"put_change_pct={safe_float(oi_unwind_metrics.get('put_change_pct'), float('nan')):+.3%}; "
+        f"reason={oi_unwind_metrics.get('reason', 'UNAVAILABLE')}; source={oi_unwind_metrics.get('source', 'UNAVAILABLE')}.",
+        f"CHANGE-OI: effective={effective_flow:+.3f}; bias={effective_bias:+d}; source={effective_source}; conflict={flow_conflict}; "
+        f"raw_aggregate={raw_intraday_flow:+.3f}.",
         f"OI STRUCTURE: support={support_1:.2f}/{support_2:.2f}; resistance={resistance_1:.2f}/{resistance_2:.2f}; breakdown_ref={breakdown_reference:.2f}; breakout_ref={breakout_reference:.2f}; breakdown={fresh_bearish_break}; breakout={fresh_bullish_break}.",
         f"FUTURES CONTEXT: regime={futures_regime}; bias={futures_bias:+d}; strength={futures_strength:.3f}; conflict_bearish={futures_conflict_bearish}; conflict_bullish={futures_conflict_bullish}.",
         f"ENTRY GATES: bearish_level_ok={bearish_level_ok}; bullish_level_ok={bullish_level_ok}; minimum_entry_change_oi={STRUCTURE_CHANGE_OI_STRONG:.3f}.",
@@ -4897,12 +4988,15 @@ def build_market_structure(
         reasons.append("Live spot temporarily cleared an OI resistance but latest completed close has not confirmed breakout.")
 
     logger.info(
-        "STRUCTURE ENGINE: phase=%s direction=%s price=%.2f VWAP=%.2f support=%s resistance=%s ChangeOI=%+.3f "
-        "breakout=%s breakdown=%s Entry=%s",
+        "STRUCTURE ENGINE V47: phase=%s direction=%s price=%.2f VWAP=%.2f support=%s resistance=%s "
+        "OI_unwind=%s call_change_pct=%+.3f%% put_change_pct=%+.3f%% breakout=%s breakdown=%s Entry=%s",
         market_phase, direction, current_close, vwap,
         f"{support_1:.2f}" if math.isfinite(support_1) else "NA",
         f"{resistance_1:.2f}" if math.isfinite(resistance_1) else "NA",
-        effective_flow, fresh_bullish_break, fresh_bearish_break, entry_confirmed,
+        oi_unwind_direction,
+        100.0 * safe_float(oi_unwind_metrics.get("call_change_pct"), 0.0),
+        100.0 * safe_float(oi_unwind_metrics.get("put_change_pct"), 0.0),
+        fresh_bullish_break, fresh_bearish_break, entry_confirmed,
     )
 
     components = {
@@ -4911,6 +5005,9 @@ def build_market_structure(
         "structure_change_oi_day_raw": float(change_oi_score),
         "structure_change_oi_conflict": 1.0 if flow_conflict else 0.0,
         "structure_change_oi_source": effective_source,
+        "oi_unwind_direction": oi_unwind_direction,
+        "oi_unwind_call_change_pct": safe_float(oi_unwind_metrics.get("call_change_pct"), float("nan")),
+        "oi_unwind_put_change_pct": safe_float(oi_unwind_metrics.get("put_change_pct"), float("nan")),
         "structure_futures_conflict_bullish": 1.0 if futures_conflict_bullish else 0.0,
         "structure_futures_conflict_bearish": 1.0 if futures_conflict_bearish else 0.0,
         "structure_vwap": 1.0 if above_vwap else -1.0 if below_vwap else 0.0,
@@ -7692,6 +7789,41 @@ def execute_scan(
             window_velocity.get("baseline_mode", "UNAVAILABLE"),
             int(window_velocity.get("coverage", 0)), int(window_velocity.get("required_coverage", 0)),
         )
+    # V47 primary direction signal: relative OI reduction by side, scoped to the same ATM +/-4 window.
+    oi_flow_sample = window_velocity if bool(window_velocity.get("available")) else local_change_oi_meta
+    call_change_sum = safe_float(oi_flow_sample.get("call_change_sum"), float("nan"))
+    put_change_sum = safe_float(oi_flow_sample.get("put_change_sum"), float("nan"))
+    oi_weight = safe_float(oi_flow_sample.get("weight"), 1.0)
+    oi_unwind_metrics = classify_oi_unwinding_direction(
+        call_change_sum=call_change_sum,
+        put_change_sum=put_change_sum,
+        call_oi_total=chain_levels.get("window_call_oi_total"),
+        put_oi_total=chain_levels.get("window_put_oi_total"),
+        weight=oi_weight,
+    )
+    oi_unwind_metrics["source"] = str(
+        window_velocity.get("baseline_mode", "LOCAL_ATM_CHANGE_OI")
+        if bool(window_velocity.get("available"))
+        else local_change_oi_meta.get("source", "LOCAL_ATM_CHANGE_OI")
+    )
+    chain_levels["call_oi_change_sum"] = call_change_sum
+    chain_levels["put_oi_change_sum"] = put_change_sum
+    chain_levels["oi_unwind_metrics"] = oi_unwind_metrics
+    chain_levels["oi_unwind_direction"] = str(oi_unwind_metrics.get("direction", "NEUTRAL"))
+    logger.info(
+        "OI UNWINDING DIRECTION: direction=%s call_change=%+.0f (%+.3f%% effective=%+.3f%%) "
+        "put_change=%+.0f (%+.3f%% effective=%+.3f%%) threshold=%.3f%% weight=%.2f reason=%s; "
+        "resistance=CALL_OI_WALL, support=PUT_OI_WALL",
+        chain_levels["oi_unwind_direction"], call_change_sum,
+        100.0 * safe_float(oi_unwind_metrics.get("call_change_pct"), 0.0),
+        100.0 * safe_float(oi_unwind_metrics.get("effective_call_change_pct"), 0.0),
+        put_change_sum,
+        100.0 * safe_float(oi_unwind_metrics.get("put_change_pct"), 0.0),
+        100.0 * safe_float(oi_unwind_metrics.get("effective_put_change_pct"), 0.0),
+        100.0 * safe_float(oi_unwind_metrics.get("threshold_pct"), OI_UNWINDING_MIN_CHANGE_PCT),
+        safe_float(oi_unwind_metrics.get("weight"), oi_weight),
+        oi_unwind_metrics.get("reason", "UNAVAILABLE"),
+    )
     chain_levels["coi_window_atm"] = safe_float(local_change_oi_meta.get("atm_strike"), float("nan"))
     chain_levels["coi_window_strikes"] = list(local_change_oi_meta.get("window_strikes", []))
     chain_levels["previous_support_1"] = safe_float(previous_snapshot.get("support_1"), float("nan"))
@@ -8438,7 +8570,7 @@ def dispatch_alerts(state: dict[str, Any], signal: Signal) -> None:
 
 
 def run_self_tests() -> None:
-    """Run deterministic V46 smoke/regression checks without network access."""
+    """Run deterministic V47 OI-unwinding and regression checks without network access."""
     self_test_flow = max(STRUCTURE_CHANGE_OI_CONFIRM, 0.25) + 0.05
     scenarios = [
         ("BULLISH", "CONTINUOUS_BULLISH", 101.0, 100.0, 100.8, 0.8, self_test_flow, True, "NONE", False),
@@ -8459,7 +8591,23 @@ def run_self_tests() -> None:
         spot=101.0, vwap=100.0, last_completed_close=100.8, atr=2.0,
         vwap_slope=-0.2, change_oi=self_test_flow,
     )
-    assert not ok, f"Opposing VWAP slope was incorrectly accepted: {why}"
+    assert ok, f"A counter-sloping VWAP should be context, not an independent direction veto: {why}"
+
+    oi_bull = classify_oi_unwinding_direction(
+        call_change_sum=-800000.0, put_change_sum=200000.0,
+        call_oi_total=30000000.0, put_oi_total=28000000.0, weight=1.0,
+    )
+    assert oi_bull["direction"] == "BULLISH", oi_bull
+    oi_bear = classify_oi_unwinding_direction(
+        call_change_sum=200000.0, put_change_sum=-900000.0,
+        call_oi_total=30000000.0, put_oi_total=28000000.0, weight=1.0,
+    )
+    assert oi_bear["direction"] == "BEARISH", oi_bear
+    oi_neutral = classify_oi_unwinding_direction(
+        call_change_sum=100000.0, put_change_sum=200000.0,
+        call_oi_total=30000000.0, put_oi_total=28000000.0, weight=1.0,
+    )
+    assert oi_neutral["direction"] == "NEUTRAL", oi_neutral
 
     ok, why = structural_direction_override_decision(
         direction="BULLISH", structure_phase="CONTINUOUS_BULLISH", entry_confirmed=True,
@@ -8467,7 +8615,7 @@ def run_self_tests() -> None:
         vwap_slope=0.2, change_oi=self_test_flow,
         divergence="BEARISH", near_structural_level=True,
     )
-    assert not ok, f"Opposing confirmed divergence was incorrectly accepted: {why}"
+    assert ok, f"RSI divergence should remain context for a confirmed OI-led direction: {why}"
 
     bullish_strikes = permitted_strikes_for_regime(
         22800.0, 50.0, "BULLISH", "NORMAL", now=datetime(2026, 10, 15, 10, 0, tzinfo=IST),
@@ -8481,7 +8629,7 @@ def run_self_tests() -> None:
         22800.0, 50.0, "BULLISH", "SIDEWAYS", now=datetime(2026, 10, 15, 10, 0, tzinfo=IST),
     )
 
-    # V46: a confirmed continuous PA/OI trend is not vetoed by low/absent midday ADX.
+    # V47: a confirmed continuous PA/OI trend is not vetoed by low/absent midday ADX.
     midday_ok, midday_reason = midday_momentum_gate_decision(
         tod_window="MIDDAY", adx_value=18.0, minimum_adx=23.0,
         structure_direction="BULLISH", structure_phase="CONTINUOUS_BULLISH",
@@ -8556,7 +8704,7 @@ def run_self_tests() -> None:
         previous_direction="BULLISH", local_event_entry=True,
     )[0] == 1
 
-    print("V46 SELF-TEST PASSED.")
+    print("V47 SELF-TEST PASSED.")
 
 
 def main() -> int:
