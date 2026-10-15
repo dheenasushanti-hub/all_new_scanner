@@ -1,5 +1,5 @@
 """
-NIFTY 50 Predictive Options Scanner — V51 Unified PA/OI Directional Context and Entry Gate Reconciliation
+NIFTY 50 Predictive Options Scanner — V52 Redundancy Cleanup and Single-Pass Gate Reconciliation
 
 What this version fixes:
 - Uses the NIFTY INDEX as the primary market-price/VWAP/intraday structure feed.
@@ -41,10 +41,12 @@ What this version fixes:
 - Uses current Upstox endpoints: v2 for option chain/contracts/status/
   instrument search/change-OI/option-chain; v3 for Full Market Quotes and candle data because the
   older v2 intraday candle API is deprecated.
+- V52 removes unused market-data unpacking and performs PA/OI regime reconciliation once,
+  with the confirmed opposing-event fact passed forward as typed evaluation output.
 
 Run:
-    python market_scanner_v51_structural_entry_risk_guard.py --self-test
-    python market_scanner_v51_structural_entry_risk_guard.py
+    python market_scanner_v52_structural_entry_risk_guard.py --self-test
+    python market_scanner_v52_structural_entry_risk_guard.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -147,7 +149,7 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-15-STRUCTURE-V51-UNIFIED-PA-OI-CONTEXT-ENTRY-RECONCILIATION-ATM4"
+SCANNER_VERSION = "2026-10-15-STRUCTURE-V52-SINGLE-PASS-RECONCILIATION-REDUNDANCY-CLEANUP-ATM4"
 # V49 introduced bounded pre-breakout target routing. V50 changes only entry eligibility:
 # no fixed reward/risk ratio veto; valid directional target/stop geometry remains mandatory.
 OPTION_TARGET_ENGINE_VERSION = "V51_PA_OI_PREDICTIVE_WALL_TARGETS"
@@ -1456,11 +1458,6 @@ def market_window_open() -> bool:
 # =============================================================================
 # UPSTOX HTTP
 # =============================================================================
-
-def api_headers() -> dict[str, str]:
-    """Compatibility adapter to the default provider's authorization headers."""
-    return DEFAULT_DATA_PROVIDER.api_headers()
-
 
 def api_get(
     url: str,
@@ -8224,6 +8221,7 @@ class MarketEvaluation:
     local_structure_event: dict[str, Any]
     breakout_watch: dict[str, Any]
     confirmed_local_event_override: bool
+    confirmed_opposing_event: bool
 
 
 def evaluate_market_structure(
@@ -8374,6 +8372,7 @@ def evaluate_market_structure(
         local_oi_break=local_oi_break, local_oi_rejection=local_oi_rejection,
         local_structure_event=local_structure_event, breakout_watch=breakout_watch,
         confirmed_local_event_override=confirmed_local_event_override,
+        confirmed_opposing_event=confirmed_opposing_event,
     )
 
 
@@ -8521,17 +8520,14 @@ def execute_scan(
     now_time = market_data.now_time
     future = market_data.future
     index_session = market_data.index_session
-    index_live_quote = market_data.index_live_quote
     spot = market_data.spot
     futures_session = market_data.futures_session
-    futures_live_quote = market_data.futures_live_quote
     futures_ltp_now = market_data.futures_ltp_now
     futures_quote_check = market_data.futures_quote_check
     futures_quote_status = market_data.futures_quote_status
     futures_analysis_quote = market_data.futures_analysis_quote
     completed_index_3m = market_data.completed_index_3m
     regime_indicator_history = market_data.regime_indicator_history
-    historical_completed = market_data.historical_completed
     futures_3m = market_data.futures_3m
 
     # Build the option-chain structure directly from current OI and Change-OI.
@@ -8691,6 +8687,7 @@ def execute_scan(
     local_structure_event = evaluation.local_structure_event
     breakout_watch = evaluation.breakout_watch
     confirmed_local_event_override = evaluation.confirmed_local_event_override
+    confirmed_opposing_event_for_gate = evaluation.confirmed_opposing_event
 
     logger.info(
         "REGIME INDICATOR READINESS: history_3m=%d total_seeded_3m=%d current_15m=%d "
@@ -8924,14 +8921,6 @@ def execute_scan(
         )
         return None
 
-    confirmed_opposing_event_for_gate = bool(
-        local_structure_event.get("confirmed")
-        and str(local_structure_event.get("direction", "")).upper() in {"BULLISH", "BEARISH"}
-        and str(local_structure_event.get("direction", "")).upper() != str(structure.direction).upper()
-    )
-    market_regime = reconcile_regime_with_structure(
-        structure, market_regime, confirmed_opposing_event=confirmed_opposing_event_for_gate,
-    )
     intensity = str(market_regime.get("intensity", "UNKNOWN")).upper()
     regime_direction = str(market_regime.get("direction", "NEUTRAL")).upper()
     adx_value = safe_float(market_regime.get("adx"), float("nan"))
@@ -9582,7 +9571,7 @@ def run_self_tests() -> None:
         previous_direction="BULLISH", local_event_entry=True,
     )[0] == 1
 
-    print("V51 SELF-TEST PASSED.")
+    print("V52 SELF-TEST PASSED.")
 
 
 def main() -> int:
@@ -9595,7 +9584,7 @@ def main() -> int:
             run_self_tests()
             return 0
         except Exception:
-            logger.error("V51 self-test failed:\n%s", traceback.format_exc())
+            logger.error("V52 self-test failed:\n%s", traceback.format_exc())
             return 1
 
     try:
