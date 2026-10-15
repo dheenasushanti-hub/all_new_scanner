@@ -1,5 +1,5 @@
 """
-NIFTY 50 Predictive Options Scanner — V48 ATM-Window Price Action, OI Walls and Scenario Engine
+NIFTY 50 Predictive Options Scanner — V51 Unified PA/OI Directional Context and Entry Gate Reconciliation
 
 What this version fixes:
 - Uses the NIFTY INDEX as the primary market-price/VWAP/intraday structure feed.
@@ -43,8 +43,8 @@ What this version fixes:
   older v2 intraday candle API is deprecated.
 
 Run:
-    python market_scanner_v48_structural_entry_risk_guard.py --self-test
-    python market_scanner_v48_structural_entry_risk_guard.py
+    python market_scanner_v51_structural_entry_risk_guard.py --self-test
+    python market_scanner_v51_structural_entry_risk_guard.py
 
 Environment:
     UPSTOX_ANALYTICS_TOKEN   required
@@ -118,7 +118,6 @@ MIN_OPPOSING_WALL_CLEARANCE_STEPS = min(0.75, max(0.20, float(os.getenv("MIN_OPP
 OI_DOMINANCE_RELIABILITY_RATIO = max(1.01, float(os.getenv("OI_DOMINANCE_RELIABILITY_RATIO", "1.20")))
 LOCAL_BREAK_MIN_PRESSURE = min(-0.05, float(os.getenv("LOCAL_BREAK_MIN_PRESSURE", "-0.20")))
 # Counter-trend OI-wall rejection entries must still have enough structural runway.
-MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO = max(1.0, float(os.getenv("MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO", os.getenv("LOCAL_REJECTION_MIN_REWARD_RISK_RATIO", "1.25"))))
 
 # Hard limit for all primary option-strike decisions: ATM plus/minus four strike steps.
 ATM_ANALYSIS_RADIUS_LEVELS = 4
@@ -148,12 +147,14 @@ if _state_file_override:
 else:
     STATE_FILE = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-SCANNER_VERSION = "2026-10-15-STRUCTURE-V48-ATM4-PA-OI-SCENARIO-ENGINE"
-# V46 updates target selection, so newly created trades must carry this engine ID.
-# V30 trades already use underlying PA/OI levels and must keep their existing levels
-# while active; migrate_active_trade_to_v25 treats them as compatible legacy structural trades.
-OPTION_TARGET_ENGINE_VERSION = "V46_DYNAMIC_PA_OI_MOMENTUM_TARGETS"
-LEGACY_STRUCTURAL_TARGET_ENGINE_VERSIONS = {"V30_DYNAMIC_COI_MATRIX_PA_OI"}
+SCANNER_VERSION = "2026-10-15-STRUCTURE-V51-UNIFIED-PA-OI-CONTEXT-ENTRY-RECONCILIATION-ATM4"
+# V49 introduced bounded pre-breakout target routing. V50 changes only entry eligibility:
+# no fixed reward/risk ratio veto; valid directional target/stop geometry remains mandatory.
+OPTION_TARGET_ENGINE_VERSION = "V51_PA_OI_PREDICTIVE_WALL_TARGETS"
+LEGACY_STRUCTURAL_TARGET_ENGINE_VERSIONS = {
+    "V30_DYNAMIC_COI_MATRIX_PA_OI",
+    "V46_DYNAMIC_PA_OI_MOMENTUM_TARGETS",
+}
 
 MARKET_START = time(9, 15)
 MARKET_END = time(15, 30)
@@ -183,10 +184,12 @@ OPTION_OI_HISTORY_KEEP_MINUTES = int(os.getenv("OPTION_OI_HISTORY_KEEP_MINUTES",
 COI_COLD_START_END = time(9, 45)
 COI_COLD_START_WEIGHT = float(os.getenv("COI_COLD_START_WEIGHT", "0.35"))
 COI_STRONG_CHANGE_PCT = float(os.getenv("COI_STRONG_CHANGE_PCT", "0.01"))
-# V48: directional movement is primarily driven by relative call/put OI unwinding.
+# V49: directional movement is primarily driven by relative call/put OI unwinding.
 # The pct is measured against current ATM-window OI, with cold-start scores down-weighted.
 OI_UNWINDING_MIN_CHANGE_PCT = max(0.0001, float(os.getenv("OI_UNWINDING_MIN_CHANGE_PCT", "0.0015")))
 OI_UNWINDING_DOMINANCE_RATIO = max(1.0, float(os.getenv("OI_UNWINDING_DOMINANCE_RATIO", "1.20")))
+# Only skip nearby opposing walls in a confirmed, aligned pre-breakout/pre-breakdown setup.
+PREBREAKOUT_WEAK_WALL_MAX_STEPS = max(0.5, float(os.getenv("PREBREAKOUT_WEAK_WALL_MAX_STEPS", "1.5")))
 COI_PUSH_MAX_POINTS = float(os.getenv("COI_PUSH_MAX_POINTS", "1.0"))
 COI_FLOOR_MAX_POINTS = float(os.getenv("COI_FLOOR_MAX_POINTS", "1.0"))
 COI_ROLL_MAX_POINTS = float(os.getenv("COI_ROLL_MAX_POINTS", "1.5"))
@@ -2306,8 +2309,7 @@ def structural_direction_override_decision(
     eligible when the structural engine has already confirmed a continuous phase,
     spot and the latest completed close remain on the correct side of VWAP (within
     a small noise buffer), VWAP slope and option Change-OI agree, and there is no
-    confirmed opposing RSI divergence at a structural level. Entry risk, wall,
-    persistence, premium, execution-score and reward/risk checks remain downstream.
+    confirmed opposing RSI divergence at a structural level. Entry target/stop geometry, wall, persistence, premium and execution-score checks remain downstream; RR is diagnostic only.
     """
     side = str(direction or "").strip().upper()
     phase = str(structure_phase or "").strip().upper()
@@ -2329,7 +2331,7 @@ def structural_direction_override_decision(
         price_aligned = flow_aligned = False
         slope_aligned = False
     else:
-        # V48 direction uses side-specific OI unwinding and simple underlying/VWAP
+        # V49 direction uses side-specific OI unwinding and simple underlying/VWAP
         # alignment. VWAP slope and RSI divergence are diagnostics, not independent
         # vetoes of an otherwise confirmed OI-led continuous direction.
         vwap_noise_buffer = max(0.10 * atr_value, abs(px) * 0.00005, 1.0)
@@ -2380,6 +2382,8 @@ def classify_market_regime(
     structure_change_oi: float = 0.0,
     structure_vwap_slope: float = float("nan"),
     structure_entry_confirmed: bool = False,
+    directional_context_override: bool = False,
+    directional_context_reason: str = "",
 ) -> dict[str, Any]:
     """Classify market regime using live-session structure and history-seeded ADX/RSI.
 
@@ -2483,13 +2487,16 @@ def classify_market_regime(
     proposed = str(proposed_direction or "NEUTRAL").upper()
     direction = proposed
     direction_gate_reason = "directional price-action confirmation passed"
-    if not ((direction == "BULLISH" and above_vwap and pa_direction == "BULLISH") or
-            (direction == "BEARISH" and below_vwap and pa_direction == "BEARISH")):
+    strict_directional_alignment = bool(
+        (direction == "BULLISH" and above_vwap and pa_direction == "BULLISH")
+        or (direction == "BEARISH" and below_vwap and pa_direction == "BEARISH")
+    )
+    if not strict_directional_alignment:
         direction = "NEUTRAL"
         direction_gate_reason = (
             f"proposed={proposed}, above_vwap={above_vwap}, below_vwap={below_vwap}, "
             f"recent_swing_structure={pa_direction}, HH={higher_high}, HL={higher_low}, "
-            f"LH={lower_high}, LL={lower_low}; price/VWAP plus matching swing structure required"
+            f"LH={lower_high}, LL={lower_low}; recent swings do not confirm continuation"
         )
 
     current_volume, median_volume, volume_reference_count = previous_completed_volume_median(work, 21)
@@ -2546,6 +2553,22 @@ def classify_market_regime(
     opposing_confirmed_divergence = bool(
         divergence in {"BULLISH", "BEARISH"} and near_level and divergence != proposed
     )
+    context_side_aligned = bool(
+        (proposed == "BULLISH" and above_vwap)
+        or (proposed == "BEARISH" and below_vwap)
+    )
+    directional_context_override_applied = bool(
+        directional_context_override
+        and proposed in {"BULLISH", "BEARISH"}
+        and context_side_aligned
+        and not opposing_confirmed_divergence
+    )
+    if directional_context_override_applied and not strict_directional_alignment:
+        direction = proposed
+        direction_gate_reason = (
+            str(directional_context_reason or "PA/OI directional context retained")
+            + f"; recent swing={pa_direction} is treated as a pullback/watch, not an automatic trend reversal"
+        )
     structural_direction_override, structural_override_reason = structural_direction_override_decision(
         direction=proposed,
         structure_phase=phase_upper,
@@ -2560,8 +2583,8 @@ def classify_market_regime(
         near_structural_level=near_level,
     )
     # Keep the direction consistent across the regime matrix and strike router.
-    # This does not skip downstream persistence, wall, R/R, liquidity, premium,
-    # COI scoring or execution-score vetoes.
+    # This does not skip downstream persistence, wall, structural target/stop
+    # geometry, liquidity, premium, COI scoring or execution-score vetoes.
     if structural_direction_override:
         direction = proposed
         direction_gate_reason = structural_override_reason
@@ -2606,6 +2629,13 @@ def classify_market_regime(
             reason = (
                 f"CONFIRMED_STRUCTURAL_CONTINUATION_OVERRIDE: ADX unavailable; {structural_override_reason}."
             )
+        elif directional_context_override_applied:
+            direction = proposed
+            intensity = "NORMAL"
+            reason = (
+                f"DIRECTIONAL_CONTEXT_PRESERVED_ADX_UNAVAILABLE: {direction_gate_reason}; "
+                "context is directional but is not an entry confirmation by itself."
+            )
         else:
             intensity = "UNKNOWN"
             reason = (
@@ -2623,6 +2653,14 @@ def classify_market_regime(
                 f"LOW_ADX_STRUCTURAL_CONTINUATION_OVERRIDE: ADX {adx:.1f} below "
                 f"{ADX_SIDEWAYS_THRESHOLD:.1f}; {structural_override_reason}. "
                 "ADX does not override confirmed directional structure."
+            )
+        elif directional_context_override_applied:
+            direction = proposed
+            intensity = "NORMAL"
+            reason = (
+                f"LOW_ADX_DIRECTIONAL_CONTEXT_PRESERVED: ADX {adx:.1f} is low but does not erase "
+                f"the broader {proposed} PA/OI context; {direction_gate_reason}. "
+                "Entry still requires continuous PA/OI structure and trade-risk validation."
             )
         else:
             intensity = "SIDEWAYS"
@@ -2669,6 +2707,8 @@ def classify_market_regime(
         "structural_direction_override": structural_direction_override,
         "structural_direction_override_applied": bool(structural_direction_override and direction == proposed),
         "structural_direction_override_reason": structural_override_reason,
+        "directional_context_override_applied": bool(directional_context_override_applied and direction == proposed),
+        "directional_context_override_reason": direction_gate_reason if directional_context_override_applied else "",
         "session_completed_bars": int(len(work)),
         "adx_role": "TREND_STRENGTH_ONLY",
         "reason": reason,
@@ -3670,8 +3710,9 @@ def cold_start_entry_gate_passed(
 
     A confirmed completed-bar OI breakout/breakdown or wall bounce/rejection is an
     independent opening trigger. It still must pass downstream wall clearance,
-    structural T1/SL, reward-to-risk, persistence where applicable, and option-quality
-    checks; this helper only avoids rejecting it for unrelated cold-start proxies.
+    valid structural T1/SL geometry, persistence where applicable, and option-quality
+    checks. Reward/risk distances remain diagnostics rather than a fixed-ratio veto.
+    This helper only avoids rejecting confirmed events for unrelated cold-start proxies.
     """
     if current_time >= COI_COLD_START_END:
         return True
@@ -3721,12 +3762,49 @@ def structural_reward_risk_profile(
     }
 
 
+def validate_structural_target_stop(
+    direction: str, spot: float, target_1: float, stop: float,
+) -> dict[str, Any]:
+    """Validate directional target/stop geometry without imposing a fixed RR threshold.
+
+    A valid setup needs finite values, a target ahead in the proposed direction,
+    and a stop on the protective side of the spot. The reward/risk ratio is
+    deliberately diagnostic only because the next OI strike spacing is not a
+    reliable forecast of the index move.
+    """
+    side = str(direction or "").upper()
+    price = safe_float(spot, float("nan"))
+    target = safe_float(target_1, float("nan"))
+    stop_value = safe_float(stop, float("nan"))
+    if side not in {"BULLISH", "BEARISH"}:
+        return {"valid": False, "reason": "INVALID_DIRECTION"}
+    if not all(math.isfinite(value) and value > 0 for value in (price, target, stop_value)):
+        return {"valid": False, "reason": "NON_FINITE_OR_NON_POSITIVE_PRICE"}
+    if side == "BULLISH":
+        if target <= price:
+            return {"valid": False, "reason": "TARGET_NOT_ABOVE_SPOT"}
+        if stop_value >= price:
+            return {"valid": False, "reason": "BULLISH_STOP_NOT_BELOW_SPOT"}
+    else:
+        if target >= price:
+            return {"valid": False, "reason": "TARGET_NOT_BELOW_SPOT"}
+        if stop_value <= price:
+            return {"valid": False, "reason": "BEARISH_STOP_NOT_ABOVE_SPOT"}
+    ratio, reward, risk = structural_reward_risk_ratio(side, price, target, stop_value)
+    if not all(math.isfinite(value) for value in (ratio, reward, risk)) or reward <= 0 or risk <= 0:
+        return {"valid": False, "reason": "INVALID_REWARD_OR_RISK_GEOMETRY"}
+    return {
+        "valid": True, "reason": "VALID_DIRECTIONAL_TARGET_AND_PROTECTIVE_STOP",
+        "reward": float(reward), "risk": float(risk), "rr_diagnostic": float(ratio),
+    }
+
+
 def dynamic_wall_clearance_steps(
     *, strike_step_value: float, atr_points: float, directional_momentum_atr: float, wall_strength: float,
 ) -> float:
     """Calculate a bounded wall buffer from volatility, aligned momentum and wall strength.
 
-    The clear-space guard is secondary to target/RR validation and no longer uses a
+    The clear-space guard is secondary to target/stop geometry validation and no longer uses a
     blanket 1.5-strike-step veto for a wall already represented by T1.
     """
     step = max(safe_float(strike_step_value, 50.0), 1.0)
@@ -3752,10 +3830,11 @@ def opposing_oi_wall_veto(
     confirmed_local_rejection: bool = False,
     clearance_steps: Optional[float] = None,
     target_level: Optional[float] = None,
-    target_rr_validated: bool = False,
+    target_geometry_validated: bool = False,
     target_is_meaningful_oi_wall: bool = False,
+    predictive_weak_wall_bypass: bool = False,
 ) -> str:
-    """Guard a nearby *unaccounted* opposing wall without duplicating the RR gate."""
+    """Guard a nearby *unaccounted* opposing wall after target/stop geometry validation."""
     direction = str(direction or "").upper()
     price = safe_float(spot, float("nan"))
     step = max(safe_float(strike_step_value, 50.0), 1.0)
@@ -3771,27 +3850,31 @@ def opposing_oi_wall_veto(
         if not math.isfinite(wall) or wall <= price:
             return ""
         gap = wall - price
-        if target_rr_validated and math.isfinite(target) and target_is_meaningful_oi_wall and abs(wall - target) <= tolerance:
-            return ""  # This wall is already T1 and has passed the directional RR check.
-        if target_rr_validated and math.isfinite(target) and wall >= target + tolerance:
+        if target_geometry_validated and math.isfinite(target) and target_is_meaningful_oi_wall and abs(wall - target) <= tolerance:
+            return ""  # This wall is already represented by the validated structural target.
+        if target_geometry_validated and math.isfinite(target) and wall >= target + tolerance:
             return ""  # Wall lies beyond the currently planned target, not in front of it.
+        if predictive_weak_wall_bypass and target_geometry_validated and math.isfinite(target) and target > wall + tolerance:
+            return ""  # This nearby weakening wall is intentionally bypassed by the target plan.
         required = min(0.75, max(0.20, safe_float(clearance_steps, MIN_OPPOSING_WALL_CLEARANCE_STEPS))) * step
         if gap < required:
             return (f"NEAR_RESISTANCE_VETO wall={wall:.2f} spot={price:.2f} runway={gap:.2f} "
-                    f"required_dynamic={required:.2f} target={target:.2f} target_rr_validated={target_rr_validated}")
+                    f"required_dynamic={required:.2f} target={target:.2f} target_geometry_validated={target_geometry_validated}")
     else:
         wall = safe_float(support, float("nan"))
         if not math.isfinite(wall) or wall >= price:
             return ""
         gap = price - wall
-        if target_rr_validated and math.isfinite(target) and target_is_meaningful_oi_wall and abs(wall - target) <= tolerance:
+        if target_geometry_validated and math.isfinite(target) and target_is_meaningful_oi_wall and abs(wall - target) <= tolerance:
             return ""
-        if target_rr_validated and math.isfinite(target) and wall <= target - tolerance:
+        if target_geometry_validated and math.isfinite(target) and wall <= target - tolerance:
             return ""
+        if predictive_weak_wall_bypass and target_geometry_validated and math.isfinite(target) and target < wall - tolerance:
+            return ""  # This nearby weakening support is intentionally bypassed by the target plan.
         required = min(0.75, max(0.20, safe_float(clearance_steps, MIN_OPPOSING_WALL_CLEARANCE_STEPS))) * step
         if gap < required:
             return (f"NEAR_SUPPORT_VETO wall={wall:.2f} spot={price:.2f} runway={gap:.2f} "
-                    f"required_dynamic={required:.2f} target={target:.2f} target_rr_validated={target_rr_validated}")
+                    f"required_dynamic={required:.2f} target={target:.2f} target_geometry_validated={target_geometry_validated}")
     return ""
 
 
@@ -4675,6 +4758,267 @@ def classify_oi_unwinding_direction(
 
 
 
+def resolve_oi_horizon_context(
+    rolling_metrics: Optional[dict[str, Any]],
+    session_metrics: Optional[dict[str, Any]],
+    *,
+    previous_direction: Optional[str] = None,
+    above_vwap: bool = False,
+    below_vwap: bool = False,
+) -> dict[str, Any]:
+    """Reconcile tactical rolling OI with broader session/day OI context.
+
+    A neutral rolling window must not erase a clear session cue. If rolling and session
+    cues disagree, an established direction is retained as a pullback context only while
+    price remains on its VWAP side; the opposite rolling cue otherwise has priority.
+    This function assesses direction/context, not trade-entry eligibility.
+    """
+    rolling = rolling_metrics if isinstance(rolling_metrics, dict) else {}
+    session = session_metrics if isinstance(session_metrics, dict) else {}
+    rolling_direction = str(rolling.get("direction", "NEUTRAL")).upper()
+    session_direction = str(session.get("direction", "NEUTRAL")).upper()
+    if rolling_direction not in {"BULLISH", "BEARISH"}:
+        rolling_direction = "NEUTRAL"
+    if session_direction not in {"BULLISH", "BEARISH"}:
+        session_direction = "NEUTRAL"
+    prior = str(previous_direction or "").upper()
+    conflict = bool(
+        rolling_direction in {"BULLISH", "BEARISH"}
+        and session_direction in {"BULLISH", "BEARISH"}
+        and rolling_direction != session_direction
+    )
+
+    prior_vwap_aligned = (
+        (prior == "BULLISH" and above_vwap)
+        or (prior == "BEARISH" and below_vwap)
+    )
+
+    if rolling_direction == "NEUTRAL" and session_direction in {"BULLISH", "BEARISH"}:
+        chosen = session_direction
+        source = "SESSION_DAY_CHANGE_FALLBACK_ROLLING_NEUTRAL"
+        reason = "Rolling OI is neutral; retain clear session/day OI context as the broader directional bias."
+    elif conflict and prior_vwap_aligned:
+        # Keep the previously established direction as context while price remains on
+        # its VWAP side. A confirmed opposing price/OI break is handled by the local
+        # event engine; a short rolling conflict alone is not a trend reversal.
+        chosen = prior
+        source = "ESTABLISHED_DIRECTION_VWAP_ALIGNED_ROLLING_CONFLICT"
+        reason = (
+            f"Rolling={rolling_direction} and session={session_direction} conflict, but established {prior} "
+            "context remains on its VWAP side; preserve broad bias until the opposing structural event is confirmed."
+        )
+    elif rolling_direction == "NEUTRAL" and session_direction == "NEUTRAL" and prior_vwap_aligned:
+        chosen = prior
+        source = "ESTABLISHED_DIRECTION_VWAP_ALIGNED_OI_NEUTRAL"
+        reason = (
+            f"Both OI horizons are neutral, but established {prior} context remains on its VWAP side; "
+            "retain directional context while entry readiness remains separately gated."
+        )
+    elif conflict and prior == session_direction and (
+        (session_direction == "BULLISH" and above_vwap)
+        or (session_direction == "BEARISH" and below_vwap)
+    ):
+        chosen = session_direction
+        source = "ESTABLISHED_SESSION_CONTEXT_ROLLING_COUNTERTREND_PULLBACK"
+        reason = (
+            f"Rolling {rolling_direction} conflicts with established {session_direction} context; "
+            "price remains on the established direction's VWAP side, so do not flip without a confirmed opposing structural break."
+        )
+    elif rolling_direction in {"BULLISH", "BEARISH"}:
+        chosen = rolling_direction
+        source = "ROLLING_15_30_PRIMARY"
+        reason = "Valid directional rolling OI is the primary tactical signal."
+    elif session_direction in {"BULLISH", "BEARISH"}:
+        chosen = session_direction
+        source = "SESSION_DAY_CHANGE_FALLBACK"
+        reason = "Rolling OI unavailable/neutral; session/day Change-OI supplies directional context."
+    else:
+        chosen = "NEUTRAL"
+        source = "NO_DIRECTIONAL_OI_HORIZON"
+        reason = "Neither rolling nor session OI establishes a material one-sided unwind and there is no VWAP-aligned prior direction."
+
+    return {
+        "direction": chosen,
+        "rolling_direction": rolling_direction,
+        "session_direction": session_direction,
+        "source": source,
+        "horizon_conflict": conflict,
+        "reason": reason,
+    }
+
+
+def resolve_structural_direction_context(
+    *,
+    base_direction: str,
+    previous_direction: Optional[str],
+    above_vwap: bool,
+    below_vwap: bool,
+    bullish_movement: bool,
+    bearish_movement: bool,
+    resistance_scenario: Optional[dict[str, Any]],
+    support_scenario: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Resolve the broad direction without allowing neutral aggregates to erase useful PA/OI context.
+
+    Wall-specific OI and price location are used to contextualize a possible next move.
+    This helper never confirms a breakout/rejection and never authorizes an entry by
+    itself; continuous entry still requires the normal structural and contract gates.
+    """
+    base = str(base_direction or "NEUTRAL").upper()
+    prior = str(previous_direction or "").upper()
+    resistance = resistance_scenario if isinstance(resistance_scenario, dict) else {}
+    support = support_scenario if isinstance(support_scenario, dict) else {}
+    threshold = -max(COI_STRONG_CHANGE_PCT, OI_UNWINDING_MIN_CHANGE_PCT)
+
+    def materially_weakening(context: dict[str, Any]) -> bool:
+        pct = safe_float(context.get("oi_change_pct"), float("nan"))
+        return (
+            bool(context.get("near"))
+            and str(context.get("oi_state", "UNKNOWN")).upper() == "WEAKENING"
+            and math.isfinite(pct) and pct <= threshold
+        )
+
+    # A directional price move into a weakening opposing wall is predictive context:
+    # it arms a continuation/breakout scenario but still does not mean the wall is broken.
+    bullish_wall_weakening = bool(
+        materially_weakening(resistance) and above_vwap
+        and (bullish_movement or base == "BULLISH" or prior == "BULLISH")
+        and not bool(resistance.get("confirmed_rejection"))
+    )
+    bearish_wall_weakening = bool(
+        materially_weakening(support) and below_vwap
+        and (bearish_movement or base == "BEARISH" or prior == "BEARISH")
+        and not bool(support.get("confirmed_bounce"))
+    )
+
+    # The opposing-side wall can also support a trend: Put OI building under price
+    # supports bullish continuation; Call OI building above price supports bearish continuation.
+    bullish_support_building = bool(
+        above_vwap and bullish_movement
+        and str(support.get("oi_state", "UNKNOWN")).upper() == "BUILDING"
+        and not bool(resistance.get("confirmed_rejection"))
+    )
+    bearish_resistance_building = bool(
+        below_vwap and bearish_movement
+        and str(resistance.get("oi_state", "UNKNOWN")).upper() == "BUILDING"
+        and not bool(support.get("confirmed_bounce"))
+    )
+
+    if bullish_wall_weakening or bullish_support_building:
+        chosen = "BULLISH"
+        source = "LOCAL_RESISTANCE_WEAKENING_OR_PUT_SUPPORT_BUILDING_WITH_BULLISH_PA"
+        reason = "Bullish price/VWAP movement is aligned with weakening Call-OI resistance or building Put-OI support; wall is not assumed broken."
+    elif bearish_wall_weakening or bearish_resistance_building:
+        chosen = "BEARISH"
+        source = "LOCAL_SUPPORT_WEAKENING_OR_CALL_RESISTANCE_BUILDING_WITH_BEARISH_PA"
+        reason = "Bearish price/VWAP movement is aligned with weakening Put-OI support or building Call-OI resistance; support is not assumed broken."
+    elif prior == "BULLISH" and above_vwap:
+        chosen = "BULLISH"
+        source = "ESTABLISHED_BULLISH_CONTEXT_ABOVE_VWAP"
+        reason = "Retain established bullish context while price remains above VWAP; conflicting short-horizon signals remain warnings unless a bearish structural event confirms."
+    elif prior == "BEARISH" and below_vwap:
+        chosen = "BEARISH"
+        source = "ESTABLISHED_BEARISH_CONTEXT_BELOW_VWAP"
+        reason = "Retain established bearish context while price remains below VWAP; conflicting short-horizon signals remain warnings unless a bullish structural event confirms."
+    elif base in {"BULLISH", "BEARISH"}:
+        chosen = base
+        source = "OI_HORIZON_CONTEXT"
+        reason = "Retain the reconciled rolling/session OI context; entry confirmation remains separate."
+    else:
+        chosen = "NEUTRAL"
+        source = "NO_ALIGNED_DIRECTIONAL_CONTEXT"
+        reason = "No VWAP-aligned prior direction, no directional OI horizon, and no aligned local wall signal."
+
+    return {
+        "direction": chosen,
+        "source": source,
+        "reason": reason,
+        "bullish_wall_weakening": bullish_wall_weakening,
+        "bearish_wall_weakening": bearish_wall_weakening,
+        "bullish_support_building": bullish_support_building,
+        "bearish_resistance_building": bearish_resistance_building,
+        "directional_context_only": not (bullish_movement or bearish_movement),
+    }
+
+
+def reconcile_regime_with_structure(
+    structure: StructureResult,
+    market_regime: Optional[dict[str, Any]],
+    *,
+    confirmed_opposing_event: bool = False,
+) -> dict[str, Any]:
+    """Make regime gating agree with confirmed PA/OI structure; never override a confirmed opposite event."""
+    result = dict(market_regime) if isinstance(market_regime, dict) else {}
+    side = str(getattr(structure, "direction", "NEUTRAL")).upper()
+    phase = str(getattr(structure, "market_phase", "")).upper()
+    confirmed = bool(getattr(structure, "entry_confirmed", False))
+    if (
+        confirmed_opposing_event or side not in {"BULLISH", "BEARISH"}
+        or phase != f"CONTINUOUS_{side}" or not confirmed
+    ):
+        return result
+
+    old_direction = str(result.get("direction", "NEUTRAL")).upper()
+    old_intensity = str(result.get("intensity", "UNKNOWN")).upper()
+    if old_direction == side and old_intensity not in {"SIDEWAYS", "UNKNOWN"}:
+        return result
+
+    adx = safe_float(result.get("adx"), float("nan"))
+    if math.isfinite(adx) and adx >= ADX_STRONG_THRESHOLD:
+        intensity = "STRONG"
+    elif math.isfinite(adx) and adx >= ADX_SIDEWAYS_THRESHOLD:
+        intensity = "NORMAL"
+    else:
+        # ADX refines strength; confirmed price/OI structure establishes direction.
+        intensity = "NORMAL"
+    result["direction"] = side
+    result["intensity"] = intensity
+    result["structural_direction_override"] = True
+    result["structural_direction_override_reason"] = (
+        f"confirmed {phase} PA/OI structure reconciled regime={old_direction}/{old_intensity}; "
+        "ADX is strength context and cannot independently erase confirmed direction"
+    )
+    result["reason"] = str(result.get("reason", "")) + "; " + result["structural_direction_override_reason"]
+    logger.warning(
+        "REGIME RECONCILED TO STRUCTURE: old=%s/%s new=%s/%s confirmed=%s opposing_event=%s reason=%s",
+        old_direction, old_intensity, side, intensity, confirmed, confirmed_opposing_event,
+        result["structural_direction_override_reason"],
+    )
+    return result
+
+
+def should_bypass_profit_booking_guard(
+    guard: Optional[dict[str, Any]],
+    direction: str,
+    structure: StructureResult,
+    spot: float,
+    *,
+    confirmed_opposing_event: bool = False,
+) -> tuple[bool, str]:
+    """A COI profit-booking guard is a warning, not an indefinite veto over confirmed aligned structure."""
+    if not isinstance(guard, dict) or str(guard.get("blocked_direction", "")).upper() != str(direction or "").upper():
+        return False, "NO_MATCHING_PROFIT_BOOKING_GUARD"
+    side = str(direction or "").upper()
+    phase = str(getattr(structure, "market_phase", "")).upper()
+    structure_side = str(getattr(structure, "direction", "NEUTRAL")).upper()
+    vwap = safe_float(getattr(structure, "vwap", float("nan")), float("nan"))
+    price = safe_float(spot, float("nan"))
+    on_directional_vwap_side = math.isfinite(vwap) and math.isfinite(price) and (
+        (side == "BULLISH" and price > vwap) or (side == "BEARISH" and price < vwap)
+    )
+    confirmed_continuation = (
+        not confirmed_opposing_event
+        and side in {"BULLISH", "BEARISH"}
+        and structure_side == side
+        and phase == f"CONTINUOUS_{side}"
+        and bool(getattr(structure, "entry_confirmed", False))
+        and on_directional_vwap_side
+    )
+    if confirmed_continuation:
+        return True, "CONFIRMED_PA_OI_CONTINUATION_AND_VWAP_ALIGNMENT"
+    return False, "PROFIT_BOOKING_GUARD_REMAINS_ACTIVE_UNTIL_STRUCTURE_RECONFIRMS"
+
+
 def evaluate_atm_window_scenarios(
     *,
     spot: float,
@@ -4842,7 +5186,7 @@ def build_market_structure(
 ) -> StructureResult:
     """Authoritative NIFTY market-structure state machine.
 
-    V48's decision hierarchy is explicit:
+    V51's decision hierarchy is explicit:
       - Price action + VWAP establish the live market direction and movement.
       - Material CALL OI reduction supports bullish continuation; material PUT OI
         reduction indicates weakening put-side support and supports bearish continuation.
@@ -4977,26 +5321,70 @@ def build_market_structure(
     above_vwap = math.isfinite(vwap) and current_close > vwap + STRUCTURE_VWAP_RECLAIM_BUFFER_ATR * volatility_unit
 
     raw_intraday_flow = safe_float(chain_levels.get("change_flow_score"), safe_float(change_oi_score))
-    oi_unwind_direction = str(chain_levels.get("oi_unwind_direction", "NEUTRAL")).upper()
-    oi_unwind_metrics = chain_levels.get("oi_unwind_metrics", {})
+    rolling_metrics = chain_levels.get("oi_unwind_rolling_metrics", {})
+    session_metrics = chain_levels.get("oi_unwind_session_metrics", {})
+    selected_metrics = chain_levels.get("oi_unwind_metrics", {})
+    rolling_metrics = rolling_metrics if isinstance(rolling_metrics, dict) else {}
+    session_metrics = session_metrics if isinstance(session_metrics, dict) else {}
+    selected_metrics = selected_metrics if isinstance(selected_metrics, dict) else {}
+    if rolling_metrics or session_metrics:
+        horizon_choice = resolve_oi_horizon_context(
+            rolling_metrics, session_metrics,
+            previous_direction=prior, above_vwap=above_vwap, below_vwap=below_vwap,
+        )
+    else:
+        # Compatibility for direct callers and persisted/pre-V49 structures that only
+        # provide the previously selected aggregate OI metric.
+        legacy_direction = str(
+            selected_metrics.get("direction", chain_levels.get("oi_unwind_direction", "NEUTRAL"))
+        ).upper()
+        horizon_choice = {
+            "direction": legacy_direction if legacy_direction in {"BULLISH", "BEARISH"} else "NEUTRAL",
+            "rolling_direction": "NEUTRAL", "session_direction": legacy_direction,
+            "source": str(selected_metrics.get("source", "LEGACY_SELECTED_OI_CONTEXT")),
+            "horizon_conflict": False,
+            "reason": "Separate rolling/session metrics unavailable; retained valid selected OI context for compatibility.",
+        }
+    oi_unwind_direction = str(horizon_choice.get("direction", chain_levels.get("oi_unwind_direction", "NEUTRAL"))).upper()
+    if oi_unwind_direction not in {"BULLISH", "BEARISH"}:
+        oi_unwind_direction = str(chain_levels.get("oi_unwind_direction", "NEUTRAL")).upper()
+    if (oi_unwind_direction in {"BULLISH", "BEARISH"}
+            and oi_unwind_direction == str(rolling_metrics.get("direction", "NEUTRAL")).upper()
+            and rolling_metrics):
+        oi_unwind_metrics = rolling_metrics
+    elif (oi_unwind_direction in {"BULLISH", "BEARISH"}
+          and oi_unwind_direction == str(session_metrics.get("direction", "NEUTRAL")).upper()
+          and session_metrics):
+        oi_unwind_metrics = session_metrics
+    elif selected_metrics:
+        oi_unwind_metrics = selected_metrics
+    else:
+        oi_unwind_metrics = rolling_metrics or session_metrics
     if not isinstance(oi_unwind_metrics, dict):
         oi_unwind_metrics = {}
-    # V48 uses the actual ATM-window side reductions as the directional driver.
-    # The prior normalized aggregate score remains logged for diagnostics only; it
-    # cannot overrule a clear side-specific OI unwind.
+    chain_levels["oi_unwind_direction"] = oi_unwind_direction
+    chain_levels["oi_unwind_metrics"] = oi_unwind_metrics
+    chain_levels["oi_unwind_resolution"] = horizon_choice
+    if horizon_choice.get("source") == "ESTABLISHED_SESSION_CONTEXT_ROLLING_COUNTERTREND_PULLBACK":
+        logger.warning(
+            "OI HORIZON CONFLICT RETAINED AS PULLBACK: rolling=%s session=%s prior=%s above_vwap=%s below_vwap=%s; "
+            "direction will not flip without a confirmed opposing structural break.",
+            horizon_choice.get("rolling_direction"), horizon_choice.get("session_direction"), prior, above_vwap, below_vwap,
+        )
     if oi_unwind_direction in {"BULLISH", "BEARISH"}:
         effective_bias = 1 if oi_unwind_direction == "BULLISH" else -1
         effective_flow = effective_bias * max(
             STRUCTURE_CHANGE_OI_STRONG + 0.01,
             min(1.0, abs(raw_intraday_flow)),
         )
-        effective_source = "CALL_OI_UNWINDING_PRIMARY" if effective_bias > 0 else "PUT_OI_UNWINDING_PRIMARY"
+        effective_source = str(oi_unwind_metrics.get("reason", horizon_choice.get("source", "OI_HORIZON_SELECTED")))
+        effective_source = f"{horizon_choice.get('source', 'OI_HORIZON_SELECTED')}:{effective_source}"
     else:
         effective_flow = 0.0
         effective_bias = 0
         effective_source = str(oi_unwind_metrics.get("reason", "NO_CONFIRMED_OI_UNWINDING"))
-    bearish_flow_ok = oi_unwind_direction == "BEARISH"
     bullish_flow_ok = oi_unwind_direction == "BULLISH"
+    bearish_flow_ok = oi_unwind_direction == "BEARISH"
 
     futures_conflict_bearish = bool(
         futures_bias > 0 and futures_strength >= STRUCTURE_FUTURES_CONFLICT_STRENGTH
@@ -5059,6 +5447,51 @@ def build_market_structure(
         resistance_scenario.get("status", "UNKNOWN"),
     )
 
+    raw_oi_unwind_direction = oi_unwind_direction
+    resolved_oi_context = resolve_structural_direction_context(
+        base_direction=oi_unwind_direction,
+        previous_direction=prior,
+        above_vwap=above_vwap,
+        below_vwap=below_vwap,
+        bullish_movement=bullish_movement,
+        bearish_movement=bearish_movement,
+        resistance_scenario=resistance_scenario,
+        support_scenario=support_scenario,
+    )
+    structural_context_direction = str(resolved_oi_context.get("direction", oi_unwind_direction)).upper()
+    if structural_context_direction not in {"BULLISH", "BEARISH", "NEUTRAL"}:
+        structural_context_direction = oi_unwind_direction
+    if structural_context_direction != oi_unwind_direction:
+        logger.warning(
+            "DIRECTIONAL CONTEXT RECONCILED: raw_OI_horizon=%s resolved=%s source=%s reason=%s; "
+            "this preserves market context only; entry remains subject to confirmed structure and risk checks.",
+            raw_oi_unwind_direction, structural_context_direction,
+            resolved_oi_context.get("source", "UNKNOWN"), resolved_oi_context.get("reason", ""),
+        )
+    oi_unwind_direction = structural_context_direction
+    chain_levels["oi_unwind_direction_raw"] = raw_oi_unwind_direction
+    chain_levels["oi_unwind_direction"] = oi_unwind_direction
+    chain_levels["oi_unwind_context_resolution"] = resolved_oi_context
+    if oi_unwind_direction in {"BULLISH", "BEARISH"}:
+        effective_bias = 1 if oi_unwind_direction == "BULLISH" else -1
+        # Direction context is synthesized only for downstream compatibility; raw
+        # rolling/session OI metrics and the original OI classifier reason are preserved.
+        effective_flow = effective_bias * max(
+            STRUCTURE_CHANGE_OI_STRONG + 0.01,
+            min(1.0, abs(raw_intraday_flow)),
+        )
+        raw_oi_reason = str(oi_unwind_metrics.get("reason", "OI_UNWINDING_CONTEXT"))
+        effective_source = (
+            f"{raw_oi_reason}; CONTEXT={resolved_oi_context.get('source', 'OI_CONTEXT')}:"
+            f"{resolved_oi_context.get('reason', '')}"
+        )
+    else:
+        effective_flow = 0.0
+        effective_bias = 0
+        effective_source = str(oi_unwind_metrics.get("reason", "NO_CONFIRMED_OI_UNWINDING"))
+    bullish_flow_ok = oi_unwind_direction == "BULLISH"
+    bearish_flow_ok = oi_unwind_direction == "BEARISH"
+
     support_is_authoritative = str(chain_levels.get("support_source", "")).upper() in {"OPTION_OI", "OPTION_OI_OI_DOMINANCE", "PERSISTED_OPTION_OI"}
     resistance_is_authoritative = str(chain_levels.get("resistance_source", "")).upper() in {"OPTION_OI", "OPTION_OI_OI_DOMINANCE", "PERSISTED_OPTION_OI"}
 
@@ -5083,7 +5516,7 @@ def build_market_structure(
     bearish_level_ok = bool(support_is_authoritative and math.isfinite(support_1) and support_1 < price_reference)
     bullish_level_ok = bool(resistance_is_authoritative and math.isfinite(resistance_1) and resistance_1 > price_reference)
 
-    # V48 direction hierarchy:
+    # V49 direction hierarchy:
     #   - Price action/VWAP establish the underlying directional state.
     #   - Material Call OI unwinding supports bullish continuation; material Put OI
     #     unwinding signals weakening support and supports bearish continuation.
@@ -5169,8 +5602,21 @@ def build_market_structure(
         entry_confirmed, confirmation_state = False, "NO_MATERIAL_OI_UNWINDING"
         interpretation = "NEUTRAL — NO MATERIAL CALL/PUT OI UNWINDING"
         scenario_trigger = f"Wait for a material call-OI reduction (bullish cue) or put-OI reduction (bearish cue); support={support_1:.2f} resistance={resistance_1:.2f}."
-        scenario_invalidation = "No OI-led directional entry without a clear side-specific OI reduction and matching NIFTY/VWAP context."
+        scenario_invalidation = "No fresh OI-led direction is inferred without side-specific OI reduction; previously established context and price/VWAP alignment remain separately visible."
 
+    # A countertrend swing during a still-aligned VWAP/OI context is reported as a pullback/watch,
+    # not a neutral market. This context alone never makes the structure entry-confirmed.
+    directional_context_override = bool(
+        not (continuous_bullish or continuous_bearish)
+        and (
+            (direction == "BULLISH" and above_vwap and bullish_flow_ok and not fresh_bearish_break)
+            or (direction == "BEARISH" and below_vwap and bearish_flow_ok and not fresh_bullish_break)
+        )
+    )
+    directional_context_reason = (
+        f"{direction} OI horizon and VWAP remain aligned; recent swing counter-move is a pullback/watch"
+        if directional_context_override else ""
+    )
     pcr = safe_float(chain_levels.get("pcr"), float("nan"))
     pcr_bias = 1 if math.isfinite(pcr) and pcr >= 1.10 else -1 if math.isfinite(pcr) and pcr <= 0.90 else 0
     structure_score = 8.0 if continuous_bullish else -8.0 if continuous_bearish else 2.0 if direction == "BULLISH" else -2.0 if direction == "BEARISH" else 0.0
@@ -5195,12 +5641,12 @@ def build_market_structure(
         reasons.append("Live spot temporarily cleared an OI resistance but latest completed close has not confirmed breakout.")
 
     if bullish_wall_test_unresolved:
-        logger.info("UNCONFIRMED RESISTANCE-REJECTION SHAPE: candle shape is visible but volume/strike-OI evidence did not confirm a reversal. Keep bullish market structure; candidate still must pass nearest-target RR, wall and contract-quality gates.")
+        logger.info("UNCONFIRMED RESISTANCE-REJECTION SHAPE: candle shape is visible but volume/strike-OI evidence did not confirm a reversal. Keep bullish market structure; candidate still must pass target/stop geometry, wall and contract-quality gates.")
     if bearish_wall_test_unresolved:
-        logger.info("UNCONFIRMED SUPPORT-BOUNCE SHAPE: candle shape is visible but volume/strike-OI evidence did not confirm a reversal. Keep bearish market structure; candidate still must pass nearest-target RR, wall and contract-quality gates.")
+        logger.info("UNCONFIRMED SUPPORT-BOUNCE SHAPE: candle shape is visible but volume/strike-OI evidence did not confirm a reversal. Keep bearish market structure; candidate still must pass target/stop geometry, wall and contract-quality gates.")
 
     logger.info(
-        "STRUCTURE ENGINE V48: phase=%s direction=%s price=%.2f VWAP=%.2f support=%s resistance=%s "
+        "STRUCTURE ENGINE V51: phase=%s direction=%s price=%.2f VWAP=%.2f support=%s resistance=%s "
         "OI_unwind=%s call_change_pct=%+.3f%% put_change_pct=%+.3f%% breakout=%s breakdown=%s Entry=%s",
         market_phase, direction, current_close, vwap,
         f"{support_1:.2f}" if math.isfinite(support_1) else "NA",
@@ -5218,6 +5664,15 @@ def build_market_structure(
         "structure_change_oi_conflict": 0.0,
         "structure_change_oi_source": effective_source,
         "oi_unwind_direction": oi_unwind_direction,
+        "oi_unwind_raw_direction": raw_oi_unwind_direction,
+        "oi_unwind_context_source": str(resolved_oi_context.get("source", "UNAVAILABLE")),
+        "oi_unwind_context_reason": str(resolved_oi_context.get("reason", "")),
+        "oi_unwind_rolling_direction": str(rolling_metrics.get("direction", "NEUTRAL")),
+        "oi_unwind_session_direction": str(session_metrics.get("direction", "NEUTRAL")),
+        "oi_unwind_horizon_source": str(horizon_choice.get("source", "UNAVAILABLE")),
+        "oi_unwind_horizon_conflict": 1.0 if bool(horizon_choice.get("horizon_conflict")) else 0.0,
+        "directional_context_override": 1.0 if directional_context_override else 0.0,
+        "directional_context_reason": directional_context_reason,
         "oi_unwind_call_change_pct": safe_float(oi_unwind_metrics.get("call_change_pct"), float("nan")),
         "oi_unwind_put_change_pct": safe_float(oi_unwind_metrics.get("put_change_pct"), float("nan")),
         "structure_futures_conflict_bullish": 1.0 if futures_conflict_bullish else 0.0,
@@ -5949,6 +6404,7 @@ def _ordered_structural_target_pair(
     window_low: float,
     window_high: float,
     strike_step_value: float,
+    skip_levels: Optional[list[float]] = None,
 ) -> tuple[float, float, dict[str, Any], dict[str, Any]]:
     """Select the nearest two distinct, in-window obstacles from meaningful OI walls and PA swings.
 
@@ -5965,6 +6421,10 @@ def _ordered_structural_target_pair(
         raise ScannerError("Cannot rank structural targets: direction, spot, or ATM-window bounds are invalid.")
 
     candidates: list[dict[str, Any]] = []
+    skipped_levels = [safe_float(value, float("nan")) for value in (skip_levels or [])]
+    skip_tolerance = max(1.0, 0.10 * step)
+    def is_predictively_skipped(level: float) -> bool:
+        return any(math.isfinite(skipped) and abs(level - skipped) <= skip_tolerance for skipped in skipped_levels)
     wall_role = "RESISTANCE" if side == "BULLISH" else "SUPPORT"
     wall_source = "OPTION_OI_RESISTANCE" if side == "BULLISH" else "OPTION_OI_SUPPORT"
     pa_source = "PRICE_ACTION_SWING_HIGH" if side == "BULLISH" else "PRICE_ACTION_SWING_LOW"
@@ -5972,7 +6432,7 @@ def _ordered_structural_target_pair(
     for wall in oi_walls:
         level = safe_float(wall.get("strike"), float("nan"))
         if (not bool(wall.get("meaningful")) or not math.isfinite(level)
-                or not (lo - 0.01 <= level <= hi + 0.01)):
+                or not (lo - 0.01 <= level <= hi + 0.01) or is_predictively_skipped(level)):
             continue
         if (side == "BULLISH" and level <= price + 0.01) or (side == "BEARISH" and level >= price - 0.01):
             continue
@@ -5984,7 +6444,7 @@ def _ordered_structural_target_pair(
 
     for raw in price_action_levels:
         level = safe_float(raw, float("nan"))
-        if (not math.isfinite(level) or not (lo - 0.01 <= level <= hi + 0.01)):
+        if (not math.isfinite(level) or not (lo - 0.01 <= level <= hi + 0.01) or is_predictively_skipped(level)):
             continue
         if (side == "BULLISH" and level <= price + 0.01) or (side == "BEARISH" and level >= price - 0.01):
             continue
@@ -6041,12 +6501,104 @@ def _ordered_structural_target_pair(
     return float(t1), float(t2), meta1, meta2
 
 
+def predictive_weak_wall_skip_levels(
+    direction: str,
+    spot: float,
+    structure: StructureResult,
+    chain_levels: Optional[dict[str, Any]],
+    candidate_walls: list[dict[str, Any]],
+    strike_step_value: float,
+) -> list[float]:
+    """Skip a nearby weakening target wall only for a confirmed aligned pre-breakout setup.
+
+    This affects target planning only. It does not state that the wall has already broken:
+    the broad direction must be continuously confirmed, price must be on the correct VWAP
+    side with aligned momentum, the nearest wall must be near and weakening, and no completed
+    rejection/bounce shape may be present. Only materially weakening walls within a bounded
+    distance are bypassed; stable/building walls remain obstacles.
+    """
+    side = str(direction or "").upper()
+    price = safe_float(spot, float("nan"))
+    step = max(1.0, safe_float(strike_step_value, 50.0))
+    if side not in {"BULLISH", "BEARISH"} or not math.isfinite(price) or price <= 0:
+        return []
+    if str(getattr(structure, "market_phase", "")).upper() != f"CONTINUOUS_{side}" or not bool(getattr(structure, "entry_confirmed", False)):
+        return []
+    vwap = safe_float(getattr(structure, "vwap", float("nan")), float("nan"))
+    slope = safe_float(getattr(structure, "vwap_slope", float("nan")), float("nan"))
+    components = getattr(structure, "components", {})
+    components = components if isinstance(components, dict) else {}
+    recent_momentum = safe_float(components.get("recent3_movement_atr"), 0.0)
+    intraday_momentum = safe_float(components.get("intraday_trend"), 0.0)
+    momentum_aligned = (recent_momentum >= -0.05 or intraday_momentum > 0) if side == "BULLISH" else (recent_momentum <= 0.05 or intraday_momentum < 0)
+    if side == "BULLISH":
+        if not (math.isfinite(vwap) and price > vwap and (not math.isfinite(slope) or slope >= 0) and momentum_aligned):
+            return []
+        scenario_name, relevant_side, expected_role = "resistance", "CALL", "RESISTANCE"
+    else:
+        if not (math.isfinite(vwap) and price < vwap and (not math.isfinite(slope) or slope <= 0) and momentum_aligned):
+            return []
+        scenario_name, relevant_side, expected_role = "support", "PUT", "SUPPORT"
+
+    levels = chain_levels if isinstance(chain_levels, dict) else {}
+    scenario_context = levels.get("atm_window_scenario_context", {})
+    scenario = scenario_context.get(scenario_name, {}) if isinstance(scenario_context, dict) else {}
+    if not isinstance(scenario, dict):
+        return []
+    scenario_pct = safe_float(scenario.get("oi_change_pct"), float("nan"))
+    scenario_reversal_shape = bool(scenario.get("price_rejection_shape")) if side == "BULLISH" else bool(scenario.get("price_bounce_shape"))
+    if not (
+        bool(scenario.get("near"))
+        and str(scenario.get("oi_state", "UNKNOWN")).upper() == "WEAKENING"
+        and math.isfinite(scenario_pct)
+        and scenario_pct <= -max(COI_STRONG_CHANGE_PCT, OI_UNWINDING_MIN_CHANGE_PCT)
+        and safe_float(scenario.get("distance_steps"), float("inf")) <= PREBREAKOUT_WEAK_WALL_MAX_STEPS
+        and not scenario_reversal_shape
+    ):
+        return []
+
+    velocity_map = levels.get("oi_velocity_by_strike", {})
+    structure_map = levels.get("oi_structure_by_strike", {})
+    velocity_map = velocity_map if isinstance(velocity_map, dict) else {}
+    structure_map = structure_map if isinstance(structure_map, dict) else {}
+    max_distance = PREBREAKOUT_WEAK_WALL_MAX_STEPS * step
+    skipped: list[float] = []
+    for wall in candidate_walls:
+        level = safe_float(wall.get("strike"), float("nan"))
+        if not math.isfinite(level):
+            continue
+        distance = level - price if side == "BULLISH" else price - level
+        if distance < -0.01 or distance > max_distance + 0.01:
+            continue
+        row = _oi_role_row(structure_map, level)
+        if str(row.get("dominant_role", "")).upper() != expected_role:
+            continue
+        velocity = velocity_map.get(float(level))
+        if not isinstance(velocity, dict):
+            velocity = velocity_map.get(int(round(level)), {})
+        state = _wall_side_oi_state(row, relevant_side, velocity if isinstance(velocity, dict) else {})
+        pct = safe_float(state.get("change_pct"), float("nan"))
+        if (
+            str(state.get("state", "UNKNOWN")).upper() == "WEAKENING"
+            and math.isfinite(pct)
+            and pct <= -max(COI_STRONG_CHANGE_PCT, OI_UNWINDING_MIN_CHANGE_PCT)
+        ):
+            skipped.append(float(level))
+    scenario_level = safe_float(scenario.get("level"), float("nan"))
+    if math.isfinite(scenario_level) and not skipped:
+        row = _oi_role_row(structure_map, scenario_level)
+        if str(row.get("dominant_role", "")).upper() == expected_role:
+            skipped.append(float(scenario_level))
+    return sorted(set(round(level, 2) for level in skipped))
+
+
 def determine_structural_trade_levels(
     chain: list[dict[str, Any]],
     spot: float,
     structure: StructureResult,
     price_session: Optional[pd.DataFrame],
     change_oi_by_strike: Optional[dict[float, dict[str, float]]] = None,
+    chain_levels: Optional[dict[str, Any]] = None,
 ) -> tuple[float, float, float, dict[str, Any]]:
     """Determine authoritative NIFTY T1/T2/SL from the nearest valid PA/OI obstacles.
 
@@ -6079,10 +6631,21 @@ def determine_structural_trade_levels(
         decision_chain, price, side="resistance", change_oi_by_strike=change_oi_by_strike,
     )
 
+    target_skip_levels: list[float] = []
+    target_skip_reason = "NONE"
     if direction == "BULLISH":
         target_walls = resistance_walls
+        target_skip_levels = predictive_weak_wall_skip_levels(direction, price, structure, chain_levels, target_walls, step)
+        if target_skip_levels:
+            target_skip_reason = "CONTINUOUS_BULLISH_PA_OI_NEARBY_CALL_OI_UNWINDING_NO_REJECTION"
+            logger.warning(
+                "PREDICTIVE TARGET ROUTING: bullish pre-breakout; skip weakening Call-OI walls=%s within %.2f steps; "
+                "VWAP/momentum align and no confirmed resistance rejection; target next intact wall.",
+                ",".join(f"{x:.2f}" for x in target_skip_levels), PREBREAKOUT_WEAK_WALL_MAX_STEPS,
+            )
         t1, t2, t1_meta, t2_meta = _ordered_structural_target_pair(
             direction, price, target_walls, swings.get("highs", []), window_low, window_high, step,
+            skip_levels=target_skip_levels,
         )
         stop_walls = [wall for wall in support_walls if bool(wall.get("meaningful"))]
         stop_u, stop_source = _initial_structural_stop(price, direction, swings, stop_walls, step)
@@ -6092,8 +6655,17 @@ def determine_structural_trade_levels(
             )
     else:
         target_walls = support_walls
+        target_skip_levels = predictive_weak_wall_skip_levels(direction, price, structure, chain_levels, target_walls, step)
+        if target_skip_levels:
+            target_skip_reason = "CONTINUOUS_BEARISH_PA_OI_NEARBY_PUT_OI_UNWINDING_NO_BOUNCE"
+            logger.warning(
+                "PREDICTIVE TARGET ROUTING: bearish pre-breakdown; skip weakening Put-OI support walls=%s within %.2f steps; "
+                "VWAP/momentum align and no confirmed support bounce; target next intact support.",
+                ",".join(f"{x:.2f}" for x in target_skip_levels), PREBREAKOUT_WEAK_WALL_MAX_STEPS,
+            )
         t1, t2, t1_meta, t2_meta = _ordered_structural_target_pair(
             direction, price, target_walls, swings.get("lows", []), window_low, window_high, step,
+            skip_levels=target_skip_levels,
         )
         stop_walls = [wall for wall in resistance_walls if bool(wall.get("meaningful"))]
         stop_u, stop_source = _initial_structural_stop(price, direction, swings, stop_walls, step)
@@ -6125,7 +6697,13 @@ def determine_structural_trade_levels(
         "window_atm": safe_float(window_meta.get("atm_strike"), float("nan")),
         "window_lower_bound": float(window_low),
         "window_upper_bound": float(window_high),
-        "target_selection_method": "NEAREST_MEANINGFUL_OI_AND_COMPLETED_PA_SWINGS",
+        "target_selection_method": (
+            "PREDICTIVE_WEAK_WALL_BYPASS_THEN_NEXT_INTACT_PA_OI_OBSTACLE"
+            if target_skip_levels else "NEAREST_MEANINGFUL_OI_AND_COMPLETED_PA_SWINGS"
+        ),
+        "predictive_prebreakout_targeting": bool(target_skip_levels),
+        "predictive_weak_walls_skipped": list(target_skip_levels),
+        "predictive_target_routing_reason": target_skip_reason,
     }
     return float(t1), float(t2), float(stop_u), meta
 
@@ -7285,7 +7863,7 @@ def entry_persistence_policy(
     last known directional state and a counter-trend exhaustion scalp still require
     two distinct completed bars to reduce CE/PE flip-flopping. Confirmed local OI
     breaks/rejections may act immediately because their own completed-bar, flow,
-    wall, target/stop, and reward/risk gates are stricter and explicit.
+    wall, target/stop geometry and execution-quality checks are explicit.
     """
     side = str(direction or "").strip().upper()
     phase = str(market_phase or "").strip().upper()
@@ -7683,6 +8261,8 @@ def evaluate_market_structure(
         structure_change_oi=safe_float(structure.components.get("structure_change_oi"), 0.0),
         structure_vwap_slope=structure.vwap_slope,
         structure_entry_confirmed=structure.entry_confirmed,
+        directional_context_override=bool(safe_float(structure.components.get("directional_context_override"), 0.0) > 0.5),
+        directional_context_reason=str(structure.components.get("directional_context_reason", "")),
     )
     current_oi_structure = chain_levels.get("oi_structure_by_strike", {})
     decision_step = strike_step(sorted(chain_rows(option_chain_atm_window(chain, spot)[0])))
@@ -7771,14 +8351,23 @@ def evaluate_market_structure(
             market_regime["structural_break_override"] = True
             market_regime["intensity"] = "NORMAL"
             logger.warning(
-                "STRUCTURAL EVENT OVERRIDE: raw_intensity=%s ADX=%s; trade eligibility will still require valid in-window T1/SL and R/R >= %.2f.",
-                classified_intensity, market_regime.get("adx"), MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO,
+                "STRUCTURAL EVENT OVERRIDE: raw_intensity=%s ADX=%s; trade eligibility will still require valid in-window target/stop geometry; R/R is diagnostic only.",
+                classified_intensity, market_regime.get("adx"),
             )
         elif classified_intensity == "UNKNOWN":
             market_regime["intensity"] = "NORMAL"
         market_regime["reason"] = (
             str(market_regime.get("reason", "")) + "; " + str(local_structure_event.get("reason", ""))
         ).strip("; ")
+
+    confirmed_opposing_event = bool(
+        local_structure_event.get("confirmed")
+        and str(local_structure_event.get("direction", "")).upper() in {"BULLISH", "BEARISH"}
+        and str(local_structure_event.get("direction", "")).upper() != str(structure.direction).upper()
+    )
+    market_regime = reconcile_regime_with_structure(
+        structure, market_regime, confirmed_opposing_event=confirmed_opposing_event,
+    )
 
     return MarketEvaluation(
         structure=structure, market_regime=market_regime,
@@ -8007,27 +8596,57 @@ def execute_scan(
             window_velocity.get("baseline_mode", "UNAVAILABLE"),
             int(window_velocity.get("coverage", 0)), int(window_velocity.get("required_coverage", 0)),
         )
-    # V48 primary direction signal: relative OI reduction by side, scoped to the same ATM +/-4 window.
-    oi_flow_sample = window_velocity if bool(window_velocity.get("available")) else local_change_oi_meta
-    call_change_sum = safe_float(oi_flow_sample.get("call_change_sum"), float("nan"))
-    put_change_sum = safe_float(oi_flow_sample.get("put_change_sum"), float("nan"))
-    oi_weight = safe_float(oi_flow_sample.get("weight"), 1.0)
-    oi_unwind_metrics = classify_oi_unwinding_direction(
-        call_change_sum=call_change_sum,
-        put_change_sum=put_change_sum,
+    # V49 keeps both horizons: rolling OI is tactical, session/day Change-OI is broad context.
+    rolling_oi_metrics = classify_oi_unwinding_direction(
+        call_change_sum=safe_float(window_velocity.get("call_change_sum"), float("nan")),
+        put_change_sum=safe_float(window_velocity.get("put_change_sum"), float("nan")),
         call_oi_total=chain_levels.get("window_call_oi_total"),
         put_oi_total=chain_levels.get("window_put_oi_total"),
-        weight=oi_weight,
+        weight=safe_float(window_velocity.get("weight"), 1.0),
+    ) if bool(window_velocity.get("available")) else {
+        "direction": "NEUTRAL", "valid": False, "reason": "ROLLING_OI_UNAVAILABLE",
+        "call_change_pct": float("nan"), "put_change_pct": float("nan"),
+        "effective_call_change_pct": float("nan"), "effective_put_change_pct": float("nan"),
+    }
+    rolling_oi_metrics["source"] = str(window_velocity.get("baseline_mode", "ROLLING_15_30"))
+    rolling_oi_metrics["call_change_sum"] = safe_float(window_velocity.get("call_change_sum"), float("nan"))
+    rolling_oi_metrics["put_change_sum"] = safe_float(window_velocity.get("put_change_sum"), float("nan"))
+    session_oi_metrics = classify_oi_unwinding_direction(
+        call_change_sum=safe_float(local_change_oi_meta.get("call_change_sum"), float("nan")),
+        put_change_sum=safe_float(local_change_oi_meta.get("put_change_sum"), float("nan")),
+        call_oi_total=chain_levels.get("window_call_oi_total"),
+        put_oi_total=chain_levels.get("window_put_oi_total"),
+        weight=safe_float(local_change_oi_meta.get("weight"), 1.0),
     )
-    oi_unwind_metrics["source"] = str(
-        window_velocity.get("baseline_mode", "LOCAL_ATM_CHANGE_OI")
-        if bool(window_velocity.get("available"))
-        else local_change_oi_meta.get("source", "LOCAL_ATM_CHANGE_OI")
-    )
+    session_oi_metrics["source"] = str(local_change_oi_meta.get("source", "LOCAL_ATM_CHANGE_OI"))
+    session_oi_metrics["call_change_sum"] = safe_float(local_change_oi_meta.get("call_change_sum"), float("nan"))
+    session_oi_metrics["put_change_sum"] = safe_float(local_change_oi_meta.get("put_change_sum"), float("nan"))
+    horizon_choice = resolve_oi_horizon_context(rolling_oi_metrics, session_oi_metrics)
+    oi_unwind_direction = str(horizon_choice.get("direction", "NEUTRAL"))
+    if oi_unwind_direction in {"BULLISH", "BEARISH"} and oi_unwind_direction == str(rolling_oi_metrics.get("direction", "NEUTRAL")).upper():
+        oi_unwind_metrics = dict(rolling_oi_metrics)
+    elif oi_unwind_direction in {"BULLISH", "BEARISH"}:
+        oi_unwind_metrics = dict(session_oi_metrics)
+    else:
+        oi_unwind_metrics = dict(rolling_oi_metrics)
+    oi_unwind_metrics["source"] = str(horizon_choice.get("source", oi_unwind_metrics.get("source", "UNAVAILABLE")))
+    call_change_sum = safe_float(oi_unwind_metrics.get("call_change_sum"), float("nan"))
+    put_change_sum = safe_float(oi_unwind_metrics.get("put_change_sum"), float("nan"))
+    oi_weight = safe_float(oi_unwind_metrics.get("weight"), 1.0)
     chain_levels["call_oi_change_sum"] = call_change_sum
     chain_levels["put_oi_change_sum"] = put_change_sum
     chain_levels["oi_unwind_metrics"] = oi_unwind_metrics
-    chain_levels["oi_unwind_direction"] = str(oi_unwind_metrics.get("direction", "NEUTRAL"))
+    chain_levels["oi_unwind_rolling_metrics"] = rolling_oi_metrics
+    chain_levels["oi_unwind_session_metrics"] = session_oi_metrics
+    chain_levels["oi_unwind_rolling_direction"] = str(rolling_oi_metrics.get("direction", "NEUTRAL"))
+    chain_levels["oi_unwind_session_direction"] = str(session_oi_metrics.get("direction", "NEUTRAL"))
+    chain_levels["oi_unwind_direction"] = oi_unwind_direction
+    logger.info(
+        "OI HORIZON RECONCILIATION: selected=%s source=%s rolling=%s session=%s conflict=%s reason=%s",
+        oi_unwind_direction, horizon_choice.get("source"),
+        rolling_oi_metrics.get("direction", "NEUTRAL"), session_oi_metrics.get("direction", "NEUTRAL"),
+        horizon_choice.get("horizon_conflict", False), horizon_choice.get("reason", ""),
+    )
     logger.info(
         "OI UNWINDING DIRECTION: direction=%s call_change=%+.0f (%+.3f%% effective=%+.3f%%) "
         "put_change=%+.0f (%+.3f%% effective=%+.3f%%) threshold=%.3f%% weight=%.2f reason=%s; "
@@ -8185,6 +8804,9 @@ def execute_scan(
         "tod_window": tod_window,
         "expiry_day": is_expiry_day,
         "oi_structure_by_strike": chain_levels.get("oi_structure_by_strike", {}),
+        "oi_unwind_rolling_direction": chain_levels.get("oi_unwind_rolling_direction", "NEUTRAL"),
+        "oi_unwind_session_direction": chain_levels.get("oi_unwind_session_direction", "NEUTRAL"),
+        "oi_unwind_resolution": chain_levels.get("oi_unwind_resolution", {}),
         "local_oi_break": local_oi_break,
         "local_oi_rejection": local_oi_rejection,
         "local_structure_event": local_structure_event,
@@ -8302,9 +8924,27 @@ def execute_scan(
         )
         return None
 
+    confirmed_opposing_event_for_gate = bool(
+        local_structure_event.get("confirmed")
+        and str(local_structure_event.get("direction", "")).upper() in {"BULLISH", "BEARISH"}
+        and str(local_structure_event.get("direction", "")).upper() != str(structure.direction).upper()
+    )
+    market_regime = reconcile_regime_with_structure(
+        structure, market_regime, confirmed_opposing_event=confirmed_opposing_event_for_gate,
+    )
     intensity = str(market_regime.get("intensity", "UNKNOWN")).upper()
     regime_direction = str(market_regime.get("direction", "NEUTRAL")).upper()
     adx_value = safe_float(market_regime.get("adx"), float("nan"))
+    logger.info(
+        "ENTRY DECISION CONTEXT: structure=%s/%s confirmed=%s regime=%s/%s ADX=%s "
+        "OI_context=%s raw_OI=%s next_move=%s",
+        structure.direction, structure.market_phase, structure.entry_confirmed,
+        regime_direction, intensity,
+        f"{adx_value:.2f}" if math.isfinite(adx_value) else "NA",
+        structure.components.get("oi_unwind_context_source", "UNAVAILABLE"),
+        structure.components.get("oi_unwind_raw_direction", "UNAVAILABLE"),
+        (structure.components.get("atm_window_scenario_context", {}) or {}).get("next_move", "UNAVAILABLE"),
+    )
     if intensity in {"SIDEWAYS", "UNKNOWN"}:
         if (
             structure.direction in {"BULLISH", "BEARISH"}
@@ -8328,11 +8968,23 @@ def execute_scan(
         return None
     coi_guard = state.get("coi_market_guard")
     if isinstance(coi_guard, dict) and str(coi_guard.get("blocked_direction", "")).upper() == regime_direction:
-        logger.warning(
-            "NO TRADE: %s counter-trend entry blocked by COI profit-booking guard (%s); waiting for fresh structural writing.",
-            regime_direction, coi_guard.get("reason", "PROFIT_BOOKING"),
+        guard_bypass, guard_bypass_reason = should_bypass_profit_booking_guard(
+            coi_guard, regime_direction, structure, spot,
+            confirmed_opposing_event=confirmed_opposing_event_for_gate,
         )
-        return None
+        if guard_bypass:
+            logger.warning(
+                "COI PROFIT-BOOKING GUARD BYPASSED FOR THIS SCAN: direction=%s reason=%s; "
+                "confirmed continuous PA/OI structure and VWAP alignment remain valid. Guard state is retained for re-evaluation.",
+                regime_direction, guard_bypass_reason,
+            )
+        else:
+            logger.warning(
+                "NO TRADE: %s entry blocked by COI profit-booking guard (%s); bypass_reason=%s; "
+                "no confirmed aligned continuation currently overrides the guard.",
+                regime_direction, coi_guard.get("reason", "PROFIT_BOOKING"), guard_bypass_reason,
+            )
+            return None
     midday_gate_passed, midday_gate_reason = midday_momentum_gate_decision(
         tod_window=tod_window, adx_value=adx_value, minimum_adx=MIDDAY_MIN_ADX,
         structure_direction=structure.direction, structure_phase=structure.market_phase,
@@ -8513,7 +9165,7 @@ def execute_scan(
         if confirmed_event_trigger:
             logger.info(
                 "COLD-START GATE PASSED: confirmed local %s in %s direction; "
-                "structural targets, opposing-wall checks, execution quality and minimum R/R remain mandatory.",
+                "structural target/stop geometry, opposing-wall checks and execution quality remain mandatory; R/R is diagnostic only.",
                 str(local_structure_event.get("kind", "STRUCTURAL_EVENT")), regime_direction,
             )
 
@@ -8584,6 +9236,7 @@ def execute_scan(
             entry_structure,
             index_session,
             change_oi_by_strike=option_flow_by_strike,
+            chain_levels=chain_levels,
         )
     except ScannerError as exc:
         logger.warning("NO TRADE: current ATM-window PA/OI targets or structural stop are invalid: %s", exc)
@@ -8603,27 +9256,30 @@ def execute_scan(
     structural_reward = rr_profile["reward_t1"]
     structural_risk = rr_profile["risk_t1"]
     local_event_kind = str(local_structure_event.get("kind", "")).upper() if local_event_entry else ""
-    logger.info(
-        "STRUCTURAL ENTRY RISK CHECK: direction=%s event=%s reward_T1=%.2f risk=%.2f RR_T1=%.2f "
-        "reward_T2=%.2f RR_T2=%.2f required_T1>=%.2f T1=%.2f T2=%.2f SL=%.2f "
-        "T2_is_diagnostic_only=True",
-        regime_direction, local_event_kind or "CONTINUATION", structural_reward, structural_risk,
-        rr_ratio, rr_profile["reward_t2"], rr_profile["rr_t2"],
-        MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO, target_u1, target_u2, stop_u,
+    geometry = validate_structural_target_stop(
+        regime_direction, float(spot), float(target_u1), float(stop_u)
     )
-    if (not math.isfinite(rr_ratio) or structural_reward <= 0 or structural_risk <= 0
-            or rr_ratio < MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO):
+    logger.info(
+        "STRUCTURAL ENTRY GEOMETRY CHECK: direction=%s event=%s valid=%s reason=%s "
+        "reward_T1=%.2f risk=%.2f RR_T1=%.2f reward_T2=%.2f RR_T2=%.2f "
+        "RR_RATIO_VETO=DISABLED T1=%.2f T2=%.2f SL=%.2f T2_is_diagnostic_only=True",
+        regime_direction, local_event_kind or "CONTINUATION", geometry["valid"], geometry["reason"],
+        structural_reward, structural_risk, rr_ratio, rr_profile["reward_t2"], rr_profile["rr_t2"],
+        target_u1, target_u2, stop_u,
+    )
+    if not geometry["valid"]:
         logger.warning(
-            "NO TRADE: structural reward/risk is insufficient or invalid; direction=%s event=%s R/R=%.2f required>=%.2f.",
-            regime_direction, local_event_kind or "CONTINUATION", rr_ratio,
-            MIN_STRUCTURAL_ENTRY_REWARD_RISK_RATIO,
+            "NO TRADE: invalid structural target/stop geometry; direction=%s event=%s reason=%s "
+            "T1=%.2f SL=%.2f RR_T1=%.3f. Fixed reward/risk ratio is not an entry veto.",
+            regime_direction, local_event_kind or "CONTINUATION", geometry["reason"],
+            target_u1, stop_u, rr_ratio,
         )
         save_state(state)
         return None
 
     # Dynamic clear-space guard for ordinary continuation setups. A confirmed
     # completed-bar event may bypass this secondary distance filter, but never the
-    # structural target/stop or minimum reward-to-risk checks above.
+    # structural target/stop geometry checks above; RR remains diagnostic only.
     local_break_risk_valid = bool(local_event_entry and local_event_kind in {"BREAKDOWN", "BREAKOUT"})
     local_rejection_risk_valid = bool(local_event_entry and local_event_kind in {"RESISTANCE_REJECTION", "SUPPORT_BOUNCE"})
     strike_step_for_gate = strike_step(sorted(chain_rows(option_chain_atm_window(chain, spot)[0])))
@@ -8640,19 +9296,20 @@ def execute_scan(
     wall_veto = opposing_oi_wall_veto(
         regime_direction, spot, guard_support, guard_resistance, strike_step_for_gate,
         confirmed_local_break=local_break_risk_valid, confirmed_local_rejection=local_rejection_risk_valid,
-        clearance_steps=dynamic_clearance_steps, target_level=target_u1, target_rr_validated=True,
+        clearance_steps=dynamic_clearance_steps, target_level=target_u1, target_geometry_validated=True,
         target_is_meaningful_oi_wall=bool(level_meta.get("t1_is_meaningful_oi_wall", False)),
+        predictive_weak_wall_bypass=bool(level_meta.get("predictive_prebreakout_targeting", False)),
     )
     if wall_veto:
         logger.warning(
-            "NO TRADE: %s; dynamic wall clearance=%.2f strike steps; target/RR and structural stops were already checked.",
+            "NO TRADE: %s; dynamic wall clearance=%.2f strike steps; structural target/stop geometry was already checked.",
             wall_veto, dynamic_clearance_steps,
         )
         save_state(state)
         return None
     logger.info(
         "STRUCTURAL WALL CLEARANCE: direction=%s atr_points=%.2f directional_momentum_atr=%+.2f "
-        "wall_strength=%.3f required_clearance=%.2f steps target=%s target_rr_validated=True veto=%s",
+        "wall_strength=%.3f required_clearance=%.2f steps target=%s target_geometry_validated=True rr_ratio_veto=DISABLED veto=%s",
         regime_direction, volatility_for_gate, directional_momentum_for_gate,
         safe_float(wall_strength_for_gate, 0.0), dynamic_clearance_steps,
         f"{target_u1:.2f}", wall_veto or "NONE",
@@ -8679,6 +9336,7 @@ def execute_scan(
     setup_label = (
         "CONFIRMED EXHAUSTION COUNTER-TREND SCALP" if exhaustion_entry
         else f"CONFIRMED LOCAL OI {local_event_kind}" if local_event_entry
+        else "PREDICTIVE PRE-BREAKOUT CONTINUATION" if level_meta.get("predictive_prebreakout_targeting")
         else "STRUCTURAL CONTINUATION ENTRY"
     )
     reasons = list(entry_structure.reasons)
@@ -8790,7 +9448,7 @@ def dispatch_alerts(state: dict[str, Any], signal: Signal) -> None:
 
 
 def run_self_tests() -> None:
-    """Run deterministic V48 OI-unwinding and regression checks without network access."""
+    """Run deterministic V50 OI-unwinding and regression checks without network access."""
     self_test_flow = max(STRUCTURE_CHANGE_OI_CONFIRM, 0.25) + 0.05
     scenarios = [
         ("BULLISH", "CONTINUOUS_BULLISH", 101.0, 100.0, 100.8, 0.8, self_test_flow, True, "NONE", False),
@@ -8849,7 +9507,7 @@ def run_self_tests() -> None:
         22800.0, 50.0, "BULLISH", "SIDEWAYS", now=datetime(2026, 10, 15, 10, 0, tzinfo=IST),
     )
 
-    # V48: a confirmed continuous PA/OI trend is not vetoed by low/absent midday ADX.
+    # V50: a confirmed continuous PA/OI trend is not vetoed by low/absent midday ADX.
     midday_ok, midday_reason = midday_momentum_gate_decision(
         tod_window="MIDDAY", adx_value=18.0, minimum_adx=23.0,
         structure_direction="BULLISH", structure_phase="CONTINUOUS_BULLISH",
@@ -8924,7 +9582,7 @@ def run_self_tests() -> None:
         previous_direction="BULLISH", local_event_entry=True,
     )[0] == 1
 
-    print("V48 SELF-TEST PASSED.")
+    print("V51 SELF-TEST PASSED.")
 
 
 def main() -> int:
@@ -8937,7 +9595,7 @@ def main() -> int:
             run_self_tests()
             return 0
         except Exception:
-            logger.error("V48 self-test failed:\n%s", traceback.format_exc())
+            logger.error("V51 self-test failed:\n%s", traceback.format_exc())
             return 1
 
     try:
