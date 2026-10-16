@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 Predictive Market Scanner & Strike Router — V64.
+"""NIFTY 50 Predictive Market Scanner & Strike Router — V65.
 
 Clean, modular redesign of the supplied V52–V58 scanner lineage. This version has
 one market-scenario engine, one strike router, one structural risk engine, one state
@@ -67,7 +67,7 @@ API sources checked during design (official Upstox docs):
 Important measurement limitation: the option-chain endpoint returns OI snapshots, not a
 continuous OI time series. Intraday COI velocity is therefore computed from this scanner's
 own timestamped snapshots. For 09:16 velocity availability, schedule the first scan at
-09:15. If a process starts later with no same-session baseline, V64 reports COI as
+09:15. If a process starts later with no same-session baseline, V65 reports COI as
 unavailable/session-proxy and will not describe the proxy as tactical velocity.
 """
 from __future__ import annotations
@@ -104,7 +104,7 @@ import requests
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com"
-SCANNER_VERSION = "2026-10-16-V64-INDICATOR-CANDLE-COUNT-FIX"
+SCANNER_VERSION = "2026-10-16-V65-UPSTOX-EXPIRY-NORMALIZATION"
 MARKET_START = time(9, 15)
 ENTRY_START = time(9, 16)
 MORNING_END = time(10, 30)
@@ -114,7 +114,7 @@ MARKET_END = time(15, 30)
 DEFAULT_NIFTY_KEY = "NSE_INDEX|Nifty 50"
 DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-LOGGER = logging.getLogger("nifty_v64")
+LOGGER = logging.getLogger("nifty_v65")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(message)s",
                     stream=sys.stderr)
@@ -245,10 +245,28 @@ def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
 
 
 def parse_date(value: Any) -> Optional[date]:
-    try:
-        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
-    except (ValueError, TypeError):
+    """Parse ISO and common exchange date formats without losing date identity.
+
+    Upstox endpoints may represent the same expiry as either ``YYYY-MM-DD`` or
+    ``DD-MM-YYYY``. Normalize both to ``datetime.date`` before comparing dates.
+    Timestamp strings are accepted by parsing their leading ISO date component.
+    """
+    if value is None:
         return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    candidate = text[:10]
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(candidate, fmt).date()
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 def parse_timestamp(value: Any) -> Optional[datetime]:
@@ -963,12 +981,44 @@ class UpstoxClient:
         return expiries[0].isoformat()
 
     def option_chain(self, expiry: str) -> list[dict[str, Any]]:
-        payload = self.get("/v2/option/chain", {"instrument_key": self.config.nifty_key, "expiry_date": expiry})
+        requested_expiry = parse_date(expiry)
+        if requested_expiry is None:
+            raise ScannerError(f"Invalid requested NIFTY option expiry: {expiry!r}.")
+        payload = self.get("/v2/option/chain", {
+            "instrument_key": self.config.nifty_key,
+            "expiry_date": requested_expiry.isoformat(),
+        })
         rows = payload.get("data", [])
         if not isinstance(rows, list) or not rows:
-            raise ScannerError(f"NIFTY option chain is empty for expiry {expiry}.")
-        filtered = [r for r in rows if isinstance(r, dict) and str(r.get("expiry", expiry))[:10] == expiry[:10]]
-        return filtered or [r for r in rows if isinstance(r, dict)]
+            raise ScannerError(f"NIFTY option chain is empty for expiry {requested_expiry.isoformat()}.")
+
+        valid_rows = [row for row in rows if isinstance(row, dict)]
+        filtered: list[dict[str, Any]] = []
+        has_explicit_expiry = False
+        has_unparseable_expiry = False
+        for row in valid_rows:
+            raw_expiry = row.get("expiry")
+            if raw_expiry is None or not str(raw_expiry).strip():
+                # The endpoint was explicitly queried for this expiry; if the API
+                # omits expiry in every row, retain compatibility with that response.
+                continue
+            has_explicit_expiry = True
+            row_expiry = parse_date(raw_expiry)
+            if row_expiry is None:
+                has_unparseable_expiry = True
+            elif row_expiry == requested_expiry:
+                filtered.append(row)
+
+        if filtered:
+            return filtered
+        if has_explicit_expiry:
+            detail = "unparseable expiry values" if has_unparseable_expiry else "no rows matching the requested date"
+            raise ScannerError(
+                f"NIFTY option-chain expiry validation failed for {requested_expiry.isoformat()}: {detail}."
+            )
+        if valid_rows:
+            return valid_rows
+        raise ScannerError(f"NIFTY option chain contains no valid rows for expiry {requested_expiry.isoformat()}.")
 
     def change_oi_by_strike(self, expiry: str, session_date: date) -> dict[str, Any]:
         """Fetch Upstox's documented interval-in-days COI for structural/session context.
@@ -986,11 +1036,19 @@ class UpstoxClient:
         data = payload.get("data", {})
         if not isinstance(data, dict):
             raise ScannerError("Upstox Change-OI endpoint returned an invalid data object.")
-        response_expiry = str(data.get("expiry", expiry))[:10]
-        if response_expiry and response_expiry != str(expiry)[:10]:
-            raise ScannerError(
-                f"Upstox Change-OI expiry mismatch: requested={str(expiry)[:10]} response={response_expiry}."
-            )
+        requested_expiry_date = parse_date(expiry)
+        if requested_expiry_date is None:
+            raise ScannerError(f"Invalid requested Change-OI expiry: {expiry!r}.")
+        response_expiry_raw = data.get("expiry", expiry)
+        if response_expiry_raw is None or not str(response_expiry_raw).strip():
+            response_expiry_date = requested_expiry_date
+        else:
+            response_expiry_date = parse_date(response_expiry_raw)
+            if response_expiry_date is None or response_expiry_date != requested_expiry_date:
+                raise ScannerError(
+                    "Upstox Change-OI expiry mismatch: "
+                    f"requested={requested_expiry_date.isoformat()} response={str(response_expiry_raw)[:32]!r}."
+                )
         items = data.get("call_put_oi_data_list", [])
         if not isinstance(items, list):
             raise ScannerError("Upstox Change-OI endpoint returned an invalid per-strike list.")
@@ -1015,7 +1073,7 @@ class UpstoxClient:
             "total_put_change_oi": safe_float(data.get("total_put_change_oi"), float("nan")),
             "interval_days": 1,
             "date": session_date.isoformat(),
-            "expiry": str(data.get("expiry", expiry))[:10],
+            "expiry": response_expiry_date.isoformat(),
             "source": "UPSTOX_CHANGE_OI_INTERVAL_1_DAY",
         }
 
@@ -3909,7 +3967,7 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
 
 def _alert_body(alert: Mapping[str, Any]) -> str:
     title, fields, disclaimer = _alert_fields(alert)
-    lines = [f"NIFTY 50 Predictive Scanner V64 — {title}", "", disclaimer, ""]
+    lines = [f"NIFTY 50 Predictive Scanner V65 — {title}", "", disclaimer, ""]
     lines.extend(f"{label}: {value}" for label, value in fields)
     lines.extend(["", f"Scanner version: {SCANNER_VERSION}"])
     return "\n".join(lines)
@@ -3929,7 +3987,7 @@ def _alert_html_body(alert: Mapping[str, Any]) -> str:
     return (
         "<!doctype html><html><body style=\"margin:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.45;\">"
         "<div style=\"max-width:820px;margin:0 auto;padding:18px;\"><div style=\"background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;\">"
-        f"<div style=\"background:{banner};padding:16px 20px;color:#ffffff;\"><div style=\"font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.9;\">NIFTY 50 Predictive Scanner · V64</div><h2 style=\"margin:6px 0 0;font-size:21px;\">{safe_title}</h2></div>"
+        f"<div style=\"background:{banner};padding:16px 20px;color:#ffffff;\"><div style=\"font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.9;\">NIFTY 50 Predictive Scanner · V65</div><h2 style=\"margin:6px 0 0;font-size:21px;\">{safe_title}</h2></div>"
         f"<div style=\"padding:16px 20px;\"><p style=\"margin:0 0 14px;padding:11px 13px;background:#f9fafb;border-left:4px solid {banner};border-radius:4px;\">{html_lib.escape(disclaimer)}</p>"
         f"<table role=\"presentation\" style=\"border-collapse:collapse;width:100%;font-size:14px;\">{rows}</table>"
         f"<p style=\"color:#6b7280;font-size:12px;margin:16px 0 0;\">Scanner version: {html_lib.escape(SCANNER_VERSION)} · Recommendation-only; no order was placed.</p></div></div></div></body></html>"
@@ -3984,7 +4042,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
             alert["attempts"] = int(alert.get("attempts", 0)) + 1
             try:
                 message = MIMEMultipart("alternative")
-                message["Subject"] = str(alert.get("subject", "NIFTY V64 scanner alert"))
+                message["Subject"] = str(alert.get("subject", "NIFTY V65 scanner alert"))
                 message["From"] = config.email_sender
                 message["To"] = config.email_receiver
                 message.attach(MIMEText(_alert_body(alert), "plain", "utf-8"))
@@ -4067,7 +4125,7 @@ class PredictiveScanner:
             enqueue_email_alert(
                 state, now=now, event_type=event_type,
                 dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{identity}",
-                subject=f"NIFTY V64 {event_type.replace('_', ' ')}{subject_suffix}",
+                subject=f"NIFTY V65 {event_type.replace('_', ' ')}{subject_suffix}",
                 payload=event, cooldown_minutes=cooldown,
             )
 
@@ -4141,7 +4199,7 @@ class PredictiveScanner:
         enqueue_email_alert(
             state, now=now, event_type=error_kind,
             dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{error_kind}|{type(exc).__name__}",
-            subject=f"NIFTY V64 scanner {error_kind.replace('_', ' ').lower()}",
+            subject=f"NIFTY V65 scanner {error_kind.replace('_', ' ').lower()}",
             payload={"timestamp": ist_iso(now), "scanner_version": SCANNER_VERSION,
                      "error_type": type(exc).__name__, "error": str(exc)[:1200],
                      "note": "No new recommendation was produced by the failed scan."},
@@ -4554,7 +4612,7 @@ class PredictiveScanner:
                     enqueue_email_alert(
                         state, now=current, event_type="REVERSAL_WATCH",
                         dedupe_key=f"{current.date().isoformat()}|REVERSAL_WATCH|{reversal_fingerprint}",
-                        subject=f"NIFTY V64 REVERSAL WATCH {reversal_watch.direction} — NOT TRADE READY",
+                        subject=f"NIFTY V65 REVERSAL WATCH {reversal_watch.direction} — NOT TRADE READY",
                         payload=watch_payload,
                     )
                 else:
@@ -4577,7 +4635,7 @@ class PredictiveScanner:
                 enqueue_email_alert(
                     state, now=current, event_type="PREDICTIVE_WATCH_INVALIDATED",
                     dedupe_key=f"{current.date().isoformat()}|PREDICTIVE_WATCH_INVALIDATED|{identity}|{reason_type}",
-                    subject=f"NIFTY V64 WATCH INVALIDATED — {reason_type.replace('_', ' ')}",
+                    subject=f"NIFTY V65 WATCH INVALIDATED — {reason_type.replace('_', ' ')}",
                     payload=watch_invalidation,
                 )
             report["directional_watch_lifecycle"] = {
@@ -4717,7 +4775,7 @@ class PredictiveScanner:
                     enqueue_email_alert(
                         state, now=current, event_type="TRACKER_MONITOR_CAP_REACHED",
                         dedupe_key=f"{current.date().isoformat()}|TRACKER_MONITOR_CAP_REACHED|{retired_fp}",
-                        subject=f"NIFTY V64 monitor-cap retirement {retired.get('strike', '')}",
+                        subject=f"NIFTY V65 monitor-cap retirement {retired.get('strike', '')}",
                         payload={"timestamp": current.isoformat(), "retired_tracker": retired,
                                  "message": "This older virtual recommendation is no longer monitored because the configured active tracker limit was reached."},
                     )
@@ -4735,7 +4793,7 @@ class PredictiveScanner:
                 enqueue_email_alert(
                     state, now=current, event_type="SIGNAL_READY",
                     dedupe_key=f"{current.date().isoformat()}|SIGNAL_READY|{fingerprint}",
-                    subject=f"NIFTY V64 SIGNAL READY {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
+                    subject=f"NIFTY V65 SIGNAL READY {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
                     payload={**signal_payload, "alert_type": "TRADE_READY_RECOMMENDATION",
                              "execution_mode": "VIRTUAL_SIGNAL_ONLY_NO_ORDER_PLACEMENT",
                              "readiness": readiness,
@@ -4779,7 +4837,7 @@ class PredictiveScanner:
                     enqueue_email_alert(
                         state, now=current, event_type="PREDICTIVE_WATCH",
                         dedupe_key=f"{current.date().isoformat()}|PREDICTIVE_WATCH|{watch_fingerprint}",
-                        subject=f"NIFTY V64 PREDICTIVE WATCH {scenario.direction} {scenario.state}",
+                        subject=f"NIFTY V65 PREDICTIVE WATCH {scenario.direction} {scenario.state}",
                         payload=watch_payload,
                     )
             # Ensure state/outbox are durable, then send; failures remain queued for the next invocation.
@@ -4858,7 +4916,7 @@ def scan_exit_code(report: Mapping[str, Any]) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V64")
+    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V65")
     parser.add_argument("--loop", action="store_true", help="Scan approximately once per minute during market hours.")
     parser.add_argument("--interval", type=float, default=60.0, help="Loop interval seconds (minimum 15).")
     args = parser.parse_args(argv)
@@ -4880,7 +4938,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enqueue_email_alert(
                 state, now=current, event_type="CONFIGURATION_ERROR",
                 dedupe_key=f"{current.date().isoformat()}|CONFIGURATION_ERROR|{type(exc).__name__}",
-                subject="NIFTY V64 scanner configuration error",
+                subject="NIFTY V65 scanner configuration error",
                 payload={"timestamp": current.isoformat(), "scanner_version": SCANNER_VERSION,
                          "error_type": type(exc).__name__, "error": str(exc),
                          "note": "The scan was stopped before market analysis; no recommendation or order was produced."},
@@ -4902,7 +4960,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_report(report)
         return scan_exit_code(report)
     interval = max(15.0, float(args.interval))
-    LOGGER.info("V64 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
+    LOGGER.info("V65 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
     while True:
         cycle_start = time_module.monotonic()
         report = scanner.scan_once()
