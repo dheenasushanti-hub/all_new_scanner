@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 Predictive Market Scanner & Strike Router — V61.
+"""NIFTY 50 Predictive Market Scanner & Strike Router — V62.
 
 Clean, modular redesign of the supplied V52–V58 scanner lineage. This version has
 one market-scenario engine, one strike router, one structural risk engine, one state
@@ -44,8 +44,8 @@ Core behavior
 * Persists the full structured scan report and OI history in state JSON; console output is a compact one-line summary.
 
 Run:
-    python market_scanner_v61.py
-    python market_scanner_v61.py --loop
+    python market_scanner_v62.py
+    python market_scanner_v62.py --loop
 
 Required environment:
     UPSTOX_ANALYTICS_TOKEN
@@ -68,7 +68,7 @@ API sources checked during design (official Upstox docs):
 Important measurement limitation: the option-chain endpoint returns OI snapshots, not a
 continuous OI time series. Intraday COI velocity is therefore computed from this scanner's
 own timestamped snapshots. For 09:16 velocity availability, schedule the first scan at
-09:15. If a process starts later with no same-session baseline, V61 reports COI as
+09:15. If a process starts later with no same-session baseline, V62 reports COI as
 unavailable/session-proxy and will not describe the proxy as tactical velocity.
 """
 from __future__ import annotations
@@ -105,7 +105,7 @@ import requests
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com"
-SCANNER_VERSION = "2026-10-16-V61-STRUCTURAL-REACTIONS-COI-FALLBACK-INTRABAR-RISK"
+SCANNER_VERSION = "2026-10-16-V62-PERSISTENT-WATCH-LIFECYCLE-FORMATTED-ALERTS"
 MARKET_START = time(9, 15)
 ENTRY_START = time(9, 16)
 MORNING_END = time(10, 30)
@@ -115,7 +115,7 @@ MARKET_END = time(15, 30)
 DEFAULT_NIFTY_KEY = "NSE_INDEX|Nifty 50"
 DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-LOGGER = logging.getLogger("nifty_v61")
+LOGGER = logging.getLogger("nifty_v62")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(message)s",
                     stream=sys.stderr)
@@ -156,6 +156,10 @@ class Config:
     email_watch_alerts: bool = field(default_factory=lambda: _env_bool("EMAIL_WATCH_ALERTS", True))
     watch_alert_min_confidence: float = field(default_factory=lambda: min(100.0, max(0.0, _env_float("WATCH_ALERT_MIN_CONFIDENCE", 55.0))))
     watch_alert_cooldown_minutes: int = field(default_factory=lambda: min(120, max(1, _env_int("WATCH_ALERT_COOLDOWN_MINUTES", 10))))
+    watch_neutral_invalidation_scans: int = field(default_factory=lambda: min(5, max(2, _env_int("WATCH_NEUTRAL_INVALIDATION_SCANS", 3))))
+    watch_opposite_invalidation_scans: int = field(default_factory=lambda: min(3, max(2, _env_int("WATCH_OPPOSITE_INVALIDATION_SCANS", 2))))
+    watch_max_age_minutes: int = field(default_factory=lambda: min(60, max(5, _env_int("WATCH_MAX_AGE_MINUTES", 18))))
+    watch_invalidation_atr_buffer: float = field(default_factory=lambda: min(0.75, max(0.05, _env_float("WATCH_INVALIDATION_ATR_BUFFER", 0.15))))
     monitor_quote_alert_cooldown_minutes: int = field(default_factory=lambda: min(120, max(1, _env_int("MONITOR_QUOTE_ALERT_COOLDOWN_MINUTES", 10))))
     max_active_trackers: int = field(default_factory=lambda: min(12, max(1, _env_int("MAX_ACTIVE_RECOMMENDATION_TRACKERS", 5))))
     reentry_cooldown_minutes: int = field(default_factory=lambda: min(60, max(1, _env_int("REENTRY_COOLDOWN_MINUTES", 6))))
@@ -549,7 +553,7 @@ def _infer_state_session_date(state: Mapping[str, Any]) -> str:
 
 
 def _normalize_legacy_chain_snapshot(raw: Any) -> Optional[dict[str, Any]]:
-    """Normalize supported historical OI snapshot layouts to the V61 chain schema."""
+    """Normalize supported historical OI snapshot layouts to the V62 chain schema."""
     if not isinstance(raw, dict):
         return None
     stamp = parse_timestamp(raw.get("timestamp"))
@@ -635,7 +639,7 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
             if active_expiry and expiry != active_expiry:
                 continue
             # Multiple legacy stores sometimes contain the same minute; prefer the
-            # canonical V61 snapshot when it was present first, but keep valid rows.
+            # canonical V62 snapshot when it was present first, but keep valid rows.
             minute_key = str(item["timestamp"])[:16]
             collected.setdefault(minute_key, item)
     snapshots = sorted(collected.values(), key=lambda item: str(item.get("timestamp", "")))
@@ -666,7 +670,7 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
     state["schema_version"] = 61
     state["scanner_version"] = SCANNER_VERSION
     state["session_date"] = today_iso
-    # Remove legacy directional latches so V61 always classifies live structure afresh.
+    # Remove legacy directional latches so V62 always classifies live structure afresh.
     for key in ("persistent_direction", "continuation_phase", "continuation_count", "continuation_last_bar"):
         state.pop(key, None)
 
@@ -739,7 +743,7 @@ class StateStore:
             self.state.setdefault("alert_outbox", [])
             self.state.setdefault("alert_dedupe", {})
 
-        # Migrate the pre-V61 singular tracker into the canonical tracker list.
+        # Migrate the pre-V62 singular tracker into the canonical tracker list.
         trackers_raw = self.state.get("recommendation_trackers")
         trackers = [dict(item) for item in trackers_raw if isinstance(item, dict)] if isinstance(trackers_raw, list) else []
         primary = self.state.get("recommendation_tracker")
@@ -2267,6 +2271,218 @@ def should_email_reversal_watch(
     )
 
 
+def _watch_strong_opposite_tactical_flow(
+    direction: str, oi: OIAnalysis, indicators: IndicatorSet, config: Config,
+) -> bool:
+    """True only for a strong fresh tactical COI impulse aligned with 3m momentum."""
+    side = str(direction or "").upper()
+    if side not in {"BULLISH", "BEARISH"} or not oi.tactical_available:
+        return False
+    if not (finite(oi.call_coi_pct) and finite(oi.put_coi_pct) and finite(indicators.momentum_3m_pct)):
+        return False
+    threshold = max(config.oi_velocity_trigger, 0.0001)
+    if side == "BULLISH":
+        return bool(oi.call_coi_pct <= -1.5 * threshold
+                    and oi.put_coi_pct >= -0.25 * threshold
+                    and indicators.momentum_3m_pct >= 0.0002)
+    return bool(oi.put_coi_pct <= -1.5 * threshold
+                and oi.call_coi_pct >= -0.25 * threshold
+                and indicators.momentum_3m_pct <= -0.0002)
+
+
+def _completed_bar_stamp(frame: pd.DataFrame, now: datetime) -> str:
+    """Return the latest completed 1m bar timestamp, or empty if no bar is trustworthy."""
+    bars = completed_one_minute_candles(frame, now)
+    if bars.empty:
+        return ""
+    ts = parse_timestamp(bars.iloc[-1].get("timestamp"))
+    return ist_iso(ts) if ts is not None else ""
+
+
+def reconcile_directional_watch(
+    state: dict[str, Any], scenario: Scenario, reversal_watch: Optional[Scenario],
+    indicators: IndicatorSet, oi: OIAnalysis, index_candles: pd.DataFrame,
+    now: datetime, config: Config,
+) -> Optional[dict[str, Any]]:
+    """Maintain a directional *watch* across scans without sticky trade bias.
+
+    A single neutral/soft-veto scan pauses the watch; it does not invalidate it.
+    Neutral invalidation requires distinct completed 1m bars. Two distinct opposite
+    observations are required unless fresh tactical COI plus momentum is decisive.
+    An explicit wall-reaction invalidation or max-age expiry may end the watch at once.
+    This state machine never changes a trade-ready tracker or authorizes entry.
+    """
+    now_ist_value = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
+    today = now_ist_value.date().isoformat()
+    bar_stamp = _completed_bar_stamp(index_candles, now_ist_value)
+    watch_raw = state.get("active_directional_watch")
+    watch = dict(watch_raw) if isinstance(watch_raw, dict) else None
+    threshold = config.watch_alert_min_confidence
+
+    scenario_dir = str(scenario.direction or "").upper()
+    scenario_dir = scenario_dir if scenario_dir in {"BULLISH", "BEARISH"} and scenario.confidence >= threshold else "NEUTRAL"
+    reversal_dir = "NEUTRAL"
+    if reversal_watch is not None:
+        raw_dir = str(reversal_watch.direction or "").upper()
+        if raw_dir in {"BULLISH", "BEARISH"} and reversal_watch.confidence >= threshold:
+            reversal_dir = raw_dir
+    observed_direction = scenario_dir if scenario_dir in {"BULLISH", "BEARISH"} else reversal_dir
+    observed_scenario = scenario if scenario_dir in {"BULLISH", "BEARISH"} else (reversal_watch or scenario)
+
+    # A watch from another session is never carried into today's decision state.
+    if watch is not None and str(watch.get("timestamp", ""))[:10] != today:
+        state.pop("active_directional_watch", None)
+        watch = None
+
+    def start_watch(direction: str, source: Scenario) -> dict[str, Any]:
+        identity_seed = f"{today}|{direction}|{source.state}|{source.wall_level}"
+        identity = hashlib.sha256(identity_seed.encode("utf-8")).hexdigest()[:20]
+        features = source.features if isinstance(source.features, dict) else {}
+        watch_state: dict[str, Any] = {
+            "identity": identity, "timestamp": ist_iso(now_ist_value),
+            "last_supported_at": ist_iso(now_ist_value), "last_observation_at": ist_iso(now_ist_value),
+            "direction": direction, "scenario": source.state,
+            "confidence_pct": round(source.confidence, 1),
+            "wall_level": source.wall_level, "wall_state": source.wall_state,
+            "reaction": features.get("reaction", ""),
+            "neutral_scan_count": 0, "opposite_scan_count": 0,
+            "last_neutral_bar_timestamp": bar_stamp,
+            "last_opposite_bar_timestamp": bar_stamp,
+            "status": "ACTIVE", "last_current_scenario": source.state,
+            "last_current_hard_veto": source.hard_veto,
+            "watch_notice": "Directional market watch only. This is not a selected option or trade-ready recommendation.",
+        }
+        explicit_level = safe_float(features.get("invalidation_level"), float("nan"))
+        if finite(explicit_level):
+            watch_state["invalidation_level"] = explicit_level
+            watch_state["invalidation_side"] = str(features.get("invalidation_side", ""))
+        state["active_directional_watch"] = watch_state
+        return watch_state
+
+    if watch is None:
+        if observed_direction in {"BULLISH", "BEARISH"}:
+            start_watch(observed_direction, observed_scenario)
+        return None
+
+    previous_direction = str(watch.get("direction", "")).upper()
+    previous_identity = str(watch.get("identity", ""))
+    watch["last_observation_at"] = ist_iso(now_ist_value)
+    watch["last_current_scenario"] = scenario.state
+    watch["last_current_hard_veto"] = scenario.hard_veto
+
+    # Strong current opposite flow bypasses the ordinary persistence wait.
+    strong_opposite = observed_direction in {"BULLISH", "BEARISH"} and observed_direction != previous_direction and _watch_strong_opposite_tactical_flow(observed_direction, oi, indicators, config)
+
+    # Explicit local wall reactions carry a defined invalidation side; only these
+    # or an explicit invalidation_level may invalidate on a single price observation.
+    wall = safe_float(watch.get("wall_level"), float("nan"))
+    buffer = max(3.0, config.watch_invalidation_atr_buffer * indicators.atr) if finite(indicators.atr) and indicators.atr > 0 else 5.0
+    reaction = str(watch.get("reaction", "")).upper()
+    structural_reason = ""
+    if finite(wall) and finite(indicators.spot):
+        if previous_direction == "BULLISH" and reaction == "SUPPORT_BOUNCE" and indicators.spot < wall - buffer:
+            structural_reason = f"SUPPORT_BOUNCE_INVALIDATED: spot {indicators.spot:.2f} fell below support wall {wall:.2f} minus buffer {buffer:.2f}"
+        elif previous_direction == "BEARISH" and reaction == "RESISTANCE_REJECTION" and indicators.spot > wall + buffer:
+            structural_reason = f"RESISTANCE_REJECTION_INVALIDATED: spot {indicators.spot:.2f} reclaimed resistance wall {wall:.2f} plus buffer {buffer:.2f}"
+    explicit_level = safe_float(watch.get("invalidation_level"), float("nan"))
+    invalidation_side = str(watch.get("invalidation_side", "")).upper()
+    if not structural_reason and finite(explicit_level) and finite(indicators.spot):
+        if invalidation_side == "BELOW" and indicators.spot < explicit_level - buffer:
+            structural_reason = f"EXPLICIT_INVALIDATION_LEVEL_BROKEN_BELOW: {explicit_level:.2f}"
+        elif invalidation_side == "ABOVE" and indicators.spot > explicit_level + buffer:
+            structural_reason = f"EXPLICIT_INVALIDATION_LEVEL_BROKEN_ABOVE: {explicit_level:.2f}"
+
+    supported_at = parse_timestamp(watch.get("last_supported_at") or watch.get("timestamp"))
+    age_minutes = (now_ist_value - supported_at.astimezone(IST)).total_seconds() / 60.0 if supported_at else 0.0
+    invalidation_reason = ""
+    invalidation_type = ""
+    if structural_reason:
+        invalidation_reason, invalidation_type = structural_reason, "STRUCTURAL_PRICE_INVALIDATION"
+    elif age_minutes >= config.watch_max_age_minutes and observed_direction != previous_direction:
+        invalidation_reason = f"WATCH_EXPIRED: no renewed aligned directional evidence for {age_minutes:.1f} minutes"
+        invalidation_type = "WATCH_MAX_AGE_EXPIRED"
+    elif observed_direction in {"BULLISH", "BEARISH"} and observed_direction != previous_direction:
+        if strong_opposite:
+            invalidation_reason = f"STRONG_OPPOSITE_TACTICAL_FLOW: {observed_direction} COI and 3m momentum aligned"
+            invalidation_type = "STRONG_OPPOSITE_TACTICAL_OVERRIDE"
+            watch["opposite_scan_count"] = config.watch_opposite_invalidation_scans
+        else:
+            # A directional observation breaks a prior neutral sequence; neutral
+            # counts must describe consecutive distinct completed-bar observations.
+            watch["neutral_scan_count"] = 0
+            watch["last_neutral_bar_timestamp"] = bar_stamp
+            same_opposite = str(watch.get("pending_opposite_direction", "")).upper() == observed_direction
+            last_bar = str(watch.get("last_opposite_bar_timestamp", "")) if same_opposite else ""
+            count = int(watch.get("opposite_scan_count", 0) or 0) if same_opposite else 0
+            if bar_stamp and bar_stamp != last_bar:
+                count += 1
+                watch["last_opposite_bar_timestamp"] = bar_stamp
+            watch["pending_opposite_direction"] = observed_direction
+            watch["opposite_scan_count"] = count
+            watch["status"] = "OPPOSITE_EVIDENCE_PENDING"
+            watch["pending_opposite_scenario"] = observed_scenario.state
+            watch["pending_opposite_confidence_pct"] = round(observed_scenario.confidence, 1)
+            if count >= config.watch_opposite_invalidation_scans:
+                invalidation_reason = f"OPPOSITE_DIRECTION_CONFIRMED: {observed_direction} on {count} distinct completed 1m observations"
+                invalidation_type = "CONFIRMED_OPPOSITE_DIRECTION"
+    else:
+        watch["pending_opposite_direction"] = ""
+        watch["opposite_scan_count"] = 0
+        watch["pending_opposite_scenario"] = ""
+
+    if not invalidation_reason and observed_direction == previous_direction and observed_direction in {"BULLISH", "BEARISH"}:
+        watch["last_supported_at"] = ist_iso(now_ist_value)
+        watch["last_supporting_scenario"] = observed_scenario.state
+        watch["scenario"] = observed_scenario.state
+        watch["confidence_pct"] = round(observed_scenario.confidence, 1)
+        if observed_scenario.wall_level is not None:
+            watch["wall_level"] = observed_scenario.wall_level
+            watch["wall_state"] = observed_scenario.wall_state
+        features = observed_scenario.features if isinstance(observed_scenario.features, dict) else {}
+        if features.get("reaction"):
+            watch["reaction"] = features["reaction"]
+        watch["neutral_scan_count"] = 0
+        watch["last_neutral_bar_timestamp"] = bar_stamp
+        watch["status"] = "ACTIVE" if observed_scenario.hard_veto is None else "ACTIVE_WATCH_ENTRY_VETOED"
+    elif not invalidation_reason and observed_direction not in {"BULLISH", "BEARISH"}:
+        if bar_stamp and bar_stamp != str(watch.get("last_neutral_bar_timestamp", "")):
+            watch["neutral_scan_count"] = int(watch.get("neutral_scan_count", 0) or 0) + 1
+            watch["last_neutral_bar_timestamp"] = bar_stamp
+        watch["status"] = "NEUTRAL_CONFIRMATION_PENDING"
+        watch["last_neutral_reason"] = scenario.hard_veto or scenario.state
+        if int(watch.get("neutral_scan_count", 0) or 0) >= config.watch_neutral_invalidation_scans:
+            invalidation_reason = f"NEUTRAL_CONFIRMATION_LIMIT_REACHED: {watch['neutral_scan_count']} distinct completed 1m observations lacked aligned direction"
+            invalidation_type = "CONFIRMED_NEUTRAL_EXPIRY"
+
+    if invalidation_reason:
+        payload = {
+            "timestamp": ist_iso(now_ist_value), "previous_watch": dict(watch),
+            "previous_direction": previous_direction, "current_direction": observed_direction,
+            "current_scenario": scenario.state, "current_hard_veto": scenario.hard_veto,
+            "nifty_spot": indicators.spot, "vwap": indicators.vwap, "atr": indicators.atr,
+            "invalidation_type": invalidation_type, "invalidation_reason": invalidation_reason,
+            "neutral_scan_count": watch.get("neutral_scan_count", 0),
+            "opposite_scan_count": watch.get("opposite_scan_count", 0),
+            "required_neutral_scans": config.watch_neutral_invalidation_scans,
+            "required_opposite_scans": config.watch_opposite_invalidation_scans,
+            "age_minutes": round(age_minutes, 1),
+            "note": "The prior predictive watch ended; this is not an actual position exit and no order was placed.",
+        }
+        state["last_invalidated_directional_watch"] = {
+            "identity": previous_identity, "direction": previous_direction,
+            "scenario": watch.get("scenario"), "timestamp": ist_iso(now_ist_value),
+            "reason": invalidation_reason, "invalidation_type": invalidation_type,
+        }
+        state.pop("active_directional_watch", None)
+        # A genuinely opposite directional signal starts its own new watch generation.
+        if observed_direction in {"BULLISH", "BEARISH"} and observed_direction != previous_direction:
+            start_watch(observed_direction, observed_scenario)
+        return payload
+
+    state["active_directional_watch"] = watch
+    return None
+
+
 def apply_direction_flip_guard(
     state: dict[str, Any], scenario: Scenario, oi: OIAnalysis,
     indicators: IndicatorSet, index_candles: pd.DataFrame, now: datetime,
@@ -3458,7 +3674,7 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
     created = str(alert.get("created_at", payload.get("timestamp", "")))
     title = event_type.replace("_", " ").title()
     if event_type in {"PREDICTIVE_WATCH", "REVERSAL_WATCH", "PREDICTIVE_WATCH_INVALIDATED", "DIRECTIONAL_SHIFT_WATCH"}:
-        title = "WATCH ONLY — NOT TRADE READY" if event_type != "PREDICTIVE_WATCH_INVALIDATED" else "PREVIOUS WATCH INVALIDATED"
+        title = "WATCH ONLY — NOT TRADE READY" if event_type != "PREDICTIVE_WATCH_INVALIDATED" else "PREVIOUS WATCH INVALIDATED AFTER CONFIRMATION"
     elif event_type == "SIGNAL_READY":
         title = "TRADE-READY SCANNER RECOMMENDATION — NO ORDER PLACED"
     elif event_type in {"T1_REACHED", "T2_REACHED", "INITIAL_STOP_LOSS_REACHED", "TRAILING_STOP_REACHED"}:
@@ -3468,7 +3684,8 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
     best = payload.get("best_candidate") if isinstance(payload.get("best_candidate"), Mapping) else {}
     tracker = payload.get("tracker") if isinstance(payload.get("tracker"), Mapping) else {}
     previous_watch = payload.get("previous_watch") if isinstance(payload.get("previous_watch"), Mapping) else {}
-    candidate = selected or best or {}
+    prior_candidate = previous_watch.get("best_candidate") if isinstance(previous_watch.get("best_candidate"), Mapping) else {}
+    candidate = selected or best or prior_candidate or {}
     levels = payload.get("nifty_levels") if isinstance(payload.get("nifty_levels"), Mapping) else {}
     risk = payload.get("risk_plan") if isinstance(payload.get("risk_plan"), Mapping) else {}
     readiness = payload.get("readiness") if isinstance(payload.get("readiness"), Mapping) else {}
@@ -3494,7 +3711,7 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
     trailing = first(payload.get("trailing_SL"), payload.get("trailing_stop"), levels.get("trailing_SL"), tracker.get("trailing_stop"))
     wall = first(payload.get("wall_level"), payload.get("wall_strike"), previous_watch.get("wall_level"))
     wall_state = first(payload.get("wall_state"), payload.get("wall_status"), previous_watch.get("wall_state"))
-    rationale = first(payload.get("trigger_reason"), payload.get("trigger_rationale"), payload.get("reason"), payload.get("message"), payload.get("note"))
+    rationale = first(payload.get("invalidation_reason"), payload.get("trigger_reason"), payload.get("trigger_rationale"), payload.get("reason"), payload.get("message"), payload.get("note"))
     blocker_list = first(payload.get("candidate_blockers"), payload.get("readiness_blockers"), candidate.get("blocking_reasons"), candidate.get("vetoes"), readiness.get("blocking_reasons"))
     if isinstance(blocker_list, str):
         blocker_text = blocker_list
@@ -3503,10 +3720,12 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
     else:
         blocker_text = "None reported"
 
-    is_preview = bool(best) or event_type in {"PREDICTIVE_WATCH", "REVERSAL_WATCH", "DIRECTIONAL_SHIFT_WATCH"}
+    is_preview = bool(best or prior_candidate) or event_type in {"PREDICTIVE_WATCH", "REVERSAL_WATCH", "PREDICTIVE_WATCH_INVALIDATED", "DIRECTIONAL_SHIFT_WATCH"}
     if symbol or strike:
         option_text = f"{_alert_display_value(symbol, fallback='N/A')} — {_alert_display_value(option_type, fallback='Option')} {_alert_display_value(strike, fallback='')}"
-        if is_preview:
+        if event_type == "PREDICTIVE_WATCH_INVALIDATED" and prior_candidate:
+            option_text = "Prior watch candidate (NOT trade-ready): " + option_text
+        elif is_preview:
             option_text = "Candidate preview (NOT selected): " + option_text
     else:
         option_text = "No option selected; this is a market watch only."
@@ -3528,9 +3747,17 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
         ("NIFTY T2", _alert_display_value(t2, fallback="Unavailable / optional")),
         ("NIFTY initial SL", _alert_display_value(sl, fallback="Not established")),
         ("NIFTY trailing SL", _alert_display_value(trailing, fallback="Not established")),
-        ("Readiness blockers", blocker_text),
+        ("Readiness blockers", blocker_text if blocker_text != "None reported" else _alert_display_value(previous_watch.get("readiness_blockers"), fallback="None reported")),
         ("Rationale", _alert_display_value(rationale)),
     ]
+    if event_type == "PREDICTIVE_WATCH_INVALIDATED":
+        fields.extend([
+            ("Previous watch direction", _alert_display_value(first(payload.get("previous_direction"), previous_watch.get("direction")))),
+            ("Current observed direction", _alert_display_value(payload.get("current_direction"))),
+            ("Invalidation type", _alert_display_value(payload.get("invalidation_type"))),
+            ("Confirmation count", f"neutral={_alert_display_value(payload.get('neutral_scan_count'), fallback='0')}/{_alert_display_value(payload.get('required_neutral_scans'), fallback='N/A')}; opposite={_alert_display_value(payload.get('opposite_scan_count'), fallback='0')}/{_alert_display_value(payload.get('required_opposite_scans'), fallback='N/A')}"),
+            ("Invalidation reason", _alert_display_value(payload.get("invalidation_reason"), fallback="Not specified")),
+        ])
     disclaimer = (
         "WATCH ONLY: this is not a trade-ready recommendation. A candidate preview is not a selected contract; "
         "if T1/SL are not established, no executable plan exists. No order was placed."
@@ -3542,7 +3769,7 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
 
 def _alert_body(alert: Mapping[str, Any]) -> str:
     title, fields, disclaimer = _alert_fields(alert)
-    lines = [f"NIFTY Predictive Scanner V61 — {title}", "", disclaimer, ""]
+    lines = [f"NIFTY 50 Predictive Scanner V62 — {title}", "", disclaimer, ""]
     lines.extend(f"{label}: {value}" for label, value in fields)
     lines.extend(["", f"Scanner version: {SCANNER_VERSION}"])
     return "\n".join(lines)
@@ -3556,13 +3783,16 @@ def _alert_html_body(alert: Mapping[str, Any]) -> str:
         + html_lib.escape(value) + "</td></tr>"
         for label, value in fields
     )
+    event_type = str(alert.get("event_type", "SCANNER_ALERT")).upper()
+    banner = "#7f1d1d" if event_type in {"INITIAL_STOP_LOSS_REACHED", "TRAILING_STOP_REACHED", "PREDICTIVE_WATCH_INVALIDATED"} else "#1d4ed8" if event_type == "SIGNAL_READY" else "#92400e" if "WATCH" in event_type else "#374151"
+    safe_title = html_lib.escape(title)
     return (
-        "<!doctype html><html><body style=\"font-family:Arial,sans-serif;color:#111827;line-height:1.45;\">"
-        f"<h2 style=\"margin-bottom:8px;\">NIFTY Predictive Scanner V61 — {html_lib.escape(title)}</h2>"
-        f"<p style=\"padding:10px;background:#f3f4f6;border-radius:6px;\">{html_lib.escape(disclaimer)}</p>"
-        f"<table style=\"border-collapse:collapse;width:100%;max-width:760px;\">{rows}</table>"
-        f"<p style=\"color:#6b7280;font-size:12px;margin-top:16px;\">Scanner version: {html_lib.escape(SCANNER_VERSION)}</p>"
-        "</body></html>"
+        "<!doctype html><html><body style=\"margin:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.45;\">"
+        "<div style=\"max-width:820px;margin:0 auto;padding:18px;\"><div style=\"background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;\">"
+        f"<div style=\"background:{banner};padding:16px 20px;color:#ffffff;\"><div style=\"font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.9;\">NIFTY 50 Predictive Scanner · V62</div><h2 style=\"margin:6px 0 0;font-size:21px;\">{safe_title}</h2></div>"
+        f"<div style=\"padding:16px 20px;\"><p style=\"margin:0 0 14px;padding:11px 13px;background:#f9fafb;border-left:4px solid {banner};border-radius:4px;\">{html_lib.escape(disclaimer)}</p>"
+        f"<table role=\"presentation\" style=\"border-collapse:collapse;width:100%;font-size:14px;\">{rows}</table>"
+        f"<p style=\"color:#6b7280;font-size:12px;margin:16px 0 0;\">Scanner version: {html_lib.escape(SCANNER_VERSION)} · Recommendation-only; no order was placed.</p></div></div></div></body></html>"
     )
 
 
@@ -3614,7 +3844,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
             alert["attempts"] = int(alert.get("attempts", 0)) + 1
             try:
                 message = MIMEMultipart("alternative")
-                message["Subject"] = str(alert.get("subject", "NIFTY V61 scanner alert"))
+                message["Subject"] = str(alert.get("subject", "NIFTY V62 scanner alert"))
                 message["From"] = config.email_sender
                 message["To"] = config.email_receiver
                 message.attach(MIMEText(_alert_body(alert), "plain", "utf-8"))
@@ -3697,7 +3927,7 @@ class PredictiveScanner:
             enqueue_email_alert(
                 state, now=now, event_type=event_type,
                 dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{identity}",
-                subject=f"NIFTY V61 {event_type.replace('_', ' ')}{subject_suffix}",
+                subject=f"NIFTY V62 {event_type.replace('_', ' ')}{subject_suffix}",
                 payload=event, cooldown_minutes=cooldown,
             )
 
@@ -3770,7 +4000,7 @@ class PredictiveScanner:
         enqueue_email_alert(
             state, now=now, event_type=error_kind,
             dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{error_kind}|{type(exc).__name__}",
-            subject=f"NIFTY V61 scanner {error_kind.replace('_', ' ').lower()}",
+            subject=f"NIFTY V62 scanner {error_kind.replace('_', ' ').lower()}",
             payload={"timestamp": ist_iso(now), "scanner_version": SCANNER_VERSION,
                      "error_type": type(exc).__name__, "error": str(exc)[:1200],
                      "note": "No new recommendation was produced by the failed scan."},
@@ -4129,7 +4359,7 @@ class PredictiveScanner:
                     enqueue_email_alert(
                         state, now=current, event_type="REVERSAL_WATCH",
                         dedupe_key=f"{current.date().isoformat()}|REVERSAL_WATCH|{reversal_watch.direction}",
-                        subject=f"NIFTY V61 REVERSAL WATCH {reversal_watch.direction} — NOT TRADE READY",
+                        subject=f"NIFTY V62 REVERSAL WATCH {reversal_watch.direction} — NOT TRADE READY",
                         payload=watch_payload, cooldown_minutes=self.config.watch_alert_cooldown_minutes,
                     )
                 else:
@@ -4141,32 +4371,30 @@ class PredictiveScanner:
             else:
                 report["reversal_watch"] = None
 
-            # Explicitly invalidate a previous directional preview when market structure
-            # turns neutral/opposite or any hard veto removes its basis.
-            previous_watch = state.get("active_directional_watch")
-            if isinstance(previous_watch, dict):
-                previous_direction = str(previous_watch.get("direction", "")).upper()
-                previous_identity = str(previous_watch.get("identity", ""))
-                invalidated = bool(scenario.hard_veto or scenario.direction == "NEUTRAL" or
-                                   (scenario.direction in {"BULLISH", "BEARISH"} and previous_direction and scenario.direction != previous_direction))
-                if invalidated:
-                    enqueue_email_alert(
-                        state, now=current, event_type="PREDICTIVE_WATCH_INVALIDATED",
-                        dedupe_key=f"{current.date().isoformat()}|PREDICTIVE_WATCH_INVALIDATED|{previous_identity}",
-                        subject=f"NIFTY V61 PRIOR {previous_direction or 'DIRECTIONAL'} WATCH INVALIDATED",
-                        payload={"timestamp": current.isoformat(), "previous_watch": previous_watch,
-                                 "current_scenario": scenario.state, "current_direction": scenario.direction,
-                                 "current_hard_veto": scenario.hard_veto, "nifty_spot": spot, "vwap": indicators.vwap,
-                                 "reason": "The prior directional watch is no longer supported by current scan state; do not treat its candidate preview as active.",
-                                 "note": "Informational only. This does not close an actual position or place an order."},
-                    )
-                    state.pop("active_directional_watch", None)
-            if scenario.direction in {"BULLISH", "BEARISH"} and scenario.confidence >= self.config.watch_alert_min_confidence:
-                identity = hashlib.sha256(f"{current.date().isoformat()}|{scenario.direction}|{scenario.state}|{scenario.wall_level}".encode()).hexdigest()[:20]
-                state["active_directional_watch"] = {"identity": identity, "timestamp": current.isoformat(),
-                    "direction": scenario.direction, "scenario": scenario.state,
-                    "confidence_pct": round(scenario.confidence, 1), "wall_level": scenario.wall_level,
-                    "wall_state": scenario.wall_state}
+            # Persistent directional-watch lifecycle: a single neutral scan pauses the
+            # watch; repeated distinct 1m evidence or strong opposite tactical flow ends it.
+            watch_invalidation = reconcile_directional_watch(
+                state, scenario, reversal_watch, indicators, oi, index_session, current, self.config
+            )
+            if watch_invalidation is not None:
+                identity = str((watch_invalidation.get("previous_watch") or {}).get("identity", "UNKNOWN"))
+                reason_type = str(watch_invalidation.get("invalidation_type", "WATCH_INVALIDATED"))
+                enqueue_email_alert(
+                    state, now=current, event_type="PREDICTIVE_WATCH_INVALIDATED",
+                    dedupe_key=f"{current.date().isoformat()}|PREDICTIVE_WATCH_INVALIDATED|{identity}|{reason_type}",
+                    subject=f"NIFTY V62 WATCH INVALIDATED — {reason_type.replace('_', ' ')}",
+                    payload=watch_invalidation,
+                )
+            report["directional_watch_lifecycle"] = {
+                "active_watch": state.get("active_directional_watch"),
+                "last_invalidation": watch_invalidation,
+                "policy": {
+                    "neutral_scans_to_invalidate": self.config.watch_neutral_invalidation_scans,
+                    "opposite_scans_to_invalidate": self.config.watch_opposite_invalidation_scans,
+                    "max_age_minutes": self.config.watch_max_age_minutes,
+                    "strong_tactical_opposite_flow_overrides": True,
+                },
+            }
 
             # STAGE 1 — directional market prediction is reported before any option-quality gate.
             report["predictive_detection"] = {
@@ -4223,6 +4451,16 @@ class PredictiveScanner:
                             list(readiness.get("blocking_reasons", [])) + ["SAME_CONTRACT_REENTRY_COOLDOWN"]
                         ))
             report["trade_readiness"] = readiness
+            active_watch = state.get("active_directional_watch")
+            if isinstance(active_watch, dict) and str(active_watch.get("direction", "")).upper() == scenario.direction:
+                active_watch["best_candidate"] = candidate_report(candidate) if candidate is not None else None
+                active_watch["readiness_blockers"] = list(readiness.get("blocking_reasons", []))
+                active_watch["last_candidate_observed_at"] = current.isoformat()
+                active_watch["last_nifty_spot"] = spot
+                active_watch["last_vwap"] = indicators.vwap
+                active_watch["last_adx"] = indicators.adx
+                active_watch["last_tactical_coi_source"] = oi.tactical_source
+                active_watch["last_tactical_coi_available"] = oi.tactical_available
             hard_vetoes = list(readiness["blocking_reasons"])
             report["vetoes"] = hard_vetoes
             current_chain_snapshot = make_chain_snapshot(chain, oi, current, expiry)
@@ -4283,7 +4521,7 @@ class PredictiveScanner:
                     enqueue_email_alert(
                         state, now=current, event_type="TRACKER_MONITOR_CAP_REACHED",
                         dedupe_key=f"{current.date().isoformat()}|TRACKER_MONITOR_CAP_REACHED|{retired_fp}",
-                        subject=f"NIFTY V61 monitor-cap retirement {retired.get('strike', '')}",
+                        subject=f"NIFTY V62 monitor-cap retirement {retired.get('strike', '')}",
                         payload={"timestamp": current.isoformat(), "retired_tracker": retired,
                                  "message": "This older virtual recommendation is no longer monitored because the configured active tracker limit was reached."},
                     )
@@ -4301,7 +4539,7 @@ class PredictiveScanner:
                 enqueue_email_alert(
                     state, now=current, event_type="SIGNAL_READY",
                     dedupe_key=f"{current.date().isoformat()}|SIGNAL_READY|{fingerprint}",
-                    subject=f"NIFTY V61 SIGNAL READY {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
+                    subject=f"NIFTY V62 SIGNAL READY {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
                     payload={**signal_payload, "alert_type": "TRADE_READY_RECOMMENDATION",
                              "execution_mode": "VIRTUAL_SIGNAL_ONLY_NO_ORDER_PLACEMENT",
                              "readiness": readiness,
@@ -4343,7 +4581,7 @@ class PredictiveScanner:
                     enqueue_email_alert(
                         state, now=current, event_type="PREDICTIVE_WATCH",
                         dedupe_key=watch_identity,
-                        subject=f"NIFTY V61 PREDICTIVE WATCH {scenario.direction} {scenario.state}",
+                        subject=f"NIFTY V62 PREDICTIVE WATCH {scenario.direction} {scenario.state}",
                         payload=watch_payload,
                         cooldown_minutes=self.config.watch_alert_cooldown_minutes,
                     )
@@ -4423,7 +4661,7 @@ def scan_exit_code(report: Mapping[str, Any]) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V61")
+    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V62")
     parser.add_argument("--loop", action="store_true", help="Scan approximately once per minute during market hours.")
     parser.add_argument("--interval", type=float, default=60.0, help="Loop interval seconds (minimum 15).")
     args = parser.parse_args(argv)
@@ -4445,7 +4683,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enqueue_email_alert(
                 state, now=current, event_type="CONFIGURATION_ERROR",
                 dedupe_key=f"{current.date().isoformat()}|CONFIGURATION_ERROR|{type(exc).__name__}",
-                subject="NIFTY V61 scanner configuration error",
+                subject="NIFTY V62 scanner configuration error",
                 payload={"timestamp": current.isoformat(), "scanner_version": SCANNER_VERSION,
                          "error_type": type(exc).__name__, "error": str(exc),
                          "note": "The scan was stopped before market analysis; no recommendation or order was produced."},
@@ -4467,7 +4705,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_report(report)
         return scan_exit_code(report)
     interval = max(15.0, float(args.interval))
-    LOGGER.info("V61 minute loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
+    LOGGER.info("V62 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
     while True:
         cycle_start = time_module.monotonic()
         report = scanner.scan_once()
