@@ -21,12 +21,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -34,7 +34,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install             --disable-pip-version-check             --no-input             --prefer-binary             -r requirements.txt
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            --prefer-binary \
+            -r requirements.txt
 
       - name: Run NIFTY predictive scanner
         env:
@@ -43,7 +47,7 @@ jobs:
           EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           STATE_FILE: state/market_state.json
-        run: python market_scanner.py
+        run: python market_scanner_v68.py
 
       - name: Persist scanner state
         if: always()

@@ -1,0 +1,44 @@
+name: Scanner Regression Tests
+
+on:
+  push:
+    branches: [main, v68-legacy-tracker-migration]
+    paths:
+      - "market_scanner_v68.py"
+      - "tests/**"
+      - "requirements.txt"
+      - ".github/workflows/scanner-tests.yml"
+  pull_request:
+    paths:
+      - "market_scanner_v68.py"
+      - "tests/**"
+      - "requirements.txt"
+      - ".github/workflows/scanner-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  regression-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            --prefer-binary \
+            -r requirements.txt
+      - name: Compile scanner
+        run: python -m py_compile market_scanner_v68.py
+      - name: Run deterministic regression tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
