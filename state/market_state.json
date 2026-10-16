@@ -35682,14 +35682,14 @@
     }
   },
   "last_email_delivery_summary": {
-    "timestamp": "2026-10-16T12:46:17.126322+05:30",
+    "timestamp": "2026-10-16T12:49:19.053436+05:30",
     "status": "IDLE",
     "attempted": 0,
     "sent": 0,
     "pending": 0,
     "smtp_configured": true
   },
-  "last_scan_timestamp": "2026-10-16T12:46:17.126322+05:30",
+  "last_scan_timestamp": "2026-10-16T12:49:19.053436+05:30",
   "market_snapshot": {
     "timestamp": "2026-10-16T10:22:19.061862+05:30",
     "spot": 23132.7,
@@ -50485,15 +50485,31 @@
       "T2": null,
       "SL": null,
       "email_status": "IDLE"
+    },
+    {
+      "timestamp": "2026-10-16T12:49:19.053436+05:30",
+      "scenario": "DATA_ERROR_NO_TRADE",
+      "market_state": "NO_TRADE",
+      "direction": "NEUTRAL",
+      "confidence_pct": 0.0,
+      "spot": 23133.5,
+      "vwap": null,
+      "signal_ready": false,
+      "option": null,
+      "candidate_preview_only": true,
+      "T1": null,
+      "T2": null,
+      "SL": null,
+      "email_status": "IDLE"
     }
   ],
   "last_scan_summary": {
-    "timestamp": "2026-10-16T12:46:17.126322+05:30",
+    "timestamp": "2026-10-16T12:49:19.053436+05:30",
     "scenario": "DATA_ERROR_NO_TRADE",
     "market_state": "NO_TRADE",
     "direction": "NEUTRAL",
     "confidence_pct": 0.0,
-    "spot": 23130.3,
+    "spot": 23133.5,
     "vwap": null,
     "signal_ready": false,
     "option": null,
@@ -50505,7 +50521,7 @@
   },
   "last_scan_report": {
     "scanner_version": "2026-10-16-V63-ADAPTIVE-RISK-GAP-SAFE-ALERTS",
-    "timestamp": "2026-10-16T12:46:17.126322+05:30",
+    "timestamp": "2026-10-16T12:49:19.053436+05:30",
     "market_state": "NO_TRADE",
     "scenario": "DATA_ERROR_NO_TRADE",
     "direction": "NEUTRAL",
@@ -50513,7 +50529,7 @@
     "trigger_rationale": "Data/API/integration error; no entry emitted: IndicatorSet.__init__() missing 1 required positional argument: 'candles_count'",
     "selected_option": null,
     "nifty_levels": {
-      "spot": 23130.3,
+      "spot": 23133.5,
       "T1": null,
       "T2": null,
       "SL": null,
@@ -50541,7 +50557,7 @@
       "IndicatorSet.__init__() missing 1 required positional argument: 'candles_count'"
     ],
     "state_file": "/home/runner/work/all_new_scanner/all_new_scanner/state/market_state.json",
-    "execution_gap_minutes": 3.0411333833333334,
+    "execution_gap_minutes": 3.0321185666666666,
     "execution_gap_reset": false,
     "execution_mode": "SIGNAL_ONLY_NO_ORDER_PLACEMENT",
     "signal_ready": false,
@@ -50570,5 +50586,5 @@
     "reason": "NEUTRAL_CONFIRMATION_LIMIT_REACHED: 3 distinct completed 1m observations lacked aligned direction",
     "invalidation_type": "CONFIRMED_NEUTRAL_EXPIRY"
   },
-  "last_run_timestamp": "2026-10-16T12:46:17.126322+05:30"
+  "last_run_timestamp": "2026-10-16T12:49:19.053436+05:30"
 }
