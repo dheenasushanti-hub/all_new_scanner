@@ -2292,17 +2292,6 @@ def detect_price_structure_candidate(frame: pd.DataFrame, indicators: IndicatorS
     bear_follow = close < open_ and close <= prior_close - 0.25 * indicators.atr
 
     trig = max(config.oi_velocity_trigger, 0.0001)
-    if scenario_state in {"CONFIRMED_BULLISH_CONTINUATION", "CONFIRMED_BEARISH_CONTINUATION"}:
-        if direction == "BULLISH":
-            if oi.put_coi_pct <= -2.0 * trig and oi.call_coi_pct > 0.0:
-                return 0.0
-            if oi.call_coi_pct < 0.0 and oi.put_coi_pct < 0.0:
-                return 0.50
-        else:
-            if oi.call_coi_pct <= -2.0 * trig and oi.put_coi_pct > 0.0:
-                return 0.0
-            if oi.call_coi_pct < 0.0 and oi.put_coi_pct < 0.0:
-                return 0.50
     tactical = bool(oi.tactical_available and finite(oi.call_coi_pct) and finite(oi.put_coi_pct))
     bull_conflict = tactical and oi.put_coi_pct <= -2.0 * trig and oi.call_coi_pct > 0.0
     bear_conflict = tactical and oi.call_coi_pct <= -2.0 * trig and oi.put_coi_pct > 0.0
@@ -3249,6 +3238,17 @@ def _coi_score(direction: str, oi: OIAnalysis, config: Config, scenario_state: s
     if not oi.tactical_available or not finite(oi.call_coi_pct) or not finite(oi.put_coi_pct):
         return float("nan")
     trig = max(config.oi_velocity_trigger, 0.0001)
+    if scenario_state in {"CONFIRMED_BULLISH_CONTINUATION", "CONFIRMED_BEARISH_CONTINUATION"}:
+        if direction == "BULLISH":
+            if oi.put_coi_pct <= -2.0 * trig and oi.call_coi_pct > 0.0:
+                return 0.0
+            if oi.call_coi_pct < 0.0 and oi.put_coi_pct < 0.0:
+                return 0.50
+        else:
+            if oi.call_coi_pct <= -2.0 * trig and oi.put_coi_pct > 0.0:
+                return 0.0
+            if oi.call_coi_pct < 0.0 and oi.put_coi_pct < 0.0:
+                return 0.50
     if direction == "BULLISH" and scenario_state == "PCR_LOW_CALL_OI_IMBALANCE" and finite(oi.pcr) and oi.pcr <= 1.0:
         velocity_score = clamp(0.70 * clamp(oi.call_coi_pct / (2.0 * trig))
                                + 0.30 * clamp(oi.put_coi_pct / (2.0 * trig)))
