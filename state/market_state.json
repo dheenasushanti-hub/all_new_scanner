@@ -35682,14 +35682,14 @@
     }
   },
   "last_email_delivery_summary": {
-    "timestamp": "2026-10-16T12:43:14.658319+05:30",
-    "status": "SENT",
-    "attempted": 1,
-    "sent": 1,
+    "timestamp": "2026-10-16T12:46:17.126322+05:30",
+    "status": "IDLE",
+    "attempted": 0,
+    "sent": 0,
     "pending": 0,
     "smtp_configured": true
   },
-  "last_scan_timestamp": "2026-10-16T12:43:14.658319+05:30",
+  "last_scan_timestamp": "2026-10-16T12:46:17.126322+05:30",
   "market_snapshot": {
     "timestamp": "2026-10-16T10:22:19.061862+05:30",
     "spot": 23132.7,
@@ -50469,15 +50469,31 @@
       "T2": null,
       "SL": null,
       "email_status": "SENT"
+    },
+    {
+      "timestamp": "2026-10-16T12:46:17.126322+05:30",
+      "scenario": "DATA_ERROR_NO_TRADE",
+      "market_state": "NO_TRADE",
+      "direction": "NEUTRAL",
+      "confidence_pct": 0.0,
+      "spot": 23130.3,
+      "vwap": null,
+      "signal_ready": false,
+      "option": null,
+      "candidate_preview_only": true,
+      "T1": null,
+      "T2": null,
+      "SL": null,
+      "email_status": "IDLE"
     }
   ],
   "last_scan_summary": {
-    "timestamp": "2026-10-16T12:43:14.658319+05:30",
+    "timestamp": "2026-10-16T12:46:17.126322+05:30",
     "scenario": "DATA_ERROR_NO_TRADE",
     "market_state": "NO_TRADE",
     "direction": "NEUTRAL",
     "confidence_pct": 0.0,
-    "spot": 23131.1,
+    "spot": 23130.3,
     "vwap": null,
     "signal_ready": false,
     "option": null,
@@ -50485,11 +50501,11 @@
     "T1": null,
     "T2": null,
     "SL": null,
-    "email_status": "SENT"
+    "email_status": "IDLE"
   },
   "last_scan_report": {
     "scanner_version": "2026-10-16-V63-ADAPTIVE-RISK-GAP-SAFE-ALERTS",
-    "timestamp": "2026-10-16T12:43:14.658319+05:30",
+    "timestamp": "2026-10-16T12:46:17.126322+05:30",
     "market_state": "NO_TRADE",
     "scenario": "DATA_ERROR_NO_TRADE",
     "direction": "NEUTRAL",
@@ -50497,7 +50513,7 @@
     "trigger_rationale": "Data/API/integration error; no entry emitted: IndicatorSet.__init__() missing 1 required positional argument: 'candles_count'",
     "selected_option": null,
     "nifty_levels": {
-      "spot": 23131.1,
+      "spot": 23130.3,
       "T1": null,
       "T2": null,
       "SL": null,
@@ -50525,7 +50541,7 @@
       "IndicatorSet.__init__() missing 1 required positional argument: 'candles_count'"
     ],
     "state_file": "/home/runner/work/all_new_scanner/all_new_scanner/state/market_state.json",
-    "execution_gap_minutes": 3.0002055333333333,
+    "execution_gap_minutes": 3.0411333833333334,
     "execution_gap_reset": false,
     "execution_mode": "SIGNAL_ONLY_NO_ORDER_PLACEMENT",
     "signal_ready": false,
@@ -50539,12 +50555,11 @@
       "path": "/home/runner/work/all_new_scanner/all_new_scanner/state/market_state.json"
     },
     "email_delivery": {
-      "status": "SENT",
-      "attempted": 1,
-      "sent": 1,
+      "status": "IDLE",
+      "attempted": 0,
+      "sent": 0,
       "pending": 0,
-      "smtp_configured": true,
-      "next_attempt_at": null
+      "smtp_configured": true
     }
   },
   "last_invalidated_directional_watch": {
@@ -50555,5 +50570,5 @@
     "reason": "NEUTRAL_CONFIRMATION_LIMIT_REACHED: 3 distinct completed 1m observations lacked aligned direction",
     "invalidation_type": "CONFIRMED_NEUTRAL_EXPIRY"
   },
-  "last_run_timestamp": "2026-10-16T12:43:14.658319+05:30"
+  "last_run_timestamp": "2026-10-16T12:46:17.126322+05:30"
 }
