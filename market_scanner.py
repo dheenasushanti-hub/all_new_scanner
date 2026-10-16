@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 Predictive Market Scanner & Strike Router — V63.
+"""NIFTY 50 Predictive Market Scanner & Strike Router — V64.
 
 Clean, modular redesign of the supplied V52–V58 scanner lineage. This version has
 one market-scenario engine, one strike router, one structural risk engine, one state
@@ -43,8 +43,8 @@ Core behavior
 * Persists the full structured scan report and OI history in state JSON; console output is a compact one-line summary.
 
 Run:
-    python market_scanner_v63.py
-    python market_scanner_v63.py --loop
+    python market_scanner_v64.py
+    python market_scanner_v64.py --loop
 
 Required environment:
     UPSTOX_ANALYTICS_TOKEN
@@ -67,7 +67,7 @@ API sources checked during design (official Upstox docs):
 Important measurement limitation: the option-chain endpoint returns OI snapshots, not a
 continuous OI time series. Intraday COI velocity is therefore computed from this scanner's
 own timestamped snapshots. For 09:16 velocity availability, schedule the first scan at
-09:15. If a process starts later with no same-session baseline, V63 reports COI as
+09:15. If a process starts later with no same-session baseline, V64 reports COI as
 unavailable/session-proxy and will not describe the proxy as tactical velocity.
 """
 from __future__ import annotations
@@ -104,7 +104,7 @@ import requests
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com"
-SCANNER_VERSION = "2026-10-16-V63-ADAPTIVE-RISK-GAP-SAFE-ALERTS"
+SCANNER_VERSION = "2026-10-16-V64-INDICATOR-CANDLE-COUNT-FIX"
 MARKET_START = time(9, 15)
 ENTRY_START = time(9, 16)
 MORNING_END = time(10, 30)
@@ -114,7 +114,7 @@ MARKET_END = time(15, 30)
 DEFAULT_NIFTY_KEY = "NSE_INDEX|Nifty 50"
 DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-LOGGER = logging.getLogger("nifty_v63")
+LOGGER = logging.getLogger("nifty_v64")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(message)s",
                     stream=sys.stderr)
@@ -566,7 +566,7 @@ def _infer_state_session_date(state: Mapping[str, Any]) -> str:
 
 
 def _normalize_legacy_chain_snapshot(raw: Any) -> Optional[dict[str, Any]]:
-    """Normalize supported historical OI snapshot layouts to the V63 chain schema."""
+    """Normalize supported historical OI snapshot layouts to the V64 chain schema."""
     if not isinstance(raw, dict):
         return None
     stamp = parse_timestamp(raw.get("timestamp"))
@@ -652,7 +652,7 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
             if active_expiry and expiry != active_expiry:
                 continue
             # Multiple legacy stores sometimes contain the same minute; prefer the
-            # canonical V63 snapshot when it was present first, but keep valid rows.
+            # canonical V64 snapshot when it was present first, but keep valid rows.
             minute_key = str(item["timestamp"])[:16]
             collected.setdefault(minute_key, item)
     snapshots = sorted(collected.values(), key=lambda item: str(item.get("timestamp", "")))
@@ -683,7 +683,7 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
     state["schema_version"] = 63
     state["scanner_version"] = SCANNER_VERSION
     state["session_date"] = today_iso
-    # Remove legacy directional latches so V63 always classifies live structure afresh.
+    # Remove legacy directional latches so V64 always classifies live structure afresh.
     for key in ("persistent_direction", "continuation_phase", "continuation_count", "continuation_last_bar"):
         state.pop(key, None)
 
@@ -756,7 +756,7 @@ class StateStore:
             self.state.setdefault("alert_outbox", [])
             self.state.setdefault("alert_dedupe", {})
 
-        # Migrate the pre-V63 singular tracker into the canonical tracker list.
+        # Migrate the pre-V64 singular tracker into the canonical tracker list.
         trackers_raw = self.state.get("recommendation_trackers")
         trackers = [dict(item) for item in trackers_raw if isinstance(item, dict)] if isinstance(trackers_raw, list) else []
         primary = self.state.get("recommendation_tracker")
@@ -1437,6 +1437,9 @@ def build_indicators(
         momentum_3m_pct=momentum, recent_range=recent_range, prior_range=prior_range,
         compressed=compressed, swing_low=swing_low, swing_high=swing_high,
         previous_close=previous_close, session_open=session_open,
+        # This is the number of usable, completed current-session 1m bars,
+        # not the historical seed length used to warm up ATR/ADX.
+        candles_count=len(session_indicators),
         indicators_seeded=(finite(adx) and finite(atr)),
         volume_source=volume_source, momentum_1m_pct=momentum_1m,
         swing_low_5m=swing_low_5m, swing_high_5m=swing_high_5m,
@@ -3906,7 +3909,7 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
 
 def _alert_body(alert: Mapping[str, Any]) -> str:
     title, fields, disclaimer = _alert_fields(alert)
-    lines = [f"NIFTY 50 Predictive Scanner V63 — {title}", "", disclaimer, ""]
+    lines = [f"NIFTY 50 Predictive Scanner V64 — {title}", "", disclaimer, ""]
     lines.extend(f"{label}: {value}" for label, value in fields)
     lines.extend(["", f"Scanner version: {SCANNER_VERSION}"])
     return "\n".join(lines)
@@ -3926,7 +3929,7 @@ def _alert_html_body(alert: Mapping[str, Any]) -> str:
     return (
         "<!doctype html><html><body style=\"margin:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.45;\">"
         "<div style=\"max-width:820px;margin:0 auto;padding:18px;\"><div style=\"background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;\">"
-        f"<div style=\"background:{banner};padding:16px 20px;color:#ffffff;\"><div style=\"font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.9;\">NIFTY 50 Predictive Scanner · V63</div><h2 style=\"margin:6px 0 0;font-size:21px;\">{safe_title}</h2></div>"
+        f"<div style=\"background:{banner};padding:16px 20px;color:#ffffff;\"><div style=\"font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.9;\">NIFTY 50 Predictive Scanner · V64</div><h2 style=\"margin:6px 0 0;font-size:21px;\">{safe_title}</h2></div>"
         f"<div style=\"padding:16px 20px;\"><p style=\"margin:0 0 14px;padding:11px 13px;background:#f9fafb;border-left:4px solid {banner};border-radius:4px;\">{html_lib.escape(disclaimer)}</p>"
         f"<table role=\"presentation\" style=\"border-collapse:collapse;width:100%;font-size:14px;\">{rows}</table>"
         f"<p style=\"color:#6b7280;font-size:12px;margin:16px 0 0;\">Scanner version: {html_lib.escape(SCANNER_VERSION)} · Recommendation-only; no order was placed.</p></div></div></div></body></html>"
@@ -3981,7 +3984,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
             alert["attempts"] = int(alert.get("attempts", 0)) + 1
             try:
                 message = MIMEMultipart("alternative")
-                message["Subject"] = str(alert.get("subject", "NIFTY V63 scanner alert"))
+                message["Subject"] = str(alert.get("subject", "NIFTY V64 scanner alert"))
                 message["From"] = config.email_sender
                 message["To"] = config.email_receiver
                 message.attach(MIMEText(_alert_body(alert), "plain", "utf-8"))
@@ -4064,7 +4067,7 @@ class PredictiveScanner:
             enqueue_email_alert(
                 state, now=now, event_type=event_type,
                 dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{identity}",
-                subject=f"NIFTY V63 {event_type.replace('_', ' ')}{subject_suffix}",
+                subject=f"NIFTY V64 {event_type.replace('_', ' ')}{subject_suffix}",
                 payload=event, cooldown_minutes=cooldown,
             )
 
@@ -4138,7 +4141,7 @@ class PredictiveScanner:
         enqueue_email_alert(
             state, now=now, event_type=error_kind,
             dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{error_kind}|{type(exc).__name__}",
-            subject=f"NIFTY V63 scanner {error_kind.replace('_', ' ').lower()}",
+            subject=f"NIFTY V64 scanner {error_kind.replace('_', ' ').lower()}",
             payload={"timestamp": ist_iso(now), "scanner_version": SCANNER_VERSION,
                      "error_type": type(exc).__name__, "error": str(exc)[:1200],
                      "note": "No new recommendation was produced by the failed scan."},
@@ -4551,7 +4554,7 @@ class PredictiveScanner:
                     enqueue_email_alert(
                         state, now=current, event_type="REVERSAL_WATCH",
                         dedupe_key=f"{current.date().isoformat()}|REVERSAL_WATCH|{reversal_fingerprint}",
-                        subject=f"NIFTY V63 REVERSAL WATCH {reversal_watch.direction} — NOT TRADE READY",
+                        subject=f"NIFTY V64 REVERSAL WATCH {reversal_watch.direction} — NOT TRADE READY",
                         payload=watch_payload,
                     )
                 else:
@@ -4574,7 +4577,7 @@ class PredictiveScanner:
                 enqueue_email_alert(
                     state, now=current, event_type="PREDICTIVE_WATCH_INVALIDATED",
                     dedupe_key=f"{current.date().isoformat()}|PREDICTIVE_WATCH_INVALIDATED|{identity}|{reason_type}",
-                    subject=f"NIFTY V63 WATCH INVALIDATED — {reason_type.replace('_', ' ')}",
+                    subject=f"NIFTY V64 WATCH INVALIDATED — {reason_type.replace('_', ' ')}",
                     payload=watch_invalidation,
                 )
             report["directional_watch_lifecycle"] = {
@@ -4714,7 +4717,7 @@ class PredictiveScanner:
                     enqueue_email_alert(
                         state, now=current, event_type="TRACKER_MONITOR_CAP_REACHED",
                         dedupe_key=f"{current.date().isoformat()}|TRACKER_MONITOR_CAP_REACHED|{retired_fp}",
-                        subject=f"NIFTY V63 monitor-cap retirement {retired.get('strike', '')}",
+                        subject=f"NIFTY V64 monitor-cap retirement {retired.get('strike', '')}",
                         payload={"timestamp": current.isoformat(), "retired_tracker": retired,
                                  "message": "This older virtual recommendation is no longer monitored because the configured active tracker limit was reached."},
                     )
@@ -4732,7 +4735,7 @@ class PredictiveScanner:
                 enqueue_email_alert(
                     state, now=current, event_type="SIGNAL_READY",
                     dedupe_key=f"{current.date().isoformat()}|SIGNAL_READY|{fingerprint}",
-                    subject=f"NIFTY V63 SIGNAL READY {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
+                    subject=f"NIFTY V64 SIGNAL READY {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
                     payload={**signal_payload, "alert_type": "TRADE_READY_RECOMMENDATION",
                              "execution_mode": "VIRTUAL_SIGNAL_ONLY_NO_ORDER_PLACEMENT",
                              "readiness": readiness,
@@ -4776,7 +4779,7 @@ class PredictiveScanner:
                     enqueue_email_alert(
                         state, now=current, event_type="PREDICTIVE_WATCH",
                         dedupe_key=f"{current.date().isoformat()}|PREDICTIVE_WATCH|{watch_fingerprint}",
-                        subject=f"NIFTY V63 PREDICTIVE WATCH {scenario.direction} {scenario.state}",
+                        subject=f"NIFTY V64 PREDICTIVE WATCH {scenario.direction} {scenario.state}",
                         payload=watch_payload,
                     )
             # Ensure state/outbox are durable, then send; failures remain queued for the next invocation.
@@ -4855,7 +4858,7 @@ def scan_exit_code(report: Mapping[str, Any]) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V63")
+    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V64")
     parser.add_argument("--loop", action="store_true", help="Scan approximately once per minute during market hours.")
     parser.add_argument("--interval", type=float, default=60.0, help="Loop interval seconds (minimum 15).")
     args = parser.parse_args(argv)
@@ -4877,7 +4880,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enqueue_email_alert(
                 state, now=current, event_type="CONFIGURATION_ERROR",
                 dedupe_key=f"{current.date().isoformat()}|CONFIGURATION_ERROR|{type(exc).__name__}",
-                subject="NIFTY V63 scanner configuration error",
+                subject="NIFTY V64 scanner configuration error",
                 payload={"timestamp": current.isoformat(), "scanner_version": SCANNER_VERSION,
                          "error_type": type(exc).__name__, "error": str(exc),
                          "note": "The scan was stopped before market analysis; no recommendation or order was produced."},
@@ -4899,7 +4902,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_report(report)
         return scan_exit_code(report)
     interval = max(15.0, float(args.interval))
-    LOGGER.info("V63 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
+    LOGGER.info("V64 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
     while True:
         cycle_start = time_module.monotonic()
         report = scanner.scan_once()
