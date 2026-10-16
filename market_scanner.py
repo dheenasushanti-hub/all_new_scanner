@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 Predictive Market Scanner & Strike Router — V67.
+"""NIFTY 50 Predictive Market Scanner & Strike Router — V68.
 
 Clean, modular redesign of the supplied V52–V58 scanner lineage. This version has
 one market-scenario engine, one strike router, one structural risk engine, one state
@@ -44,7 +44,7 @@ Core behavior
 * Persists the full structured scan report and OI history in state JSON; console output is a compact one-line summary.
 
 Run:
-    python market_scanner_v67.py
+    python market_scanner_v68.py
     python market_scanner_v67.py --loop
 
 Required environment:
@@ -105,7 +105,7 @@ import requests
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com"
-SCANNER_VERSION = "2026-10-16-V67-STRUCTURE-GATED-FAILURE-ONLY-EMAILS"
+SCANNER_VERSION = "2026-10-16-V68-PRICE-STRUCTURE-CONTINUATION-REDESIGN"
 MARKET_START = time(9, 15)
 ENTRY_START = time(9, 16)
 MORNING_END = time(10, 30)
@@ -124,7 +124,7 @@ EMAIL_ALLOWED_EVENT_TYPES = frozenset({
 DEFAULT_NIFTY_KEY = "NSE_INDEX|Nifty 50"
 DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-LOGGER = logging.getLogger("nifty_v66")
+LOGGER = logging.getLogger("nifty_v68")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(message)s",
                     stream=sys.stderr)
@@ -749,7 +749,7 @@ class StateStore:
                         and str(alert.get("status", "PENDING")).upper() == "PENDING"
                         and str(alert.get("event_type", "")).upper() == "VIRTUAL_RECOMMENDATION_INVALIDATED_BY_STRUCTURE"):
                     alert["event_type"] = "MARKET_REVERSAL_CONFIRMED"
-                    alert["subject"] = "NIFTY V67 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
+                    alert["subject"] = "NIFTY V68 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
                     payload = alert.get("payload") if isinstance(alert.get("payload"), dict) else {}
                     payload.setdefault("invalidated_direction", payload.get("direction"))
                     payload.setdefault("replacement_direction", "Not available in legacy alert")
@@ -2254,6 +2254,133 @@ def completed_one_minute_candles(frame: Optional[pd.DataFrame], now: datetime) -
     return work.reset_index(drop=True)
 
 
+def detect_price_structure_candidate(frame: pd.DataFrame, indicators: IndicatorSet, oi: OIAnalysis,
+                                    now: datetime, future_regime: str, config: Config) -> Optional[Scenario]:
+    """Price-led continuation based on completed 1m candles, not an OI-only pattern."""
+    bars = completed_one_minute_candles(frame, now).tail(10).copy()
+    if len(bars) < 6 or not finite(indicators.atr) or indicators.atr <= 0:
+        return None
+    if finite(indicators.adx) and indicators.adx < 20.0 and oi.both_sides_building:
+        return None
+    for col in ("open", "high", "low", "close"):
+        bars[col] = pd.to_numeric(bars[col], errors="coerce")
+    bars = bars.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    if len(bars) < 6:
+        return None
+    last, prev = bars.iloc[-1], bars.iloc[-2]
+    close, open_ = safe_float(last["close"]), safe_float(last["open"])
+    prior_close = safe_float(prev["close"])
+    prior3 = bars.iloc[-4:-1]
+    prior_low, prior_high = safe_float(prior3["low"].min()), safe_float(prior3["high"].max())
+    if not all(finite(x) for x in (close, open_, prior_close, prior_low, prior_high)):
+        return None
+
+    buffer = max(0.08 * indicators.atr, 1.0)
+    m1, m3 = indicators.momentum_1m_pct, indicators.momentum_3m_pct
+    di_bull = finite(indicators.plus_di) and finite(indicators.minus_di) and indicators.plus_di > indicators.minus_di + 1.0
+    di_bear = finite(indicators.plus_di) and finite(indicators.minus_di) and indicators.minus_di > indicators.plus_di + 1.0
+    vwap_bull = finite(indicators.vwap) and indicators.spot > indicators.vwap
+    vwap_bear = finite(indicators.vwap) and indicators.spot < indicators.vwap
+    rsi_bull = finite(indicators.rsi) and indicators.rsi >= 52.0
+    rsi_bear = finite(indicators.rsi) and indicators.rsi <= 48.0
+
+    bull_break = close >= prior_high + buffer and close > prior_close
+    bear_break = close <= prior_low - buffer and close < prior_close
+    bull_momentum = finite(m1) and m1 > 0 and finite(m3) and m3 >= -0.00010 and (di_bull or rsi_bull)
+    bear_momentum = finite(m1) and m1 < 0 and finite(m3) and m3 <= 0.00010 and (di_bear or rsi_bear)
+    bull_follow = close > open_ and close >= prior_close + 0.25 * indicators.atr
+    bear_follow = close < open_ and close <= prior_close - 0.25 * indicators.atr
+
+    trig = max(config.oi_velocity_trigger, 0.0001)
+    if scenario_state in {"CONFIRMED_BULLISH_CONTINUATION", "CONFIRMED_BEARISH_CONTINUATION"}:
+        if direction == "BULLISH":
+            if oi.put_coi_pct <= -2.0 * trig and oi.call_coi_pct > 0.0:
+                return 0.0
+            if oi.call_coi_pct < 0.0 and oi.put_coi_pct < 0.0:
+                return 0.50
+        else:
+            if oi.call_coi_pct <= -2.0 * trig and oi.put_coi_pct > 0.0:
+                return 0.0
+            if oi.call_coi_pct < 0.0 and oi.put_coi_pct < 0.0:
+                return 0.50
+    tactical = bool(oi.tactical_available and finite(oi.call_coi_pct) and finite(oi.put_coi_pct))
+    bull_conflict = tactical and oi.put_coi_pct <= -2.0 * trig and oi.call_coi_pct > 0.0
+    bear_conflict = tactical and oi.call_coi_pct <= -2.0 * trig and oi.put_coi_pct > 0.0
+    bull_conflict = bull_conflict or futures_regime_conflicts("BULLISH", future_regime)
+    bear_conflict = bear_conflict or futures_regime_conflicts("BEARISH", future_regime)
+    last_ts = parse_timestamp(last.get("timestamp"))
+    oi_label = ("TACTICAL_OI_MIXED_OR_BOTH_UNWINDING" if tactical and oi.call_coi_pct < 0 and oi.put_coi_pct < 0
+                else "TACTICAL_OI_OBSERVED" if tactical else "TACTICAL_OI_UNAVAILABLE")
+    features = {
+        "setup_route": "PRICE_STRUCTURE_CONTINUATION",
+        "completed_bar_timestamp": ist_iso(last_ts or now),
+        "structure_confirmed": True,
+        "oi_evidence": {"available": tactical, "source": oi.tactical_source,
+            "call_coi_pct": oi.call_coi_pct if finite(oi.call_coi_pct) else None,
+            "put_coi_pct": oi.put_coi_pct if finite(oi.put_coi_pct) else None,
+            "interpretation": oi_label},
+    }
+
+    if bull_break and bull_momentum and bull_follow and vwap_bull and not bull_conflict:
+        confidence = min(88.0, 69.0 + (5.0 if di_bull else 0.0)
+                         + (4.0 if tactical and oi.call_coi_pct < 0 <= oi.put_coi_pct else 0.0))
+        features["price_structure_confirmation"] = {
+            "break_confirmed": True, "momentum_confirmed": True, "follow_through_confirmed": True,
+            "boundary": prior_high, "buffer_points": buffer, "close": close,
+            "vwap_alignment": True, "directional_indicator_alignment": di_bull,
+            "oi_conflict": False, "futures_conflict": False}
+        return Scenario("CONFIRMED_BULLISH_CONTINUATION", "BULLISH", confidence,
+            f"Price-led bullish continuation: completed 1m close {close:.2f} cleared prior 3-bar high {prior_high:.2f}; momentum and VWAP align. {oi_label}; OI does not identify buyer/writer side.",
+            None, "UNKNOWN", True, None, features)
+
+    if bear_break and bear_momentum and bear_follow and vwap_bear and not bear_conflict:
+        confidence = min(88.0, 69.0 + (5.0 if di_bear else 0.0)
+                         + (4.0 if tactical and oi.put_coi_pct < 0 <= oi.call_coi_pct else 0.0))
+        features["price_structure_confirmation"] = {
+            "break_confirmed": True, "momentum_confirmed": True, "follow_through_confirmed": True,
+            "boundary": prior_low, "buffer_points": buffer, "close": close,
+            "vwap_alignment": True, "directional_indicator_alignment": di_bear,
+            "oi_conflict": False, "futures_conflict": False}
+        return Scenario("CONFIRMED_BEARISH_CONTINUATION", "BEARISH", confidence,
+            f"Price-led bearish continuation: completed 1m close {close:.2f} broke prior 3-bar low {prior_low:.2f}; momentum and VWAP align. {oi_label}; OI does not identify buyer/writer side.",
+            None, "UNKNOWN", True, None, features)
+    return None
+
+
+def resolve_v68_direction(primary: Scenario, price_candidate: Optional[Scenario],
+                          reversal_watch: Optional[Scenario], indicators: IndicatorSet,
+                          oi: OIAnalysis, future_regime: str) -> Scenario:
+    """Resolve scenario disagreement without latching a stale bias or promoting a watch alone."""
+    if finite(indicators.adx) and indicators.adx < 20.0 and oi.both_sides_building and price_candidate is None:
+        return Scenario("SIDEWAYS_CHOP", "NEUTRAL", 0.0,
+            "Low ADX and two-sided OI build indicate pinning; directional entries remain vetoed.",
+            None, "", False, "SIDEWAYS_ADX_DUAL_SIDE_OI_BUILD", {"price_candidate_blocked": None})
+    if price_candidate is not None:
+        return price_candidate
+    if primary.direction in {"BULLISH", "BEARISH"} and reversal_watch is not None and reversal_watch.direction != primary.direction:
+        opposite = reversal_watch.direction
+        momentum_ok = finite(indicators.momentum_3m_pct) and (
+            indicators.momentum_3m_pct < -0.00035 if opposite == "BEARISH" else indicators.momentum_3m_pct > 0.00035)
+        di_ok = (
+            finite(indicators.minus_di) and finite(indicators.plus_di) and indicators.minus_di > indicators.plus_di + 1.0
+            if opposite == "BEARISH" else
+            finite(indicators.plus_di) and finite(indicators.minus_di) and indicators.plus_di > indicators.minus_di + 1.0)
+        if momentum_ok and di_ok:
+            return Scenario("DIRECTIONAL_CONFLICT_WATCH", "NEUTRAL", 0.0,
+                f"Primary {primary.direction} setup conflicts with {opposite} reversal watch; wait for completed structure confirmation.",
+                None, "", False, None, {"primary_scenario": primary.state, "primary_direction": primary.direction,
+                    "opposing_watch": reversal_watch.state, "opposing_direction": opposite,
+                    "opposing_momentum_confirmed": True, "opposing_di_confirmed": True})
+        return primary
+    if reversal_watch is not None and reversal_watch.direction in {"BULLISH", "BEARISH"}:
+        return Scenario("DIRECTIONAL_REVERSAL_WATCH", "NEUTRAL", 0.0,
+            f"{reversal_watch.direction} reversal watch detected without completed price-structure confirmation; no strike forced.",
+            None, "", False, None, {"watch_scenario": reversal_watch.state, "watch_direction": reversal_watch.direction,
+                "watch_confidence_pct": reversal_watch.confidence, "price_structure_confirmed": False,
+                "oi_tactical_available": oi.tactical_available})
+    return primary
+
+
 def confirm_wall_breakout_scenario(
     scenario: Scenario, frame: pd.DataFrame, indicators: IndicatorSet, oi: OIAnalysis,
     future_regime: str, now: datetime, config: Config,
@@ -2461,6 +2588,18 @@ def selection_trigger_confirmation(
 
     features = scenario.features if isinstance(scenario.features, Mapping) else {}
     state = str(scenario.state or "").upper()
+    if state in {"CONFIRMED_BULLISH_CONTINUATION", "CONFIRMED_BEARISH_CONTINUATION"}:
+        expected = "BULLISH" if state == "CONFIRMED_BULLISH_CONTINUATION" else "BEARISH"
+        confirmation = features.get("price_structure_confirmation")
+        passed = bool(
+            direction == expected and features.get("setup_route") == "PRICE_STRUCTURE_CONTINUATION"
+            and features.get("structure_confirmed") is True and isinstance(confirmation, Mapping)
+            and confirmation.get("break_confirmed") is True
+            and confirmation.get("momentum_confirmed") is True
+            and confirmation.get("follow_through_confirmed") is True
+            and str(features.get("completed_bar_timestamp") or "").strip()
+        )
+        return (True, "CONFIRMED_PRICE_STRUCTURE_CONTINUATION") if passed else (False, "PRICE_STRUCTURE_CONFIRMATION_INCOMPLETE")
     if state == "STRUCTURAL_SUPPORT_BOUNCE" and direction == "BULLISH":
         confirmed = bool(
             features.get("reaction") == "SUPPORT_BOUNCE"
@@ -3160,6 +3299,10 @@ def _candidate_from_data(
     lift_ratio = (ltp / premium_vwap - 1.0) if finite(ltp) and finite(premium_vwap) and premium_vwap > 0 else float("nan")
     vwap_score = clamp(lift_ratio / 0.003) if finite(lift_ratio) else float("nan")
     coi_score = _coi_score(direction, oi, config, scenario_state=scenario_state)
+    price_led_neutral_coi = (
+        scenario_state in {"CONFIRMED_BULLISH_CONTINUATION", "CONFIRMED_BEARISH_CONTINUATION"}
+        and finite(coi_score) and abs(coi_score - 0.5) < 1e-9
+    )
     weighted_components = [(0.40, flow_score, "FLOW"), (0.30, vwap_score, "PREMIUM_VWAP"), (0.30, coi_score, "TACTICAL_COI")]
     available_components = [(weight, value, label) for weight, value, label in weighted_components
                             if finite(value) and 0.0 <= float(value) <= 1.0]
@@ -3201,7 +3344,7 @@ def _candidate_from_data(
             coi_floor = config.min_coi_score_high_adx
         else:
             coi_floor = config.min_coi_score_normal_adx
-        if coi_score <= coi_floor:
+        if not price_led_neutral_coi and coi_score <= coi_floor:
             vetoes.append(f"TACTICAL_COI_COMPONENT<={coi_floor:.2f}_ADX={indicators.adx:.1f}")
     if finite(total) and total < config.min_score:
         vetoes.append(f"SCORE<{config.min_score:.3f}")
@@ -4269,7 +4412,7 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
 
 def _alert_body(alert: Mapping[str, Any]) -> str:
     title, fields, disclaimer = _alert_fields(alert)
-    lines = [f"NIFTY 50 Predictive Scanner V67 — {title}", "", disclaimer, ""]
+    lines = [f"NIFTY 50 Predictive Scanner V68 — {title}", "", disclaimer, ""]
     lines.extend(f"{label}: {value}" for label, value in fields)
     lines.extend(["", f"Scanner version: {SCANNER_VERSION}"])
     return "\n".join(lines)
@@ -4351,7 +4494,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
             alert["attempts"] = int(alert.get("attempts", 0)) + 1
             try:
                 message = MIMEMultipart("alternative")
-                message["Subject"] = str(alert.get("subject", "NIFTY V67 scanner alert"))
+                message["Subject"] = str(alert.get("subject", "NIFTY V68 scanner alert"))
                 message["From"] = config.email_sender
                 message["To"] = config.email_receiver
                 message.attach(MIMEText(_alert_body(alert), "plain", "utf-8"))
@@ -4438,9 +4581,9 @@ class PredictiveScanner:
             direction = str(event.get("direction", "")).upper()
             subject_suffix = f" {direction} {safe_float(event.get('strike'), 0.0):.0f}" if strike else f" {direction}" if direction else ""
             if event_type == "MARKET_REVERSAL_CONFIRMED":
-                subject = f"NIFTY V67 MARKET REVERSAL CONFIRMED — {direction} RECOMMENDATION INVALIDATED"
+                subject = f"NIFTY V68 MARKET REVERSAL CONFIRMED — {direction} RECOMMENDATION INVALIDATED"
             else:
-                subject = f"NIFTY V67 {event_type.replace('_', ' ')}{subject_suffix}"
+                subject = f"NIFTY V68 {event_type.replace('_', ' ')}{subject_suffix}"
             enqueue_email_alert(
                 state, now=now, event_type=event_type,
                 dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{identity}",
@@ -4517,7 +4660,7 @@ class PredictiveScanner:
         enqueue_email_alert(
             state, now=now, event_type=error_kind,
             dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{error_kind}|{type(exc).__name__}",
-            subject=f"NIFTY V67 scanner {error_kind.replace('_', ' ').lower()}",
+            subject=f"NIFTY V68 scanner {error_kind.replace('_', ' ').lower()}",
             payload={"timestamp": ist_iso(now), "scanner_version": SCANNER_VERSION,
                      "error_type": type(exc).__name__, "error": str(exc)[:1200],
                      "note": "No new recommendation was produced by the failed scan."},
@@ -4796,6 +4939,13 @@ class PredictiveScanner:
                     scenario, index_session, indicators, oi, future_regime, current, self.config
                 )
             reversal_watch = detect_reversal_watch(index_session, indicators, oi, current, self.config) if index_candles_available else None
+            price_structure_candidate = detect_price_structure_candidate(
+                index_session, indicators, oi, current, future_regime, self.config
+            ) if index_candles_available else None
+            primary_scenario_before_v68_resolution = scenario.state
+            scenario = resolve_v68_direction(
+                scenario, price_structure_candidate, reversal_watch, indicators, oi, future_regime
+            )
             # Existing virtual recommendations are monitored independently of fresh-signal routing.
             tracked = update_recommendation_tracker(
                 state, spot, indicators, oi, current, quote_map,
@@ -4861,6 +5011,7 @@ class PredictiveScanner:
 
             report.update({
                 "scenario": scenario.state,
+                "v68_direction_resolution": {"primary_scenario_before_resolution": primary_scenario_before_v68_resolution, "price_structure_candidate": price_structure_candidate.state if price_structure_candidate else None, "price_structure_candidate_direction": price_structure_candidate.direction if price_structure_candidate else None, "reversal_watch": reversal_watch.state if reversal_watch else None, "resolved_scenario": scenario.state, "resolved_direction": scenario.direction, "price_led_route": bool(isinstance(scenario.features, Mapping) and scenario.features.get("setup_route") == "PRICE_STRUCTURE_CONTINUATION")},
                 "market_state": scenario.state if scenario.direction != "NEUTRAL" else "SIDEWAYS" if scenario.state.startswith("SIDEWAYS") else "WATCH",
                 "direction": scenario.direction,
                 "confidence_pct": round(scenario.confidence, 1),
@@ -5128,7 +5279,7 @@ class PredictiveScanner:
                 enqueue_email_alert(
                     state, now=current, event_type="SIGNAL_READY",
                     dedupe_key=f"{current.date().isoformat()}|SIGNAL_READY|{fingerprint}",
-                    subject=f"NIFTY V67 STRIKE SELECTED — {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
+                    subject=f"NIFTY V68 STRIKE SELECTED — {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
                     payload={**signal_payload, "alert_type": "TRADE_READY_RECOMMENDATION",
                              "execution_mode": "VIRTUAL_SIGNAL_ONLY_NO_ORDER_PLACEMENT",
                              "readiness": readiness,
@@ -5187,6 +5338,8 @@ def print_report(report: dict[str, Any]) -> None:
     signal_ready = bool(report.get("signal_ready", False) and selected)
     compact = {
         "timestamp": report.get("timestamp"), "version": SCANNER_VERSION,
+        "market_regime": report.get("market_regime", report.get("scenario")),
+        "v68_direction_resolution": report.get("v68_direction_resolution"),
         "scenario": report.get("scenario"), "market_state": report.get("market_state"),
         "direction": report.get("direction"), "confidence_pct": report.get("confidence_pct"),
         "spot": levels.get("spot", indicators.get("spot")), "vwap": indicators.get("vwap"),
@@ -5230,7 +5383,7 @@ def scan_exit_code(report: Mapping[str, Any]) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V67")
+    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V68")
     parser.add_argument("--loop", action="store_true", help="Scan approximately once per minute during market hours.")
     parser.add_argument("--interval", type=float, default=60.0, help="Loop interval seconds (minimum 15).")
     args = parser.parse_args(argv)
@@ -5252,7 +5405,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enqueue_email_alert(
                 state, now=current, event_type="CONFIGURATION_ERROR",
                 dedupe_key=f"{current.date().isoformat()}|CONFIGURATION_ERROR|{type(exc).__name__}",
-                subject="NIFTY V67 scanner configuration error",
+                subject="NIFTY V68 scanner configuration error",
                 payload={"timestamp": current.isoformat(), "scanner_version": SCANNER_VERSION,
                          "error_type": type(exc).__name__, "error": str(exc),
                          "note": "The scan was stopped before market analysis; no recommendation or order was produced."},
@@ -5274,7 +5427,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_report(report)
         return scan_exit_code(report)
     interval = max(15.0, float(args.interval))
-    LOGGER.info("V67 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
+    LOGGER.info("V68 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
     while True:
         cycle_start = time_module.monotonic()
         report = scanner.scan_once()
