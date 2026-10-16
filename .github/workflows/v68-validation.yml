@@ -1,0 +1,39 @@
+name: V68 Regression Validation
+
+on:
+  push:
+    branches:
+      - v68-predictive-structure-redesign
+    paths:
+      - "market_scanner.py"
+      - "tests/test_v68_logic.py"
+      - ".github/workflows/v68-validation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax-and-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout V68 branch
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install scanner dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --prefer-binary -r requirements.txt
+      - name: Compile scanner and regression tests
+        run: |
+          python -m py_compile market_scanner.py tests/test_v68_logic.py
+      - name: Run deterministic V68 regression tests
+        env:
+          UPSTOX_ANALYTICS_TOKEN: ""
+          EMAIL_SENDER: ""
+          EMAIL_PASSWORD: ""
+          EMAIL_RECEIVER: ""
+        run: python -m unittest discover -s tests -p "test_v68_logic.py" -v
