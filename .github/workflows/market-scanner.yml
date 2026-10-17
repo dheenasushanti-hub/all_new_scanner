@@ -1,14 +1,13 @@
-name: NIFTY Predictive Market Scanner
+name: NIFTY Predictive Market Scanner v71
 
 on:
-  # Scheduling is handled externally by the Cloudflare Worker.
+  # Scheduling remains controlled by the existing Cloudflare Worker.
   workflow_dispatch:
 
 permissions:
   contents: write
 
-# Prevent two Cloudflare-triggered scans from modifying scanner state
-# at the same time.
+# Serialize scans so appends to market_state.json and the daily audit file do not race.
 concurrency:
   group: nifty-market-scanner
   cancel-in-progress: false
@@ -40,7 +39,7 @@ jobs:
             --prefer-binary \
             -r requirements.txt
 
-      - name: Run NIFTY predictive scanner V70
+      - name: Run NIFTY predictive scanner
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
@@ -72,6 +71,6 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Update NIFTY V70 state and scan audit"
+          git commit -m "Update NIFTY scanner state and audit logs"
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
