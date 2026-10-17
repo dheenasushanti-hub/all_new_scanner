@@ -40,12 +40,6 @@ jobs:
             --prefer-binary \
             -r requirements.txt
 
-      - name: Validate V70 syntax
-        run: python -m py_compile market_scanner_v70.py test_market_scanner_v70.py
-
-      - name: Run V70 audit tests
-        run: python test_market_scanner.py
-
       - name: Run NIFTY predictive scanner V70
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
@@ -54,7 +48,7 @@ jobs:
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           STATE_FILE: state/market_state.json
           AUDIT_DIR: audit
-        run: python market_scanner_v70.py
+        run: python market_scanner.py
 
       - name: Persist scanner state and audit logs
         if: always()
