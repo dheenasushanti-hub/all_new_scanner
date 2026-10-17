@@ -205,6 +205,12 @@ class Config:
         if not (70.0 <= self.predictive_selection_min_confidence <= 90.0):
             raise ScannerError("PREDICTIVE_SELECTION_MIN_CONFIDENCE must be between 70 and 90.")
 
+def market_window_open() -> bool:
+    # NSE status is checked immediately afterwards and is the authoritative
+    # open/closed gate. Avoid a separate holiday API call on every 5-minute run.
+    now = now_ist()
+    return now.weekday() < 5 and MARKET_START <= now.time() <= MARKET_END
+  
 
 def _env_float(key: str, default: float) -> float:
     try:
