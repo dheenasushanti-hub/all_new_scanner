@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 Predictive Market Scanner & Strike Router — V68.
+"""NIFTY 50 Predictive Market Scanner & Strike Router — V70.
 
 Clean, modular redesign of the supplied V52–V58 scanner lineage. This version has
 one market-scenario engine, one strike router, one structural risk engine, one state
@@ -21,11 +21,12 @@ Core behavior
   VWAP/COI/progress has deteriorated; the warning is not an exit or invalidation.
 * Gives valid tactical OI velocity from the nearest 1m/3m/5m snapshot interval priority over session
   aggregate bias. It never invents tactical velocity when no historical snapshot exists.
-* Finds weakening/building OI walls and can report a market-only pre-breakout watch.
-  Breakout/gamma-squeeze strike routing requires a completed 1m close beyond the wall, a
-  live spot hold, VWAP and 1m momentum alignment, tactical OI confirmation, and non-conflicting
-  futures. Option routing then independently enforces quote, premium-VWAP, spread, delta,
-  score, structural risk, directional regime, and timing gates.
+* Finds weakening/building OI walls and can rank a provisional strike before market
+  confirmation. A narrowly qualified pre-breakout route can issue an early recommendation
+  only when a high-confidence compression setup, weakening nearby wall, exact-wall OI unwind,
+  aligned tactical flow, VWAP/momentum, and non-conflicting futures all agree. Normal breakout
+  routing still requires completed 1m structure. Every route retains the final quote, premium-VWAP,
+  spread, delta, score, structural risk, directional regime, and timing gates.
 * Implements morning Gap & Go, Gamma Squeeze / Pre-Breakout Compression, Exhaustion
   Reversal, Continuation, and a hard Sideways/Pinning veto.
 * Restricts normal option candidates to ATM, ITM1, ITM2; permits one-step OTM only for
@@ -36,16 +37,18 @@ Core behavior
   tracker ratchets its stop to current structural support/resistance; this is not a
   representation of an actual user position.
 * Uses an atomic JSON store with trading-date resets and no sticky directional latch.
-* Uses predictive detection, strict structural entry confirmation, internal candidate diagnostics, and trade readiness. Only a selected-strike email and confirmed post-selection failures are emailed; watch/target/diagnostic events stay internal.
-  Rejected contracts are diagnostic-only and never appear as selected.
+* Separates provisional strike ranking from final recommendation. Only a final selected-strike
+  email, one-time T1/T2 milestones, and confirmed stop/reversal failures are emailed; watches,
+  blocked candidates, and routine scans stay internal. Rejected contracts are never labelled selected.
 * Enforces 0.650 as the minimum aggregate score; the environment variable cannot lower it.
+  PREDICTIVE_SELECTION_MIN_CONFIDENCE is independently configurable (70–90, default 74).
 * T2 is optional: a valid T1 and structural stop are sufficient for readiness; missing T2 is
   reported as unavailable rather than blocking a valid structural setup.
-* Persists the full structured scan report and OI history in state JSON; console output is a compact one-line summary.
+* Persists active state in market_state.json and appends one full JSONL audit record per run under AUDIT_DIR (default ./audit). The daily log includes the normalized full option chain, quote snapshots, OI-by-strike analysis, recent candles, candidate ranks/vetoes, selection and monitoring outcomes. Console output remains compact.
 
 Run:
-    python market_scanner_v68.py
-    python market_scanner_v67.py --loop
+    python market_scanner_v70.py
+    python market_scanner_v70.py --loop
 
 Required environment:
     UPSTOX_ANALYTICS_TOKEN
@@ -54,7 +57,7 @@ Optional environment:
     NIFTY_INSTRUMENT_KEY, STATE_FILE, REQUEST_TIMEOUT, API_RETRIES,
     MIN_SCORE (hard minimum 0.650), MIN_COI_SCORE_LOW_ADX (0.40), MIN_COI_SCORE_NORMAL_ADX (0.35), MIN_COI_SCORE_HIGH_ADX (0.30), MIN_DIRECTIONAL_DELTA (0.55),
     MIN_EXHAUSTION_DELTA (0.75), MAX_QUOTE_AGE_SECONDS, MAX_SPREAD_RATIO, RISK_FREE_RATE,
-    FALLBACK_IV, CHANGE_OI_FALLBACK_ENABLED, MIN_OPPOSING_WALL_CLEARANCE_STEPS,
+    FALLBACK_IV, CHANGE_OI_FALLBACK_ENABLED, AUDIT_DIR (default ./audit), MIN_OPPOSING_WALL_CLEARANCE_STEPS,
     DIRECTION_FLIP_CONFIRMATIONS, INTRABAR_MONITOR_LOOKBACK, STAGNATION_RANGE_PCT,
     STAGNATION_MIN_FAVORABLE_PROGRESS_PCT, STAGNATION_WARNING_COOLDOWN_MINUTES,
     EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER, SMTP_HOST, SMTP_PORT.
@@ -68,7 +71,7 @@ API sources checked during design (official Upstox docs):
 Important measurement limitation: the option-chain endpoint returns OI snapshots, not a
 continuous OI time series. Intraday COI velocity is therefore computed from this scanner's
 own timestamped snapshots. For 09:16 velocity availability, schedule the first scan at
-09:15. If a process starts later with no same-session baseline, V67 reports COI as
+09:15. If a process starts later with no same-session baseline, V70 reports COI as
 unavailable/session-proxy and will not describe the proxy as tactical velocity.
 """
 from __future__ import annotations
@@ -105,7 +108,7 @@ import requests
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com"
-SCANNER_VERSION = "2026-10-16-V68-PRICE-STRUCTURE-CONTINUATION-REDESIGN"
+SCANNER_VERSION = "2026-10-17-V70-PREDICTIVE-STRIKE-RANKING-AUDIT-LOGGING"
 MARKET_START = time(9, 15)
 ENTRY_START = time(9, 16)
 MORNING_END = time(10, 30)
@@ -113,10 +116,12 @@ MIDDAY_END = time(13, 30)
 ENTRY_CUTOFF = time(15, 15)
 MARKET_END = time(15, 30)
 # Email policy: selected strike, confirmed market reversal of an active virtual signal,
-# or a confirmed initial/trailing stop. All watch, target, quote-health and diagnostics
-# events remain internal and must never be delivered as email.
+# plus one-time T1/T2 milestones and confirmed failure events. Watches and diagnostics
+# remain internal, so scheduled scans do not generate repeated email noise.
 EMAIL_ALLOWED_EVENT_TYPES = frozenset({
     "SIGNAL_READY",
+    "T1_REACHED",
+    "T2_REACHED",
     "MARKET_REVERSAL_CONFIRMED",
     "INITIAL_STOP_LOSS_REACHED",
     "TRAILING_STOP_REACHED",
@@ -124,7 +129,7 @@ EMAIL_ALLOWED_EVENT_TYPES = frozenset({
 DEFAULT_NIFTY_KEY = "NSE_INDEX|Nifty 50"
 DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-LOGGER = logging.getLogger("nifty_v68")
+LOGGER = logging.getLogger("nifty_v70")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(message)s",
                     stream=sys.stderr)
@@ -166,6 +171,7 @@ class Config:
     smtp_host: str = field(default_factory=lambda: os.getenv("SMTP_HOST", "smtp.gmail.com").strip())
     smtp_port: int = field(default_factory=lambda: max(1, _env_int("SMTP_PORT", 465)))
     watch_alert_min_confidence: float = field(default_factory=lambda: min(100.0, max(0.0, _env_float("WATCH_ALERT_MIN_CONFIDENCE", 55.0))))
+    predictive_selection_min_confidence: float = field(default_factory=lambda: min(90.0, max(70.0, _env_float("PREDICTIVE_SELECTION_MIN_CONFIDENCE", 74.0))))
     watch_neutral_invalidation_scans: int = field(default_factory=lambda: min(5, max(2, _env_int("WATCH_NEUTRAL_INVALIDATION_SCANS", 3))))
     watch_opposite_invalidation_scans: int = field(default_factory=lambda: min(3, max(2, _env_int("WATCH_OPPOSITE_INVALIDATION_SCANS", 2))))
     watch_max_age_minutes: int = field(default_factory=lambda: min(60, max(5, _env_int("WATCH_MAX_AGE_MINUTES", 18))))
@@ -196,6 +202,8 @@ class Config:
             LOGGER.warning("Delta floor is below the requested default; use only for historical calibration and risk analysis.")
         if not (0.0 <= self.strike_stickiness_tolerance <= 0.20):
             raise ScannerError("STRIKE_STICKINESS_SCORE_TOLERANCE must be between 0 and 0.20.")
+        if not (70.0 <= self.predictive_selection_min_confidence <= 90.0):
+            raise ScannerError("PREDICTIVE_SELECTION_MIN_CONFIDENCE must be between 70 and 90.")
 
 
 def _env_float(key: str, default: float) -> float:
@@ -450,6 +458,16 @@ class OptionContract:
     vetoes: tuple[str, ...] = ()
     score_basis: str = "FULL_40_30_30"
     score_components_available: tuple[str, ...] = ()
+    gamma: float = float("nan")
+    vega: float = float("nan")
+    local_oi_score: float = float("nan")
+    delta_fit_score: float = float("nan")
+    theta_efficiency_score: float = float("nan")
+    ranking_score: float = float("nan")
+    expected_underlying_move_points: float = float("nan")
+    expected_option_move_rupees: float = float("nan")
+    expected_option_move_pct: float = float("nan")
+    projection_rank_score: float = float("nan")
 
 
 @dataclass(frozen=True)
@@ -706,10 +724,10 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
         state["session_oi_baseline_source"] = "MIGRATED_EXISTING_SAME_SESSION_BASELINE"
     else:
         state.setdefault("session_oi_baseline_source", "UNAVAILABLE")
-    state["schema_version"] = 67
+    state["schema_version"] = 70
     state["scanner_version"] = SCANNER_VERSION
     state["session_date"] = today_iso
-    # Remove legacy directional latches so V64 always classifies live structure afresh.
+    # Remove legacy directional latches so V70 classifies live structure afresh.
     for key in ("persistent_direction", "continuation_phase", "continuation_count", "continuation_last_bar"):
         state.pop(key, None)
 
@@ -741,7 +759,7 @@ class StateStore:
                 LOGGER.error("Unable to back up corrupt state file: %s", backup_exc)
             self.state = {}
 
-        # Preserve a queued V66 structural-reversal failure under the V67 failure-only policy.
+        # Preserve queued legacy structural-reversal alerts under the V70 milestone/failure policy.
         raw_outbox = self.state.get("alert_outbox")
         if isinstance(raw_outbox, list):
             for alert in raw_outbox:
@@ -749,7 +767,7 @@ class StateStore:
                         and str(alert.get("status", "PENDING")).upper() == "PENDING"
                         and str(alert.get("event_type", "")).upper() == "VIRTUAL_RECOMMENDATION_INVALIDATED_BY_STRUCTURE"):
                     alert["event_type"] = "MARKET_REVERSAL_CONFIRMED"
-                    alert["subject"] = "NIFTY V68 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
+                    alert["subject"] = "NIFTY V70 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
                     payload = alert.get("payload") if isinstance(alert.get("payload"), dict) else {}
                     payload.setdefault("invalidated_direction", payload.get("direction"))
                     payload.setdefault("replacement_direction", "Not available in legacy alert")
@@ -761,13 +779,16 @@ class StateStore:
             if stored_date:
                 LOGGER.info("SESSION RESET: state_date=%s current_date=%s; clearing intraday OI/direction state.", stored_date, today_iso)
             # Unsent notifications must survive a date boundary; market/virtual trackers must not.
+            # A failed selection/failure email may survive a date boundary for operator
+            # visibility, but old T1/T2 milestones must never be delivered as if current.
             old_outbox = [dict(x) for x in self.state.get("alert_outbox", [])
                           if isinstance(x, dict)
                           and str(x.get("status", "PENDING")).upper() == "PENDING"
-                          and str(x.get("event_type", "")).upper() in EMAIL_ALLOWED_EVENT_TYPES] if isinstance(self.state.get("alert_outbox"), list) else []
+                          and str(x.get("event_type", "")).upper() in EMAIL_ALLOWED_EVENT_TYPES
+                          and str(x.get("event_type", "")).upper() not in {"T1_REACHED", "T2_REACHED"}] if isinstance(self.state.get("alert_outbox"), list) else []
             old_dedupe = self.state.get("alert_dedupe", {}) if isinstance(self.state.get("alert_dedupe"), dict) else {}
             self.state = {
-                "schema_version": 67,
+                "schema_version": 70,
                 "scanner_version": SCANNER_VERSION,
                 "session_date": today_iso,
                 "chain_snapshots": [],
@@ -852,8 +873,9 @@ class StateStore:
                 if isinstance(previous_watch, dict):
                     previous_watch.pop("best_candidate", None)
                     previous_watch.pop("candidate_preview", None)
-        # V67 email policy migration: suppress any previously queued V66 watch, target,
-        # quote-health, stagnation, cap, or diagnostic emails rather than sending them later.
+        # V70 email policy migration: suppress queued watches, quote-health, stagnation,
+        # cap and diagnostic emails. SIGNAL_READY, T1/T2 milestones and confirmed failures
+        # are the only permitted customer-facing event types.
         for alert in self.state.get("alert_outbox", []):
             if not isinstance(alert, dict):
                 continue
@@ -861,7 +883,7 @@ class StateStore:
                     and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
                 alert["status"] = "SUPPRESSED_POLICY"
                 alert["suppressed_at"] = now_ist().isoformat()
-                alert["last_error"] = "Suppressed by V67: only strike selection and confirmed failure emails are permitted."
+                alert["last_error"] = "Suppressed by V70: only selected-strike and discrete milestone/failure emails are permitted."
                 alert.pop("next_attempt_at", None)
         # Remove obsolete direction latches. Every decision is recomputed from current structure.
         self.state.pop("persistent_direction", None)
@@ -1409,8 +1431,42 @@ def parse_option_side(row: dict[str, Any], option_type: str) -> dict[str, Any]:
         "ask_qty": max(0.0, safe_float(market.get("ask_qty"), 0.0)),
         "delta": safe_float(greeks.get("delta")),
         "theta": safe_float(greeks.get("theta")),
+        "gamma": safe_float(greeks.get("gamma")),
+        "vega": safe_float(greeks.get("vega")),
         "iv": safe_float(greeks.get("iv")),
     }
+
+
+def audit_option_chain_rows(chain: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a stable, normalized audit view of every CE/PE row in the fetched chain."""
+    rows: list[dict[str, Any]] = []
+    for row in chain:
+        if not isinstance(row, dict):
+            continue
+        strike = safe_float(row.get("strike_price"))
+        if not finite(strike) or strike <= 0:
+            continue
+        rows.append({
+            "strike": float(strike),
+            "expiry": str(row.get("expiry", "")),
+            "underlying_spot_price": safe_float(row.get("underlying_spot_price")),
+            "CE": parse_option_side(row, "CE"),
+            "PE": parse_option_side(row, "PE"),
+        })
+    return rows
+
+
+def audit_candle_tail(frame: pd.DataFrame, limit: int = 45) -> list[dict[str, Any]]:
+    """Serialize a bounded tail of OHLCV candles; successive scans preserve older bars."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return []
+    output: list[dict[str, Any]] = []
+    for row in frame.tail(max(1, limit)).to_dict(orient="records"):
+        item = dict(row)
+        stamp = parse_timestamp(item.get("timestamp"))
+        item["timestamp"] = ist_iso(stamp) if stamp else str(item.get("timestamp", ""))
+        output.append(json_safe(item))
+    return output
 
 
 # =============================================================================
@@ -1861,6 +1917,12 @@ def analyze_option_oi(chain: Sequence[dict[str, Any]], prior_snapshots: Sequence
         put_pct = put_pct * velocity_scale if finite(put_pct) else put_pct
         call_changes = {k: v * velocity_scale for k, v in call_changes.items()}
         put_changes = {k: v * velocity_scale for k, v in put_changes.items()}
+    # V70: retain normalized per-strike tactical COI as well as the market-wide aggregate.
+    # This lets the candidate router distinguish strikes instead of applying an identical
+    # aggregate COI component to every CE/PE contract on the same side.
+    for strike, row in current.items():
+        row["call_coi_pct"] = call_changes.get(strike, float("nan"))
+        row["put_coi_pct"] = put_changes.get(strike, float("nan"))
     def normalized_window(baseline: Optional[tuple[dict[str, Any], float]], minutes: float) -> tuple[float, float]:
         if not baseline or not finite(baseline[1]) or baseline[1] <= 0:
             return float("nan"), float("nan")
@@ -2553,6 +2615,155 @@ def detect_structural_wall_reaction(
     return max(reactions, key=lambda item: (item.confidence, item.executable_candidate))
 
 
+def predictive_prebreakout_selection_gate(
+    scenario: Scenario, indicators: IndicatorSet, oi: OIAnalysis, risk: RiskPlan,
+    now: datetime, future_regime: str, config: Config,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Allow tightly qualified pre-breakout strike selection before wall crossing.
+
+    This is intentionally narrower than a provisional watch. It applies only to
+    the scanner's explicit compression/wall-weakening scenarios and still leaves
+    quote, option score, delta, premium-VWAP, spread, risk and readiness gates intact.
+    A pass means a predictive recommendation is qualified, not that a breakout is
+    guaranteed or already confirmed.
+    """
+    state = str(scenario.state or "").upper()
+    eligible = {
+        "PREDICTIVE_BULLISH_BREAKOUT", "PREDICTIVE_BEARISH_BREAKDOWN", "GAMMA_SQUEEZE"
+    }
+    evidence: dict[str, Any] = {"eligible_scenario": state in eligible, "checks": {}}
+
+    def reject(reason: str) -> tuple[bool, str, dict[str, Any]]:
+        evidence["passed"] = False
+        evidence["rejection_reason"] = reason
+        return False, reason, evidence
+
+    if state not in eligible:
+        return reject("NOT_A_SUPPORTED_PREBREAKOUT_SCENARIO")
+    if scenario.direction not in {"BULLISH", "BEARISH"}:
+        return reject("NO_DIRECTIONAL_SETUP")
+    if scenario.hard_veto:
+        return reject(f"MARKET_HARD_VETO:{scenario.hard_veto}")
+    if scenario.confidence < config.predictive_selection_min_confidence:
+        evidence["confidence_pct"] = scenario.confidence
+        evidence["required_confidence_pct"] = config.predictive_selection_min_confidence
+        return reject("PREDICTIVE_CONFIDENCE_BELOW_SELECTION_FLOOR")
+    local_time = now.astimezone(IST).time() if now.tzinfo else now.replace(tzinfo=IST).time()
+    if not (ENTRY_START <= local_time < ENTRY_CUTOFF):
+        return reject("OUTSIDE_NEW_SELECTION_WINDOW")
+    if not risk.valid:
+        return reject("STRUCTURAL_RISK_PLAN_INVALID")
+    if not finite(indicators.adx):
+        return reject("ADX_UNAVAILABLE")
+    if indicators.adx < 12.0:
+        evidence["adx"] = indicators.adx
+        return reject("ADX_TOO_LOW_FOR_PREBREAKOUT_SELECTION")
+    if not oi.tactical_available or not finite(oi.call_coi_pct) or not finite(oi.put_coi_pct):
+        return reject("TACTICAL_COI_UNAVAILABLE")
+    if not finite(oi.tactical_age_minutes) or oi.tactical_age_minutes < 0.0 or oi.tactical_age_minutes > 8.0:
+        evidence["tactical_age_minutes"] = oi.tactical_age_minutes if finite(oi.tactical_age_minutes) else None
+        return reject("TACTICAL_COI_AGE_UNAVAILABLE_OR_TOO_OLD_FOR_PREBREAKOUT_SELECTION")
+    if futures_regime_conflicts(scenario.direction, future_regime):
+        return reject(f"FUTURES_REGIME_CONFLICT:{str(future_regime).upper()}")
+
+    trigger = config.oi_velocity_trigger
+    momentum = safe_float(indicators.momentum_1m_pct, float("nan"))
+    spot = safe_float(indicators.spot, float("nan"))
+    vwap = safe_float(indicators.vwap, float("nan"))
+    wall = safe_float(scenario.wall_level, float("nan"))
+    atr = safe_float(indicators.atr, float("nan"))
+    bullish = scenario.direction == "BULLISH"
+    if bullish:
+        flow_ok = oi.call_coi_pct <= -trigger and oi.put_coi_pct >= 0.0
+        price_ok = finite(spot) and finite(vwap) and spot > vwap and finite(momentum) and momentum > 0.0
+        wall_side = "CALL"
+        wall_still_ahead = finite(wall) and wall > spot
+        wall_collection = oi.walls_resistance
+        local_change_key = "call_coi_pct"
+        opposite_momentum = finite(indicators.momentum_3m_pct) and indicators.momentum_3m_pct < -0.0005
+        di_conflict = (finite(indicators.plus_di) and finite(indicators.minus_di)
+                       and indicators.minus_di > indicators.plus_di + 5.0)
+    else:
+        flow_ok = oi.put_coi_pct <= -trigger and oi.call_coi_pct >= 0.0
+        price_ok = finite(spot) and finite(vwap) and spot < vwap and finite(momentum) and momentum < 0.0
+        wall_side = "PUT"
+        wall_still_ahead = finite(wall) and wall < spot
+        wall_collection = oi.walls_support
+        local_change_key = "put_coi_pct"
+        opposite_momentum = finite(indicators.momentum_3m_pct) and indicators.momentum_3m_pct > 0.0005
+        di_conflict = (finite(indicators.plus_di) and finite(indicators.minus_di)
+                       and indicators.plus_di > indicators.minus_di + 5.0)
+    evidence["checks"].update({
+        "aggregate_tactical_flow_aligned": bool(flow_ok),
+        "spot_vwap_and_1m_momentum_aligned": bool(price_ok),
+        "futures_non_conflicting": True,
+        "spot": spot if finite(spot) else None,
+        "vwap": vwap if finite(vwap) else None,
+        "momentum_1m_pct": momentum if finite(momentum) else None,
+        "adx": indicators.adx,
+    })
+    if not flow_ok:
+        return reject("AGGREGATE_TACTICAL_COI_NOT_ALIGNED")
+    if not price_ok:
+        return reject("VWAP_OR_1M_MOMENTUM_NOT_ALIGNED")
+    if opposite_momentum or di_conflict:
+        return reject("HIGHER_INTRADAY_MOMENTUM_OR_DI_CONFLICT")
+    if not wall_still_ahead:
+        return reject("STRUCTURAL_WALL_NOT_AHEAD_OF_SPOT")
+
+    matching_walls = [w for w in wall_collection
+                      if finite(w.strike) and abs(float(w.strike) - wall) <= 0.51]
+    wall_obj = matching_walls[0] if matching_walls else None
+    if wall_obj is None:
+        return reject(f"{wall_side}_WALL_NOT_FOUND_IN_CURRENT_OI_STRUCTURE")
+    distance = abs(wall - spot)
+    step = infer_strike_step(list(oi.rows))
+    max_distance = max(
+        (config.wall_proximity_atr * atr * 1.5) if finite(atr) and atr > 0 else 0.0,
+        1.5 * step if finite(step) and step > 0 else 0.0,
+        5.0,
+    )
+    evidence["checks"].update({
+        "wall_strike": wall,
+        "wall_state": wall_obj.state,
+        "wall_distance_points": distance,
+        "maximum_wall_distance_points": max_distance,
+        "wall_change_pct": wall_obj.change_pct,
+        "wall_side": wall_side,
+    })
+    if distance > max_distance:
+        return reject("STRUCTURAL_WALL_TOO_FAR_FOR_PREBREAKOUT_ENTRY")
+
+    # Require direct evidence that the actual wall and its exact strike are weakening,
+    # not merely that aggregate OI is moving.
+    nearest_strike = min(oi.rows, key=lambda k: abs(float(k) - wall)) if oi.rows else None
+    wall_row = oi.rows.get(nearest_strike, {}) if nearest_strike is not None else {}
+    local_change = safe_float(wall_row.get(local_change_key), float("nan")) if isinstance(wall_row, Mapping) else float("nan")
+    wall_weakening = str(wall_obj.state).upper() == "WEAKENING"
+    local_unwind = finite(local_change) and local_change <= -(0.5 * trigger)
+    evidence["checks"].update({
+        "wall_local_coi_pct": local_change if finite(local_change) else None,
+        "wall_is_weakening": wall_weakening,
+        "wall_local_oi_unwind": local_unwind,
+    })
+    if not wall_weakening:
+        return reject("STRUCTURAL_WALL_NOT_CLASSIFIED_AS_WEAKENING")
+    if not local_unwind:
+        return reject("WALL_STRIKE_LOCAL_OI_UNWIND_NOT_CONFIRMED")
+
+    # Only explicit compression setups can pre-select. A regular continuation must
+    # use the existing completed-structure entry rule instead.
+    compressed = bool(scenario.features.get("compressed", False)) or state == "GAMMA_SQUEEZE"
+    if not compressed:
+        return reject("COMPRESSION_NOT_CONFIRMED")
+
+    evidence["passed"] = True
+    evidence["rejection_reason"] = None
+    evidence["tactical_age_minutes"] = oi.tactical_age_minutes
+    evidence["oi_source"] = oi.tactical_source
+    return True, f"QUALIFIED_EARLY_PREDICTIVE_SELECTION:{state}", evidence
+
+
 def selection_trigger_confirmation(
     scenario: Scenario, indicators: IndicatorSet, oi: OIAnalysis, config: Config,
     future_regime: str = "UNKNOWN",
@@ -3163,6 +3374,33 @@ def append_futures_snapshot(state: dict[str, Any], quote: Optional[LiveQuote], n
 # Strike quality, premium VWAP, targets and stops
 # =============================================================================
 
+def expected_underlying_move_for_ranking(
+    scenario: Scenario, spot: float, indicators: IndicatorSet,
+    oi: OIAnalysis, risk: RiskPlan,
+) -> tuple[float, str]:
+    """Estimate the NIFTY move to a structural target for option ranking only.
+
+    A validated T1 is preferred. For a watch without a complete risk plan, use the
+    nearest intact opposing OI wall. ATR is an explicitly labelled last-resort proxy;
+    this estimate never authorizes a signal and is not reported as a guaranteed target.
+    """
+    if risk.valid and finite(risk.target_1) and abs(float(risk.target_1) - spot) >= 1.0:
+        return abs(float(risk.target_1) - spot), str(risk.target_1_source or "STRUCTURAL_T1")
+    if scenario.direction == "BULLISH":
+        walls = [w for w in oi.walls_resistance if w.strike > spot and w.state in {"BUILDING", "STABLE"}]
+        walls.sort(key=lambda w: w.strike)
+        if walls:
+            return abs(walls[0].strike - spot), f"NEXT_INTACT_CALL_WALL_{walls[0].state}"
+    elif scenario.direction == "BEARISH":
+        walls = [w for w in oi.walls_support if w.strike < spot and w.state in {"BUILDING", "STABLE"}]
+        walls.sort(key=lambda w: w.strike, reverse=True)
+        if walls:
+            return abs(spot - walls[0].strike), f"NEXT_INTACT_PUT_WALL_{walls[0].state}"
+    if finite(indicators.atr) and indicators.atr > 0:
+        return float(indicators.atr), "ATR_ONLY_RANKING_PROXY_NOT_STRUCTURAL_TARGET"
+    return float("nan"), "UNAVAILABLE"
+
+
 def allowed_strikes(spot: float, strikes: Sequence[float], direction: str, now: datetime,
                     scenario: Scenario, indicators: IndicatorSet) -> tuple[float, list[tuple[float, str]]]:
     atm = nearest_strike(spot, strikes)
@@ -3273,12 +3511,44 @@ def _coi_score(direction: str, oi: OIAnalysis, config: Config, scenario_state: s
     return clamp(0.70 * velocity_score + 0.30 * accel_score)
 
 
+def _strike_local_coi_score(direction: str, strike: float, oi: OIAnalysis,
+                            config: Config) -> float:
+    """Score whether the candidate strike's own OI changes support the setup.
+
+    For CE selection, call-OI unwinding at the candidate strike and put-OI building
+    are supportive clues. For PE selection the inverse is used. This is a weak
+    location-level signal, not proof of buyer/seller identity; missing baselines stay
+    unavailable rather than being fabricated.
+    """
+    row = oi.rows.get(float(strike))
+    if not isinstance(row, Mapping):
+        row = oi.rows.get(round(float(strike), 2))
+    if not isinstance(row, Mapping):
+        return float("nan")
+    call_change = safe_float(row.get("call_coi_pct"), float("nan"))
+    put_change = safe_float(row.get("put_coi_pct"), float("nan"))
+    if not finite(call_change) or not finite(put_change):
+        return float("nan")
+    trigger = max(config.oi_velocity_trigger, 0.0001)
+    # Smooth scaling preserves differences between neighbouring strikes and avoids
+    # saturating the local score on a single strong snapshot change.
+    if str(direction).upper() == "BULLISH":
+        call_unwind = clamp(0.5 - call_change / (8.0 * trigger))
+        put_build = clamp(0.5 + put_change / (8.0 * trigger))
+        return clamp(0.60 * call_unwind + 0.40 * put_build)
+    if str(direction).upper() == "BEARISH":
+        put_unwind = clamp(0.5 - put_change / (8.0 * trigger))
+        call_build = clamp(0.5 + call_change / (8.0 * trigger))
+        return clamp(0.60 * put_unwind + 0.40 * call_build)
+    return float("nan")
+
+
 def _candidate_from_data(
     *, row: dict[str, Any], strike: float, option_type: str, expiry: str,
     quote: LiveQuote, candle_frame: pd.DataFrame,
     oi: OIAnalysis, direction: str, now: datetime, indicators: IndicatorSet,
     config: Config, moneyness: str, pin_disqualified: bool, exhaustion: bool = False,
-    scenario_state: str = "",
+    scenario_state: str = "", expected_underlying_move: float = float("nan"),
 ) -> OptionContract:
     side = parse_option_side(row, option_type)
     # Never silently fall back to the untimestamped chain LTP when the dedicated
@@ -3298,11 +3568,24 @@ def _candidate_from_data(
     flow_score, premium_return, volume_ratio = _option_candle_flow(candle_frame, ltp, direction, quote.depth_imbalance)
     lift_ratio = (ltp / premium_vwap - 1.0) if finite(ltp) and finite(premium_vwap) and premium_vwap > 0 else float("nan")
     vwap_score = clamp(lift_ratio / 0.003) if finite(lift_ratio) else float("nan")
-    coi_score = _coi_score(direction, oi, config, scenario_state=scenario_state)
+    aggregate_coi_score = _coi_score(direction, oi, config, scenario_state=scenario_state)
+    local_oi_score = _strike_local_coi_score(direction, strike, oi, config)
+    # Keep aggregate positioning as the anchor. Strike-local COI is blended in only
+    # when a valid same-session baseline exists, preventing one noisy strike from
+    # overriding the broader flow reading.
+    if finite(aggregate_coi_score) and finite(local_oi_score):
+        coi_score = clamp(0.60 * aggregate_coi_score + 0.40 * local_oi_score)
+    else:
+        coi_score = aggregate_coi_score
     price_led_neutral_coi = (
         scenario_state in {"CONFIRMED_BULLISH_CONTINUATION", "CONFIRMED_BEARISH_CONTINUATION"}
         and finite(coi_score) and abs(coi_score - 0.5) < 1e-9
     )
+    delta_fit_score = (clamp(1.0 - abs(abs(delta_api) - 0.65) / 0.40)
+                       if finite(delta_api) and abs(delta_api) <= 1.0
+                       else clamp(1.0 - abs(abs(delta) - 0.65) / 0.40) if finite(delta) else float("nan"))
+    theta_burden = abs(safe_float(side.get("theta"), float("nan"))) / ltp if finite(side.get("theta")) and finite(ltp) and ltp > 0 else float("nan")
+    theta_efficiency_score = clamp(1.0 - theta_burden / 0.25) if finite(theta_burden) else 0.50
     weighted_components = [(0.40, flow_score, "FLOW"), (0.30, vwap_score, "PREMIUM_VWAP"), (0.30, coi_score, "TACTICAL_COI")]
     available_components = [(weight, value, label) for weight, value, label in weighted_components
                             if finite(value) and 0.0 <= float(value) <= 1.0]
@@ -3310,6 +3593,25 @@ def _candidate_from_data(
     # An incomplete score remains unavailable and cannot accidentally inflate readiness.
     total = (sum(weight * value for weight, value, _ in available_components)
              if len(available_components) == 3 else float("nan"))
+    # This separate rank score is not a probability and does not replace the hard
+    # 0.650 quality gate. It combines the legacy quality score with delta suitability,
+    # theta burden, and a target-distance option-move estimate for candidate ranking.
+    move_points = abs(safe_float(expected_underlying_move, float("nan")))
+    if finite(move_points) and move_points > 0 and finite(delta) and finite(ltp) and ltp > 0:
+        # First-order delta plus second-order gamma approximation. It intentionally
+        # excludes IV movement and time decay; those are not forecast with certainty.
+        projected_rupees = abs(delta) * move_points
+        if finite(side.get("gamma")):
+            projected_rupees += 0.5 * abs(safe_float(side.get("gamma"))) * move_points * move_points
+        projected_return_pct = 100.0 * projected_rupees / ltp
+    else:
+        projected_rupees = projected_return_pct = float("nan")
+    # A provisional neutral projection rank is replaced with a within-scan relative
+    # projection rank after all permitted strikes have been evaluated.
+    projection_rank_score = 0.50
+    ranking_score = (clamp(0.65 * total + 0.10 * delta_fit_score
+                            + 0.05 * theta_efficiency_score + 0.20 * projection_rank_score)
+                     if finite(total) and finite(delta_fit_score) else float("nan"))
     score_basis = "FULL_40_30_30" if len(available_components) == 3 else "INCOMPLETE_" + "_".join(label for _, _, label in available_components)
     vetoes: list[str] = []
     if quote.freshness != "FRESH":
@@ -3365,6 +3667,13 @@ def _candidate_from_data(
         premium_return_pct=premium_return * 100.0 if finite(premium_return) else float("nan"),
         volume_ratio=volume_ratio, pin_disqualified=pin_disqualified, vetoes=tuple(vetoes),
         score_basis=score_basis, score_components_available=tuple(label for _, _, label in available_components),
+        gamma=side.get("gamma", float("nan")), vega=side.get("vega", float("nan")),
+        local_oi_score=local_oi_score, delta_fit_score=delta_fit_score,
+        theta_efficiency_score=theta_efficiency_score, ranking_score=ranking_score,
+        expected_underlying_move_points=move_points,
+        expected_option_move_rupees=projected_rupees,
+        expected_option_move_pct=projected_return_pct,
+        projection_rank_score=projection_rank_score,
     )
 
 
@@ -3373,20 +3682,24 @@ def select_option_contract(
     indicators: IndicatorSet, oi: OIAnalysis, quotes: Mapping[str, LiveQuote],
     option_candles: Mapping[str, pd.DataFrame], expiry: str, config: Config,
     preferred_instrument_key: Optional[str] = None,
+    provisional: bool = False,
+    expected_underlying_move: float = float("nan"),
 ) -> tuple[Optional[OptionContract], list[dict[str, Any]]]:
-    """Return an option candidate only when market confirmation and option gates pass.
+    """Rank eligible-side contracts; final selection remains strictly gated.
 
-    Blocked instruments remain in diagnostics for auditability, but are never returned as
-    selected candidates. A watch-only scenario does not route or rank option contracts.
-    The final trade-readiness stage still has to approve the full setup before selection.
+    In provisional mode, a directional, non-hard-veto watch may rank contracts for
+    internal JSON diagnostics before the underlying break/interaction is confirmed.
+    That result is never fed into trade readiness, tracker registration, or email.
+    The normal mode retains the original market and option hard gates.
     """
     if scenario.direction not in {"BULLISH", "BEARISH"}:
         return None, []
-    if not scenario.executable_candidate or scenario.hard_veto:
+    if scenario.hard_veto or (not scenario.executable_candidate and not provisional):
         return None, [{
             "route_status": "SKIPPED_MARKET_NOT_CONFIRMED",
             "execution_eligible": False,
             "selected_for_execution": False,
+            "provisional_only": bool(provisional),
             "vetoes": ["MARKET_SCENARIO_NOT_CONFIRMED_STRIKE_ROUTING_SKIPPED"],
         }]
     chain_map = chain_rows_by_strike(chain)
@@ -3414,7 +3727,7 @@ def select_option_contract(
             candle_frame=option_candles.get(key, pd.DataFrame()), oi=oi, direction=scenario.direction,
             now=now, indicators=indicators, config=config, moneyness=moneyness,
             pin_disqualified=(strike in pin_set), exhaustion="EXHAUSTION" in scenario.state,
-            scenario_state=scenario.state,
+            scenario_state=scenario.state, expected_underlying_move=expected_underlying_move,
         )
         candidates.append(candidate)
         diagnostics.append({
@@ -3422,23 +3735,73 @@ def select_option_contract(
             "instrument_key": key, "score": candidate.total_score, "score_basis": candidate.score_basis,
             "score_components_available": list(candidate.score_components_available),
             "flow_score": candidate.flow_score, "vwap_lift_score": candidate.vwap_lift_score,
-            "coi_score": candidate.coi_score, "vetoes": list(candidate.vetoes),
+            "coi_score": candidate.coi_score, "local_oi_score": candidate.local_oi_score,
+            "delta_fit_score": candidate.delta_fit_score,
+            "theta_efficiency_score": candidate.theta_efficiency_score,
+            "ranking_score": candidate.ranking_score,
+            "expected_underlying_move_points": candidate.expected_underlying_move_points,
+            "expected_option_move_rupees": candidate.expected_option_move_rupees,
+            "expected_option_move_pct": candidate.expected_option_move_pct,
+            "projection_rank_score": candidate.projection_rank_score,
+            "call_coi_at_strike_pct": oi.rows.get(float(strike), {}).get("call_coi_pct"),
+            "put_coi_at_strike_pct": oi.rows.get(float(strike), {}).get("put_coi_pct"),
+            "vetoes": list(candidate.vetoes),
             "execution_eligible": not candidate.vetoes,
+            "provisional_only": bool(provisional),
             "premium_vwap": candidate.premium_vwap, "ltp": candidate.ltp,
-            "delta": candidate.delta, "spread_ratio": candidate.spread_ratio,
+            "delta": candidate.delta, "gamma": candidate.gamma, "vega": candidate.vega,
+            "theta": candidate.theta, "spread_ratio": candidate.spread_ratio,
             "quote_freshness": candidate.quote_freshness,
         })
 
     if not candidates:
         return None, diagnostics
 
+    projection_values = [candidate.expected_option_move_pct for candidate in candidates
+                         if finite(candidate.expected_option_move_pct) and candidate.expected_option_move_pct >= 0]
+    max_projection = max(projection_values) if projection_values else float("nan")
+    candidate_by_key: dict[str, OptionContract] = {}
+    for candidate in candidates:
+        if finite(candidate.expected_option_move_pct) and finite(max_projection) and max_projection > 0:
+            projection_rank = clamp(candidate.expected_option_move_pct / max_projection)
+        else:
+            projection_rank = 0.50
+        total = candidate.total_score
+        if finite(total) and finite(candidate.delta_fit_score):
+            rank_score = clamp(0.65 * total + 0.10 * candidate.delta_fit_score
+                               + 0.05 * (candidate.theta_efficiency_score if finite(candidate.theta_efficiency_score) else 0.50)
+                               + 0.20 * projection_rank)
+        else:
+            rank_score = float("nan")
+        updated = replace(candidate, ranking_score=rank_score, projection_rank_score=projection_rank)
+        candidate_by_key[updated.instrument_key] = updated
+        for diagnostic in diagnostics:
+            if diagnostic.get("instrument_key") == updated.instrument_key:
+                diagnostic["ranking_score"] = rank_score
+                diagnostic["projection_rank_score"] = projection_rank
+                break
+    candidates = [candidate_by_key.get(candidate.instrument_key, candidate) for candidate in candidates]
+
     def rank_key(candidate: OptionContract) -> tuple[Any, ...]:
-        return (0 if candidate.score_basis == "FULL_40_30_30" else 1,
-                -(candidate.total_score if finite(candidate.total_score) else -1.0),
+        return (0 if finite(candidate.total_score) else 1,
+                -(candidate.ranking_score if finite(candidate.ranking_score) else
+                  candidate.total_score if finite(candidate.total_score) else -1.0),
                 0 if candidate.strike == atm else 1, candidate.strike)
 
     ranked = sorted(candidates, key=rank_key)
     passing = sorted((candidate for candidate in candidates if not candidate.vetoes), key=rank_key)
+    if provisional:
+        # Provisional output is a shortlist only: even a zero-veto candidate is not
+        # authorized to become the selected recommendation until final market gates pass.
+        best_review = ranked[0]
+        for diagnostic in diagnostics:
+            match = (diagnostic.get("instrument_key") == best_review.instrument_key
+                     and diagnostic.get("strike") == best_review.strike)
+            diagnostic["best_candidate_for_review"] = bool(match)
+            diagnostic["option_gate_pass"] = bool(diagnostic.get("execution_eligible"))
+            diagnostic["selected_for_execution"] = False
+            diagnostic["provisional_only"] = True
+        return best_review, diagnostics
     if not passing:
         # Mark the best blocked contract for internal diagnostics only. Never return it as a candidate.
         best_review = ranked[0]
@@ -3997,9 +4360,9 @@ def register_recommendation_tracker(
 ) -> dict[str, Any]:
     """Register a signal for virtual monitoring without resetting an identical tracker.
 
-    Several distinct alerts may remain monitored independently, so a later signal does
-    not silently stop the prior recommendation's T1/T2/stop alerts. The active tracker
-    count is bounded; if the cap is reached, the oldest tracker is explicitly retired.
+    V70's main scan guard suppresses new selection while any recommendation is active.
+    The tracker-list compatibility remains for older persisted states; active legacy
+    records continue to be monitored rather than silently discarded during migration.
     """
     raw = state.get("recommendation_trackers")
     trackers = [dict(x) for x in raw if isinstance(x, dict)] if isinstance(raw, list) else []
@@ -4187,7 +4550,17 @@ def candidate_report(candidate: Optional[OptionContract]) -> Optional[dict[str, 
         "score_basis": candidate.score_basis,
         "score_components_available": list(candidate.score_components_available),
         "flow_score": candidate.flow_score, "vwap_lift_score": candidate.vwap_lift_score,
-        "coi_score": candidate.coi_score, "spread_ratio": candidate.spread_ratio,
+        "coi_score": candidate.coi_score, "local_oi_score": candidate.local_oi_score,
+        "delta_fit_score": candidate.delta_fit_score,
+        "theta_efficiency_score": candidate.theta_efficiency_score,
+        "ranking_score": candidate.ranking_score,
+        "expected_underlying_move_points": candidate.expected_underlying_move_points,
+        "expected_option_move_rupees": candidate.expected_option_move_rupees,
+        "expected_option_move_pct": candidate.expected_option_move_pct,
+        "projection_rank_score": candidate.projection_rank_score,
+        "projection_method": "DELTA_GAMMA_ESTIMATE_EXCLUDES_IV_CHANGE_AND_TIME_DECAY",
+        "gamma": candidate.gamma, "vega": candidate.vega, "theta": candidate.theta,
+        "spread_ratio": candidate.spread_ratio,
         "quote_freshness": candidate.quote_freshness, "quote_age_seconds": candidate.quote_age_seconds,
         "execution_eligible": not candidate.vetoes, "blocking_reasons": list(candidate.vetoes),
     }
@@ -4216,10 +4589,10 @@ def enqueue_email_alert(
     state: dict[str, Any], *, now: datetime, event_type: str, dedupe_key: str,
     subject: str, payload: Mapping[str, Any], cooldown_minutes: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
-    """Queue only strike selection and confirmed failure emails; all other events are internal."""
+    """Queue one-time selection, T1/T2 milestone, and confirmed failure emails."""
     event_type = str(event_type or "").upper()
     if event_type not in EMAIL_ALLOWED_EVENT_TYPES:
-        LOGGER.debug("EMAIL SUPPRESSED BY V67 POLICY: event=%s", event_type or "UNKNOWN")
+        LOGGER.debug("EMAIL SUPPRESSED BY V70 POLICY: event=%s", event_type or "UNKNOWN")
         return None
     dedupe = state.setdefault("alert_dedupe", {})
     if not isinstance(dedupe, dict):
@@ -4412,7 +4785,7 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
 
 def _alert_body(alert: Mapping[str, Any]) -> str:
     title, fields, disclaimer = _alert_fields(alert)
-    lines = [f"NIFTY 50 Predictive Scanner V68 — {title}", "", disclaimer, ""]
+    lines = [f"NIFTY 50 Predictive Scanner V70 — {title}", "", disclaimer, ""]
     lines.extend(f"{label}: {value}" for label, value in fields)
     lines.extend(["", f"Scanner version: {SCANNER_VERSION}"])
     return "\n".join(lines)
@@ -4432,7 +4805,7 @@ def _alert_html_body(alert: Mapping[str, Any]) -> str:
     return (
         '<!doctype html><html><body style="margin:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.45;">'
         '<div style="max-width:780px;margin:0 auto;padding:16px;"><div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">'
-        f'<div style="background:{banner};padding:16px 20px;color:#ffffff;"><div style="font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.9;">NIFTY 50 Predictive Scanner · V67</div><h2 style="margin:6px 0 0;font-size:21px;line-height:1.3;">{safe_title}</h2></div>'
+        f'<div style="background:{banner};padding:16px 20px;color:#ffffff;"><div style="font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.9;">NIFTY 50 Predictive Scanner · V70</div><h2 style="margin:6px 0 0;font-size:21px;line-height:1.3;">{safe_title}</h2></div>'
         f'<div style="padding:16px 20px;"><p style="margin:0 0 14px;padding:11px 13px;background:#f9fafb;border-left:4px solid {banner};border-radius:4px;overflow-wrap:anywhere;">{html_lib.escape(disclaimer)}</p>'
         f'<table role="presentation" style="border-collapse:collapse;width:100%;table-layout:fixed;font-size:14px;"><colgroup><col style="width:31%;"><col style="width:69%;"></colgroup><tbody>{rows}</tbody></table>'
         f'<p style="color:#6b7280;font-size:12px;margin:16px 0 0;">Scanner version: {html_lib.escape(SCANNER_VERSION)} · Recommendation-only; no order was placed.</p></div></div></div></body></html>'
@@ -4457,7 +4830,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
                 and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
             alert["status"] = "SUPPRESSED_POLICY"
             alert["suppressed_at"] = ist_iso(now)
-            alert["last_error"] = "Suppressed by V67 email policy."
+            alert["last_error"] = "Suppressed by V70 email policy."
             alert.pop("next_attempt_at", None)
     all_pending = [x for x in outbox if isinstance(x, dict) and str(x.get("status", "PENDING")).upper() == "PENDING"]
     if not all_pending:
@@ -4494,7 +4867,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
             alert["attempts"] = int(alert.get("attempts", 0)) + 1
             try:
                 message = MIMEMultipart("alternative")
-                message["Subject"] = str(alert.get("subject", "NIFTY V68 scanner alert"))
+                message["Subject"] = str(alert.get("subject", "NIFTY V70 scanner alert"))
                 message["From"] = config.email_sender
                 message["To"] = config.email_receiver
                 message.attach(MIMEText(_alert_body(alert), "plain", "utf-8"))
@@ -4539,12 +4912,137 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
             "smtp_configured": True, "next_attempt_at": next_attempt}
 
 
+class ScanAuditWriter:
+    """Append one complete, JSON-safe audit record per scanner invocation.
+
+    The daily JSONL log is intentionally separate from market_state.json so the active
+    state remains compact while every scan can later be reconstructed and reviewed.
+    """
+
+    def __init__(self, directory: Optional[Path] = None) -> None:
+        raw = os.getenv("AUDIT_DIR", "").strip()
+        if directory is not None:
+            self.directory = Path(directory).expanduser()
+        elif raw:
+            candidate = Path(raw).expanduser()
+            self.directory = candidate if candidate.is_absolute() else (Path.cwd() / candidate).resolve()
+        else:
+            self.directory = Path(__file__).resolve().parent / "audit"
+
+    @staticmethod
+    def _record_id(report: Mapping[str, Any]) -> str:
+        version = str(report.get("scanner_version", SCANNER_VERSION))
+        stamp = str(report.get("timestamp", ""))
+        return hashlib.sha256(f"{version}|{stamp}".encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _last_record_id(path: Path) -> Optional[str]:
+        """Read the last JSONL record without loading the entire daily file."""
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                if size <= 0:
+                    return None
+                chunk_size = min(size, 2 * 1024 * 1024)
+                handle.seek(-chunk_size, os.SEEK_END)
+                tail = handle.read(chunk_size)
+            lines = [line for line in tail.splitlines() if line.strip()]
+            if not lines:
+                return None
+            payload = json.loads(lines[-1].decode("utf-8"))
+            return str(payload.get("record_id", "")) or None if isinstance(payload, dict) else None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return None
+
+    def append(self, now: datetime, report: Mapping[str, Any], state: Mapping[str, Any]) -> dict[str, Any]:
+        local_now = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
+        day = local_now.date().isoformat()
+        path = self.directory / f"market_scan_{day}.jsonl"
+        record_id = self._record_id(report)
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            if path.exists() and self._last_record_id(path) == record_id:
+                return {"status": "ALREADY_PRESENT", "path": str(path), "record_id": record_id}
+
+            scan_report = dict(report)
+            # The write result belongs to market_state.json/console, not inside the
+            # immutable record itself, so the record does not claim it wrote itself.
+            scan_report.pop("audit_log", None)
+            trackers_raw = state.get("recommendation_trackers", [])
+            trackers = [
+                {
+                    key: item.get(key)
+                    for key in ("signal_fingerprint", "status", "direction", "scenario", "option_type",
+                                "strike", "trading_symbol", "instrument_key", "created_at", "completed_at",
+                                "completion_reason", "target_1", "target_2", "stop_loss", "trailing_stop",
+                                "target_1_hit", "target_2_hit", "last_nifty_spot", "last_option_ltp_observed",
+                                "last_option_quote_status", "last_intrabar_bar_timestamp")
+                    if key in item
+                }
+                for item in trackers_raw if isinstance(item, dict)
+            ] if isinstance(trackers_raw, list) else []
+            snapshots = state.get("chain_snapshots", [])
+            snapshot_times = [str(row.get("timestamp", "")) for row in snapshots if isinstance(row, dict)] if isinstance(snapshots, list) else []
+            record = {
+                "audit_schema_version": 1,
+                "record_id": record_id,
+                "recorded_at": ist_iso(local_now),
+                "scanner_version": str(report.get("scanner_version", SCANNER_VERSION)),
+                "scan_outcome": {
+                    "scenario": report.get("scenario"),
+                    "market_state": report.get("market_state"),
+                    "direction": report.get("direction"),
+                    "confidence_pct": report.get("confidence_pct"),
+                    "signal_ready": bool(report.get("signal_ready", False)),
+                    "selected_option": report.get("selected_option"),
+                    "candidate_ranking": report.get("candidate_ranking"),
+                    "trade_readiness": report.get("trade_readiness"),
+                    "vetoes": report.get("vetoes", []),
+                    "monitoring_events": ((report.get("monitoring") or {}).get("events_this_scan", [])
+                                           if isinstance(report.get("monitoring"), Mapping) else []),
+                    "email_delivery": report.get("email_delivery"),
+                },
+                "state_context": {
+                    "session_date": state.get("session_date"),
+                    "option_expiry": state.get("option_expiry"),
+                    "session_oi_baseline_source": state.get("session_oi_baseline_source"),
+                    "session_oi_baseline_timestamp": ((state.get("session_oi_baseline") or {}).get("timestamp")
+                                                       if isinstance(state.get("session_oi_baseline"), Mapping) else None),
+                    "recent_chain_snapshot_timestamps": snapshot_times,
+                    "active_or_recent_trackers": trackers,
+                    "last_signal_fingerprint": state.get("last_signal_fingerprint"),
+                },
+                # Preserve the full normalized report, all candidate diagnostics, selected
+                # strike details, and the current scan's captured input snapshots.
+                "scan": json_safe(scan_report),
+            }
+            line = json.dumps(json_safe(record), ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+            with path.open("a", encoding="utf-8", newline="") as handle:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+            return {"status": "APPENDED", "path": str(path), "record_id": record_id,
+                    "record_bytes": len(line.encode("utf-8"))}
+        except (OSError, TypeError, ValueError) as exc:
+            LOGGER.error("AUDIT LOG WRITE FAILURE: %s", exc)
+            return {"status": "FAILED", "path": str(path), "record_id": record_id,
+                    "error": f"{type(exc).__name__}: {str(exc)[:800]}"}
+
+
 class PredictiveScanner:
     def __init__(self, config: Config, client: Optional[UpstoxClient] = None,
                  store: Optional[StateStore] = None) -> None:
         self.config = config
         self.client = client or UpstoxClient(config)
         self.store = store or StateStore(config.state_file)
+        self.audit_writer = ScanAuditWriter()
+
+    def _append_audit(self, state: Mapping[str, Any], report: dict[str, Any], now: datetime) -> None:
+        result = self.audit_writer.append(now, report, state)
+        report["audit_log"] = result
+        if result.get("status") == "FAILED":
+            report.setdefault("warnings", []).append("Detailed scan audit could not be written; inspect audit_log.error.")
 
     def _get_quotes_or_empty(self, keys: Sequence[str]) -> dict[str, LiveQuote]:
         try:
@@ -4581,9 +5079,9 @@ class PredictiveScanner:
             direction = str(event.get("direction", "")).upper()
             subject_suffix = f" {direction} {safe_float(event.get('strike'), 0.0):.0f}" if strike else f" {direction}" if direction else ""
             if event_type == "MARKET_REVERSAL_CONFIRMED":
-                subject = f"NIFTY V68 MARKET REVERSAL CONFIRMED — {direction} RECOMMENDATION INVALIDATED"
+                subject = f"NIFTY V70 MARKET REVERSAL CONFIRMED — {direction} RECOMMENDATION INVALIDATED"
             else:
-                subject = f"NIFTY V68 {event_type.replace('_', ' ')}{subject_suffix}"
+                subject = f"NIFTY V70 {event_type.replace('_', ' ')}{subject_suffix}"
             enqueue_email_alert(
                 state, now=now, event_type=event_type,
                 dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{identity}",
@@ -4592,10 +5090,38 @@ class PredictiveScanner:
 
     def _finish(self, state: dict[str, Any], report: dict[str, Any], now: datetime) -> dict[str, Any]:
         """Persist outbox, the last full report and bounded summaries before/after delivery."""
+        def state_report_copy(item: Mapping[str, Any]) -> dict[str, Any]:
+            """Keep active JSON state compact; full input snapshots live in daily JSONL."""
+            stored = dict(item)
+            audit_inputs = stored.pop("audit_inputs", None)
+            if isinstance(audit_inputs, Mapping):
+                candles = audit_inputs.get("candles_1m") if isinstance(audit_inputs.get("candles_1m"), Mapping) else {}
+                quote_map = audit_inputs.get("live_quotes") if isinstance(audit_inputs.get("live_quotes"), Mapping) else {}
+                chain = audit_inputs.get("option_chain") if isinstance(audit_inputs.get("option_chain"), list) else []
+                oi_rows = audit_inputs.get("oi_by_strike") if isinstance(audit_inputs.get("oi_by_strike"), Mapping) else {}
+                index_bars = candles.get("nifty_index_recent", []) if isinstance(candles.get("nifty_index_recent"), list) else []
+                future_bars = candles.get("nifty_future_recent", []) if isinstance(candles.get("nifty_future_recent"), list) else []
+                option_candles = candles.get("option_candidates", {}) if isinstance(candles.get("option_candidates"), Mapping) else {}
+                stored["audit_input_summary"] = {
+                    "capture_version": audit_inputs.get("capture_version"),
+                    "capture_scope": audit_inputs.get("capture_scope"),
+                    "data_coverage": audit_inputs.get("data_coverage", {}),
+                    "option_chain_strikes": len(chain),
+                    "live_quote_instruments": len(quote_map),
+                    "oi_strikes_analysed": len(oi_rows),
+                    "nifty_index_candles_captured": len(index_bars),
+                    "nifty_future_candles_captured": len(future_bars),
+                    "option_candle_instruments_captured": len(option_candles),
+                    "historical_seed_info": audit_inputs.get("historical_seed_info"),
+                }
+            return json_safe(stored)
+
         def summarize(item: Mapping[str, Any]) -> dict[str, Any]:
             levels = item.get("nifty_levels") if isinstance(item.get("nifty_levels"), Mapping) else {}
             indicators = item.get("indicators") if isinstance(item.get("indicators"), Mapping) else {}
             selected = item.get("selected_option") if isinstance(item.get("selected_option"), Mapping) else {}
+            ranking = item.get("candidate_ranking") if isinstance(item.get("candidate_ranking"), Mapping) else {}
+            provisional = ranking.get("provisional_candidate") if isinstance(ranking.get("provisional_candidate"), Mapping) else {}
             signal_ready = bool(item.get("signal_ready", False) and selected)
             return json_safe({
                 "timestamp": item.get("timestamp", ist_iso(now)), "scenario": item.get("scenario", "UNKNOWN"),
@@ -4603,9 +5129,15 @@ class PredictiveScanner:
                 "confidence_pct": item.get("confidence_pct", 0), "spot": levels.get("spot", indicators.get("spot")),
                 "vwap": indicators.get("vwap"), "signal_ready": signal_ready,
                 "option": selected.get("trading_symbol") if signal_ready else None,
+                "provisional_only": bool(provisional and not signal_ready),
+                "provisional_option": provisional.get("trading_symbol") if not signal_ready else None,
+                "provisional_strike": provisional.get("strike") if not signal_ready else None,
+                "provisional_score": provisional.get("score") if not signal_ready else None,
                 "candidate_preview_only": not signal_ready, "T1": levels.get("T1") if signal_ready else None,
                 "T2": levels.get("T2") if signal_ready else None, "SL": levels.get("SL") if signal_ready else None,
+                "top_vetoes": (item.get("vetoes") or [])[:3] if isinstance(item.get("vetoes"), list) else [],
                 "email_status": (item.get("email_delivery") or {}).get("status") if isinstance(item.get("email_delivery"), Mapping) else "PENDING",
+                "audit_status": (item.get("audit_log") or {}).get("status") if isinstance(item.get("audit_log"), Mapping) else "PENDING",
             })
 
         try:
@@ -4622,12 +5154,13 @@ class PredictiveScanner:
                 history.append(summary)
             state["scan_history"] = history[-120:]
             state["last_scan_summary"] = summary
-            state["last_scan_report"] = json_safe(report)
+            state["last_scan_report"] = state_report_copy(report)
             self.store.save()
         except Exception as exc:
             LOGGER.error("STATE PERSISTENCE FAILURE before email delivery: %s", exc)
             report["state_persistence"] = {"status": "FAILED", "error": str(exc)}
             report["email_delivery"] = {"status": "NOT_ATTEMPTED_STATE_SAVE_FAILED", "sent": 0, "pending": None}
+            self._append_audit(state, report, now)
             return json_safe(report)
 
         delivery = deliver_email_outbox(state, self.config, now)
@@ -4642,8 +5175,12 @@ class PredictiveScanner:
             report.setdefault("warnings", []).append("Email secrets are incomplete; notifications remain queued in state for retry.")
         elif delivery.get("status") in {"RETRY_QUEUED", "PARTIAL"}:
             report.setdefault("warnings", []).append("One or more emails could not be sent; they remain queued for retry on the next invocation.")
+        # Write the immutable full scan record after delivery status is known. Audit
+        # failure is surfaced in the report and process exit code, but never triggers
+        # a repeat strike-selection email.
+        self._append_audit(state, report, now)
         try:
-            state["last_scan_report"] = json_safe(report)
+            state["last_scan_report"] = state_report_copy(report)
             summary = summarize(report)
             state["last_scan_summary"] = summary
             history = state.get("scan_history", [])
@@ -4660,7 +5197,7 @@ class PredictiveScanner:
         enqueue_email_alert(
             state, now=now, event_type=error_kind,
             dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{error_kind}|{type(exc).__name__}",
-            subject=f"NIFTY V68 scanner {error_kind.replace('_', ' ').lower()}",
+            subject=f"NIFTY V70 scanner {error_kind.replace('_', ' ').lower()}",
             payload={"timestamp": ist_iso(now), "scanner_version": SCANNER_VERSION,
                      "error_type": type(exc).__name__, "error": str(exc)[:1200],
                      "note": "No new recommendation was produced by the failed scan."},
@@ -4695,6 +5232,16 @@ class PredictiveScanner:
             "selected_option": None,
             "nifty_levels": {"spot": None, "T1": None, "T2": None, "SL": None, "trailing_SL": None},
             "indicators": {}, "oi": {}, "futures": {}, "risk": {}, "candidate_diagnostics": [],
+            "audit_inputs": {
+                "capture_version": 1,
+                "capture_scope": "NORMALIZED_FULL_OPTION_CHAIN_QUOTES_AND_RECENT_1M_CANDLES_WHEN_AVAILABLE",
+                "index_quote": None, "option_chain": [], "live_quotes": {},
+                "oi_by_strike": {}, "oi_comparison_snapshot_timestamps": [],
+                "change_oi_fallback_data": None,
+                "historical_seed_info": None, "historical_seed_snapshot": None,
+                "candles_1m": {"nifty_index_recent": [], "nifty_future_recent": [], "option_candidates": {}},
+                "data_coverage": {},
+            },
             "predictive_detection": {"detected": False, "stage": "NOT_RUN"},
             "candidate_ranking": {"best_candidate": None, "ranking_basis": "NOT_RUN"},
             "trade_readiness": {"status": "NOT_EVALUATED", "blocking_reasons": []},
@@ -4771,12 +5318,24 @@ class PredictiveScanner:
                 raise ScannerError("Fresh NIFTY index quote unavailable.")
             spot = index_quote.ltp
             report["nifty_levels"]["spot"] = spot
+            report["audit_inputs"]["index_quote"] = json_safe(asdict(index_quote))
+            report["audit_inputs"]["data_coverage"]["index_quote"] = "AVAILABLE"
             if index_quote.freshness != "FRESH":
                 raise ScannerError(f"NIFTY index quote is {index_quote.freshness}; entry triggers suppressed.")
 
             expiry = self.client.option_expiry(state, current.date())
             chain = self.client.option_chain(expiry)
             chain_map = chain_rows_by_strike(chain)
+            report["audit_inputs"]["option_chain"] = audit_option_chain_rows(chain)
+            report["audit_inputs"]["data_coverage"].update({
+                "option_chain": "AVAILABLE",
+                "option_chain_expiry": expiry,
+                "option_chain_strikes": len(chain_map),
+                "option_chain_contract_sides": sum(
+                    bool(parse_option_side(row, side).get("instrument_key"))
+                    for row in chain if isinstance(row, dict) for side in ("CE", "PE")
+                ),
+            })
             strikes = sorted(chain_map)
             atm = nearest_strike(spot, strikes)
             step = infer_strike_step(strikes)
@@ -4789,6 +5348,11 @@ class PredictiveScanner:
                                             session_baseline=state.get("session_oi_baseline"),
                                             session_baseline_source=str(state.get("session_oi_baseline_source", "UNAVAILABLE")))
                 warm_snapshot = make_chain_snapshot(chain, warm_oi, current, expiry)
+                report["audit_inputs"]["oi_by_strike"] = json_safe(warm_oi.rows)
+                report["audit_inputs"]["oi_comparison_snapshot_timestamps"] = [
+                    str(x.get("timestamp", "")) for x in prior if isinstance(x, dict)
+                ]
+                report["audit_inputs"]["data_coverage"]["oi_analysis"] = "AVAILABLE_WARMUP_BASELINE"
                 self.store.append_chain_snapshot(warm_snapshot, current)
                 if not isinstance(state.get("session_oi_baseline"), dict):
                     state["session_oi_baseline"] = warm_snapshot
@@ -4832,6 +5396,10 @@ class PredictiveScanner:
                     if key:
                         all_keys.append(key)
             quote_map = self._get_quotes_or_empty(all_keys)
+            report["audit_inputs"]["live_quotes"] = {
+                key: json_safe(asdict(quote)) for key, quote in quote_map.items()
+            }
+            report["audit_inputs"]["data_coverage"]["live_quote_instruments"] = len(quote_map)
             # Keep initial index quote if bulk quote batch omitted it.
             quote_map.setdefault(self.config.nifty_key, index_quote)
             index_quote = quote_map[self.config.nifty_key]
@@ -4843,6 +5411,8 @@ class PredictiveScanner:
                 LOGGER.error("NIFTY 1m candle feed unavailable; new entries suppressed, continuing quote-based tracker monitoring: %s", candle_exc)
                 index_session = pd.DataFrame()
             index_candles_available = not index_session.empty
+            report["audit_inputs"]["candles_1m"]["nifty_index_recent"] = audit_candle_tail(index_session, 45)
+            report["audit_inputs"]["data_coverage"]["nifty_index_1m_candles"] = "AVAILABLE" if index_candles_available else "UNAVAILABLE"
             if state.get("gap_reset_pending") and index_candles_available:
                 completed_gap_bars = completed_one_minute_candles(index_session, current)
                 if not completed_gap_bars.empty:
@@ -4875,7 +5445,23 @@ class PredictiveScanner:
                     futures_session = self.client.candles(future_key, interval=1, historical=False)
                 except ScannerError as exc:
                     LOGGER.warning("FUTURES 1m candles unavailable; price regime uses live quote snapshots only: %s", exc)
+            report["audit_inputs"]["candles_1m"]["nifty_future_recent"] = audit_candle_tail(futures_session, 45)
+            report["audit_inputs"]["data_coverage"]["nifty_future_1m_candles"] = "AVAILABLE" if not futures_session.empty else "UNAVAILABLE"
             historical_seed = load_historical_seed(self.client, state, self.config.nifty_key, current)
+            seed_state = state.get("historical_seed") if isinstance(state.get("historical_seed"), dict) else {}
+            seed_blob = json.dumps(json_safe(seed_state), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            seed_hash = hashlib.sha256(seed_blob.encode("utf-8")).hexdigest()
+            seed_rows = seed_state.get("candles", []) if isinstance(seed_state.get("candles"), list) else []
+            seed_timestamps = [str(row[0]) for row in seed_rows if isinstance(row, (list, tuple)) and row]
+            report["audit_inputs"]["historical_seed_info"] = {
+                "date": seed_state.get("date"), "instrument_key": seed_state.get("instrument_key"),
+                "candle_count": len(seed_rows), "first_timestamp": seed_timestamps[0] if seed_timestamps else None,
+                "last_timestamp": seed_timestamps[-1] if seed_timestamps else None, "sha256": seed_hash,
+                "captured_in_audit_record": seed_hash != str(state.get("audit_historical_seed_hash", "")),
+            }
+            if seed_hash != str(state.get("audit_historical_seed_hash", "")):
+                report["audit_inputs"]["historical_seed_snapshot"] = json_safe(seed_state)
+                state["audit_historical_seed_hash"] = seed_hash
             if index_candles_available:
                 indicators = build_indicators(current, spot, index_session, futures_session, historical_seed,
                                               self.config, previous_close=index_quote.previous_close)
@@ -4890,14 +5476,26 @@ class PredictiveScanner:
             if self.config.change_oi_fallback_enabled and not has_tactical_baseline:
                 try:
                     api_change_oi = self.client.change_oi_by_strike(expiry, current.date())
+                    report["audit_inputs"]["change_oi_fallback_data"] = json_safe(api_change_oi)
+                    report["audit_inputs"]["data_coverage"]["change_oi_fallback"] = "AVAILABLE_SESSION_CONTEXT_ONLY"
                     LOGGER.info("CHANGE-OI FALLBACK: loaded %d strike rows for structural/session context only; not tactical velocity.",
                                 len(api_change_oi.get("by_strike", {})))
                 except ScannerError as change_exc:
+                    report["audit_inputs"]["data_coverage"]["change_oi_fallback"] = "UNAVAILABLE"
+                    report["audit_inputs"]["data_coverage"]["change_oi_fallback_error"] = str(change_exc)[:600]
                     LOGGER.warning("CHANGE-OI fallback unavailable; OI concentration remains structural-only: %s", change_exc)
             oi = analyze_option_oi(chain, prior_snapshots, current, spot, self.config,
                                    session_baseline=state.get("session_oi_baseline"),
                                    session_baseline_source=str(state.get("session_oi_baseline_source", "UNAVAILABLE")),
                                    api_change_oi=api_change_oi)
+            report["audit_inputs"]["oi_by_strike"] = json_safe(oi.rows)
+            report["audit_inputs"]["oi_comparison_snapshot_timestamps"] = [
+                str(x.get("timestamp", "")) for x in prior_snapshots if isinstance(x, dict)
+            ]
+            report["audit_inputs"]["data_coverage"]["oi_analysis"] = "AVAILABLE"
+            report["audit_inputs"]["data_coverage"]["change_oi_fallback"] = (
+                "AVAILABLE" if api_change_oi else "NOT_USED_OR_UNAVAILABLE"
+            )
             future_regime, future_detail = futures_regime_from_snapshots(futures_quote, state, current)
             if index_candles_available:
                 scenario = detect_scenario(current, indicators, oi, future_regime, self.config)
@@ -4981,19 +5579,70 @@ class PredictiveScanner:
                     if isinstance(item, dict) and str(item.get("status", "")).upper() == "TRACKING"
                 )
 
-            # Risk and option selection use the FINAL guarded scenario. No option-candle
-            # requests or contract ranking are performed for a watch-only/unconfirmed setup.
+            # V70 follows an existing recommendation to completion before issuing another
+            # one. The active recommendation is monitored above on every scan; a different
+            # contract cannot replace it merely because its rank fluctuates between runs.
+            active_tracker_rows = state.get("recommendation_trackers", [])
+            if not isinstance(active_tracker_rows, list):
+                active_tracker_rows = []
+            active_recommendation_in_progress = any(
+                isinstance(item, dict) and str(item.get("status", "")).upper() == "TRACKING"
+                for item in active_tracker_rows
+            )
+            report["active_recommendation_guard"] = {
+                "active_tracker_count": sum(
+                    1 for item in active_tracker_rows
+                    if isinstance(item, dict) and str(item.get("status", "")).upper() == "TRACKING"
+                ),
+                "new_selection_suppressed": active_recommendation_in_progress,
+                "policy": "Monitor active selection until T2, SL, or confirmed structural invalidation; no per-scan re-selection email.",
+            }
+
+            # V70 separates predictive shortlist from final selection. A meaningful
+            # directional watch can rank same-side contracts before the underlying break
+            # is confirmed; this shortlist is diagnostic-only and never triggers email.
             risk = route_targets_and_stop(scenario, spot, indicators, oi, self.config) if scenario.direction in {"BULLISH", "BEARISH"} else RiskPlan(False, None, None, None, "", "", "", (), "No directional scenario.")
             option_candles: dict[str, pd.DataFrame] = {}
             entry_trigger_ok, entry_trigger_reason = selection_trigger_confirmation(
                 scenario, indicators, oi, self.config, future_regime=future_regime
             )
+            predictive_selection_ok, predictive_selection_reason, predictive_selection_evidence = (
+                predictive_prebreakout_selection_gate(
+                    scenario, indicators, oi, risk, current, future_regime, self.config
+                )
+            )
+            # A narrowly qualified compression/wall-weakening setup may select early,
+            # before a completed candle crosses the wall. This does not weaken the
+            # final option/risk gates and is tracked explicitly as a predictive entry.
+            routing_scenario = scenario
+            if predictive_selection_ok and not entry_trigger_ok:
+                routing_scenario = replace(
+                    scenario,
+                    executable_candidate=True,
+                    trigger_reason=(scenario.trigger_reason + " Predictive pre-breakout gate passed; "
+                                    "final option, quote and risk gates still apply."),
+                    features={**(scenario.features if isinstance(scenario.features, Mapping) else {}),
+                              "predictive_prebreakout_selection": predictive_selection_evidence},
+                )
+                entry_trigger_ok = True
+                entry_trigger_reason = predictive_selection_reason
             route_market_confirmed = bool(
                 scenario.direction in {"BULLISH", "BEARISH"}
-                and scenario.executable_candidate and not scenario.hard_veto and risk.valid
-                and entry_trigger_ok
+                and (scenario.executable_candidate or predictive_selection_ok)
+                and not scenario.hard_veto and risk.valid
+                and entry_trigger_ok and not active_recommendation_in_progress
             )
-            if route_market_confirmed:
+            provisional_rank_allowed = bool(
+                scenario.direction in {"BULLISH", "BEARISH"}
+                and not scenario.hard_veto
+                and scenario.confidence >= self.config.watch_alert_min_confidence
+                and not route_market_confirmed
+                and not active_recommendation_in_progress
+            )
+            expected_move_points, expected_move_source = expected_underlying_move_for_ranking(
+                scenario, spot, indicators, oi, risk
+            )
+            if route_market_confirmed or provisional_rank_allowed:
                 _, permitted_candles = allowed_strikes(spot, strikes, scenario.direction, current, scenario, indicators)
                 option_side = "CE" if scenario.direction == "BULLISH" else "PE"
                 for strike_value, _moneyness in permitted_candles:
@@ -5008,6 +5657,10 @@ class PredictiveScanner:
                     except ScannerError as exc:
                         option_candles[option_key] = pd.DataFrame()
                         LOGGER.warning("OPTION 1m candle unavailable key=%s: %s", option_key, exc)
+                    report["audit_inputs"]["candles_1m"]["option_candidates"][option_key] = {
+                        "candles": audit_candle_tail(option_candles[option_key], 30),
+                        "candle_status": "AVAILABLE" if not option_candles[option_key].empty else "UNAVAILABLE",
+                    }
 
             report.update({
                 "scenario": scenario.state,
@@ -5077,7 +5730,7 @@ class PredictiveScanner:
                 "scenario_features": scenario.features,
             })
             if reversal_watch is not None and (scenario.hard_veto is not None or scenario.direction != reversal_watch.direction or scenario.direction == "NEUTRAL"):
-                # Reversal watches remain internal diagnostics only; V67 never emails them.
+                # Reversal watches remain internal diagnostics only; V70 never emails them.
                 watch_payload = {
                     "timestamp": current.isoformat(), "scenario": reversal_watch.state,
                     "direction": reversal_watch.direction, "confidence_pct": round(reversal_watch.confidence, 1),
@@ -5116,14 +5769,19 @@ class PredictiveScanner:
             # STAGE 1 — directional market prediction is reported before any option-quality gate.
             report["predictive_detection"] = {
                 "detected": scenario.direction in {"BULLISH", "BEARISH"},
-                "stage": ("ENTRY_TRIGGER_CONFIRMED" if entry_trigger_ok else "WAITING_FOR_STRUCTURAL_INTERACTION")
+                "stage": ("EARLY_PREDICTIVE_SELECTION_GATE_PASSED" if predictive_selection_ok and route_market_confirmed
+                          else "ENTRY_TRIGGER_CONFIRMED" if entry_trigger_ok
+                          else "WAITING_FOR_STRUCTURAL_INTERACTION")
                          if scenario.direction in {"BULLISH", "BEARISH"} else "NO_DIRECTIONAL_SETUP",
                 "scenario": scenario.state, "direction": scenario.direction,
                 "confidence_pct": round(scenario.confidence, 1),
                 "trigger_rationale": scenario.trigger_reason,
-                "execution_candidate": bool(scenario.executable_candidate and entry_trigger_ok),
+                "execution_candidate": bool(route_market_confirmed),
                 "entry_trigger_confirmed": entry_trigger_ok,
                 "entry_trigger_reason": entry_trigger_reason,
+                "selection_mode": ("EARLY_PREDICTIVE_PREBREAKOUT" if predictive_selection_ok and route_market_confirmed
+                                   else "CONFIRMED_STRUCTURAL_INTERACTION" if route_market_confirmed else "WATCH_ONLY"),
+                "predictive_prebreakout_gate": predictive_selection_evidence,
                 "features": scenario.features,
                 "confidence_type": "RULE_BASED_HEURISTIC_NOT_CALIBRATED_PROBABILITY",
             }
@@ -5138,32 +5796,74 @@ class PredictiveScanner:
             # STAGE 2 — route only a market-confirmed setup with a valid structural plan.
             # If a contract fails any option gate, its row remains in diagnostics but it
             # is not returned as a selected candidate.
+            provisional_candidate: Optional[OptionContract] = None
             if route_market_confirmed:
-                candidate, diagnostics = select_option_contract(chain, spot, scenario, current, indicators, oi,
-                                                                quote_map, option_candles, expiry, self.config,
-                                                                preferred_instrument_key=preferred_key)
+                candidate, diagnostics = select_option_contract(
+                    chain, spot, routing_scenario, current, indicators, oi, quote_map, option_candles,
+                    expiry, self.config, preferred_instrument_key=preferred_key, provisional=False,
+                    expected_underlying_move=expected_move_points,
+                )
             else:
                 candidate = None
-                if scenario.direction not in {"BULLISH", "BEARISH"}:
-                    route_reason = "NO_DIRECTIONAL_SETUP_STRIKE_ROUTING_SKIPPED"
-                elif scenario.hard_veto:
-                    route_reason = f"HARD_VETO_STRIKE_ROUTING_SKIPPED:{scenario.hard_veto}"
-                elif not scenario.executable_candidate:
-                    route_reason = "MARKET_SCENARIO_NOT_CONFIRMED_STRIKE_ROUTING_SKIPPED"
-                elif not risk.valid:
-                    route_reason = "STRUCTURAL_RISK_PLAN_INVALID_STRIKE_ROUTING_SKIPPED"
-                elif not entry_trigger_ok:
-                    route_reason = f"ENTRY_TRIGGER_BLOCKED:{entry_trigger_reason}"
+                if provisional_rank_allowed:
+                    provisional_candidate, diagnostics = select_option_contract(
+                        chain, spot, scenario, current, indicators, oi, quote_map, option_candles,
+                        expiry, self.config, preferred_instrument_key=None, provisional=True,
+                        expected_underlying_move=expected_move_points,
+                    )
+                    route_reason = ("PROVISIONAL_STRIKE_RANKING_ONLY; "
+                                   f"final selection held: {entry_trigger_reason}; no email or tracker created")
+                    diagnostics.insert(0, {
+                        "route_status": "PROVISIONAL_RANKING_ONLY",
+                        "execution_eligible": False,
+                        "selected_for_execution": False,
+                        "provisional_only": True,
+                        "vetoes": [route_reason],
+                    })
                 else:
-                    route_reason = "STRIKE_ROUTING_NOT_PERMITTED"
-                diagnostics = [{"route_status": "SKIPPED", "execution_eligible": False,
-                                "selected_for_execution": False, "vetoes": [route_reason]}]
+                    if active_recommendation_in_progress:
+                        route_reason = "ACTIVE_RECOMMENDATION_IN_PROGRESS_NEW_SELECTION_SUPPRESSED"
+                    elif scenario.direction not in {"BULLISH", "BEARISH"}:
+                        route_reason = "NO_DIRECTIONAL_SETUP_STRIKE_ROUTING_SKIPPED"
+                    elif scenario.hard_veto:
+                        route_reason = f"HARD_VETO_STRIKE_ROUTING_SKIPPED:{scenario.hard_veto}"
+                    elif not scenario.executable_candidate:
+                        route_reason = "MARKET_SCENARIO_NOT_CONFIRMED_STRIKE_ROUTING_SKIPPED"
+                    elif not risk.valid:
+                        route_reason = "STRUCTURAL_RISK_PLAN_INVALID_STRIKE_ROUTING_SKIPPED"
+                    elif not entry_trigger_ok:
+                        route_reason = f"ENTRY_TRIGGER_BLOCKED:{entry_trigger_reason}"
+                    else:
+                        route_reason = "STRIKE_ROUTING_NOT_PERMITTED"
+                    diagnostics = [{"route_status": "SKIPPED", "execution_eligible": False,
+                                    "selected_for_execution": False, "provisional_only": False,
+                                    "vetoes": [route_reason]}]
             report["candidate_diagnostics"] = diagnostics
 
+            # Provisional rows are not final-selection failures. Keep them in the full
+            # report, but give readiness only a routing-status diagnostic until the
+            # market trigger is confirmed; otherwise a valid provisional candidate can
+            # incorrectly create a misleading NO_OPTION_PASSED_ALL_OPTION_GATES blocker.
+            readiness_diagnostics = diagnostics
+            if provisional_rank_allowed and not route_market_confirmed:
+                readiness_diagnostics = [{
+                    "route_status": "PROVISIONAL_RANKING_ONLY",
+                    "execution_eligible": False,
+                    "selected_for_execution": False,
+                    "provisional_only": True,
+                    "vetoes": ["FINAL_SELECTION_NOT_ATTEMPTED_BEFORE_MARKET_CONFIRMATION"],
+                }]
+
             # STAGE 3 — one authoritative, testable readiness decision.
-            readiness = evaluate_trade_readiness(current, scenario, indicators, oi, risk,
+            readiness = evaluate_trade_readiness(current, routing_scenario, indicators, oi, risk,
                                                  index_quote, future_regime, candidate, self.config,
-                                                 candidate_diagnostics=diagnostics)
+                                                 candidate_diagnostics=readiness_diagnostics)
+            readiness["selection_mode"] = (
+                "EARLY_PREDICTIVE_PREBREAKOUT" if predictive_selection_ok and route_market_confirmed
+                else "CONFIRMED_STRUCTURAL_INTERACTION" if route_market_confirmed
+                else "WATCH_ONLY"
+            )
+            readiness["predictive_prebreakout_gate"] = predictive_selection_evidence
             if not entry_trigger_ok:
                 readiness["blocking_reasons"] = list(dict.fromkeys(
                     list(readiness.get("blocking_reasons", [])) + [f"ENTRY_TRIGGER_BLOCKED:{entry_trigger_reason}"]
@@ -5196,13 +5896,25 @@ class PredictiveScanner:
                     and diagnostic.get("strike") == candidate.strike
                 )
             review_row = next((item for item in diagnostics if item.get("best_candidate_for_review")), None)
+            provisional_report = candidate_report(provisional_candidate)
+            if provisional_report is not None:
+                provisional_report["provisional_only"] = True
+                provisional_report["selection_status"] = "WATCH_ONLY_NOT_SELECTED"
+                provisional_report["reason"] = "Early strike ranking for a directional watch; final market/option/risk gates have not all passed."
             report["candidate_ranking"] = {
                 "best_candidate": candidate_report(candidate) if selected_is_ready else None,
+                "provisional_candidate": provisional_report if not selected_is_ready else None,
+                "provisional_only": bool(provisional_report is not None and not selected_is_ready),
                 "best_candidate_for_review": review_row,
-                "ranking_basis": candidate.score_basis if candidate and selected_is_ready else "DIAGNOSTICS_ONLY_OR_ROUTING_SKIPPED",
+                "ranking_basis": (candidate.score_basis if candidate and selected_is_ready else
+                                  "PROVISIONAL_RANKING_ONLY" if provisional_candidate is not None else
+                                  "DIAGNOSTICS_ONLY_OR_ROUTING_SKIPPED"),
+                "expected_underlying_move_points": expected_move_points if finite(expected_move_points) else None,
+                "expected_move_source": expected_move_source,
+                "option_move_estimate_method": "DELTA_GAMMA_ESTIMATE_EXCLUDES_IV_CHANGE_AND_TIME_DECAY",
                 "option_gate_eligible_count": sum(1 for item in diagnostics if item.get("execution_eligible")),
                 "candidate_count": sum(1 for item in diagnostics if item.get("strike") is not None),
-                "note": "A contract is selected only when the complete market, risk, quote, premium VWAP, delta, flow, COI and score gates pass. Otherwise rows are diagnostics only.",
+                "note": "Provisional candidate is a non-actionable shortlist only. A narrowly qualified high-confidence pre-breakout setup may issue an early predictive selection only after the predictive gate and all final option/risk/quote gates pass. Delta/gamma option-move estimates exclude IV change and time decay. Watch scans do not create trackers or emails.",
             }
             active_watch = state.get("active_directional_watch")
             if isinstance(active_watch, dict) and str(active_watch.get("direction", "")).upper() == scenario.direction:
@@ -5232,6 +5944,8 @@ class PredictiveScanner:
                     "timestamp": current.isoformat(), "scenario": scenario.state, "direction": scenario.direction,
                     "confidence_pct": round(scenario.confidence, 1), "trigger_reason": scenario.trigger_reason,
                     "entry_trigger_confirmation": entry_trigger_reason,
+                    "selection_mode": readiness.get("selection_mode", "CONFIRMED_STRUCTURAL_INTERACTION"),
+                    "predictive_prebreakout_gate": predictive_selection_evidence if predictive_selection_ok else None,
                     "option_type": candidate.option_type, "strike": candidate.strike,
                     "trading_symbol": candidate.trading_symbol, "instrument_key": candidate.instrument_key,
                     "delta": candidate.delta, "delta_source": candidate.delta_source,
@@ -5279,7 +5993,7 @@ class PredictiveScanner:
                 enqueue_email_alert(
                     state, now=current, event_type="SIGNAL_READY",
                     dedupe_key=f"{current.date().isoformat()}|SIGNAL_READY|{fingerprint}",
-                    subject=f"NIFTY V68 STRIKE SELECTED — {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
+                    subject=f"NIFTY V70 STRIKE SELECTED — {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
                     payload={**signal_payload, "alert_type": "TRADE_READY_RECOMMENDATION",
                              "execution_mode": "VIRTUAL_SIGNAL_ONLY_NO_ORDER_PLACEMENT",
                              "readiness": readiness,
@@ -5297,7 +6011,7 @@ class PredictiveScanner:
                     )
                 else:
                     report["market_state"] = scenario.state
-                # No watch/blocked-candidate emails are permitted in V67. Blockers remain
+                # No watch/blocked-candidate emails are permitted in V70. Blockers remain
                 # in the JSON/console diagnostics; email is reserved for confirmed selection
                 # and post-selection failure events only.
                 LOGGER.info("NO EMAIL: signal not trade-ready; market_state=%s blockers=%s",
@@ -5353,6 +6067,7 @@ def print_report(report: dict[str, Any]) -> None:
         "top_vetoes": (report.get("vetoes") or [])[:3],
         "email": delivery.get("status", "UNKNOWN"), "pending_emails": delivery.get("pending"),
         "state_persistence": persistence.get("status", "UNKNOWN"),
+        "audit_log": report.get("audit_log", {"status": "UNKNOWN"}),
     }
     print(json.dumps(json_safe(compact), separators=(",", ":"), ensure_ascii=False, allow_nan=False))
 
@@ -5373,6 +6088,9 @@ def scan_exit_code(report: Mapping[str, Any]) -> int:
         return 2
     if isinstance(persistence, dict) and str(persistence.get("status", "")).startswith("FAILED"):
         return 3
+    audit = report.get("audit_log")
+    if isinstance(audit, dict) and str(audit.get("status", "")).upper() == "FAILED":
+        return 5
     delivery = report.get("email_delivery")
     if isinstance(delivery, dict):
         status = str(delivery.get("status", "")).upper()
@@ -5383,7 +6101,7 @@ def scan_exit_code(report: Mapping[str, Any]) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V68")
+    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V70")
     parser.add_argument("--loop", action="store_true", help="Scan approximately once per minute during market hours.")
     parser.add_argument("--interval", type=float, default=60.0, help="Loop interval seconds (minimum 15).")
     args = parser.parse_args(argv)
@@ -5405,7 +6123,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enqueue_email_alert(
                 state, now=current, event_type="CONFIGURATION_ERROR",
                 dedupe_key=f"{current.date().isoformat()}|CONFIGURATION_ERROR|{type(exc).__name__}",
-                subject="NIFTY V68 scanner configuration error",
+                subject="NIFTY V70 scanner configuration error",
                 payload={"timestamp": current.isoformat(), "scanner_version": SCANNER_VERSION,
                          "error_type": type(exc).__name__, "error": str(exc),
                          "note": "The scan was stopped before market analysis; no recommendation or order was produced."},
@@ -5419,6 +6137,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except Exception as persist_exc:
             LOGGER.error("Unable to persist configuration-error alert: %s", persist_exc)
             report["state_persistence"] = {"status": "FAILED", "error": str(persist_exc)}
+        audit_state = locals().get("state", {})
+        report["audit_log"] = ScanAuditWriter().append(current, report, audit_state if isinstance(audit_state, Mapping) else {})
         print_report(report)
         return 2
     scanner = PredictiveScanner(config)
@@ -5427,7 +6147,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_report(report)
         return scan_exit_code(report)
     interval = max(15.0, float(args.interval))
-    LOGGER.info("V68 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
+    LOGGER.info("V70 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
     while True:
         cycle_start = time_module.monotonic()
         report = scanner.scan_once()
