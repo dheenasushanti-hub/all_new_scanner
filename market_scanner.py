@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 Predictive Market Scanner & Strike Router — V70.
+"""NIFTY 50 Predictive Market Scanner & Strike Router — V71.
 
 Clean, modular redesign of the supplied V52–V58 scanner lineage. This version has
 one market-scenario engine, one strike router, one structural risk engine, one state
@@ -47,8 +47,8 @@ Core behavior
 * Persists active state in market_state.json and appends one full JSONL audit record per run under AUDIT_DIR (default ./audit). The daily log includes the normalized full option chain, quote snapshots, OI-by-strike analysis, recent candles, candidate ranks/vetoes, selection and monitoring outcomes. Console output remains compact.
 
 Run:
-    python market_scanner_v70.py
-    python market_scanner_v70.py --loop
+    python market_scanner.py
+    python market_scanner.py --loop
 
 Required environment:
     UPSTOX_ANALYTICS_TOKEN
@@ -71,7 +71,7 @@ API sources checked during design (official Upstox docs):
 Important measurement limitation: the option-chain endpoint returns OI snapshots, not a
 continuous OI time series. Intraday COI velocity is therefore computed from this scanner's
 own timestamped snapshots. For 09:16 velocity availability, schedule the first scan at
-09:15. If a process starts later with no same-session baseline, V70 reports COI as
+09:15. If a process starts later with no same-session baseline, V71 reports COI as
 unavailable/session-proxy and will not describe the proxy as tactical velocity.
 """
 from __future__ import annotations
@@ -108,7 +108,7 @@ import requests
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com"
-SCANNER_VERSION = "2026-10-17-V70-PREDICTIVE-STRIKE-RANKING-AUDIT-LOGGING"
+SCANNER_VERSION = "2026-10-17-V71-NSE-HOLIDAY-CALENDAR-AUDIT-LOGGING"
 MARKET_START = time(9, 15)
 ENTRY_START = time(9, 16)
 MORNING_END = time(10, 30)
@@ -129,7 +129,7 @@ EMAIL_ALLOWED_EVENT_TYPES = frozenset({
 DEFAULT_NIFTY_KEY = "NSE_INDEX|Nifty 50"
 DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-LOGGER = logging.getLogger("nifty_v70")
+LOGGER = logging.getLogger("nifty_v71")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(message)s",
                     stream=sys.stderr)
@@ -205,12 +205,6 @@ class Config:
         if not (70.0 <= self.predictive_selection_min_confidence <= 90.0):
             raise ScannerError("PREDICTIVE_SELECTION_MIN_CONFIDENCE must be between 70 and 90.")
 
-def market_window_open() -> bool:
-    # NSE status is checked immediately afterwards and is the authoritative
-    # open/closed gate. Avoid a separate holiday API call on every 5-minute run.
-    now = now_ist()
-    return now.weekday() < 5 and MARKET_START <= now.time() <= MARKET_END
-  
 
 def _env_float(key: str, default: float) -> float:
     try:
@@ -381,6 +375,210 @@ def market_time_allowed(dt: datetime) -> tuple[bool, str]:
     if local.time() >= ENTRY_CUTOFF:
         return True, "POST_15_15_MONITOR_ONLY_NO_NEW_ENTRIES"
     return True, "ENTRY_WINDOW_OPEN"
+
+
+# NSE publishes segment-specific holiday calendars. NIFTY options trade in the
+# derivatives (FO) segment, so use FO dates rather than assuming the cash-market
+# calendar is identical. This 2026 list is a fallback sourced from NSE's official
+# holiday page; the live holiday-master endpoint is refreshed once per local date.
+NSE_HOLIDAY_API_URL = "https://www.nseindia.com/api/holiday-master"
+NSE_HOLIDAY_PAGE_URL = "https://www.nseindia.com/resources/exchange-communication-holidays"
+NSE_HOLIDAY_HOME_URL = "https://www.nseindia.com/"
+NSE_FO_HOLIDAYS_FALLBACK: dict[int, list[dict[str, str]]] = {
+    2026: [
+        {"date": "2026-01-26", "description": "Republic Day"},
+        {"date": "2026-03-03", "description": "Holi (Second Day)"},
+        {"date": "2026-03-26", "description": "Ram Navami"},
+        {"date": "2026-03-31", "description": "Mahavir Jayanti"},
+        {"date": "2026-04-03", "description": "Good Friday"},
+        {"date": "2026-04-14", "description": "Dr. Babasaheb Ambedkar Jayanti"},
+        {"date": "2026-05-01", "description": "Maharashtra Din / Buddha Pournima"},
+        {"date": "2026-05-28", "description": "Bakri Id (Id-Uz-Zuha)"},
+        {"date": "2026-06-26", "description": "Muharram"},
+        {"date": "2026-09-14", "description": "Ganesh Chaturthi"},
+        {"date": "2026-10-02", "description": "Mahatma Gandhi Jayanti"},
+        {"date": "2026-10-20", "description": "Dussehra"},
+        {"date": "2026-11-10", "description": "Diwali (Bali Pratipada)"},
+        {"date": "2026-11-24", "description": "Guru Nanak Jayanti"},
+        {"date": "2026-12-25", "description": "Christmas"},
+    ],
+}
+
+
+def _parse_nse_holiday_date(value: Any) -> Optional[date]:
+    """Parse the NSE holiday-master date formats without accepting ambiguous text."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            candidate = text if fmt == "%d-%B-%Y" else text[:11] if fmt == "%d-%b-%Y" else text[:10]
+            return datetime.strptime(candidate, fmt).date()
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _normalise_nse_fo_holidays(payload: Any, year: int) -> list[dict[str, str]]:
+    """Extract a verifiable FO holiday list from NSE's holiday-master JSON."""
+    if not isinstance(payload, Mapping):
+        raise ScannerError("NSE holiday-master response is not a JSON object.")
+    rows = None
+    for key in ("FO", "F&O", "DERIVATIVES", "derivatives"):
+        candidate = payload.get(key)
+        if isinstance(candidate, list):
+            rows = candidate
+            break
+    if rows is None:
+        raise ScannerError("NSE holiday response did not contain a recognizable FO/derivatives list.")
+
+    dates: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        raw_date = next((row.get(key) for key in (
+            "tradingDate", "trading_date", "holidayDate", "holiday_date", "date", "tradingdate"
+        ) if row.get(key) not in (None, "")), None)
+        parsed = _parse_nse_holiday_date(raw_date)
+        if parsed is None or parsed.year != year:
+            continue
+        description = next((str(row.get(key)).strip() for key in (
+            "description", "holidayDescription", "holiday_description", "reason", "event"
+        ) if row.get(key) not in (None, "")), "NSE trading holiday")
+        dates[parsed.isoformat()] = description[:180]
+
+    if not dates:
+        raise ScannerError(f"NSE holiday response did not contain recognizable FO holiday dates for {year}.")
+    return [{"date": key, "description": dates[key]} for key in sorted(dates)]
+
+
+def _fetch_nse_fo_holidays(year: int, timeout_seconds: float, retries: int) -> list[dict[str, str]]:
+    """Fetch NSE's official FO holiday calendar with browser-like headers and retries."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": NSE_HOLIDAY_PAGE_URL,
+        "Origin": "https://www.nseindia.com",
+    }
+    session = requests.Session()
+    session.headers.update(headers)
+    timeout = max(3.0, min(float(timeout_seconds), 10.0))
+    try:
+        # Warm the NSE session for its anti-bot/cookie requirements. API fetch is
+        # still attempted if the homepage warm-up fails.
+        try:
+            session.get(NSE_HOLIDAY_HOME_URL, timeout=(3.0, timeout))
+        except requests.RequestException as warmup_exc:
+            LOGGER.debug("NSE holiday session warm-up did not complete: %s", warmup_exc)
+
+        last_error = "NSE holiday API request failed."
+        for attempt in range(1, max(1, min(int(retries), 2)) + 1):
+            try:
+                response = session.get(
+                    NSE_HOLIDAY_API_URL.format(year=year),
+                    params={"type": "trading", "year": year},
+                    timeout=(3.0, timeout),
+                )
+                if response.status_code == 200:
+                    try:
+                        payload = response.json()
+                    except ValueError as exc:
+                        last_error = f"NSE holiday API returned invalid JSON: {exc}"
+                    else:
+                        return _normalise_nse_fo_holidays(payload, year)
+                else:
+                    last_error = f"NSE holiday API HTTP {response.status_code}: {response.text[:180]}"
+                    if response.status_code not in {429, 500, 502, 503, 504}:
+                        break
+            except requests.RequestException as exc:
+                last_error = f"NSE holiday API network error: {exc}"
+            if attempt < max(1, min(int(retries), 2)):
+                time_module.sleep(0.4 * attempt)
+        raise ScannerError(last_error)
+    finally:
+        session.close()
+
+
+def resolve_nse_holiday_calendar(
+    state: dict[str, Any], today: date, timeout_seconds: float, retries: int
+) -> dict[str, Any]:
+    """Return a once-daily, persisted NSE FO holiday calendar with controlled fallbacks.
+
+    A same-year calendar is reused for repeated three-minute runs. The official API is
+    refreshed at most once per India-local date. If NSE is unreachable, a previously
+    fetched same-year calendar is retained; otherwise the verified 2026 static fallback
+    is used. For years with no fallback, the existing Upstox market-status gate remains
+    the final authority and is still required before processing any market data.
+    """
+    today_iso = today.isoformat()
+    cached = state.get("nse_holiday_calendar")
+    cached = cached if isinstance(cached, dict) else {}
+    cached_year = int(safe_float(cached.get("year"), -1))
+    cached_holidays = cached.get("holidays") if isinstance(cached.get("holidays"), list) else []
+    cache_same_year = cached_year == today.year and bool(cached_holidays)
+
+    if cached_year == today.year and str(cached.get("last_attempt_date", "")) == today_iso:
+        return cached
+
+    try:
+        holidays = _fetch_nse_fo_holidays(today.year, timeout_seconds, retries)
+        result: dict[str, Any] = {
+            "year": today.year,
+            "status": "AVAILABLE",
+            "source": "NSE_HOLIDAY_MASTER_FO",
+            "fetched_at": ist_iso(now_ist()),
+            "last_attempt_date": today_iso,
+            "holidays": holidays,
+        }
+        state["nse_holiday_calendar"] = result
+        LOGGER.info("NSE FO holiday calendar refreshed: year=%s dates=%s source=%s", today.year, len(holidays), result["source"])
+        return result
+    except (ScannerError, requests.RequestException, ValueError, TypeError) as exc:
+        LOGGER.warning("NSE holiday calendar refresh failed for %s: %s", today.year, str(exc)[:300])
+        if cache_same_year:
+            result = dict(cached)
+            result["last_attempt_date"] = today_iso
+            result["refresh_error"] = str(exc)[:300]
+            result["status"] = "STALE_CACHE_USED"
+        elif today.year in NSE_FO_HOLIDAYS_FALLBACK:
+            result = {
+                "year": today.year,
+                "status": "STATIC_FALLBACK",
+                "source": "NSE_OFFICIAL_2026_FO_HOLIDAYS_FALLBACK",
+                "fetched_at": None,
+                "last_attempt_date": today_iso,
+                "refresh_error": str(exc)[:300],
+                "holidays": NSE_FO_HOLIDAYS_FALLBACK[today.year],
+            }
+        else:
+            result = {
+                "year": today.year,
+                "status": "UNAVAILABLE",
+                "source": "NONE",
+                "fetched_at": None,
+                "last_attempt_date": today_iso,
+                "refresh_error": str(exc)[:300],
+                "holidays": [],
+            }
+        state["nse_holiday_calendar"] = result
+        return result
+
+
+def holiday_for_date(calendar: Mapping[str, Any], day: date) -> Optional[dict[str, str]]:
+    """Find an explicitly listed exchange holiday for a date."""
+    raw = calendar.get("holidays")
+    if not isinstance(raw, list):
+        return None
+    target = day.isoformat()
+    for item in raw:
+        if isinstance(item, Mapping) and str(item.get("date", "")) == target:
+            return {"date": target, "description": str(item.get("description", "NSE trading holiday"))}
+    return None
 
 
 # =============================================================================
@@ -730,7 +928,7 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
         state["session_oi_baseline_source"] = "MIGRATED_EXISTING_SAME_SESSION_BASELINE"
     else:
         state.setdefault("session_oi_baseline_source", "UNAVAILABLE")
-    state["schema_version"] = 70
+    state["schema_version"] = 71
     state["scanner_version"] = SCANNER_VERSION
     state["session_date"] = today_iso
     # Remove legacy directional latches so V70 classifies live structure afresh.
@@ -773,7 +971,7 @@ class StateStore:
                         and str(alert.get("status", "PENDING")).upper() == "PENDING"
                         and str(alert.get("event_type", "")).upper() == "VIRTUAL_RECOMMENDATION_INVALIDATED_BY_STRUCTURE"):
                     alert["event_type"] = "MARKET_REVERSAL_CONFIRMED"
-                    alert["subject"] = "NIFTY V70 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
+                    alert["subject"] = "NIFTY V71 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
                     payload = alert.get("payload") if isinstance(alert.get("payload"), dict) else {}
                     payload.setdefault("invalidated_direction", payload.get("direction"))
                     payload.setdefault("replacement_direction", "Not available in legacy alert")
@@ -793,8 +991,12 @@ class StateStore:
                           and str(x.get("event_type", "")).upper() in EMAIL_ALLOWED_EVENT_TYPES
                           and str(x.get("event_type", "")).upper() not in {"T1_REACHED", "T2_REACHED"}] if isinstance(self.state.get("alert_outbox"), list) else []
             old_dedupe = self.state.get("alert_dedupe", {}) if isinstance(self.state.get("alert_dedupe"), dict) else {}
+            # The holiday calendar is year-level reference data, not intraday state;
+            # preserve it across trading-date resets so every scan does not refetch it.
+            old_holiday_calendar = self.state.get("nse_holiday_calendar")
             self.state = {
-                "schema_version": 70,
+                "schema_version": 71,
+                "nse_holiday_calendar": old_holiday_calendar if isinstance(old_holiday_calendar, dict) else {},
                 "scanner_version": SCANNER_VERSION,
                 "session_date": today_iso,
                 "chain_snapshots": [],
@@ -824,6 +1026,7 @@ class StateStore:
             self.state.setdefault("recommendation_trackers", [])
             self.state.setdefault("alert_outbox", [])
             self.state.setdefault("alert_dedupe", {})
+            self.state.setdefault("nse_holiday_calendar", {})
 
         # Migrate the pre-V64 singular tracker into the canonical tracker list.
         trackers_raw = self.state.get("recommendation_trackers")
@@ -889,7 +1092,7 @@ class StateStore:
                     and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
                 alert["status"] = "SUPPRESSED_POLICY"
                 alert["suppressed_at"] = now_ist().isoformat()
-                alert["last_error"] = "Suppressed by V70: only selected-strike and discrete milestone/failure emails are permitted."
+                alert["last_error"] = "Suppressed by V71: only selected-strike and discrete milestone/failure emails are permitted."
                 alert.pop("next_attempt_at", None)
         # Remove obsolete direction latches. Every decision is recomputed from current structure.
         self.state.pop("persistent_direction", None)
@@ -4598,7 +4801,7 @@ def enqueue_email_alert(
     """Queue one-time selection, T1/T2 milestone, and confirmed failure emails."""
     event_type = str(event_type or "").upper()
     if event_type not in EMAIL_ALLOWED_EVENT_TYPES:
-        LOGGER.debug("EMAIL SUPPRESSED BY V70 POLICY: event=%s", event_type or "UNKNOWN")
+        LOGGER.debug("EMAIL SUPPRESSED BY V71 POLICY: event=%s", event_type or "UNKNOWN")
         return None
     dedupe = state.setdefault("alert_dedupe", {})
     if not isinstance(dedupe, dict):
@@ -4791,7 +4994,7 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
 
 def _alert_body(alert: Mapping[str, Any]) -> str:
     title, fields, disclaimer = _alert_fields(alert)
-    lines = [f"NIFTY 50 Predictive Scanner V70 — {title}", "", disclaimer, ""]
+    lines = [f"NIFTY 50 Predictive Scanner V71 — {title}", "", disclaimer, ""]
     lines.extend(f"{label}: {value}" for label, value in fields)
     lines.extend(["", f"Scanner version: {SCANNER_VERSION}"])
     return "\n".join(lines)
@@ -4811,7 +5014,7 @@ def _alert_html_body(alert: Mapping[str, Any]) -> str:
     return (
         '<!doctype html><html><body style="margin:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.45;">'
         '<div style="max-width:780px;margin:0 auto;padding:16px;"><div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">'
-        f'<div style="background:{banner};padding:16px 20px;color:#ffffff;"><div style="font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.9;">NIFTY 50 Predictive Scanner · V70</div><h2 style="margin:6px 0 0;font-size:21px;line-height:1.3;">{safe_title}</h2></div>'
+        f'<div style="background:{banner};padding:16px 20px;color:#ffffff;"><div style="font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.9;">NIFTY 50 Predictive Scanner · V71</div><h2 style="margin:6px 0 0;font-size:21px;line-height:1.3;">{safe_title}</h2></div>'
         f'<div style="padding:16px 20px;"><p style="margin:0 0 14px;padding:11px 13px;background:#f9fafb;border-left:4px solid {banner};border-radius:4px;overflow-wrap:anywhere;">{html_lib.escape(disclaimer)}</p>'
         f'<table role="presentation" style="border-collapse:collapse;width:100%;table-layout:fixed;font-size:14px;"><colgroup><col style="width:31%;"><col style="width:69%;"></colgroup><tbody>{rows}</tbody></table>'
         f'<p style="color:#6b7280;font-size:12px;margin:16px 0 0;">Scanner version: {html_lib.escape(SCANNER_VERSION)} · Recommendation-only; no order was placed.</p></div></div></div></body></html>'
@@ -4836,7 +5039,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
                 and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
             alert["status"] = "SUPPRESSED_POLICY"
             alert["suppressed_at"] = ist_iso(now)
-            alert["last_error"] = "Suppressed by V70 email policy."
+            alert["last_error"] = "Suppressed by V71 email policy."
             alert.pop("next_attempt_at", None)
     all_pending = [x for x in outbox if isinstance(x, dict) and str(x.get("status", "PENDING")).upper() == "PENDING"]
     if not all_pending:
@@ -4873,7 +5076,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
             alert["attempts"] = int(alert.get("attempts", 0)) + 1
             try:
                 message = MIMEMultipart("alternative")
-                message["Subject"] = str(alert.get("subject", "NIFTY V70 scanner alert"))
+                message["Subject"] = str(alert.get("subject", "NIFTY V71 scanner alert"))
                 message["From"] = config.email_sender
                 message["To"] = config.email_receiver
                 message.attach(MIMEText(_alert_body(alert), "plain", "utf-8"))
@@ -5085,9 +5288,9 @@ class PredictiveScanner:
             direction = str(event.get("direction", "")).upper()
             subject_suffix = f" {direction} {safe_float(event.get('strike'), 0.0):.0f}" if strike else f" {direction}" if direction else ""
             if event_type == "MARKET_REVERSAL_CONFIRMED":
-                subject = f"NIFTY V70 MARKET REVERSAL CONFIRMED — {direction} RECOMMENDATION INVALIDATED"
+                subject = f"NIFTY V71 MARKET REVERSAL CONFIRMED — {direction} RECOMMENDATION INVALIDATED"
             else:
-                subject = f"NIFTY V70 {event_type.replace('_', ' ')}{subject_suffix}"
+                subject = f"NIFTY V71 {event_type.replace('_', ' ')}{subject_suffix}"
             enqueue_email_alert(
                 state, now=now, event_type=event_type,
                 dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{identity}",
@@ -5203,7 +5406,7 @@ class PredictiveScanner:
         enqueue_email_alert(
             state, now=now, event_type=error_kind,
             dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{error_kind}|{type(exc).__name__}",
-            subject=f"NIFTY V70 scanner {error_kind.replace('_', ' ').lower()}",
+            subject=f"NIFTY V71 scanner {error_kind.replace('_', ' ').lower()}",
             payload={"timestamp": ist_iso(now), "scanner_version": SCANNER_VERSION,
                      "error_type": type(exc).__name__, "error": str(exc)[:1200],
                      "note": "No new recommendation was produced by the failed scan."},
@@ -5256,6 +5459,46 @@ class PredictiveScanner:
             "execution_mode": "SIGNAL_ONLY_NO_ORDER_PLACEMENT",
             "signal_ready": False,
         }
+        # NSE FO holiday gate must run before end-of-session handling; otherwise a holiday
+        # weekday at/after 15:30 could incorrectly finalize an active recommendation.
+        if current.weekday() < 5:
+            calendar = resolve_nse_holiday_calendar(
+                state, current.date(), self.config.timeout_seconds, self.config.retries
+            )
+            report["market_calendar"] = {
+                "segment": "FO",
+                "status": calendar.get("status", "UNAVAILABLE"),
+                "source": calendar.get("source", "NONE"),
+                "year": calendar.get("year"),
+                "last_attempt_date": calendar.get("last_attempt_date"),
+                "holiday_count": len(calendar.get("holidays", [])) if isinstance(calendar.get("holidays"), list) else 0,
+                "refresh_error": calendar.get("refresh_error"),
+                "regular_session": {"weekdays": "Monday-Friday", "open": "09:15 IST", "close": "15:30 IST",
+                                    "new_entries_cutoff": "15:15 IST"},
+            }
+            exchange_holiday = holiday_for_date(calendar, current.date())
+            if exchange_holiday is not None:
+                report["market_status"] = "CLOSED_HOLIDAY"
+                report["scenario"] = "NSE_TRADING_HOLIDAY"
+                report["market_state"] = "MARKET_CLOSED"
+                report["trigger_rationale"] = (
+                    f"NSE derivatives trading holiday: {exchange_holiday['description']} "
+                    f"({exchange_holiday['date']}); market data scan and entries are skipped."
+                )
+                report["vetoes"] = ["NSE_TRADING_HOLIDAY"]
+                report["audit_inputs"]["data_coverage"]["market_calendar"] = "CONFIRMED_NSE_FO_HOLIDAY"
+                state["last_scan_timestamp"] = current.isoformat()
+                return self._finish(state, report, current)
+            if calendar.get("status") == "UNAVAILABLE":
+                LOGGER.warning("NSE holiday calendar unavailable for %s; requiring Upstox market-status API before any market data or entry.", current.year)
+                report["market_calendar"]["fallback_policy"] = "UPSTOX_MARKET_STATUS_REQUIRED"
+        else:
+            report["market_calendar"] = {
+                "segment": "FO", "status": "WEEKEND_BLOCKED", "source": "WEEKDAY_SCHEDULE",
+                "year": current.year,
+                "regular_session": {"weekdays": "Monday-Friday", "open": "09:15 IST", "close": "15:30 IST",
+                                    "new_entries_cutoff": "15:15 IST"},
+            }
         # Explicitly end virtual monitoring after the NSE regular session instead of carrying
         # yesterday's levels into a new date without telling the user.
         if current.weekday() < 5 and current.time() >= MARKET_END:
@@ -5999,7 +6242,7 @@ class PredictiveScanner:
                 enqueue_email_alert(
                     state, now=current, event_type="SIGNAL_READY",
                     dedupe_key=f"{current.date().isoformat()}|SIGNAL_READY|{fingerprint}",
-                    subject=f"NIFTY V70 STRIKE SELECTED — {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
+                    subject=f"NIFTY V71 STRIKE SELECTED — {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
                     payload={**signal_payload, "alert_type": "TRADE_READY_RECOMMENDATION",
                              "execution_mode": "VIRTUAL_SIGNAL_ONLY_NO_ORDER_PLACEMENT",
                              "readiness": readiness,
@@ -6107,7 +6350,7 @@ def scan_exit_code(report: Mapping[str, Any]) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V70")
+    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V71")
     parser.add_argument("--loop", action="store_true", help="Scan approximately once per minute during market hours.")
     parser.add_argument("--interval", type=float, default=60.0, help="Loop interval seconds (minimum 15).")
     args = parser.parse_args(argv)
@@ -6129,7 +6372,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enqueue_email_alert(
                 state, now=current, event_type="CONFIGURATION_ERROR",
                 dedupe_key=f"{current.date().isoformat()}|CONFIGURATION_ERROR|{type(exc).__name__}",
-                subject="NIFTY V70 scanner configuration error",
+                subject="NIFTY V71 scanner configuration error",
                 payload={"timestamp": current.isoformat(), "scanner_version": SCANNER_VERSION,
                          "error_type": type(exc).__name__, "error": str(exc),
                          "note": "The scan was stopped before market analysis; no recommendation or order was produced."},
@@ -6153,7 +6396,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_report(report)
         return scan_exit_code(report)
     interval = max(15.0, float(args.interval))
-    LOGGER.info("V70 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
+    LOGGER.info("V71 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
     while True:
         cycle_start = time_module.monotonic()
         report = scanner.scan_once()
