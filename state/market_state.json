@@ -17,7 +17,7 @@
   "last_signal_timestamp": "",
   "alert_outbox": [],
   "alert_dedupe": {},
-  "last_run_timestamp": "2026-10-17T23:05:08.232651+05:30",
+  "last_run_timestamp": "2026-10-17T23:22:41.809202+05:30",
   "scan_history": [
     {
       "timestamp": "2026-10-17T23:05:08.232651+05:30",
@@ -42,10 +42,34 @@
       ],
       "email_status": "IDLE",
       "audit_status": "APPENDED"
+    },
+    {
+      "timestamp": "2026-10-17T23:22:41.809202+05:30",
+      "scenario": "UNINITIALIZED",
+      "market_state": "NO_TRADE",
+      "direction": "NEUTRAL",
+      "confidence_pct": 0.0,
+      "spot": null,
+      "vwap": null,
+      "signal_ready": false,
+      "option": null,
+      "provisional_only": false,
+      "provisional_option": null,
+      "provisional_strike": null,
+      "provisional_score": null,
+      "candidate_preview_only": true,
+      "T1": null,
+      "T2": null,
+      "SL": null,
+      "top_vetoes": [
+        "WEEKEND"
+      ],
+      "email_status": "IDLE",
+      "audit_status": "APPENDED"
     }
   ],
   "last_scan_summary": {
-    "timestamp": "2026-10-17T23:05:08.232651+05:30",
+    "timestamp": "2026-10-17T23:22:41.809202+05:30",
     "scenario": "UNINITIALIZED",
     "market_state": "NO_TRADE",
     "direction": "NEUTRAL",
@@ -70,7 +94,7 @@
   },
   "last_scan_report": {
     "scanner_version": "2026-10-17-V70-PREDICTIVE-STRIKE-RANKING-AUDIT-LOGGING",
-    "timestamp": "2026-10-17T23:05:08.232651+05:30",
+    "timestamp": "2026-10-17T23:22:41.809202+05:30",
     "market_state": "NO_TRADE",
     "scenario": "UNINITIALIZED",
     "direction": "NEUTRAL",
@@ -105,8 +129,8 @@
       "WEEKEND"
     ],
     "state_file": "/home/runner/work/all_new_scanner/all_new_scanner/state/market_state.json",
-    "execution_gap_minutes": null,
-    "execution_gap_reset": false,
+    "execution_gap_minutes": 17.559609183333336,
+    "execution_gap_reset": true,
     "execution_mode": "SIGNAL_ONLY_NO_ORDER_PLACEMENT",
     "signal_ready": false,
     "state_persistence": {
@@ -123,8 +147,8 @@
     "audit_log": {
       "status": "APPENDED",
       "path": "/home/runner/work/all_new_scanner/all_new_scanner/audit/market_scan_2026-10-17.jsonl",
-      "record_id": "c065ac5c345f7bbb120ed96d767b7dcf6e4e63f06f561a3f2da62a10e5a9179c",
-      "record_bytes": 2422
+      "record_id": "5c459f30d73a1fe6b3b1d4042f1cc6fe859b87980d907c1735f2ab1060ccaeac",
+      "record_bytes": 2435
     },
     "audit_input_summary": {
       "capture_version": 1,
@@ -140,11 +164,14 @@
     }
   },
   "last_email_delivery_summary": {
-    "timestamp": "2026-10-17T23:05:08.232651+05:30",
+    "timestamp": "2026-10-17T23:22:41.809202+05:30",
     "status": "IDLE",
     "attempted": 0,
     "sent": 0,
     "pending": 0,
     "smtp_configured": true
-  }
+  },
+  "gap_reset_pending": true,
+  "last_gap_reset_at": "2026-10-17T23:22:41.809202+05:30",
+  "last_gap_reset_minutes": 17.559609183333336
 }
