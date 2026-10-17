@@ -1,3 +1,163 @@
 {
- 
+  "schema_version": 71,
+  "nse_holiday_calendar": {},
+  "scanner_version": "2026-10-17-V71-NSE-HOLIDAY-CALENDAR-AUDIT-LOGGING",
+  "session_date": "2026-10-17",
+  "chain_snapshots": [],
+  "session_oi_baseline": null,
+  "session_oi_baseline_source": "UNAVAILABLE",
+  "futures_snapshots": [],
+  "market_history": [],
+  "historical_seed": {},
+  "option_expiry": "",
+  "nifty_future": {},
+  "recommendation_tracker": null,
+  "recommendation_trackers": [],
+  "last_email_fingerprint": "",
+  "last_signal_fingerprint": "",
+  "last_signal_timestamp": "",
+  "alert_outbox": [],
+  "alert_dedupe": {},
+  "last_run_timestamp": "2026-10-17T23:35:48.303069+05:30",
+  "scan_history": [
+    {
+      "timestamp": "2026-10-17T23:35:48.303069+05:30",
+      "scenario": "UNINITIALIZED",
+      "market_state": "NO_TRADE",
+      "direction": "NEUTRAL",
+      "confidence_pct": 0.0,
+      "spot": null,
+      "vwap": null,
+      "signal_ready": false,
+      "option": null,
+      "provisional_only": false,
+      "provisional_option": null,
+      "provisional_strike": null,
+      "provisional_score": null,
+      "candidate_preview_only": true,
+      "T1": null,
+      "T2": null,
+      "SL": null,
+      "top_vetoes": [
+        "WEEKEND"
+      ],
+      "email_status": "IDLE",
+      "audit_status": "APPENDED"
+    }
+  ],
+  "last_scan_summary": {
+    "timestamp": "2026-10-17T23:35:48.303069+05:30",
+    "scenario": "UNINITIALIZED",
+    "market_state": "NO_TRADE",
+    "direction": "NEUTRAL",
+    "confidence_pct": 0.0,
+    "spot": null,
+    "vwap": null,
+    "signal_ready": false,
+    "option": null,
+    "provisional_only": false,
+    "provisional_option": null,
+    "provisional_strike": null,
+    "provisional_score": null,
+    "candidate_preview_only": true,
+    "T1": null,
+    "T2": null,
+    "SL": null,
+    "top_vetoes": [
+      "WEEKEND"
+    ],
+    "email_status": "IDLE",
+    "audit_status": "APPENDED"
+  },
+  "last_scan_report": {
+    "scanner_version": "2026-10-17-V71-NSE-HOLIDAY-CALENDAR-AUDIT-LOGGING",
+    "timestamp": "2026-10-17T23:35:48.303069+05:30",
+    "market_state": "NO_TRADE",
+    "scenario": "UNINITIALIZED",
+    "direction": "NEUTRAL",
+    "confidence_pct": 0.0,
+    "trigger_rationale": "WEEKEND",
+    "selected_option": null,
+    "nifty_levels": {
+      "spot": null,
+      "T1": null,
+      "T2": null,
+      "SL": null,
+      "trailing_SL": null
+    },
+    "indicators": {},
+    "oi": {},
+    "futures": {},
+    "risk": {},
+    "candidate_diagnostics": [],
+    "predictive_detection": {
+      "detected": false,
+      "stage": "NOT_RUN"
+    },
+    "candidate_ranking": {
+      "best_candidate": null,
+      "ranking_basis": "NOT_RUN"
+    },
+    "trade_readiness": {
+      "status": "NOT_EVALUATED",
+      "blocking_reasons": []
+    },
+    "vetoes": [
+      "WEEKEND"
+    ],
+    "state_file": "/home/runner/work/all_new_scanner/all_new_scanner/state/market_state.json",
+    "execution_gap_minutes": null,
+    "execution_gap_reset": false,
+    "execution_mode": "SIGNAL_ONLY_NO_ORDER_PLACEMENT",
+    "signal_ready": false,
+    "market_calendar": {
+      "segment": "FO",
+      "status": "WEEKEND_BLOCKED",
+      "source": "WEEKDAY_SCHEDULE",
+      "year": 2026,
+      "regular_session": {
+        "weekdays": "Monday-Friday",
+        "open": "09:15 IST",
+        "close": "15:30 IST",
+        "new_entries_cutoff": "15:15 IST"
+      }
+    },
+    "state_persistence": {
+      "status": "SAVED",
+      "path": "/home/runner/work/all_new_scanner/all_new_scanner/state/market_state.json"
+    },
+    "email_delivery": {
+      "status": "IDLE",
+      "attempted": 0,
+      "sent": 0,
+      "pending": 0,
+      "smtp_configured": true
+    },
+    "audit_log": {
+      "status": "APPENDED",
+      "path": "/home/runner/work/all_new_scanner/all_new_scanner/audit/market_scan_2026-10-17.jsonl",
+      "record_id": "3f421b3542bf2d8d46b1f641c5a6d48584ec3564ed07c604ac06a941d52b2d49",
+      "record_bytes": 2633
+    },
+    "audit_input_summary": {
+      "capture_version": 1,
+      "capture_scope": "NORMALIZED_FULL_OPTION_CHAIN_QUOTES_AND_RECENT_1M_CANDLES_WHEN_AVAILABLE",
+      "data_coverage": {},
+      "option_chain_strikes": 0,
+      "live_quote_instruments": 0,
+      "oi_strikes_analysed": 0,
+      "nifty_index_candles_captured": 0,
+      "nifty_future_candles_captured": 0,
+      "option_candle_instruments_captured": 0,
+      "historical_seed_info": null
+    }
+  },
+  "last_email_delivery_summary": {
+    "timestamp": "2026-10-17T23:35:48.303069+05:30",
+    "status": "IDLE",
+    "attempted": 0,
+    "sent": 0,
+    "pending": 0,
+    "smtp_configured": true
+  }
 }
