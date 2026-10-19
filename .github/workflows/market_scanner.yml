@@ -1,0 +1,76 @@
+name: NIFTY Predictive Market Scanner v71
+
+on:
+  # Scheduling remains controlled by the existing Cloudflare Worker.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Serialize scans so appends to market_state.json and the daily audit file do not race.
+concurrency:
+  group: nifty-market-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    environment: Production
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            --prefer-binary \
+            -r requirements.txt
+
+      - name: Run NIFTY predictive scanner
+        env:
+          UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          STATE_FILE: state/market_state.json
+          AUDIT_DIR: audit
+        run: python market_scanner.py
+
+      - name: Persist scanner state and audit logs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -f state/market_state.json ]; then
+            git add -f -- state/market_state.json
+          fi
+
+          if compgen -G "audit/market_scan_*.jsonl" > /dev/null; then
+            git add -f -- audit/market_scan_*.jsonl
+          fi
+
+          if git diff --cached --quiet; then
+            echo "No state or audit changes to persist."
+            exit 0
+          fi
+
+          git commit -m "Update NIFTY scanner state and audit logs"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
