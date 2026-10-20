@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 Predictive Market Scanner & Strike Router — V72.
+"""NIFTY 50 Predictive Market Scanner & Strike Router — V74.
 
 Clean, modular redesign of the supplied V52–V58 scanner lineage. This version has
 one market-scenario engine, one strike router, one structural risk engine, one state
@@ -17,6 +17,13 @@ Core behavior
   handling when a bar's internal order cannot be known from OHLC alone.
 * Guards ordinary opposite-direction flips using distinct 1m evidence, while strong
   aligned tactical COI/momentum can override; no prior direction is latched.
+* Reassesses the active signal against the current resolved scenario, VWAP, momentum,
+  directional DI/ADX, tactical COI, and futures regime on every scan. This is diagnostic
+  context, not a weighted exit vote: only structural stops or the existing confirmed
+  direction-flip guard can end a signal early.
+* Detects when completed 1m candle history has gaps or falls outside the supported
+  replay window. It labels that uncertainty explicitly and never invents hidden OHLC
+  crossings; a candleless feed still permits clearly labelled live-spot level monitoring.
 * Issues stagnation-risk warnings after tight completed 5m ranges only when aligned
   VWAP/COI/progress has deteriorated; the warning is not an exit or invalidation.
 * Gives valid tactical OI velocity from the nearest 1m/3m/5m snapshot interval priority over session
@@ -32,10 +39,15 @@ Core behavior
 * Restricts normal option candidates to ATM, ITM1, ITM2; permits one-step OTM only for
   a confirmed high-momentum afternoon squeeze. Option quality score is exactly
   40% flow + 30% premium-VWAP lift + 30% tactical COI acceleration.
-* Derives index targets/stops from intact OI walls and 1-minute price-action pivots.
-  A weakening opposing wall is skipped for T1. After T1, a virtual recommendation
-  tracker ratchets its stop to current structural support/resistance; this is not a
-  representation of an actual user position.
+* Derives index targets/stops from intact opposing OI walls and completed 5-minute pivots.
+  A weakening opposing wall is skipped for T1; T1/T2 are filtered by a conservative,
+  remaining-time/volatility reachability ceiling. The initial stop uses completed 5-minute
+  ATR when available (explicitly labelled 1-minute ATR fallback otherwise), and T1 must
+  offer at least 1:1 index-point reward/risk by default. After T1, the virtual tracker
+  ratchets its stop to current structural support/resistance; this is not an actual position.
+* Selection and level-event emails show the selected contract, NIFTY index-point levels,
+  structural sources, target/stop distances, reward/risk, crossing time when available, and
+  option-premium change separately. Index levels are not option-premium exit prices.
 * Uses an atomic JSON store with trading-date resets and no sticky directional latch.
 * Allows qualified directional reversal watches to rank provisional same-side strikes even when the resolved market direction remains neutral; provisional ranking never authorizes readiness, tracker creation, or email. Uses liquidity-adjusted spread ceilings while preserving freshness/delta/score/risk gates.
 * Separates provisional strike ranking from final recommendation. Only a final selected-strike
@@ -58,6 +70,7 @@ Optional environment:
     NIFTY_INSTRUMENT_KEY, STATE_FILE, REQUEST_TIMEOUT, API_RETRIES,
     MIN_SCORE (hard minimum 0.650), MIN_COI_SCORE_LOW_ADX (0.40), MIN_COI_SCORE_NORMAL_ADX (0.35), MIN_COI_SCORE_HIGH_ADX (0.30), MIN_DIRECTIONAL_DELTA (0.55),
     MIN_EXHAUSTION_DELTA (0.75), MAX_QUOTE_AGE_SECONDS, MAX_SPREAD_RATIO (global cap; default 0.25% with liquidity tiers), RISK_FREE_RATE,
+    MIN_T1_REWARD_RISK_RATIO (hard floor 1.0; default 1.0), MAX_T1_EXPECTED_MOVE_MULTIPLE (default 1.5),
     FALLBACK_IV, CHANGE_OI_FALLBACK_ENABLED, AUDIT_DIR (default ./audit), MIN_OPPOSING_WALL_CLEARANCE_STEPS,
     DIRECTION_FLIP_CONFIRMATIONS, INTRABAR_MONITOR_LOOKBACK, STAGNATION_RANGE_PCT,
     STAGNATION_MIN_FAVORABLE_PROGRESS_PCT, STAGNATION_WARNING_COOLDOWN_MINUTES,
@@ -72,7 +85,7 @@ API sources checked during design (official Upstox docs):
 Important measurement limitation: the option-chain endpoint returns OI snapshots, not a
 continuous OI time series. Intraday COI velocity is therefore computed from this scanner's
 own timestamped snapshots. For 09:16 velocity availability, schedule the first scan at
-09:15. If a process starts later with no same-session baseline, V72 reports COI as
+09:15. If a process starts later with no same-session baseline, V74 reports COI as
 unavailable/session-proxy and will not describe the proxy as tactical velocity.
 """
 from __future__ import annotations
@@ -109,7 +122,7 @@ import requests
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com"
-SCANNER_VERSION = "2026-10-19-V72-REVERSAL-WATCH-RANKING-LIQUIDITY-SPREAD"
+SCANNER_VERSION = "2026-10-20-V74-ACTIVE-REGIME-GAPSAFE-MONITOR"
 MARKET_START = time(9, 15)
 ENTRY_START = time(9, 16)
 MORNING_END = time(10, 30)
@@ -130,7 +143,7 @@ EMAIL_ALLOWED_EVENT_TYPES = frozenset({
 DEFAULT_NIFTY_KEY = "NSE_INDEX|Nifty 50"
 DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-LOGGER = logging.getLogger("nifty_v72")
+LOGGER = logging.getLogger("nifty_v74")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(message)s",
                     stream=sys.stderr)
@@ -181,6 +194,8 @@ class Config:
     max_active_trackers: int = field(default_factory=lambda: min(12, max(1, _env_int("MAX_ACTIVE_RECOMMENDATION_TRACKERS", 5))))
     reentry_cooldown_minutes: int = field(default_factory=lambda: min(60, max(1, _env_int("REENTRY_COOLDOWN_MINUTES", 6))))
     opposing_wall_clearance_steps: float = field(default_factory=lambda: min(1.0, max(0.10, _env_float("MIN_OPPOSING_WALL_CLEARANCE_STEPS", 0.35))))
+    min_t1_reward_risk_ratio: float = field(default_factory=lambda: min(3.0, max(1.0, _env_float("MIN_T1_REWARD_RISK_RATIO", 1.0))))
+    max_t1_expected_move_multiple: float = field(default_factory=lambda: min(3.0, max(1.0, _env_float("MAX_T1_EXPECTED_MOVE_MULTIPLE", 1.5))))
     direction_flip_confirmations: int = field(default_factory=lambda: min(3, max(2, _env_int("DIRECTION_FLIP_CONFIRMATIONS", 2))))
     intrabar_monitor_lookback: int = field(default_factory=lambda: min(15, max(1, _env_int("INTRABAR_MONITOR_LOOKBACK", 15))))
     stagnation_warning_cooldown_minutes: int = field(default_factory=lambda: min(120, max(5, _env_int("STAGNATION_WARNING_COOLDOWN_MINUTES", 15))))
@@ -205,6 +220,10 @@ class Config:
             raise ScannerError("STRIKE_STICKINESS_SCORE_TOLERANCE must be between 0 and 0.20.")
         if not (70.0 <= self.predictive_selection_min_confidence <= 90.0):
             raise ScannerError("PREDICTIVE_SELECTION_MIN_CONFIDENCE must be between 70 and 90.")
+        if not (1.0 <= self.min_t1_reward_risk_ratio <= 3.0):
+            raise ScannerError("MIN_T1_REWARD_RISK_RATIO must be between 1.0 and 3.0; T1 reward cannot be configured below 1:1 risk.")
+        if not (1.0 <= self.max_t1_expected_move_multiple <= 3.0):
+            raise ScannerError("MAX_T1_EXPECTED_MOVE_MULTIPLE must be between 1.0 and 3.0.")
 
 
 def _env_float(key: str, default: float) -> float:
@@ -378,210 +397,6 @@ def market_time_allowed(dt: datetime) -> tuple[bool, str]:
     return True, "ENTRY_WINDOW_OPEN"
 
 
-# NSE publishes segment-specific holiday calendars. NIFTY options trade in the
-# derivatives (FO) segment, so use FO dates rather than assuming the cash-market
-# calendar is identical. This 2026 list is a fallback sourced from NSE's official
-# holiday page; the live holiday-master endpoint is refreshed once per local date.
-NSE_HOLIDAY_API_URL = "https://www.nseindia.com/api/holiday-master"
-NSE_HOLIDAY_PAGE_URL = "https://www.nseindia.com/resources/exchange-communication-holidays"
-NSE_HOLIDAY_HOME_URL = "https://www.nseindia.com/"
-NSE_FO_HOLIDAYS_FALLBACK: dict[int, list[dict[str, str]]] = {
-    2026: [
-        {"date": "2026-01-26", "description": "Republic Day"},
-        {"date": "2026-03-03", "description": "Holi (Second Day)"},
-        {"date": "2026-03-26", "description": "Ram Navami"},
-        {"date": "2026-03-31", "description": "Mahavir Jayanti"},
-        {"date": "2026-04-03", "description": "Good Friday"},
-        {"date": "2026-04-14", "description": "Dr. Babasaheb Ambedkar Jayanti"},
-        {"date": "2026-05-01", "description": "Maharashtra Din / Buddha Pournima"},
-        {"date": "2026-05-28", "description": "Bakri Id (Id-Uz-Zuha)"},
-        {"date": "2026-06-26", "description": "Muharram"},
-        {"date": "2026-09-14", "description": "Ganesh Chaturthi"},
-        {"date": "2026-10-02", "description": "Mahatma Gandhi Jayanti"},
-        {"date": "2026-10-20", "description": "Dussehra"},
-        {"date": "2026-11-10", "description": "Diwali (Bali Pratipada)"},
-        {"date": "2026-11-24", "description": "Guru Nanak Jayanti"},
-        {"date": "2026-12-25", "description": "Christmas"},
-    ],
-}
-
-
-def _parse_nse_holiday_date(value: Any) -> Optional[date]:
-    """Parse the NSE holiday-master date formats without accepting ambiguous text."""
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    text = str(value or "").strip()
-    if not text:
-        return None
-    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d"):
-        try:
-            candidate = text if fmt == "%d-%B-%Y" else text[:11] if fmt == "%d-%b-%Y" else text[:10]
-            return datetime.strptime(candidate, fmt).date()
-        except (ValueError, TypeError):
-            continue
-    return None
-
-
-def _normalise_nse_fo_holidays(payload: Any, year: int) -> list[dict[str, str]]:
-    """Extract a verifiable FO holiday list from NSE's holiday-master JSON."""
-    if not isinstance(payload, Mapping):
-        raise ScannerError("NSE holiday-master response is not a JSON object.")
-    rows = None
-    for key in ("FO", "F&O", "DERIVATIVES", "derivatives"):
-        candidate = payload.get(key)
-        if isinstance(candidate, list):
-            rows = candidate
-            break
-    if rows is None:
-        raise ScannerError("NSE holiday response did not contain a recognizable FO/derivatives list.")
-
-    dates: dict[str, str] = {}
-    for row in rows:
-        if not isinstance(row, Mapping):
-            continue
-        raw_date = next((row.get(key) for key in (
-            "tradingDate", "trading_date", "holidayDate", "holiday_date", "date", "tradingdate"
-        ) if row.get(key) not in (None, "")), None)
-        parsed = _parse_nse_holiday_date(raw_date)
-        if parsed is None or parsed.year != year:
-            continue
-        description = next((str(row.get(key)).strip() for key in (
-            "description", "holidayDescription", "holiday_description", "reason", "event"
-        ) if row.get(key) not in (None, "")), "NSE trading holiday")
-        dates[parsed.isoformat()] = description[:180]
-
-    if not dates:
-        raise ScannerError(f"NSE holiday response did not contain recognizable FO holiday dates for {year}.")
-    return [{"date": key, "description": dates[key]} for key in sorted(dates)]
-
-
-def _fetch_nse_fo_holidays(year: int, timeout_seconds: float, retries: int) -> list[dict[str, str]]:
-    """Fetch NSE's official FO holiday calendar with browser-like headers and retries."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": NSE_HOLIDAY_PAGE_URL,
-        "Origin": "https://www.nseindia.com",
-    }
-    session = requests.Session()
-    session.headers.update(headers)
-    timeout = max(3.0, min(float(timeout_seconds), 10.0))
-    try:
-        # Warm the NSE session for its anti-bot/cookie requirements. API fetch is
-        # still attempted if the homepage warm-up fails.
-        try:
-            session.get(NSE_HOLIDAY_HOME_URL, timeout=(3.0, timeout))
-        except requests.RequestException as warmup_exc:
-            LOGGER.debug("NSE holiday session warm-up did not complete: %s", warmup_exc)
-
-        last_error = "NSE holiday API request failed."
-        for attempt in range(1, max(1, min(int(retries), 2)) + 1):
-            try:
-                response = session.get(
-                    NSE_HOLIDAY_API_URL.format(year=year),
-                    params={"type": "trading", "year": year},
-                    timeout=(3.0, timeout),
-                )
-                if response.status_code == 200:
-                    try:
-                        payload = response.json()
-                    except ValueError as exc:
-                        last_error = f"NSE holiday API returned invalid JSON: {exc}"
-                    else:
-                        return _normalise_nse_fo_holidays(payload, year)
-                else:
-                    last_error = f"NSE holiday API HTTP {response.status_code}: {response.text[:180]}"
-                    if response.status_code not in {429, 500, 502, 503, 504}:
-                        break
-            except requests.RequestException as exc:
-                last_error = f"NSE holiday API network error: {exc}"
-            if attempt < max(1, min(int(retries), 2)):
-                time_module.sleep(0.4 * attempt)
-        raise ScannerError(last_error)
-    finally:
-        session.close()
-
-
-def resolve_nse_holiday_calendar(
-    state: dict[str, Any], today: date, timeout_seconds: float, retries: int
-) -> dict[str, Any]:
-    """Return a once-daily, persisted NSE FO holiday calendar with controlled fallbacks.
-
-    A same-year calendar is reused for repeated three-minute runs. The official API is
-    refreshed at most once per India-local date. If NSE is unreachable, a previously
-    fetched same-year calendar is retained; otherwise the verified 2026 static fallback
-    is used. For years with no fallback, the existing Upstox market-status gate remains
-    the final authority and is still required before processing any market data.
-    """
-    today_iso = today.isoformat()
-    cached = state.get("nse_holiday_calendar")
-    cached = cached if isinstance(cached, dict) else {}
-    cached_year = int(safe_float(cached.get("year"), -1))
-    cached_holidays = cached.get("holidays") if isinstance(cached.get("holidays"), list) else []
-    cache_same_year = cached_year == today.year and bool(cached_holidays)
-
-    if cached_year == today.year and str(cached.get("last_attempt_date", "")) == today_iso:
-        return cached
-
-    try:
-        holidays = _fetch_nse_fo_holidays(today.year, timeout_seconds, retries)
-        result: dict[str, Any] = {
-            "year": today.year,
-            "status": "AVAILABLE",
-            "source": "NSE_HOLIDAY_MASTER_FO",
-            "fetched_at": ist_iso(now_ist()),
-            "last_attempt_date": today_iso,
-            "holidays": holidays,
-        }
-        state["nse_holiday_calendar"] = result
-        LOGGER.info("NSE FO holiday calendar refreshed: year=%s dates=%s source=%s", today.year, len(holidays), result["source"])
-        return result
-    except (ScannerError, requests.RequestException, ValueError, TypeError) as exc:
-        LOGGER.warning("NSE holiday calendar refresh failed for %s: %s", today.year, str(exc)[:300])
-        if cache_same_year:
-            result = dict(cached)
-            result["last_attempt_date"] = today_iso
-            result["refresh_error"] = str(exc)[:300]
-            result["status"] = "STALE_CACHE_USED"
-        elif today.year in NSE_FO_HOLIDAYS_FALLBACK:
-            result = {
-                "year": today.year,
-                "status": "STATIC_FALLBACK",
-                "source": "NSE_OFFICIAL_2026_FO_HOLIDAYS_FALLBACK",
-                "fetched_at": None,
-                "last_attempt_date": today_iso,
-                "refresh_error": str(exc)[:300],
-                "holidays": NSE_FO_HOLIDAYS_FALLBACK[today.year],
-            }
-        else:
-            result = {
-                "year": today.year,
-                "status": "UNAVAILABLE",
-                "source": "NONE",
-                "fetched_at": None,
-                "last_attempt_date": today_iso,
-                "refresh_error": str(exc)[:300],
-                "holidays": [],
-            }
-        state["nse_holiday_calendar"] = result
-        return result
-
-
-def holiday_for_date(calendar: Mapping[str, Any], day: date) -> Optional[dict[str, str]]:
-    """Find an explicitly listed exchange holiday for a date."""
-    raw = calendar.get("holidays")
-    if not isinstance(raw, list):
-        return None
-    target = day.isoformat()
-    for item in raw:
-        if isinstance(item, Mapping) and str(item.get("date", "")) == target:
-            return {"date": target, "description": str(item.get("description", "NSE trading holiday"))}
-    return None
-
-
 # =============================================================================
 # Typed data structures
 # =============================================================================
@@ -715,6 +530,7 @@ class IndicatorSet:
     momentum_1m_pct: float = float("nan")
     swing_low_5m: float = float("nan")
     swing_high_5m: float = float("nan")
+    atr_5m: float = float("nan")
     session_high: float = float("nan")
     session_low: float = float("nan")
 
@@ -782,6 +598,14 @@ class RiskPlan:
     target_2_source: str
     skipped_weak_walls: tuple[float, ...]
     reason: str
+    reward_points: Optional[float] = None
+    risk_points: Optional[float] = None
+    reward_risk_ratio: Optional[float] = None
+    max_t1_distance_points: Optional[float] = None
+    remaining_session_minutes: Optional[float] = None
+    stop_atr_points: Optional[float] = None
+    stop_atr_source: str = "UNAVAILABLE"
+    skipped_unreachable_walls: tuple[float, ...] = ()
 
 
 def _infer_state_session_date(state: Mapping[str, Any]) -> str:
@@ -929,10 +753,29 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
         state["session_oi_baseline_source"] = "MIGRATED_EXISTING_SAME_SESSION_BASELINE"
     else:
         state.setdefault("session_oi_baseline_source", "UNAVAILABLE")
-    state["schema_version"] = 72
+    state["schema_version"] = 74
     state["scanner_version"] = SCANNER_VERSION
     state["session_date"] = today_iso
-    # Remove legacy directional latches so V72 classifies live structure afresh.
+    # V74 diagnostics are additive and bounded; preserve all valid active trackers.
+    tracker_rows = state.get("recommendation_trackers")
+    if isinstance(tracker_rows, list):
+        for tracker in tracker_rows:
+            if isinstance(tracker, dict):
+                tracker.setdefault("regime_history", [])
+                if not isinstance(tracker.get("regime_history"), list):
+                    tracker["regime_history"] = []
+                tracker["regime_history"] = tracker["regime_history"][-12:]
+                tracker.setdefault("monitoring_data_status", "NOT_YET_ASSESSED")
+                tracker.setdefault("target_event_integrity", "UNASSESSED")
+    legacy_tracker = state.get("recommendation_tracker")
+    if isinstance(legacy_tracker, dict):
+        legacy_tracker.setdefault("regime_history", [])
+        if not isinstance(legacy_tracker.get("regime_history"), list):
+            legacy_tracker["regime_history"] = []
+        legacy_tracker["regime_history"] = legacy_tracker["regime_history"][-12:]
+        legacy_tracker.setdefault("monitoring_data_status", "NOT_YET_ASSESSED")
+        legacy_tracker.setdefault("target_event_integrity", "UNASSESSED")
+    # Remove legacy directional latches so V74 classifies live structure afresh.
     for key in ("persistent_direction", "continuation_phase", "continuation_count", "continuation_last_bar"):
         state.pop(key, None)
 
@@ -964,7 +807,7 @@ class StateStore:
                 LOGGER.error("Unable to back up corrupt state file: %s", backup_exc)
             self.state = {}
 
-        # Preserve queued legacy structural-reversal alerts under the V72 milestone/failure policy.
+        # Preserve queued legacy structural-reversal alerts under the V74 milestone/failure policy.
         raw_outbox = self.state.get("alert_outbox")
         if isinstance(raw_outbox, list):
             for alert in raw_outbox:
@@ -972,7 +815,7 @@ class StateStore:
                         and str(alert.get("status", "PENDING")).upper() == "PENDING"
                         and str(alert.get("event_type", "")).upper() == "VIRTUAL_RECOMMENDATION_INVALIDATED_BY_STRUCTURE"):
                     alert["event_type"] = "MARKET_REVERSAL_CONFIRMED"
-                    alert["subject"] = "NIFTY V72 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
+                    alert["subject"] = "NIFTY V74 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
                     payload = alert.get("payload") if isinstance(alert.get("payload"), dict) else {}
                     payload.setdefault("invalidated_direction", payload.get("direction"))
                     payload.setdefault("replacement_direction", "Not available in legacy alert")
@@ -992,12 +835,8 @@ class StateStore:
                           and str(x.get("event_type", "")).upper() in EMAIL_ALLOWED_EVENT_TYPES
                           and str(x.get("event_type", "")).upper() not in {"T1_REACHED", "T2_REACHED"}] if isinstance(self.state.get("alert_outbox"), list) else []
             old_dedupe = self.state.get("alert_dedupe", {}) if isinstance(self.state.get("alert_dedupe"), dict) else {}
-            # The holiday calendar is year-level reference data, not intraday state;
-            # preserve it across trading-date resets so every scan does not refetch it.
-            old_holiday_calendar = self.state.get("nse_holiday_calendar")
             self.state = {
-                "schema_version": 72,
-                "nse_holiday_calendar": old_holiday_calendar if isinstance(old_holiday_calendar, dict) else {},
+                "schema_version": 74,
                 "scanner_version": SCANNER_VERSION,
                 "session_date": today_iso,
                 "chain_snapshots": [],
@@ -1027,7 +866,6 @@ class StateStore:
             self.state.setdefault("recommendation_trackers", [])
             self.state.setdefault("alert_outbox", [])
             self.state.setdefault("alert_dedupe", {})
-            self.state.setdefault("nse_holiday_calendar", {})
 
         # Migrate the pre-V64 singular tracker into the canonical tracker list.
         trackers_raw = self.state.get("recommendation_trackers")
@@ -1083,7 +921,7 @@ class StateStore:
                 if isinstance(previous_watch, dict):
                     previous_watch.pop("best_candidate", None)
                     previous_watch.pop("candidate_preview", None)
-        # V72 email policy migration: suppress queued watches, quote-health, stagnation,
+        # V74 email policy migration: suppress queued watches, quote-health, stagnation,
         # cap and diagnostic emails. SIGNAL_READY, T1/T2 milestones and confirmed failures
         # are the only permitted customer-facing event types.
         for alert in self.state.get("alert_outbox", []):
@@ -1093,8 +931,10 @@ class StateStore:
                     and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
                 alert["status"] = "SUPPRESSED_POLICY"
                 alert["suppressed_at"] = now_ist().isoformat()
-                alert["last_error"] = "Suppressed by V72: only selected-strike and discrete milestone/failure emails are permitted."
+                alert["last_error"] = "Suppressed by V74: only selected-strike and discrete milestone/failure emails are permitted."
                 alert.pop("next_attempt_at", None)
+        # V74 no longer performs holiday-calendar lookups; discard a legacy persisted cache.
+        self.state.pop("nse_holiday_calendar", None)
         # Remove obsolete direction latches. Every decision is recomputed from current structure.
         self.state.pop("persistent_direction", None)
         self.state.pop("continuation_phase", None)
@@ -1760,6 +1600,9 @@ def build_indicators(
         vwap_slope = float(valid_v.iloc[-1] - valid_v.iloc[max(0, len(valid_v) - 4)])
     last_idx = len(combined) - 1
     atr = safe_float(atr_series.iloc[last_idx]) if len(atr_series) else float("nan")
+    five_minute_all = completed_resampled_candles_all_sessions(combined, 5, now)
+    atr_5m_series = calculate_atr(five_minute_all, config.atr_period) if not five_minute_all.empty else pd.Series(dtype=float)
+    atr_5m = safe_float(atr_5m_series.iloc[-1]) if len(atr_5m_series) else float("nan")
     adx = safe_float(adx_series.iloc[last_idx]) if len(adx_series) else float("nan")
     plus_di = safe_float(plus_series.iloc[last_idx]) if len(plus_series) else float("nan")
     minus_di = safe_float(minus_series.iloc[last_idx]) if len(minus_series) else float("nan")
@@ -1825,7 +1668,7 @@ def build_indicators(
         candles_count=len(session_indicators),
         indicators_seeded=(finite(adx) and finite(atr)),
         volume_source=volume_source, momentum_1m_pct=momentum_1m,
-        swing_low_5m=swing_low_5m, swing_high_5m=swing_high_5m,
+        swing_low_5m=swing_low_5m, swing_high_5m=swing_high_5m, atr_5m=atr_5m,
         session_high=session_high, session_low=session_low,
     )
 
@@ -1845,7 +1688,7 @@ def unavailable_current_session_indicators(spot: float, previous_close: float) -
         momentum_3m_pct=missing, recent_range=missing, prior_range=missing,
         compressed=False, swing_low=missing, swing_high=missing,
         previous_close=previous_close, session_open=missing, candles_count=0,
-        indicators_seeded=False, volume_source="CURRENT_SESSION_1M_UNAVAILABLE",
+        indicators_seeded=False, volume_source="CURRENT_SESSION_1M_UNAVAILABLE", atr_5m=missing,
     )
 
 
@@ -3519,6 +3362,13 @@ def apply_direction_flip_guard(
         tracker["status"] = "INVALIDATED_STATE"
         tracker["completed_at"] = ist_iso(now)
         tracker["completion_reason"] = f"Opposite {scenario.direction} structure confirmed by {confirm_reason}; virtual recommendation is no longer active."
+        prior_assessment = tracker.get("regime_assessment") if isinstance(tracker.get("regime_assessment"), dict) else {}
+        tracker["regime_assessment"] = {**prior_assessment,
+            "assessed_at": ist_iso(now), "context_state": "OPPOSITE_STRUCTURE_CONFIRMED_BY_GUARD",
+            "scenario_relation": "OPPOSITE_DIRECTION_CONFIRMED",
+            "replacement_direction": scenario.direction, "confirmation_source": confirm_reason,
+            "confirmation_trigger_reason": trigger_reason,
+            "policy": "Confirmed only by the existing structural direction-flip guard; diagnostics did not cause invalidation."}
         events.append({
             "event_type": "MARKET_REVERSAL_CONFIRMED",
             "event_at": ist_iso(now), "tracker_fingerprint": tracker.get("signal_fingerprint", ""),
@@ -3529,6 +3379,12 @@ def apply_direction_flip_guard(
             "spot": indicators.spot, "option_ltp": tracker.get("last_option_ltp_observed"),
             "T1": tracker.get("target_1"), "T2": tracker.get("target_2"),
             "SL": tracker.get("stop_loss"), "trailing_SL": tracker.get("trailing_stop", tracker.get("stop_loss")),
+            "active_regime_assessment": tracker.get("regime_assessment", {}),
+            "monitoring_data_status": tracker.get("monitoring_data_status", "UNAVAILABLE"),
+            "target_event_integrity": tracker.get("target_event_integrity", "UNASSESSED"),
+            "target_event_integrity_since": tracker.get("target_event_integrity_since"),
+            "monitoring_gap_minutes": tracker.get("monitoring_gap_minutes"),
+            "monitoring_data_note": tracker.get("monitoring_data_note", ""),
             "message": f"Confirmed market reversal: opposite {scenario.direction} structure passed the structural-entry confirmation gate ({trigger_reason}; {confirm_reason}). The previous {tracker.get('direction')} virtual recommendation is invalidated; no broker order was placed.",
         })
     state["recommendation_trackers"] = trackers
@@ -4104,7 +3960,11 @@ def select_option_contract(
 
 
 def dynamic_atr_buffer_multiple(indicators: IndicatorSet) -> float:
-    """Use 0.5 ATR normally and expand to 0.8 ATR during a sudden range expansion."""
+    """Use a wider structural stop buffer during recent 1m range expansion.
+
+    The multiplier is applied to the 5-minute ATR when available, matching the
+    5-minute pivot timeframe; the 1-minute ATR is used only as a documented fallback.
+    """
     atr = indicators.atr
     recent = indicators.recent_range
     prior = indicators.prior_range
@@ -4115,90 +3975,192 @@ def dynamic_atr_buffer_multiple(indicators: IndicatorSet) -> float:
     return 0.5
 
 
-def route_targets_and_stop(scenario: Scenario, spot: float, indicators: IndicatorSet,
-                           oi: OIAnalysis, config: Config) -> RiskPlan:
-    """Route T1/T2 to intact opposing OI walls; use real price-action swings as fallback."""
+def structural_stop_atr(indicators: IndicatorSet) -> tuple[float, str]:
+    """Return ATR consistent with structural stops, with a conservative fallback.
+
+    The stop anchor is a 5-minute pivot/OI level, so prefer true 5-minute ATR. If it is
+    unavailable, scale 1-minute ATR by sqrt(5) as an explicitly labelled approximation.
+    """
+    if finite(indicators.atr_5m) and indicators.atr_5m > 0:
+        return float(indicators.atr_5m), "ATR_5M_COMPLETED_CANDLES"
+    if finite(indicators.atr) and indicators.atr > 0:
+        return float(indicators.atr) * math.sqrt(5.0), "ATR_1M_SQRT5_FALLBACK"
+    return float("nan"), "UNAVAILABLE"
+
+
+def remaining_regular_session_minutes(now: datetime) -> float:
+    """Minutes remaining until the regular NSE close, using the timestamp's IST date."""
+    local = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
+    close_at = datetime.combine(local.date(), MARKET_END, tzinfo=IST)
+    return max(0.0, (close_at - local).total_seconds() / 60.0)
+
+
+def route_targets_and_stop(
+    scenario: Scenario, spot: float, indicators: IndicatorSet, oi: OIAnalysis, config: Config,
+    *, now: Optional[datetime] = None,
+) -> RiskPlan:
+    """Route structural NIFTY levels, cap target reachability, and enforce minimum T1 R:R.
+
+    Targets remain opposing OI walls or observed session extremes, never synthetic prices.
+    The time/volatility ceiling is a plausibility filter, not a probability forecast.
+    """
     if scenario.direction not in {"BULLISH", "BEARISH"}:
         return RiskPlan(False, None, None, None, "", "", "", (), "No directional scenario.")
-    atr = indicators.atr
-    if not finite(atr) or atr <= 0:
-        return RiskPlan(False, None, None, None, "", "", "", (), "ATR unavailable; cannot apply required adaptive 0.50-0.80 ATR stop buffer.")
+    atr_stop, atr_source = structural_stop_atr(indicators)
+    if not finite(atr_stop) or atr_stop <= 0:
+        return RiskPlan(False, None, None, None, "", "", "", (), "ATR unavailable; cannot place a volatility-buffered structural stop.")
+    local_now = now or now_ist()
+    remaining_minutes = remaining_regular_session_minutes(local_now)
+    # Square-root time scaling approximates how far a directional target can reasonably
+    # be considered within the remaining session. It is deliberately only a ceiling.
+    time_bars = max(1.0, remaining_minutes / 5.0)
+    max_target_distance = max(1.5 * atr_stop, config.max_t1_expected_move_multiple * atr_stop * math.sqrt(time_bars))
     bullish = scenario.direction == "BULLISH"
     target_walls = oi.walls_resistance if bullish else oi.walls_support
     stop_walls = oi.walls_support if bullish else oi.walls_resistance
-    candidates = sorted([w for w in target_walls if (w.strike > spot if bullish else w.strike < spot)],
-                        key=lambda w: w.strike if bullish else -w.strike)
-    skipped: list[float] = []
+    candidates = sorted(
+        [w for w in target_walls if (w.strike > spot if bullish else w.strike < spot)],
+        key=lambda w: w.strike if bullish else -w.strike,
+    )
+    skipped_weak: list[float] = []
+    skipped_unreachable: list[float] = []
     intact: list[StructuralWall] = []
     for wall in candidates:
         if wall.state == "WEAKENING":
-            skipped.append(wall.strike)
+            skipped_weak.append(wall.strike)
             continue
-        if wall.state in {"BUILDING", "STABLE"}:
-            intact.append(wall)
-    t1, t2 = None, None
-    t1_source = t2_source = ""
-    min_distance = max(0.20 * atr, 1.0)
-    if intact:
-        valid_intact = [w for w in intact if abs(w.strike - spot) >= min_distance]
-        if valid_intact:
-            t1 = valid_intact[0].strike
-            t1_source = f"INTACT_{valid_intact[0].side}_OI_WALL_{valid_intact[0].state}"
-            for wall in valid_intact[1:]:
-                if (wall.strike > t1 if bullish else wall.strike < t1):
-                    t2 = wall.strike
-                    t2_source = f"NEXT_INTACT_{wall.side}_OI_WALL_{wall.state}"
-                    break
-    # If T1 has no intact OI wall, use a real same-session price swing, never a synthetic target.
+        if wall.state not in {"BUILDING", "STABLE"}:
+            continue
+        distance = abs(float(wall.strike) - spot)
+        if distance > max_target_distance:
+            skipped_unreachable.append(float(wall.strike))
+            continue
+        intact.append(wall)
+
+    short_atr = indicators.atr if finite(indicators.atr) and indicators.atr > 0 else atr_stop / math.sqrt(5.0)
+    min_distance = max(0.20 * short_atr, 1.0)
+    t1: Optional[float] = None
+    t2: Optional[float] = None
+    t1_source = ""
+    t2_source = ""
+    valid_intact = [w for w in intact if abs(float(w.strike) - spot) >= min_distance]
+    if valid_intact:
+        t1 = float(valid_intact[0].strike)
+        t1_source = f"INTACT_{valid_intact[0].side}_OI_WALL_{valid_intact[0].state}"
+        next_wall = next((w for w in valid_intact[1:]
+                          if (w.strike > t1 if bullish else w.strike < t1)), None)
+        if next_wall is not None:
+            t2 = float(next_wall.strike)
+            t2_source = f"NEXT_INTACT_{next_wall.side}_OI_WALL_{next_wall.state}"
+
+    # Fall back to a real current-session extreme only if it is ahead, non-trivial,
+    # and remains inside the time/volatility plausibility ceiling.
     swing_target = indicators.session_high if bullish else indicators.session_low
-    if t1 is None and finite(swing_target) and (swing_target > spot + min_distance if bullish else swing_target < spot - min_distance):
-        t1 = swing_target
-        t1_source = "CURRENT_SESSION_1M_SWING_EXTREME"
+    swing_ahead = finite(swing_target) and (
+        swing_target > spot + min_distance if bullish else swing_target < spot - min_distance
+    )
+    if t1 is None and swing_ahead:
+        swing_distance = abs(float(swing_target) - spot)
+        if swing_distance <= max_target_distance:
+            t1 = float(swing_target)
+            t1_source = "CURRENT_SESSION_1M_SWING_EXTREME"
+        else:
+            skipped_unreachable.append(float(swing_target))
+
+    # T2 is optional. Prefer the next eligible OI wall beyond T1; otherwise use a
+    # real session extreme beyond T1. Both must remain inside the same reachability cap.
     if t1 is not None and t2 is None:
-        # T2 may be a real price swing beyond T1 if no second intact OI wall exists.
-        swing2 = indicators.session_high if bullish else indicators.session_low
-        if finite(swing2) and (swing2 > t1 + min_distance if bullish else swing2 < t1 - min_distance):
-            t2 = swing2
-            t2_source = "CURRENT_SESSION_1M_SWING_BEYOND_T1"
-    # SL uses a confirmed completed 5m swing pivot or the nearest intact same-side OI wall.
+        next_wall = next((w for w in valid_intact
+                          if (w.strike > t1 + min_distance if bullish else w.strike < t1 - min_distance)), None)
+        if next_wall is not None:
+            t2 = float(next_wall.strike)
+            t2_source = f"NEXT_INTACT_{next_wall.side}_OI_WALL_{next_wall.state}"
+        elif finite(swing_target) and (
+            swing_target > t1 + min_distance if bullish else swing_target < t1 - min_distance
+        ):
+            swing_distance = abs(float(swing_target) - spot)
+            if swing_distance <= max_target_distance:
+                t2 = float(swing_target)
+                t2_source = "CURRENT_SESSION_1M_SWING_BEYOND_T1"
+            else:
+                t2_source = "UNAVAILABLE_EXPECTED_MOVE_LIMIT"
+        elif skipped_unreachable:
+            t2_source = "UNAVAILABLE_EXPECTED_MOVE_LIMIT"
+        else:
+            t2_source = "UNAVAILABLE_NO_SECOND_STRUCTURAL_LEVEL"
+
+    # SL uses the closest available anchor: a confirmed completed 5m pivot or an intact OI wall.
     local_pivot = indicators.swing_low_5m if bullish else indicators.swing_high_5m
     structural = None
-    stop_candidates = [w for w in stop_walls if (w.strike < spot if bullish else w.strike > spot)
+    stop_candidates = [w for w in stop_walls
+                       if (w.strike < spot if bullish else w.strike > spot)
                        and w.state in {"BUILDING", "STABLE"}]
     if stop_candidates:
         structural = max(stop_candidates, key=lambda w: w.strike) if bullish else min(stop_candidates, key=lambda w: w.strike)
     support_levels = []
     if finite(local_pivot) and (local_pivot < spot if bullish else local_pivot > spot):
-        support_levels.append(local_pivot)
+        support_levels.append(float(local_pivot))
     if structural and (structural.strike < spot if bullish else structural.strike > spot):
-        support_levels.append(structural.strike)
+        support_levels.append(float(structural.strike))
     if not support_levels:
-        return RiskPlan(False, t1, t2, None, "", t1_source, t2_source, tuple(skipped), "No confirmed 5-minute pivot or intact structural wall for stop placement.")
+        return RiskPlan(False, t1, t2, None, "", t1_source, t2_source, tuple(skipped_weak),
+                        "No confirmed 5-minute pivot or intact structural wall for stop placement.",
+                        max_t1_distance_points=max_target_distance, remaining_session_minutes=remaining_minutes,
+                        stop_atr_points=atr_stop, stop_atr_source=atr_source,
+                        skipped_unreachable_walls=tuple(skipped_unreachable))
     base = max(support_levels) if bullish else min(support_levels)
     atr_buffer = dynamic_atr_buffer_multiple(indicators)
-    stop = base - atr_buffer * atr if bullish else base + atr_buffer * atr
-    stop_source = (f"CONFIRMED_5M_PIVOT_OR_INTACT_PUT_SUPPORT_MINUS_{atr_buffer:.2f}_ATR" if bullish
-                   else f"CONFIRMED_5M_PIVOT_OR_INTACT_CALL_RESISTANCE_PLUS_{atr_buffer:.2f}_ATR")
+    stop = base - atr_buffer * atr_stop if bullish else base + atr_buffer * atr_stop
+    stop_source = (f"CONFIRMED_5M_PIVOT_OR_INTACT_PUT_SUPPORT_MINUS_{atr_buffer:.2f}_{atr_source}" if bullish
+                   else f"CONFIRMED_5M_PIVOT_OR_INTACT_CALL_RESISTANCE_PLUS_{atr_buffer:.2f}_{atr_source}")
     t1_ok = t1 is not None and (t1 > spot if bullish else t1 < spot)
     t2_ok = t2 is None or (t1 is not None and (t2 > t1 if bullish else t2 < t1))
-    stop_ok = stop is not None and (stop < spot if bullish else stop > spot)
+    stop_ok = finite(stop) and (stop < spot if bullish else stop > spot)
     if not (t1_ok and t2_ok and stop_ok):
         missing = []
-        if t1 is None: missing.append("T1 unavailable")
-        elif not t1_ok: missing.append("T1 on wrong side of spot")
-        if t2 is not None and not t2_ok: missing.append("T2 order invalid")
-        if stop is None: missing.append("stop unavailable")
-        elif not stop_ok: missing.append("stop on wrong side of spot")
-        return RiskPlan(False, t1, t2, stop, stop_source, t1_source, t2_source, tuple(skipped), "; ".join(missing) or "Invalid target/stop geometry.")
-    target_detail = "T1 and ATR-buffered stop valid; T2 available." if t2 is not None else "T1 and ATR-buffered stop valid; T2 unavailable and intentionally left unset."
-    return RiskPlan(True, float(t1), float(t2) if t2 is not None else None, float(stop), stop_source, t1_source, t2_source,
-                    tuple(skipped), f"Valid OI/price-action target and ATR-buffered stop geometry. {target_detail}")
+        if t1 is None:
+            missing.append("T1 unavailable inside remaining-session expected-move limit")
+        elif not t1_ok:
+            missing.append("T1 on wrong side of spot")
+        if t2 is not None and not t2_ok:
+            missing.append("T2 order invalid")
+        if not stop_ok:
+            missing.append("stop on wrong side of spot")
+        return RiskPlan(False, t1, t2, float(stop) if finite(stop) else None, stop_source, t1_source, t2_source,
+                        tuple(skipped_weak), "; ".join(missing) or "Invalid target/stop geometry.",
+                        max_t1_distance_points=max_target_distance, remaining_session_minutes=remaining_minutes,
+                        stop_atr_points=atr_stop, stop_atr_source=atr_source,
+                        skipped_unreachable_walls=tuple(skipped_unreachable))
+
+    reward_points = abs(float(t1) - spot)
+    risk_points = abs(spot - float(stop))
+    rr = reward_points / risk_points if risk_points > 0 else float("nan")
+    if not finite(rr) or rr < config.min_t1_reward_risk_ratio:
+        reason = (f"T1 reward/risk {rr:.2f}:1 is below required "
+                  f"{config.min_t1_reward_risk_ratio:.2f}:1; reward={reward_points:.2f} points, risk={risk_points:.2f} points.")
+        return RiskPlan(False, float(t1), float(t2) if t2 is not None else None, float(stop), stop_source,
+                        t1_source, t2_source, tuple(skipped_weak), reason,
+                        reward_points=reward_points, risk_points=risk_points, reward_risk_ratio=rr,
+                        max_t1_distance_points=max_target_distance, remaining_session_minutes=remaining_minutes,
+                        stop_atr_points=atr_stop, stop_atr_source=atr_source,
+                        skipped_unreachable_walls=tuple(skipped_unreachable))
+
+    target_detail = ("T1 and structural stop passed the minimum reward/risk gate; T2 available."
+                     if t2 is not None else
+                     "T1 and structural stop passed the minimum reward/risk gate; T2 unavailable and intentionally left unset.")
+    return RiskPlan(True, float(t1), float(t2) if t2 is not None else None, float(stop), stop_source,
+                    t1_source, t2_source, tuple(skipped_weak),
+                    f"Valid structural plan. T1 reward/risk={rr:.2f}:1; target ceiling={max_target_distance:.2f} points; {target_detail}",
+                    reward_points=reward_points, risk_points=risk_points, reward_risk_ratio=rr,
+                    max_t1_distance_points=max_target_distance, remaining_session_minutes=remaining_minutes,
+                    stop_atr_points=atr_stop, stop_atr_source=atr_source,
+                    skipped_unreachable_walls=tuple(skipped_unreachable))
 
 
 def _scan_intrabar_level_crossings(
     tracker: dict[str, Any], frame: Optional[pd.DataFrame], now: datetime,
     direction: str, target_1: float, target_2: float, stop_loss: float,
-    *, lookback: int = 60,
+    *, lookback: int = 60, prior_monitor_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """Inspect newly completed 1m NIFTY OHLC ranges for virtual target/stop crossings.
 
@@ -4208,17 +4170,95 @@ def _scan_intrabar_level_crossings(
     """
     result = {"stop_hit": False, "t1_hit": False, "t2_hit": False,
               "stop_timestamp": None, "t1_timestamp": None, "t2_timestamp": None,
-              "ambiguous_bar": False, "bars_processed": 0}
+              "ambiguous_bar": False, "bars_processed": 0,
+              "monitoring_data_status": "UNAVAILABLE", "monitoring_gap_minutes": None,
+              "monitoring_data_note": "No candle integrity assessment completed."}
     bars = completed_one_minute_candles(frame, now)
-    if bars.empty:
-        return result
-    bars = bars.tail(min(15, max(1, int(lookback))))
-    gap_cutoff = (now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)) - timedelta(minutes=15)
-    bars_local = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST)
-    bars = bars.loc[bars_local >= gap_cutoff].copy()
     now_ist_value = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
     created = parse_timestamp(tracker.get("created_at"))
     last_processed = parse_timestamp(tracker.get("last_intrabar_bar_timestamp"))
+    if created:
+        created = created.astimezone(IST)
+    if last_processed:
+        last_processed = last_processed.astimezone(IST)
+    prior_monitor = prior_monitor_at.astimezone(IST) if prior_monitor_at and prior_monitor_at.tzinfo else (prior_monitor_at.replace(tzinfo=IST) if prior_monitor_at else None)
+    elapsed_monitor_minutes = ((now_ist_value - prior_monitor).total_seconds() / 60.0) if prior_monitor else None
+    result["monitoring_gap_minutes"] = round(max(0.0, elapsed_monitor_minutes), 2) if elapsed_monitor_minutes is not None else None
+    if bars.empty:
+        if prior_monitor is not None:
+            result["monitoring_data_status"] = "GAP_UNRESOLVED"
+            result["monitoring_data_note"] = (
+                "Completed 1m candles disappeared after a prior monitoring scan. The interval's OHLC path "
+                "cannot be reconstructed; keep the virtual tracker active, continue current-spot stop checks, "
+                "and suppress new T1/T2 milestones for this signal generation."
+            )
+        else:
+            # Preserve the original cold-start regression: if candles have never been available for this
+            # tracker, live NIFTY spot can still surface a level, explicitly marked as spot-only evidence.
+            result["monitoring_data_status"] = "CANDLES_UNAVAILABLE_LIVE_SPOT_ONLY"
+            result["monitoring_data_note"] = (
+                "No completed 1m candles are available. Current live NIFTY spot may still trigger a level, "
+                "but any unobserved path between scans cannot be reconstructed from OHLC history."
+            )
+        return result
+    bars = bars.tail(min(15, max(1, int(lookback))))
+    gap_cutoff = now_ist_value - timedelta(minutes=15)
+    bars_local = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST)
+    bars = bars.loc[bars_local >= gap_cutoff].copy().sort_values("timestamp").reset_index(drop=True)
+    # Assess whether the available recent OHLC window covers the tracker timeline. A gap
+    # is not filled with synthetic bars; targets are withheld when chronology is uncertain.
+    candidate_stamps = [parse_timestamp(v) for v in bars["timestamp"].tolist()]
+    candidate_stamps = [v.astimezone(IST) for v in candidate_stamps if v is not None]
+    relevant_stamps = [v for v in candidate_stamps if (last_processed is None or v > last_processed)
+                       and (created is None or v >= created)]
+    unresolved_gap = False
+    gap_note = "Completed 1m candles are contiguous within the supported monitoring window."
+    gap_minutes = None
+    if elapsed_monitor_minutes is not None and elapsed_monitor_minutes > 15.0:
+        unresolved_gap = True
+        gap_note = ("Monitoring gap exceeded the 15-minute completed-candle replay window; "
+                    "hidden level-crossing order cannot be reconstructed.")
+    if last_processed is not None and candidate_stamps:
+        first_window = candidate_stamps[0]
+        if last_processed < gap_cutoff and (first_window - last_processed).total_seconds() > 120.0:
+            unresolved_gap = True
+            gap_minutes = round((first_window - last_processed).total_seconds() / 60.0 - 1.0, 2)
+            gap_note = "The bounded 15-minute candle window starts after the last processed candle; older crossings may be missing."
+    if last_processed is not None and relevant_stamps:
+        if (relevant_stamps[0] - last_processed).total_seconds() > 120.0:
+            unresolved_gap = True
+            gap_minutes = round((relevant_stamps[0] - last_processed).total_seconds() / 60.0 - 1.0, 2)
+            gap_note = "One or more completed 1m candles are missing since the prior processed bar; target chronology is uncertain."
+    for previous_stamp, next_stamp in zip(relevant_stamps, relevant_stamps[1:]):
+        delta_minutes = (next_stamp - previous_stamp).total_seconds() / 60.0
+        if delta_minutes > 1.5:
+            unresolved_gap = True
+            gap_minutes = max(gap_minutes or 0.0, round(delta_minutes - 1.0, 2))
+            gap_note = "A timestamp gap was found in completed 1m candles; target chronology is uncertain."
+            break
+    if created is not None and last_processed is None and relevant_stamps:
+        expected_first = created.replace(second=0, microsecond=0)
+        if created.second or created.microsecond:
+            expected_first += timedelta(minutes=1)
+        if (relevant_stamps[0] - expected_first).total_seconds() > 30.0:
+            unresolved_gap = True
+            gap_minutes = round(max(0.0, (relevant_stamps[0] - expected_first).total_seconds() / 60.0 - 1.0), 2)
+            gap_note = "The first available candle is later than expected after signal creation; earlier crossings may be missing."
+    latest_stamp = candidate_stamps[-1] if candidate_stamps else None
+    if latest_stamp is not None and (now_ist_value - (latest_stamp + timedelta(minutes=1))).total_seconds() > 150.0:
+        if not unresolved_gap:
+            gap_note = "The completed-candle feed is lagging; the current signal is monitored but OHLC chronology may be incomplete."
+        unresolved_gap = True
+    if unresolved_gap:
+        result["monitoring_data_status"] = "GAP_UNRESOLVED" if gap_note.find("lagging") == -1 else "CANDLE_FEED_STALE"
+        result["monitoring_data_note"] = gap_note
+    elif elapsed_monitor_minutes is not None and elapsed_monitor_minutes > 7.0:
+        result["monitoring_data_status"] = "GAP_REPLAYED_WITHIN_WINDOW"
+        result["monitoring_data_note"] = "Scans were farther apart than usual, but the completed 1m candle sequence is contiguous within the supported replay window."
+    else:
+        result["monitoring_data_status"] = "CONTIGUOUS"
+        result["monitoring_data_note"] = gap_note
+    result["monitoring_gap_minutes"] = gap_minutes if gap_minutes is not None else result["monitoring_gap_minutes"]
     if created:
         created = created.astimezone(IST)
     if last_processed:
@@ -4268,6 +4308,59 @@ def _scan_intrabar_level_crossings(
     if last_seen:
         tracker["last_intrabar_bar_timestamp"] = ist_iso(last_seen)
     return result
+
+
+def completed_resampled_candles_all_sessions(
+    frame: Optional[pd.DataFrame], interval_minutes: int, now: datetime,
+) -> pd.DataFrame:
+    """Resample complete intraday bars across prior sessions and the current session.
+
+    Unlike completed_resampled_candles(), this helper preserves prior trading dates so
+    Wilder ATR can be seeded on completed 5-minute candles without relying on a short
+    current-session-only history. Off-session bars and incomplete intervals are excluded.
+    """
+    columns = ["timestamp", "open", "high", "low", "close", "volume"]
+    if frame is None or frame.empty or "timestamp" not in frame.columns or interval_minutes < 2:
+        return pd.DataFrame(columns=columns)
+    work = frame.copy()
+    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
+    work = work.dropna(subset=["timestamp"]).sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+    for column in ("open", "high", "low", "close", "volume"):
+        if column not in work.columns:
+            work[column] = 0.0 if column == "volume" else np.nan
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    current = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
+    local_ts = work["timestamp"].dt.tz_convert(IST)
+    local_times = local_ts.dt.time
+    complete = local_ts + pd.to_timedelta(1, unit="m") <= current
+    in_session = (local_times >= MARKET_START) & (local_times < MARKET_END)
+    work = work.loc[complete & in_session].dropna(subset=["open", "high", "low", "close"]).copy()
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+    work["timestamp"] = work["timestamp"].dt.tz_convert(IST).dt.tz_localize(None)
+    work = work.set_index("timestamp").sort_index()
+    minutes = int(interval_minutes)
+    resampled = work.resample(
+        f"{minutes}min", origin="start_day", offset="9h15min", label="left", closed="left"
+    ).agg(
+        open=("open", "first"), high=("high", "max"), low=("low", "min"),
+        close=("close", "last"), volume=("volume", "sum"), observed_minutes=("close", "count"),
+    )
+    current_naive = current.replace(tzinfo=None)
+    bar_end = resampled.index + pd.to_timedelta(minutes, unit="m")
+    valid = resampled["observed_minutes"].eq(minutes)
+    valid &= resampled.index.time >= MARKET_START
+    valid &= bar_end.time <= MARKET_END
+    # No current-day bar is used until its full interval has elapsed. Prior dates are complete.
+    current_day_mask = pd.Index(resampled.index.date) == current.date()
+    valid &= (~current_day_mask) | (bar_end <= current_naive)
+    result = resampled.loc[valid].dropna(subset=["open", "high", "low", "close"]).reset_index()
+    if result.empty:
+        return pd.DataFrame(columns=columns)
+    result["timestamp"] = pd.to_datetime(result["timestamp"]).dt.tz_localize(IST)
+    return result[columns].reset_index(drop=True)
 
 
 def completed_resampled_candles(
@@ -4373,6 +4466,195 @@ def evaluate_stagnation_watch(
     return {**details, "status": "STAGNATION_RISK_WARNING", "warning": warning}
 
 
+def _active_feature_status(direction: str, value: float, threshold: float) -> str:
+    """Map a directional numeric observation to ALIGNED/OPPOSING/NEUTRAL/UNAVAILABLE."""
+    if not finite(value):
+        return "UNAVAILABLE"
+    signed = float(value) if direction == "BULLISH" else -float(value)
+    if signed >= threshold:
+        return "ALIGNED"
+    if signed <= -threshold:
+        return "OPPOSING"
+    return "NEUTRAL"
+
+
+def _assess_active_signal_regime(
+    tracker: dict[str, Any], scenario: Optional[Scenario], indicators: IndicatorSet,
+    oi: OIAnalysis, future_regime: str, config: Optional[Config], now: datetime,
+    index_candles: Optional[pd.DataFrame],
+) -> dict[str, Any]:
+    """Persist compact context diagnostics without independently changing signal status.
+
+    This routine is intentionally non-voting. It never computes an aggregate score and
+    never exits or invalidates a tracker. Structural SL/T2 and apply_direction_flip_guard
+    remain the only signal-ending paths during ordinary market monitoring.
+    """
+    direction = str(tracker.get("direction", "")).upper()
+    if direction not in {"BULLISH", "BEARISH"}:
+        direction = "UNKNOWN"
+    trigger = config.oi_velocity_trigger if config is not None else 0.0015
+    scenario_state = "UNAVAILABLE"
+    scenario_direction = "UNKNOWN"
+    scenario_executable: Optional[bool] = None
+    scenario_hard_veto = False
+    if scenario is not None:
+        scenario_state = str(scenario.state or "UNKNOWN")
+        scenario_direction = str(scenario.direction or "NEUTRAL").upper()
+        scenario_executable = bool(scenario.executable_candidate)
+        scenario_hard_veto = bool(scenario.hard_veto)
+    if scenario is None:
+        scenario_relation = "SCENARIO_UNAVAILABLE"
+    elif scenario_hard_veto or scenario_direction not in {"BULLISH", "BEARISH"}:
+        scenario_relation = "NEUTRAL_OR_HARD_VETO"
+    elif scenario_direction == direction:
+        scenario_relation = "SAME_DIRECTION_SETUP"
+    else:
+        scenario_relation = "OPPOSITE_DIRECTION_SETUP_OR_WATCH"
+
+    atr = safe_float(indicators.atr)
+    spot = safe_float(indicators.spot)
+    vwap = safe_float(indicators.vwap)
+    vwap_tolerance = max(0.05 * atr if finite(atr) and atr > 0 else 0.0,
+                         0.00005 * spot if finite(spot) and spot > 0 else 0.0, 0.5)
+    vwap_gap = spot - vwap if finite(spot) and finite(vwap) else float("nan")
+    signed_vwap_gap = vwap_gap if direction == "BULLISH" else -vwap_gap
+    if direction not in {"BULLISH", "BEARISH"} or not finite(vwap_gap):
+        vwap_status = "UNAVAILABLE"
+    elif signed_vwap_gap > vwap_tolerance:
+        vwap_status = "ALIGNED"
+    elif signed_vwap_gap < -vwap_tolerance:
+        vwap_status = "OPPOSING"
+    else:
+        vwap_status = "NEAR_VWAP_NOISE_BAND"
+
+    momentum_status = _active_feature_status(direction, safe_float(indicators.momentum_3m_pct), 0.0001)
+    momentum_1m_status = _active_feature_status(direction, safe_float(indicators.momentum_1m_pct), 0.0001)
+    di_difference = (safe_float(indicators.plus_di) - safe_float(indicators.minus_di)
+                     if finite(indicators.plus_di) and finite(indicators.minus_di) else float("nan"))
+    if not finite(indicators.adx) or not finite(di_difference):
+        directional_status = "UNAVAILABLE"
+    elif indicators.adx < 18.0:
+        directional_status = "LOW_ADX_NON_DIRECTIONAL"
+    else:
+        directional_status = _active_feature_status(direction, di_difference, 2.0)
+
+    coi_status = "UNAVAILABLE"
+    call_coi = safe_float(oi.call_coi_pct)
+    put_coi = safe_float(oi.put_coi_pct)
+    if oi.tactical_available and finite(call_coi) and finite(put_coi) and direction in {"BULLISH", "BEARISH"}:
+        aligned = ((call_coi <= -1.5 * trigger and put_coi >= -0.25 * trigger)
+                   if direction == "BULLISH" else
+                   (put_coi <= -1.5 * trigger and call_coi >= -0.25 * trigger))
+        opposing = ((put_coi <= -1.5 * trigger and call_coi >= -0.25 * trigger)
+                    if direction == "BULLISH" else
+                    (call_coi <= -1.5 * trigger and put_coi >= -0.25 * trigger))
+        coi_status = "ALIGNED" if aligned else "OPPOSING" if opposing else "MIXED_OR_WEAK"
+
+    future = str(future_regime or "UNKNOWN").upper()
+    if future in {"UNKNOWN", "", "NONE", "UNAVAILABLE", "NEUTRAL"}:
+        futures_status = "UNAVAILABLE_OR_NEUTRAL"
+    elif futures_regime_conflicts(direction, future):
+        futures_status = "OPPOSING"
+    elif ((direction == "BULLISH" and future in {"STRONG_LONG_BUILDUP", "LONG_BUILDUP", "SHORT_COVERING"}) or
+          (direction == "BEARISH" and future in {"STRONG_SHORT_BUILDUP", "SHORT_BUILDUP", "LONG_UNWINDING"})):
+        futures_status = "ALIGNED"
+    else:
+        futures_status = "OTHER_REGIME"
+
+    contrary = [name for name, value in (
+        ("VWAP", vwap_status), ("MOMENTUM_3M", momentum_status),
+        ("DIRECTIONAL_DI_ADX", directional_status), ("TACTICAL_COI", coi_status),
+        ("FUTURES", futures_status),
+    ) if value == "OPPOSING"]
+    unavailable_or_neutral = any(value in {"UNAVAILABLE", "UNAVAILABLE_OR_NEUTRAL", "OTHER_REGIME",
+                                           "MIXED_OR_WEAK", "NEUTRAL", "NEAR_VWAP_NOISE_BAND",
+                                           "LOW_ADX_NON_DIRECTIONAL"}
+                                for value in (vwap_status, momentum_status, directional_status,
+                                              coi_status, futures_status))
+    critical_supportive = (vwap_status == "ALIGNED" and momentum_status == "ALIGNED"
+                           and scenario_relation == "SAME_DIRECTION_SETUP"
+                           and futures_status != "OPPOSING" and "OPPOSING" not in
+                           (directional_status, coi_status))
+    if scenario_relation == "OPPOSITE_DIRECTION_SETUP_OR_WATCH" and (
+            momentum_status == "OPPOSING" or directional_status == "OPPOSING" or
+            coi_status == "OPPOSING" or futures_status == "OPPOSING"):
+        context_state = "OPPOSITE_PRESSURE_PRESENT_PENDING_GUARD"
+    elif contrary:
+        context_state = "CONFLICT_PRESENT"
+    elif critical_supportive and not unavailable_or_neutral and coi_status == "ALIGNED":
+        context_state = "AVAILABLE_CONTEXT_ALIGNED"
+    else:
+        context_state = "MIXED_OR_INCOMPLETE"
+
+    bars = completed_one_minute_candles(index_candles, now)
+    bar_timestamp = ""
+    if not bars.empty:
+        latest_timestamp = parse_timestamp(bars.iloc[-1].get("timestamp"))
+        if latest_timestamp:
+            bar_timestamp = ist_iso(latest_timestamp)
+    previous_bar_timestamp = str(tracker.get("last_regime_bar_timestamp", ""))
+    history = tracker.get("regime_history")
+    history = [dict(x) for x in history if isinstance(x, dict)] if isinstance(history, list) else []
+    opposite_count = max(0, int(safe_float(tracker.get("opposite_scenario_consecutive_bars"), 0)))
+    if scenario_relation == "OPPOSITE_DIRECTION_SETUP_OR_WATCH":
+        # Count at most once per distinct completed candle. This is telemetry only; the
+        # authoritative reversal threshold remains apply_direction_flip_guard().
+        if bar_timestamp and bar_timestamp != previous_bar_timestamp:
+            opposite_count += 1
+    else:
+        opposite_count = 0
+    if bar_timestamp and bar_timestamp != previous_bar_timestamp:
+        history.append({
+            "timestamp": bar_timestamp,
+            "active_direction": direction,
+            "scenario_state": scenario_state,
+            "scenario_direction": scenario_direction,
+            "scenario_relation": scenario_relation,
+            "context_state": context_state,
+            "vwap": vwap_status,
+            "momentum_3m": momentum_status,
+            "momentum_1m": momentum_1m_status,
+            "directional_di_adx": directional_status,
+            "tactical_coi": coi_status,
+            "futures": futures_status,
+        })
+        tracker["last_regime_bar_timestamp"] = bar_timestamp
+    tracker["regime_history"] = history[-12:]
+    tracker["opposite_scenario_consecutive_bars"] = opposite_count
+    assessment = {
+        "assessed_at": ist_iso(now),
+        "active_direction": direction,
+        "scenario_state": scenario_state,
+        "scenario_direction": scenario_direction,
+        "scenario_relation": scenario_relation,
+        "scenario_executable_candidate": scenario_executable,
+        "scenario_hard_veto": scenario_hard_veto,
+        "context_state": context_state,
+        "evidence": {
+            "vwap": vwap_status,
+            "vwap_gap_points": round(vwap_gap, 2) if finite(vwap_gap) else None,
+            "vwap_noise_tolerance_points": round(vwap_tolerance, 2),
+            "momentum_3m": momentum_status,
+            "momentum_3m_pct": round(safe_float(indicators.momentum_3m_pct) * 100.0, 4) if finite(indicators.momentum_3m_pct) else None,
+            "momentum_1m": momentum_1m_status,
+            "directional_di_adx": directional_status,
+            "adx": round(float(indicators.adx), 2) if finite(indicators.adx) else None,
+            "di_difference_plus_minus": round(di_difference, 2) if finite(di_difference) else None,
+            "tactical_coi": coi_status,
+            "call_coi_pct": round(call_coi, 4) if finite(call_coi) else None,
+            "put_coi_pct": round(put_coi, 4) if finite(put_coi) else None,
+            "futures_regime": future,
+            "futures_alignment": futures_status,
+            "contrary_sources": contrary,
+        },
+        "opposite_scenario_consecutive_bars": opposite_count,
+        "distinct_completed_bar_timestamp": bar_timestamp or None,
+        "policy": "DIAGNOSTIC_ONLY_NO_WEIGHTED_EXIT_VOTE; structural stop and confirmed direction-flip guard remain authoritative.",
+    }
+    tracker["regime_assessment"] = assessment
+    return assessment
+
+
 def update_recommendation_tracker(
     state: dict[str, Any], spot: float, indicators: IndicatorSet,
     oi: OIAnalysis, now: datetime,
@@ -4384,11 +4666,17 @@ def update_recommendation_tracker(
     stagnation_range_pct: float = 0.001,
     stagnation_min_progress_pct: float = 0.0001,
     oi_velocity_trigger: float = 0.0015,
+    scenario: Optional[Scenario] = None,
+    future_regime: str = "UNKNOWN",
+    config: Optional[Config] = None,
 ) -> dict[str, Any]:
     """Monitor every active virtual recommendation using NIFTY levels and its live option quote.
 
     The tracker is explicitly hypothetical: it never represents an exchange position.
     Level events are edge-triggered so each T1/T2/stop event can create one alert only.
+    Per-scan scenario/flow/futures reassessment is diagnostic only. Candle gaps are never
+    filled synthetically; unresolved chronology is surfaced and T1/T2 alerting stays disabled
+    for that signal generation after an unresolved history gap.
     """
     raw = state.get("recommendation_trackers")
     trackers = [dict(x) for x in raw if isinstance(x, dict)] if isinstance(raw, list) else []
@@ -4414,6 +4702,7 @@ def update_recommendation_tracker(
         instrument_key = str(tracker.get("instrument_key", ""))
         quote = quotes.get(instrument_key) if instrument_key else None
         prior_quote_status = str(tracker.get("last_option_quote_status", "UNKNOWN")).upper()
+        prior_monitored_at = parse_timestamp(tracker.get("last_monitored_at"))
         quote_status = quote.freshness if quote is not None else "UNAVAILABLE"
         option_ltp: Optional[float] = None
         if quote is not None and finite(quote.ltp) and quote.ltp > 0:
@@ -4427,7 +4716,6 @@ def update_recommendation_tracker(
         else:
             tracker["last_option_quote_status"] = quote_status
         tracker["last_nifty_spot"] = float(spot) if finite(spot) else tracker.get("last_nifty_spot")
-        tracker["last_monitored_at"] = ist_iso(now)
 
         # Quote freshness is reported independently from index-level event monitoring.
         # A missing/stale option quote cannot create a price exit, but it must be visible.
@@ -4485,8 +4773,32 @@ def update_recommendation_tracker(
         intrabar = _scan_intrabar_level_crossings(
             tracker, index_candles, now, direction, t1,
             t2 if finite(t2) else float("nan"), stored_stop,
-            lookback=intrabar_monitor_lookback,
+            lookback=intrabar_monitor_lookback, prior_monitor_at=prior_monitored_at,
         )
+        tracker["monitoring_data_status"] = str(intrabar.get("monitoring_data_status", "UNAVAILABLE"))
+        tracker["monitoring_gap_minutes"] = intrabar.get("monitoring_gap_minutes")
+        tracker["monitoring_data_note"] = str(intrabar.get("monitoring_data_note", ""))
+        # Once an OHLC-history gap makes level order unknowable, do not quietly restore
+        # target alerting on the next contiguous scan: a stop could have crossed unseen
+        # and price may since have rebounded. Keep the virtual tracker alive, continue
+        # current-spot stop monitoring, but permanently disable new T1/T2 milestones for
+        # this tracker generation. A new independently selected signal gets a fresh state.
+        existing_integrity = str(tracker.get("target_event_integrity", "UNASSESSED")).upper()
+        gap_statuses = {"GAP_UNRESOLVED", "CANDLE_FEED_STALE"}
+        if tracker["monitoring_data_status"] in gap_statuses:
+            if existing_integrity != "UNRESOLVED_AFTER_DATA_GAP":
+                tracker["target_event_integrity_since"] = ist_iso(now)
+                tracker["target_event_integrity_reason"] = tracker["monitoring_data_note"][:500]
+            tracker["target_event_integrity"] = "UNRESOLVED_AFTER_DATA_GAP"
+        elif existing_integrity in {"", "UNASSESSED", "NONE"}:
+            tracker["target_event_integrity"] = "LIVE_SPOT_ONLY" if tracker["monitoring_data_status"] == "CANDLES_UNAVAILABLE_LIVE_SPOT_ONLY" else "CONTIGUOUS_OR_NOT_YET_PROVEN_GAPPED"
+        if str(tracker.get("target_event_integrity", "")).upper() == "UNRESOLVED_AFTER_DATA_GAP":
+            sticky_note = ("Target milestones remain suppressed for this signal because candle chronology became unresolved at "
+                           f"{tracker.get('target_event_integrity_since', 'an unknown time')}. The tracker stays active for current-spot stop monitoring and the existing structural reversal guard.")
+            tracker["monitoring_data_note"] = (tracker["monitoring_data_note"] + " " + sticky_note).strip()
+        tracker["last_monitored_at"] = ist_iso(now)
+        if scenario is not None or index_candles is not None:
+            _assess_active_signal_regime(tracker, scenario, indicators, oi, future_regime, config, now, index_candles)
         was_t1_hit = bool(tracker.get("target_1_hit", False))
         spot_t1_cross = (direction == "BULLISH" and spot >= t1) or (direction == "BEARISH" and spot <= t1)
         # A stop-first ambiguous OHLC bar invalidates any same-scan live-spot T1 inference.
@@ -4494,7 +4806,11 @@ def update_recommendation_tracker(
         # Suppress T1 only when the very same OHLC bar also crossed the stop.
         # A prior candle can reach T1 and a later candle can stop out in one cron gap;
         # in that case both events must be retained in chronological order.
+        chronology_uncertain = (str(intrabar.get("monitoring_data_status", "")).upper() in {
+            "GAP_UNRESOLVED", "CANDLE_FEED_STALE"
+        } or str(tracker.get("target_event_integrity", "")).upper() == "UNRESOLVED_AFTER_DATA_GAP")
         t1_newly_hit = (not was_t1_hit and not bool(intrabar.get("ambiguous_bar"))
+                        and not chronology_uncertain
                         and (spot_t1_cross or bool(intrabar.get("t1_hit"))))
         trailing_stop_active_before_scan = bool(tracker.get("trailing_stop_source")) or (
             finite(tracker.get("trailing_stop")) and finite(tracker.get("stop_loss"))
@@ -4507,20 +4823,21 @@ def update_recommendation_tracker(
         old_stop = stored_stop
         stop = old_stop
         trailing_changed = False
-        if bool(tracker.get("target_1_hit", False)) and finite(indicators.atr) and indicators.atr > 0:
+        trailing_atr, trailing_atr_source = structural_stop_atr(indicators)
+        if bool(tracker.get("target_1_hit", False)) and finite(trailing_atr) and trailing_atr > 0:
             wall_rows = oi.walls_support if direction == "BULLISH" else oi.walls_resistance
             side_walls = [w for w in wall_rows if w.state in {"BUILDING", "STABLE"}
                           and (w.strike < spot if direction == "BULLISH" else w.strike > spot)]
             if side_walls:
                 wall = max(side_walls, key=lambda w: w.strike) if direction == "BULLISH" else min(side_walls, key=lambda w: w.strike)
                 atr_buffer = dynamic_atr_buffer_multiple(indicators)
-                new_stop = wall.strike - atr_buffer * indicators.atr if direction == "BULLISH" else wall.strike + atr_buffer * indicators.atr
+                new_stop = wall.strike - atr_buffer * trailing_atr if direction == "BULLISH" else wall.strike + atr_buffer * trailing_atr
                 ratcheted = max(stop, new_stop) if direction == "BULLISH" else min(stop, new_stop)
                 if ((direction == "BULLISH" and ratcheted < spot and ratcheted > stop)
                         or (direction == "BEARISH" and ratcheted > spot and ratcheted < stop)):
                     stop = float(ratcheted)
                     tracker["trailing_stop"] = stop
-                    tracker["trailing_stop_source"] = f"POST_T1_CURRENT_{wall.side}_WALL_MINUS_PLUS_{atr_buffer:.2f}_ATR"
+                    tracker["trailing_stop_source"] = f"POST_T1_CURRENT_{wall.side}_WALL_MINUS_PLUS_{atr_buffer:.2f}_{trailing_atr_source}"
                     tracker["trailing_stop_updated_at"] = ist_iso(now)
                     trailing_changed = abs(stop - old_stop) >= 0.01
 
@@ -4534,12 +4851,31 @@ def update_recommendation_tracker(
             "T1": t1, "T2": t2 if finite(t2) else None,
             "SL": tracker.get("stop_loss"), "trailing_SL": stop,
             "entry_reference_ltp": tracker.get("entry_reference_ltp"),
+            "nifty_entry_reference": tracker.get("nifty_entry_reference"),
+            "nifty_move_from_signal_points": (spot - safe_float(tracker.get("nifty_entry_reference")) if direction == "BULLISH" and finite(tracker.get("nifty_entry_reference")) and finite(spot) else safe_float(tracker.get("nifty_entry_reference")) - spot if direction == "BEARISH" and finite(tracker.get("nifty_entry_reference")) and finite(spot) else None),
             "option_ltp_change_pct_from_signal": tracker.get("option_ltp_change_pct_from_signal"),
+            "T1_source": tracker.get("T1_source", tracker.get("target_1_source")),
+            "T2_source": tracker.get("T2_source", tracker.get("target_2_source")),
+            "SL_source": tracker.get("SL_source", tracker.get("stop_source")),
+            "trailing_SL_source": tracker.get("trailing_stop_source", tracker.get("SL_source")),
+            "reward_risk_ratio": tracker.get("reward_risk_ratio"),
+            "t1_distance_points": tracker.get("t1_distance_points"),
+            "sl_distance_points": tracker.get("sl_distance_points"),
+            "max_t1_distance_points": tracker.get("max_t1_distance_points"),
+            "remaining_session_minutes": tracker.get("remaining_session_minutes_at_signal"),
+            "stop_atr_points": tracker.get("stop_atr_points"),
+            "stop_atr_source": tracker.get("stop_atr_source"),
             "intrabar_bars_processed": intrabar.get("bars_processed", 0),
             "intrabar_stop_timestamp": intrabar.get("stop_timestamp"),
             "intrabar_t1_timestamp": intrabar.get("t1_timestamp"),
             "intrabar_t2_timestamp": intrabar.get("t2_timestamp"),
             "intrabar_ambiguous_bar": bool(intrabar.get("ambiguous_bar", False)),
+            "monitoring_data_status": tracker.get("monitoring_data_status"),
+            "target_event_integrity": tracker.get("target_event_integrity"),
+            "target_event_integrity_since": tracker.get("target_event_integrity_since"),
+            "monitoring_gap_minutes": tracker.get("monitoring_gap_minutes"),
+            "monitoring_data_note": tracker.get("monitoring_data_note"),
+            "active_regime_assessment": tracker.get("regime_assessment", {}),
         }
         if t1_newly_hit:
             events.append({**common_event, "event_type": "T1_REACHED",
@@ -4550,7 +4886,8 @@ def update_recommendation_tracker(
                            "message": "NIFTY structural support/resistance changed; the virtual trailing stop moved only in the favorable direction."})
 
         stop_hit = bool(intrabar.get("stop_hit")) or (direction == "BULLISH" and spot <= stop) or (direction == "BEARISH" and spot >= stop)
-        t2_hit = bool(intrabar.get("t2_hit")) or (finite(t2) and ((direction == "BULLISH" and spot >= t2) or (direction == "BEARISH" and spot <= t2)))
+        t2_hit = (not chronology_uncertain) and (bool(intrabar.get("t2_hit")) or
+                  (finite(t2) and ((direction == "BULLISH" and spot >= t2) or (direction == "BEARISH" and spot <= t2))))
         if stop_hit:
             # Label a stop as trailing only if a favorable trailing level was already
             # active before this scan. A T1 and stop hit on separate missed candles must
@@ -4603,6 +4940,12 @@ def update_recommendation_tracker(
             "T1": t1, "T2": t2 if finite(t2) else None, "SL": tracker.get("stop_loss"),
             "trailing_SL": tracker.get("trailing_stop", tracker.get("stop_loss")),
             "last_monitored_at": tracker.get("last_monitored_at"),
+            "signal_fingerprint": tracker.get("signal_fingerprint", ""),
+            "monitoring_data_status": tracker.get("monitoring_data_status", "UNAVAILABLE"),
+            "monitoring_gap_minutes": tracker.get("monitoring_gap_minutes"),
+            "monitoring_data_note": tracker.get("monitoring_data_note", ""),
+            "active_regime_assessment": tracker.get("regime_assessment", {}),
+            "opposite_scenario_consecutive_bars": tracker.get("opposite_scenario_consecutive_bars", 0),
         })
 
     # Keep only a bounded same-session history; the latest recommendation is the legacy view.
@@ -4621,6 +4964,11 @@ def update_recommendation_tracker(
         "target_1": primary.get("target_1"), "target_2": primary.get("target_2"),
         "trailing_stop": primary.get("trailing_stop", primary.get("stop_loss")),
         "active_tracker_count": active_count, "trackers": monitor_rows,
+        "monitoring_data_quality": {
+            "unresolved_gap_count": sum(1 for row in monitor_rows if row.get("monitoring_data_status") in {"GAP_UNRESOLVED", "CANDLE_FEED_STALE"} or row.get("target_event_integrity") == "UNRESOLVED_AFTER_DATA_GAP"),
+            "candleless_live_spot_count": sum(1 for row in monitor_rows if row.get("monitoring_data_status") == "CANDLES_UNAVAILABLE_LIVE_SPOT_ONLY"),
+            "active_context_conflict_count": sum(1 for row in monitor_rows if isinstance(row.get("active_regime_assessment"), dict) and row["active_regime_assessment"].get("context_state") in {"CONFLICT_PRESENT", "OPPOSITE_PRESSURE_PRESENT_PENDING_GUARD"}),
+        },
         "events": events,
         "message": ("Virtual recommendation(s) monitored using NIFTY index levels and the selected option's live quote. No order was placed."
                     if monitor_rows else "No active recommendation tracker."),
@@ -4633,7 +4981,7 @@ def register_recommendation_tracker(
 ) -> dict[str, Any]:
     """Register a signal for virtual monitoring without resetting an identical tracker.
 
-    V72's main scan guard suppresses new selection while any recommendation is active.
+    V74's main scan guard suppresses new selection while any recommendation is active.
     The tracker-list compatibility remains for older persisted states; active legacy
     records continue to be monitored rather than silently discarded during migration.
     """
@@ -4692,6 +5040,12 @@ def register_recommendation_tracker(
             "nifty_entry_reference": signal["nifty_spot"],
             "target_1": signal["T1"], "target_2": signal.get("T2"),
             "stop_loss": signal["SL"], "trailing_stop": signal["SL"],
+            "T1_source": signal.get("T1_source"), "T2_source": signal.get("T2_source"),
+            "SL_source": signal.get("SL_source"), "reward_risk_ratio": signal.get("reward_risk_ratio"),
+            "t1_distance_points": signal.get("t1_distance_points"), "sl_distance_points": signal.get("sl_distance_points"),
+            "max_t1_distance_points": signal.get("max_t1_distance_points"),
+            "remaining_session_minutes_at_signal": signal.get("remaining_session_minutes"),
+            "stop_atr_points": signal.get("stop_atr_points"), "stop_atr_source": signal.get("stop_atr_source"),
             "target_1_hit": False, "alerted_events": [],
             "latest_signal_score": signal.get("score"),
             "latest_signal_confidence_pct": signal.get("confidence_pct"),
@@ -4866,7 +5220,7 @@ def enqueue_email_alert(
     """Queue one-time selection, T1/T2 milestone, and confirmed failure emails."""
     event_type = str(event_type or "").upper()
     if event_type not in EMAIL_ALLOWED_EVENT_TYPES:
-        LOGGER.debug("EMAIL SUPPRESSED BY V72 POLICY: event=%s", event_type or "UNKNOWN")
+        LOGGER.debug("EMAIL SUPPRESSED BY V74 POLICY: event=%s", event_type or "UNKNOWN")
         return None
     dedupe = state.setdefault("alert_dedupe", {})
     if not isinstance(dedupe, dict):
@@ -4920,7 +5274,7 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
     raw = alert.get("payload", {})
     payload = raw if isinstance(raw, Mapping) else {}
     event_type = str(alert.get("event_type", "SCANNER_ALERT")).upper()
-    created = str(alert.get("created_at", payload.get("timestamp", "")))
+    created = str(payload.get("event_at") or alert.get("created_at") or payload.get("timestamp", ""))
     created_dt = parse_timestamp(created)
     created_display = created_dt.astimezone(IST).strftime("%d %b %Y, %I:%M:%S %p IST") if created_dt else created
 
@@ -4943,8 +5297,10 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
         title = "DIRECTION SHIFT WATCH — NO OPTION SELECTED"
     elif event_type == "PREDICTIVE_WATCH_INVALIDATED":
         title = "MARKET WATCH INVALIDATED — NO TRADE WAS OPENED"
-    elif event_type in {"T1_REACHED", "T2_REACHED"}:
-        title = event_type.replace("_", " ")
+    elif event_type == "T1_REACHED":
+        title = "T1 REACHED — FIRST STRUCTURAL NIFTY TARGET TOUCHED"
+    elif event_type == "T2_REACHED":
+        title = "T2 REACHED — VIRTUAL MONITORING COMPLETE"
 
     selected = payload.get("selected_option") if isinstance(payload.get("selected_option"), Mapping) else {}
     best = payload.get("best_candidate") if isinstance(payload.get("best_candidate"), Mapping) else {}
@@ -5012,12 +5368,47 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
         sl_text = _alert_display_value(sl, fallback="Not established")
         trailing_text = _alert_display_value(trailing, fallback="Not established")
 
+    entry_spot = first(payload.get("nifty_entry_reference"), payload.get("nifty_spot"), payload.get("spot"), tracker.get("nifty_entry_reference"))
+    reward_risk = first(payload.get("reward_risk_ratio"), risk.get("reward_risk_ratio"), tracker.get("reward_risk_ratio"))
+    t1_distance = first(payload.get("t1_distance_points"), risk.get("reward_points"), tracker.get("t1_distance_points"))
+    sl_distance = first(payload.get("sl_distance_points"), risk.get("risk_points"), tracker.get("sl_distance_points"))
+    reachability_limit = first(payload.get("max_t1_distance_points"), risk.get("max_t1_distance_points"), tracker.get("max_t1_distance_points"))
+    remaining_minutes = first(payload.get("remaining_session_minutes"), risk.get("remaining_session_minutes"), tracker.get("remaining_session_minutes_at_signal"))
+    stop_atr_points = first(payload.get("stop_atr_points"), risk.get("stop_atr_points"), tracker.get("stop_atr_points"))
+    stop_atr_source = first(payload.get("stop_atr_source"), risk.get("stop_atr_source"), tracker.get("stop_atr_source"))
+    t1_source = first(payload.get("T1_source"), payload.get("target_1_source"), tracker.get("T1_source"))
+    t2_source = first(payload.get("T2_source"), payload.get("target_2_source"), tracker.get("T2_source"))
+    sl_source = first(payload.get("SL_source"), payload.get("stop_source"), tracker.get("SL_source"))
+    trailing_sl_source = first(payload.get("trailing_SL_source"), tracker.get("trailing_stop_source"), sl_source)
+    nifty_progress = first(payload.get("nifty_move_from_signal_points"), tracker.get("nifty_move_from_signal_points"))
+    option_change_pct = first(payload.get("option_ltp_change_pct_from_signal"), tracker.get("option_ltp_change_pct_from_signal"))
+    crossed_at = None
+    if event_type == "T1_REACHED":
+        crossed_at = payload.get("intrabar_t1_timestamp")
+    elif event_type == "T2_REACHED":
+        crossed_at = payload.get("intrabar_t2_timestamp")
+    elif event_type in {"INITIAL_STOP_LOSS_REACHED", "TRAILING_STOP_REACHED"}:
+        crossed_at = payload.get("intrabar_stop_timestamp")
+    crossed_dt = parse_timestamp(crossed_at) if crossed_at else None
+    crossed_display = crossed_dt.astimezone(IST).strftime("%d %b %Y, %I:%M:%S %p IST") if crossed_dt else "No completed-candle crossing timestamp available"
+    event_level = None
+    if event_type == "T1_REACHED":
+        event_level = t1
+    elif event_type == "T2_REACHED":
+        event_level = t2
+    elif event_type == "INITIAL_STOP_LOSS_REACHED":
+        event_level = sl
+    elif event_type == "TRAILING_STOP_REACHED":
+        event_level = trailing
+
     fields = [
         ("Event time (IST)", created_display),
         ("Market scenario", _alert_display_value(scenario)),
         ("Direction", _alert_display_value(direction)),
         ("Confidence (heuristic)", f"{_alert_display_value(confidence)}%" if confidence is not None else "Not calibrated"),
-        ("NIFTY spot", _alert_display_value(spot)),
+        ("NIFTY spot at signal", _alert_display_value(entry_spot)),
+        ("NIFTY spot observed at alert", _alert_display_value(spot)),
+        ("Level-crossing candle time (IST)", crossed_display if event_type in {"T1_REACHED", "T2_REACHED", "INITIAL_STOP_LOSS_REACHED", "TRAILING_STOP_REACHED"} else "Not applicable"),
         ("NIFTY VWAP", _alert_display_value(vwap)),
         ("Structural wall", f"{_alert_display_value(wall)} ({_alert_display_value(wall_state)})" if wall is not None else "Not identified"),
         ("Option", option_text),
@@ -5029,7 +5420,36 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
         ("NIFTY T2", t2_text),
         ("NIFTY initial SL", sl_text),
         ("NIFTY trailing SL", trailing_text),
+        ("T1 distance from signal", f"{_alert_display_value(t1_distance)} NIFTY points" if t1_distance is not None else "Not available"),
+        ("Initial SL risk from signal", f"{_alert_display_value(sl_distance)} NIFTY points" if sl_distance is not None else "Not available"),
+        ("T1 reward / risk", f"{_alert_display_value(reward_risk)}:1" if reward_risk is not None else "Not available"),
+        ("T1 reachability ceiling", f"{_alert_display_value(reachability_limit)} NIFTY points; {_alert_display_value(remaining_minutes)} minutes remained at signal" if reachability_limit is not None else "Not available"),
+        ("Stop volatility basis", f"{_alert_display_value(stop_atr_source)} ({_alert_display_value(stop_atr_points)} points)" if stop_atr_source is not None else "Not available"),
+        ("T1 structural source", _alert_display_value(t1_source)),
+        ("T2 structural source", _alert_display_value(t2_source)),
+        ("SL structural source", _alert_display_value(sl_source)),
+        ("Trailing SL source", _alert_display_value(trailing_sl_source)),
+        ("NIFTY progress since signal", f"{safe_float(nifty_progress):+.2f} points (direction-adjusted)" if finite(nifty_progress) else "Not applicable"),
+        ("Option premium change since signal", f"{_alert_display_value(option_change_pct)}% (quote freshness still applies)" if option_change_pct is not None else "Not available"),
+        ("Event level crossed", _alert_display_value(event_level) if event_level is not None else "Not applicable"),
         ("Readiness blockers", blocker_text),
+        ("Active-signal context state", _alert_display_value(
+            (payload.get("active_regime_assessment") or {}).get("context_state")
+            if isinstance(payload.get("active_regime_assessment"), Mapping) else None)),
+        ("Active-signal scenario relation", _alert_display_value(
+            (payload.get("active_regime_assessment") or {}).get("scenario_relation")
+            if isinstance(payload.get("active_regime_assessment"), Mapping) else None)),
+        ("VWAP / momentum / directional DI-ADX / tactical COI / futures", "; ".join(
+            f"{key}={value}" for key, value in
+            ((payload.get("active_regime_assessment") or {}).get("evidence", {}) if
+             isinstance(payload.get("active_regime_assessment"), Mapping) and
+             isinstance((payload.get("active_regime_assessment") or {}).get("evidence", {}), Mapping) else {}).items()
+            if key in {"vwap", "momentum_3m", "directional_di_adx", "tactical_coi", "futures_alignment"}) or "Not available"),
+        ("Candle monitoring integrity", _alert_display_value(payload.get("monitoring_data_status"))),
+        ("Target-event integrity", _alert_display_value(payload.get("target_event_integrity"))),
+        ("Target monitoring degraded since", _alert_display_value(payload.get("target_event_integrity_since"))),
+        ("Candle-gap duration (minutes)", _alert_display_value(payload.get("monitoring_gap_minutes"))),
+        ("Monitoring data note", _alert_display_value(payload.get("monitoring_data_note"))),
         ("Rationale", _alert_display_value(rationale)),
     ]
     if event_type == "MARKET_REVERSAL_CONFIRMED":
@@ -5054,12 +5474,15 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
             "WATCH ONLY — NOT TRADE READY. No option contract was selected; T1/T2/SL are not issued as trade levels until all market, risk and option gates pass. No broker order was placed."
         )
     else:
-        disclaimer = "This is a scanner recommendation and virtual monitoring alert only. No order was placed and no actual position is inferred."
+        disclaimer = (
+            "This is a scanner recommendation and virtual monitoring alert only. No order was placed and no actual position is inferred. "
+            "T1/T2/SL are NIFTY index levels (index points), not option-premium exit prices; option premiums can differ because of delta, gamma, IV, theta and spread."
+        )
     return title, fields, disclaimer
 
 def _alert_body(alert: Mapping[str, Any]) -> str:
     title, fields, disclaimer = _alert_fields(alert)
-    lines = [f"NIFTY 50 Predictive Scanner V72 — {title}", "", disclaimer, ""]
+    lines = [f"NIFTY 50 Predictive Scanner V74 — {title}", "", disclaimer, ""]
     lines.extend(f"{label}: {value}" for label, value in fields)
     lines.extend(["", f"Scanner version: {SCANNER_VERSION}"])
     return "\n".join(lines)
@@ -5079,7 +5502,7 @@ def _alert_html_body(alert: Mapping[str, Any]) -> str:
     return (
         '<!doctype html><html><body style="margin:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.45;">'
         '<div style="max-width:780px;margin:0 auto;padding:16px;"><div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">'
-        f'<div style="background:{banner};padding:16px 20px;color:#ffffff;"><div style="font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.9;">NIFTY 50 Predictive Scanner · V72</div><h2 style="margin:6px 0 0;font-size:21px;line-height:1.3;">{safe_title}</h2></div>'
+        f'<div style="background:{banner};padding:16px 20px;color:#ffffff;"><div style="font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.9;">NIFTY 50 Predictive Scanner · V74</div><h2 style="margin:6px 0 0;font-size:21px;line-height:1.3;">{safe_title}</h2></div>'
         f'<div style="padding:16px 20px;"><p style="margin:0 0 14px;padding:11px 13px;background:#f9fafb;border-left:4px solid {banner};border-radius:4px;overflow-wrap:anywhere;">{html_lib.escape(disclaimer)}</p>'
         f'<table role="presentation" style="border-collapse:collapse;width:100%;table-layout:fixed;font-size:14px;"><colgroup><col style="width:31%;"><col style="width:69%;"></colgroup><tbody>{rows}</tbody></table>'
         f'<p style="color:#6b7280;font-size:12px;margin:16px 0 0;">Scanner version: {html_lib.escape(SCANNER_VERSION)} · Recommendation-only; no order was placed.</p></div></div></div></body></html>'
@@ -5104,7 +5527,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
                 and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
             alert["status"] = "SUPPRESSED_POLICY"
             alert["suppressed_at"] = ist_iso(now)
-            alert["last_error"] = "Suppressed by V72 email policy."
+            alert["last_error"] = "Suppressed by V74 email policy."
             alert.pop("next_attempt_at", None)
     all_pending = [x for x in outbox if isinstance(x, dict) and str(x.get("status", "PENDING")).upper() == "PENDING"]
     if not all_pending:
@@ -5141,7 +5564,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
             alert["attempts"] = int(alert.get("attempts", 0)) + 1
             try:
                 message = MIMEMultipart("alternative")
-                message["Subject"] = str(alert.get("subject", "NIFTY V72 scanner alert"))
+                message["Subject"] = str(alert.get("subject", "NIFTY V74 scanner alert"))
                 message["From"] = config.email_sender
                 message["To"] = config.email_receiver
                 message.attach(MIMEText(_alert_body(alert), "plain", "utf-8"))
@@ -5353,9 +5776,9 @@ class PredictiveScanner:
             direction = str(event.get("direction", "")).upper()
             subject_suffix = f" {direction} {safe_float(event.get('strike'), 0.0):.0f}" if strike else f" {direction}" if direction else ""
             if event_type == "MARKET_REVERSAL_CONFIRMED":
-                subject = f"NIFTY V72 MARKET REVERSAL CONFIRMED — {direction} RECOMMENDATION INVALIDATED"
+                subject = f"NIFTY V74 MARKET REVERSAL CONFIRMED — {direction} RECOMMENDATION INVALIDATED"
             else:
-                subject = f"NIFTY V72 {event_type.replace('_', ' ')}{subject_suffix}"
+                subject = f"NIFTY V74 {event_type.replace('_', ' ')}{subject_suffix}"
             enqueue_email_alert(
                 state, now=now, event_type=event_type,
                 dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{identity}",
@@ -5471,7 +5894,7 @@ class PredictiveScanner:
         enqueue_email_alert(
             state, now=now, event_type=error_kind,
             dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{error_kind}|{type(exc).__name__}",
-            subject=f"NIFTY V72 scanner {error_kind.replace('_', ' ').lower()}",
+            subject=f"NIFTY V74 scanner {error_kind.replace('_', ' ').lower()}",
             payload={"timestamp": ist_iso(now), "scanner_version": SCANNER_VERSION,
                      "error_type": type(exc).__name__, "error": str(exc)[:1200],
                      "note": "No new recommendation was produced by the failed scan."},
@@ -5524,46 +5947,9 @@ class PredictiveScanner:
             "execution_mode": "SIGNAL_ONLY_NO_ORDER_PLACEMENT",
             "signal_ready": False,
         }
-        # NSE FO holiday gate must run before end-of-session handling; otherwise a holiday
-        # weekday at/after 15:30 could incorrectly finalize an active recommendation.
-        if current.weekday() < 5:
-            calendar = resolve_nse_holiday_calendar(
-                state, current.date(), self.config.timeout_seconds, self.config.retries
-            )
-            report["market_calendar"] = {
-                "segment": "FO",
-                "status": calendar.get("status", "UNAVAILABLE"),
-                "source": calendar.get("source", "NONE"),
-                "year": calendar.get("year"),
-                "last_attempt_date": calendar.get("last_attempt_date"),
-                "holiday_count": len(calendar.get("holidays", [])) if isinstance(calendar.get("holidays"), list) else 0,
-                "refresh_error": calendar.get("refresh_error"),
-                "regular_session": {"weekdays": "Monday-Friday", "open": "09:15 IST", "close": "15:30 IST",
-                                    "new_entries_cutoff": "15:15 IST"},
-            }
-            exchange_holiday = holiday_for_date(calendar, current.date())
-            if exchange_holiday is not None:
-                report["market_status"] = "CLOSED_HOLIDAY"
-                report["scenario"] = "NSE_TRADING_HOLIDAY"
-                report["market_state"] = "MARKET_CLOSED"
-                report["trigger_rationale"] = (
-                    f"NSE derivatives trading holiday: {exchange_holiday['description']} "
-                    f"({exchange_holiday['date']}); market data scan and entries are skipped."
-                )
-                report["vetoes"] = ["NSE_TRADING_HOLIDAY"]
-                report["audit_inputs"]["data_coverage"]["market_calendar"] = "CONFIRMED_NSE_FO_HOLIDAY"
-                state["last_scan_timestamp"] = current.isoformat()
-                return self._finish(state, report, current)
-            if calendar.get("status") == "UNAVAILABLE":
-                LOGGER.warning("NSE holiday calendar unavailable for %s; requiring Upstox market-status API before any market data or entry.", current.year)
-                report["market_calendar"]["fallback_policy"] = "UPSTOX_MARKET_STATUS_REQUIRED"
-        else:
-            report["market_calendar"] = {
-                "segment": "FO", "status": "WEEKEND_BLOCKED", "source": "WEEKDAY_SCHEDULE",
-                "year": current.year,
-                "regular_session": {"weekdays": "Monday-Friday", "open": "09:15 IST", "close": "15:30 IST",
-                                    "new_entries_cutoff": "15:15 IST"},
-            }
+        # Trading-holiday scheduling is handled by the external Cloudflare Worker.
+        # This scanner retains only weekday/session-hours and live Upstox market-status
+        # safeguards; it no longer calls NSE holiday endpoints or applies a local holiday list.
         # Explicitly end virtual monitoring after the NSE regular session instead of carrying
         # yesterday's levels into a new date without telling the user.
         if current.weekday() < 5 and current.time() >= MARKET_END:
@@ -5868,6 +6254,7 @@ class PredictiveScanner:
                 stagnation_range_pct=self.config.stagnation_range_pct,
                 stagnation_min_progress_pct=self.config.stagnation_min_progress_pct,
                 oi_velocity_trigger=self.config.oi_velocity_trigger,
+                scenario=scenario, future_regime=future_regime, config=self.config,
             )
             self._queue_monitor_events(state, tracked.get("events", []), current)
             # Apply the direction-flip guard only after monitoring the prior recommendation
@@ -5893,7 +6280,39 @@ class PredictiveScanner:
                     if isinstance(item, dict) and str(item.get("status", "")).upper() == "TRACKING"
                 )
 
-            # V72 follows an existing recommendation to completion before issuing another
+            active_regime_rows = []
+            for active_tracker in state.get("recommendation_trackers", []):
+                if not isinstance(active_tracker, dict):
+                    continue
+                if str(active_tracker.get("status", "")).upper() != "TRACKING" and not active_tracker.get("regime_assessment"):
+                    continue
+                assessment = active_tracker.get("regime_assessment") if isinstance(active_tracker.get("regime_assessment"), dict) else {}
+                if scenario.features.get("direction_flip_guard"):
+                    assessment["direction_flip_guard_state"] = scenario.features.get("direction_flip_guard")
+                    assessment["flip_confirmation_count"] = scenario.features.get("flip_confirmation_count")
+                    assessment["flip_confirmations_required"] = scenario.features.get("flip_confirmations_required")
+                    active_tracker["regime_assessment"] = assessment
+                active_regime_rows.append({
+                    "signal_fingerprint": active_tracker.get("signal_fingerprint", ""),
+                    "direction": active_tracker.get("direction", ""),
+                    "status": active_tracker.get("status", ""),
+                    "monitoring_data_status": active_tracker.get("monitoring_data_status", "UNAVAILABLE"),
+                    "target_event_integrity": active_tracker.get("target_event_integrity", "UNASSESSED"),
+                    "target_event_integrity_since": active_tracker.get("target_event_integrity_since"),
+                    "monitoring_gap_minutes": active_tracker.get("monitoring_gap_minutes"),
+                    "monitoring_data_note": active_tracker.get("monitoring_data_note", ""),
+                    "regime_assessment": assessment,
+                })
+            report["active_regime_reassessment"] = {
+                "current_resolved_scenario": scenario.state,
+                "current_resolved_direction": scenario.direction,
+                "current_direction_flip_guard": scenario.features.get("direction_flip_guard", "NOT_REQUIRED_OR_CONFIRMED"),
+                "active_signal_count": sum(1 for row in active_regime_rows if str(row.get("status", "")).upper() == "TRACKING"),
+                "signals": active_regime_rows,
+                "policy": "Diagnostic-only context review; no aggregate voting and no exit from regime weakness alone. Structural stops and the established confirmation guard remain authoritative.",
+            }
+
+            # V74 follows an existing recommendation to completion before issuing another
             # one. The active recommendation is monitored above on every scan; a different
             # contract cannot replace it merely because its rank fluctuates between runs.
             active_tracker_rows = state.get("recommendation_trackers", [])
@@ -5912,10 +6331,10 @@ class PredictiveScanner:
                 "policy": "Monitor active selection until T2, SL, or confirmed structural invalidation; no per-scan re-selection email.",
             }
 
-            # V72 separates predictive shortlist from final selection. A meaningful
+            # V74 separates predictive shortlist from final selection. A meaningful
             # directional watch can rank same-side contracts before the underlying break
             # is confirmed; this shortlist is diagnostic-only and never triggers email.
-            risk = route_targets_and_stop(scenario, spot, indicators, oi, self.config) if scenario.direction in {"BULLISH", "BEARISH"} else RiskPlan(False, None, None, None, "", "", "", (), "No directional scenario.")
+            risk = route_targets_and_stop(scenario, spot, indicators, oi, self.config, now=current) if scenario.direction in {"BULLISH", "BEARISH"} else RiskPlan(False, None, None, None, "", "", "", (), "No directional scenario.")
             # Preserve the final resolved scenario as the only scenario allowed to
             # determine readiness. A neutralized reversal watch can be used only to
             # rank provisional strikes for diagnostics, fixing the V71 direction-loss bug.
@@ -5926,7 +6345,7 @@ class PredictiveScanner:
                                 else provisional_reversal_scenario)
             ranking_risk = risk
             if ranking_scenario is not None and ranking_scenario is not scenario:
-                ranking_risk = route_targets_and_stop(ranking_scenario, spot, indicators, oi, self.config)
+                ranking_risk = route_targets_and_stop(ranking_scenario, spot, indicators, oi, self.config, now=current)
             option_candles: dict[str, pd.DataFrame] = {}
             entry_trigger_ok, entry_trigger_reason = selection_trigger_confirmation(
                 scenario, indicators, oi, self.config, future_regime=future_regime
@@ -6006,7 +6425,7 @@ class PredictiveScanner:
                     "spot": spot, "vwap": indicators.vwap, "vwap_slope": indicators.vwap_slope,
                     "stddev": indicators.stddev, "upper_1sd": indicators.upper_1sd,
                     "lower_1sd": indicators.lower_1sd, "upper_2sd": indicators.upper_2sd,
-                    "lower_2sd": indicators.lower_2sd, "atr_1m": indicators.atr,
+                    "lower_2sd": indicators.lower_2sd, "atr_1m": indicators.atr, "atr_5m": indicators.atr_5m,
                     "adx": indicators.adx, "plus_di": indicators.plus_di, "minus_di": indicators.minus_di,
                     "rsi": indicators.rsi, "momentum_1m_pct": indicators.momentum_1m_pct,
                     "momentum_3m_pct": indicators.momentum_3m_pct,
@@ -6059,7 +6478,7 @@ class PredictiveScanner:
                 "scenario_features": scenario.features,
             })
             if reversal_watch is not None and (scenario.hard_veto is not None or scenario.direction != reversal_watch.direction or scenario.direction == "NEUTRAL"):
-                # Reversal watches remain internal diagnostics only; V72 never emails watch-only alerts.
+                # Reversal watches remain internal diagnostics only; V74 never emails watch-only alerts.
                 watch_payload = {
                     "timestamp": current.isoformat(), "scenario": reversal_watch.state,
                     "direction": reversal_watch.direction, "confidence_pct": round(reversal_watch.confidence, 1),
@@ -6288,7 +6707,14 @@ class PredictiveScanner:
                     "SL": risk.stop_loss, "trailing_SL": risk.stop_loss,
                     "SL_source": risk.stop_source, "T1_source": risk.target_1_source,
                     "T2_source": risk.target_2_source, "skipped_weak_walls": list(risk.skipped_weak_walls),
-                    "atr_buffer_multiple": dynamic_atr_buffer_multiple(indicators) if finite(indicators.atr) else None,
+                    "skipped_unreachable_walls": list(risk.skipped_unreachable_walls),
+                    "t1_distance_points": risk.reward_points, "sl_distance_points": risk.risk_points,
+                    "reward_risk_ratio": risk.reward_risk_ratio,
+                    "max_t1_distance_points": risk.max_t1_distance_points,
+                    "remaining_session_minutes": risk.remaining_session_minutes,
+                    "stop_atr_points": risk.stop_atr_points, "stop_atr_source": risk.stop_atr_source,
+                    "atr_1m": indicators.atr, "atr_5m": indicators.atr_5m,
+                    "atr_buffer_multiple": dynamic_atr_buffer_multiple(indicators),
                     "invalidation": f"Invalidate if NIFTY crosses {risk.stop_loss:.2f} against the position or the supporting/defending OI structure flips materially; this is a signal plan, not an order.",
                     "vwap": indicators.vwap, "adx": indicators.adx, "rsi": indicators.rsi,
                     "pcr": oi.pcr, "tactical_coi_source": oi.tactical_source,
@@ -6310,6 +6736,60 @@ class PredictiveScanner:
                     self.config.reentry_cooldown_minutes,
                 )
                 fingerprint = str(registration.get("signal_fingerprint", fingerprint))
+                # Reconcile the first scan's report and SIGNAL_READY email with the tracker
+                # just registered. The earlier active-monitor pass happens before selection,
+                # so a newly created tracker would otherwise be missing from active regime
+                # telemetry and its first email would incorrectly show no context assessment.
+                registered_tracker = next((item for item in reversed(state.get("recommendation_trackers", []))
+                                            if isinstance(item, dict)
+                                            and str(item.get("signal_fingerprint", "")) == fingerprint
+                                            and str(item.get("status", "")).upper() == "TRACKING"), None)
+                if registered_tracker is not None:
+                    active_assessment = _assess_active_signal_regime(
+                        registered_tracker, scenario, indicators, oi, future_regime,
+                        self.config, current, None,
+                    )
+                    initial_monitor_note = (
+                        "Signal registered on this scan; completed-candle continuity and level crossings "
+                        "will be assessed on the next monitoring scan. This first email is not a claim "
+                        "that post-selection target/stop chronology has been monitored."
+                    )
+                    registered_tracker["monitoring_data_status"] = "AWAITING_FIRST_MONITOR_SCAN"
+                    registered_tracker.setdefault("target_event_integrity", "UNASSESSED")
+                    registered_tracker["monitoring_data_note"] = initial_monitor_note
+                    signal_payload["active_regime_assessment"] = active_assessment
+                    signal_payload["monitoring_data_status"] = "AWAITING_FIRST_MONITOR_SCAN"
+                    signal_payload["target_event_integrity"] = registered_tracker["target_event_integrity"]
+                    signal_payload["monitoring_gap_minutes"] = None
+                    signal_payload["monitoring_data_note"] = initial_monitor_note
+
+                    regime_report = report.get("active_regime_reassessment")
+                    if isinstance(regime_report, dict):
+                        signal_row = {
+                            "signal_fingerprint": fingerprint,
+                            "direction": registered_tracker.get("direction", scenario.direction),
+                            "status": registered_tracker.get("status", "TRACKING"),
+                            "monitoring_data_status": registered_tracker["monitoring_data_status"],
+                            "target_event_integrity": registered_tracker["target_event_integrity"],
+                            "target_event_integrity_since": registered_tracker.get("target_event_integrity_since"),
+                            "monitoring_gap_minutes": None,
+                            "monitoring_data_note": initial_monitor_note,
+                            "regime_assessment": active_assessment,
+                        }
+                        rows = [row for row in regime_report.get("signals", [])
+                                if isinstance(row, dict) and str(row.get("signal_fingerprint", "")) != fingerprint]
+                        regime_report["signals"] = rows + [signal_row]
+                        regime_report["active_signal_count"] = sum(
+                            1 for row in regime_report["signals"]
+                            if str(row.get("status", "")).upper() == "TRACKING"
+                        )
+                    guard_report = report.get("active_recommendation_guard")
+                    if isinstance(guard_report, dict):
+                        guard_report["active_tracker_count"] = sum(
+                            1 for item in state.get("recommendation_trackers", [])
+                            if isinstance(item, dict) and str(item.get("status", "")).upper() == "TRACKING"
+                        )
+                        guard_report["active_signal_registered_this_scan"] = True
                 report["recommendation_tracker"] = registration
                 report["recommendation_trackers"] = [
                     {"status": item.get("status"), "direction": item.get("direction"),
@@ -6325,7 +6805,7 @@ class PredictiveScanner:
                 enqueue_email_alert(
                     state, now=current, event_type="SIGNAL_READY",
                     dedupe_key=f"{current.date().isoformat()}|SIGNAL_READY|{fingerprint}",
-                    subject=f"NIFTY V72 STRIKE SELECTED — {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
+                    subject=f"NIFTY V74 STRIKE SELECTED — {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
                     payload={**signal_payload, "alert_type": "TRADE_READY_RECOMMENDATION",
                              "execution_mode": "VIRTUAL_SIGNAL_ONLY_NO_ORDER_PLACEMENT",
                              "readiness": readiness,
@@ -6343,7 +6823,7 @@ class PredictiveScanner:
                     )
                 else:
                     report["market_state"] = scenario.state
-                # No watch/blocked-candidate emails are permitted in V72. Blockers remain
+                # No watch/blocked-candidate emails are permitted in V74. Blockers remain
                 # in the JSON/console diagnostics; email is reserved for confirmed selection
                 # and post-selection failure events only.
                 LOGGER.info("NO EMAIL: signal not trade-ready; market_state=%s blockers=%s",
@@ -6433,7 +6913,7 @@ def scan_exit_code(report: Mapping[str, Any]) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V72")
+    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V74")
     parser.add_argument("--loop", action="store_true", help="Scan approximately once per minute during market hours.")
     parser.add_argument("--interval", type=float, default=60.0, help="Loop interval seconds (minimum 15).")
     args = parser.parse_args(argv)
@@ -6455,7 +6935,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enqueue_email_alert(
                 state, now=current, event_type="CONFIGURATION_ERROR",
                 dedupe_key=f"{current.date().isoformat()}|CONFIGURATION_ERROR|{type(exc).__name__}",
-                subject="NIFTY V72 scanner configuration error",
+                subject="NIFTY V74 scanner configuration error",
                 payload={"timestamp": current.isoformat(), "scanner_version": SCANNER_VERSION,
                          "error_type": type(exc).__name__, "error": str(exc),
                          "note": "The scan was stopped before market analysis; no recommendation or order was produced."},
@@ -6479,7 +6959,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_report(report)
         return scan_exit_code(report)
     interval = max(15.0, float(args.interval))
-    LOGGER.info("V72 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
+    LOGGER.info("V74 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
     while True:
         cycle_start = time_module.monotonic()
         report = scanner.scan_once()
