@@ -1,0 +1,28 @@
+name: Cleanup Workflow Runs
+
+on:
+  workflow_dispatch: # This enables the manual "Run workflow" button in the Actions tab
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # Required for the token to have deletion rights
+      contents: read
+      
+    steps:
+      - name: Delete successful workflow runs older than 1 day
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 1
+          keep_minimum_runs: 1
+
+      - name: Delete ALL failed workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          delete_run_by_conclusion_pattern: "failure"
