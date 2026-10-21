@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""NIFTY 50 Predictive Market Scanner & Strike Router — V74.
+"""NIFTY 50 Predictive Market Scanner & Strike Router — V77.
 
-Clean, modular redesign of the supplied V52–V58 scanner lineage. This version has
-one market-scenario engine, one strike router, one structural risk engine, one state
-store, and one reporting path; it does not place, modify, or cancel orders.
+Production hardening of the supplied V74 scanner using the 21 Oct 2026 scan audit. The
+scanner keeps one scenario engine, one strike router, one structural risk engine, one
+state store, and one reporting path; it does not place, modify, or cancel orders.
 
 Core behavior
 -------------
@@ -12,7 +12,8 @@ Core behavior
   not wait for five completed 3-minute bars.
 * Uses Upstox V2 option-chain/contract APIs plus V3 live quotes and candles. The V2
   interval-in-days Change-OI endpoint is a validated wall/session fallback, never 1m velocity.
-* Detects 1m support bounces and resistance rejections at intact structural OI walls.
+* Detects repeated price/OI support bounces and resistance rejections, plus confirmed two-close boundary breaks.
+* Waits at repeatedly tested boundaries when price is compressing or evidence conflicts; generic 3-bar continuation alone cannot select a strike.
 * Monitors complete 1m OHLC ranges for virtual T1/T2/SL crossings, with stop-first
   handling when a bar's internal order cannot be known from OHLC alone.
 * Guards ordinary opposite-direction flips using distinct 1m evidence, while strong
@@ -28,11 +29,9 @@ Core behavior
   VWAP/COI/progress has deteriorated; the warning is not an exit or invalidation.
 * Gives valid tactical OI velocity from the nearest 1m/3m/5m snapshot interval priority over session
   aggregate bias. It never invents tactical velocity when no historical snapshot exists.
-* Finds weakening/building OI walls and can rank a provisional strike before market
-  confirmation. A narrowly qualified pre-breakout route can issue an early recommendation
-  only when a high-confidence compression setup, weakening nearby wall, exact-wall OI unwind,
-  aligned tactical flow, VWAP/momentum, and non-conflicting futures all agree. Normal breakout
-  routing still requires completed 1m structure. Every route retains the final quote, premium-VWAP,
+* Uses weakening/building OI walls for context and provisional diagnostics, but never selects
+  before a repeated boundary rejection/bounce or a tested boundary break confirmed by two completed
+  1m closes. Every route retains the final quote, premium-VWAP,
   spread, delta, score, structural risk, directional regime, and timing gates.
 * Implements morning Gap & Go, Gamma Squeeze / Pre-Breakout Compression, Exhaustion
   Reversal, Continuation, and a hard Sideways/Pinning veto.
@@ -40,14 +39,13 @@ Core behavior
   a confirmed high-momentum afternoon squeeze. Option quality score is exactly
   40% flow + 30% premium-VWAP lift + 30% tactical COI acceleration.
 * Derives index targets/stops from intact opposing OI walls and completed 5-minute pivots.
-  A weakening opposing wall is skipped for T1; T1/T2 are filtered by a conservative,
-  remaining-time/volatility reachability ceiling. The initial stop uses completed 5-minute
-  ATR when available (explicitly labelled 1-minute ATR fallback otherwise), and T1 must
-  offer at least 1:1 index-point reward/risk by default. After T1, the virtual tracker
-  ratchets its stop to current structural support/resistance; this is not an actual position.
-* Selection and level-event emails show the selected contract, NIFTY index-point levels,
-  structural sources, target/stop distances, reward/risk, crossing time when available, and
-  option-premium change separately. Index levels are not option-premium exit prices.
+  A weakening opposing wall is skipped for T1; targets are filtered by a conservative,
+  remaining-time/volatility reachability ceiling. Every active signal reassesses T1/T2 and
+  favorable-only SL after each distinct completed 3-minute bar when multi-factor context is
+  sufficiently aligned. Level changes apply prospectively; the just-completed OHLC interval
+  is always evaluated against the levels that were active during it.
+* Selection and milestone emails contain only the contract/strike, signal spot, confidence, IST
+  time, and NIFTY T1/T2/SL levels.
 * Uses an atomic JSON store with trading-date resets and no sticky directional latch.
 * Allows qualified directional reversal watches to rank provisional same-side strikes even when the resolved market direction remains neutral; provisional ranking never authorizes readiness, tracker creation, or email. Uses liquidity-adjusted spread ceilings while preserving freshness/delta/score/risk gates.
 * Separates provisional strike ranking from final recommendation. Only a final selected-strike
@@ -57,7 +55,7 @@ Core behavior
   PREDICTIVE_SELECTION_MIN_CONFIDENCE is independently configurable (70–90, default 74).
 * T2 is optional: a valid T1 and structural stop are sufficient for readiness; missing T2 is
   reported as unavailable rather than blocking a valid structural setup.
-* Persists active state in market_state.json and appends one full JSONL audit record per run under AUDIT_DIR (default ./audit). The daily log includes the normalized full option chain, quote snapshots, OI-by-strike analysis, recent candles, candidate ranks/vetoes, selection and monitoring outcomes. Console output remains compact.
+* Persists compact active state in market_state.json and appends one compact JSONL audit record per run under AUDIT_DIR (default ./audit). The daily log preserves indicator/structure/OI evidence, near-spot strike rows, selected/leading candidates, quote health, recent candle tails, gates, and event chronology. Full-chain persistence is opt-in via AUDIT_DETAIL_LEVEL=full for short-lived diagnosis; console output remains compact.
 
 Run:
     python market_scanner.py
@@ -85,7 +83,7 @@ API sources checked during design (official Upstox docs):
 Important measurement limitation: the option-chain endpoint returns OI snapshots, not a
 continuous OI time series. Intraday COI velocity is therefore computed from this scanner's
 own timestamped snapshots. For 09:16 velocity availability, schedule the first scan at
-09:15. If a process starts later with no same-session baseline, V74 reports COI as
+09:15. If a process starts later with no same-session baseline, V77 reports COI as
 unavailable/session-proxy and will not describe the proxy as tactical velocity.
 """
 from __future__ import annotations
@@ -122,7 +120,7 @@ import requests
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com"
-SCANNER_VERSION = "2026-10-20-V74-ACTIVE-REGIME-GAPSAFE-MONITOR"
+SCANNER_VERSION = "2026-10-21-V77-DYNAMIC-STRUCTURAL-TARGETS-COMPACT-AUDIT"
 MARKET_START = time(9, 15)
 ENTRY_START = time(9, 16)
 MORNING_END = time(10, 30)
@@ -143,7 +141,7 @@ EMAIL_ALLOWED_EVENT_TYPES = frozenset({
 DEFAULT_NIFTY_KEY = "NSE_INDEX|Nifty 50"
 DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-LOGGER = logging.getLogger("nifty_v74")
+LOGGER = logging.getLogger("nifty_v77")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(message)s",
                     stream=sys.stderr)
@@ -729,7 +727,7 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
             minute_key = str(item["timestamp"])[:16]
             collected.setdefault(minute_key, item)
     snapshots = sorted(collected.values(), key=lambda item: str(item.get("timestamp", "")))
-    state["chain_snapshots"] = snapshots[-120:]
+    state["chain_snapshots"] = snapshots[-12:]
 
     baseline = _normalize_legacy_chain_snapshot(state.get("session_oi_baseline"))
     if baseline is not None and str(baseline.get("timestamp", ""))[:10] == today_iso:
@@ -753,10 +751,23 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
         state["session_oi_baseline_source"] = "MIGRATED_EXISTING_SAME_SESSION_BASELINE"
     else:
         state.setdefault("session_oi_baseline_source", "UNAVAILABLE")
-    state["schema_version"] = 74
+    # Persist only enough history to warm indicators and explain recent decisions. The
+    # original 2,250-row seed and unbounded legacy histories need not remain in GitHub state:
+    # 900 1m bars still cover roughly two-to-three regular sessions and >60 5m equivalents.
+    seed = state.get("historical_seed")
+    if isinstance(seed, dict) and isinstance(seed.get("candles"), list):
+        seed["candles"] = seed["candles"][-900:]
+        state["historical_seed"] = seed
+    if isinstance(state.get("scan_history"), list):
+        state["scan_history"] = state["scan_history"][-60:]
+    if isinstance(state.get("market_history"), list):
+        state["market_history"] = state["market_history"][-120:]
+    if isinstance(state.get("futures_snapshots"), list):
+        state["futures_snapshots"] = state["futures_snapshots"][-32:]
+    state["schema_version"] = 77
     state["scanner_version"] = SCANNER_VERSION
     state["session_date"] = today_iso
-    # V74 diagnostics are additive and bounded; preserve all valid active trackers.
+    # V77 diagnostics are additive and bounded; preserve all valid active trackers.
     tracker_rows = state.get("recommendation_trackers")
     if isinstance(tracker_rows, list):
         for tracker in tracker_rows:
@@ -767,6 +778,8 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
                 tracker["regime_history"] = tracker["regime_history"][-12:]
                 tracker.setdefault("monitoring_data_status", "NOT_YET_ASSESSED")
                 tracker.setdefault("target_event_integrity", "UNASSESSED")
+                if tracker.get("confidence_pct") is None:
+                    tracker["confidence_pct"] = tracker.get("latest_signal_confidence_pct", tracker.get("confidence"))
     legacy_tracker = state.get("recommendation_tracker")
     if isinstance(legacy_tracker, dict):
         legacy_tracker.setdefault("regime_history", [])
@@ -775,6 +788,8 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
         legacy_tracker["regime_history"] = legacy_tracker["regime_history"][-12:]
         legacy_tracker.setdefault("monitoring_data_status", "NOT_YET_ASSESSED")
         legacy_tracker.setdefault("target_event_integrity", "UNASSESSED")
+        if legacy_tracker.get("confidence_pct") is None:
+            legacy_tracker["confidence_pct"] = legacy_tracker.get("latest_signal_confidence_pct", legacy_tracker.get("confidence"))
     # Remove legacy directional latches so V74 classifies live structure afresh.
     for key in ("persistent_direction", "continuation_phase", "continuation_count", "continuation_last_bar"):
         state.pop(key, None)
@@ -815,12 +830,17 @@ class StateStore:
                         and str(alert.get("status", "PENDING")).upper() == "PENDING"
                         and str(alert.get("event_type", "")).upper() == "VIRTUAL_RECOMMENDATION_INVALIDATED_BY_STRUCTURE"):
                     alert["event_type"] = "MARKET_REVERSAL_CONFIRMED"
-                    alert["subject"] = "NIFTY V74 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
+                    alert["subject"] = "NIFTY V77 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
                     payload = alert.get("payload") if isinstance(alert.get("payload"), dict) else {}
                     payload.setdefault("invalidated_direction", payload.get("direction"))
                     payload.setdefault("replacement_direction", "Not available in legacy alert")
                     payload.setdefault("message", "An opposite structure was confirmed; the prior virtual recommendation was invalidated. No order was placed.")
                     alert["payload"] = payload
+        raw_outbox = self.state.get("alert_outbox")
+        if isinstance(raw_outbox, list):
+            for alert in raw_outbox:
+                if isinstance(alert, dict) and isinstance(alert.get("payload"), Mapping):
+                    alert["payload"] = _compact_email_payload(alert["payload"])
         stored_date = _infer_state_session_date(self.state)
         today_iso = today.isoformat()
         if stored_date != today_iso:
@@ -829,6 +849,7 @@ class StateStore:
             # Unsent notifications must survive a date boundary; market/virtual trackers must not.
             # A failed selection/failure email may survive a date boundary for operator
             # visibility, but old T1/T2 milestones must never be delivered as if current.
+            old_audit_compaction_done = bool(self.state.get("audit_v77_legacy_compaction_done", False))
             old_outbox = [dict(x) for x in self.state.get("alert_outbox", [])
                           if isinstance(x, dict)
                           and str(x.get("status", "PENDING")).upper() == "PENDING"
@@ -836,9 +857,10 @@ class StateStore:
                           and str(x.get("event_type", "")).upper() not in {"T1_REACHED", "T2_REACHED"}] if isinstance(self.state.get("alert_outbox"), list) else []
             old_dedupe = self.state.get("alert_dedupe", {}) if isinstance(self.state.get("alert_dedupe"), dict) else {}
             self.state = {
-                "schema_version": 74,
+                "schema_version": 77,
                 "scanner_version": SCANNER_VERSION,
                 "session_date": today_iso,
+                "audit_v77_legacy_compaction_done": old_audit_compaction_done,
                 "chain_snapshots": [],
                 "session_oi_baseline": None,
                 "session_oi_baseline_source": "UNAVAILABLE",
@@ -859,6 +881,7 @@ class StateStore:
             # Preserve current-session history across version upgrades; normalize older
             # snapshot formats rather than throwing away valid tactical COI baselines.
             _migrate_intraday_state(self.state, today)
+            self.state.setdefault("audit_v77_legacy_compaction_done", False)
             self.state.setdefault("futures_snapshots", [])
             self.state.setdefault("market_history", [])
             self.state.setdefault("historical_seed", {})
@@ -884,7 +907,7 @@ class StateStore:
                 else:
                     trackers.append(dict(primary))
                     primary = trackers[-1]
-        trackers = trackers[-60:]
+        trackers = _compact_persisted_tracker_history(trackers)
         self.state["recommendation_trackers"] = trackers
         if trackers:
             latest = next((item for item in reversed(trackers)
@@ -931,9 +954,9 @@ class StateStore:
                     and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
                 alert["status"] = "SUPPRESSED_POLICY"
                 alert["suppressed_at"] = now_ist().isoformat()
-                alert["last_error"] = "Suppressed by V74: only selected-strike and discrete milestone/failure emails are permitted."
+                alert["last_error"] = "Suppressed by V77: only selected-strike and discrete milestone/failure emails are permitted."
                 alert.pop("next_attempt_at", None)
-        # V74 no longer performs holiday-calendar lookups; discard a legacy persisted cache.
+        # V77 no longer performs holiday-calendar lookups; discard a legacy persisted cache.
         self.state.pop("nse_holiday_calendar", None)
         # Remove obsolete direction latches. Every decision is recomputed from current structure.
         self.state.pop("persistent_direction", None)
@@ -942,7 +965,7 @@ class StateStore:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(json_safe(self.state), indent=2, ensure_ascii=False, allow_nan=False)
+        payload = json.dumps(json_safe(self.state), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         fd, temp_path = tempfile.mkstemp(prefix=self.path.name + ".", suffix=".tmp", dir=str(self.path.parent))
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -970,7 +993,7 @@ class StateStore:
             if ts and ts.date() == now.date() and cutoff <= ts <= now + timedelta(seconds=5):
                 valid.append(row)
         valid.sort(key=lambda r: str(r.get("timestamp", "")))
-        self.state["chain_snapshots"] = valid[-32:]
+        self.state["chain_snapshots"] = valid[-12:]
         return valid
 
     def append_chain_snapshot(self, snapshot: dict[str, Any], now: datetime) -> None:
@@ -981,7 +1004,7 @@ class StateStore:
         samples.sort(key=lambda r: str(r.get("timestamp", "")))
         cutoff = now - timedelta(minutes=20)
         samples = [x for x in samples if (parse_timestamp(x.get("timestamp")) or datetime.min.replace(tzinfo=IST)) >= cutoff]
-        self.state["chain_snapshots"] = samples[-32:]
+        self.state["chain_snapshots"] = samples[-12:]
 
 
 # =============================================================================
@@ -1705,6 +1728,10 @@ def load_historical_seed(client: UpstoxClient, state: dict[str, Any], key: str, 
     if isinstance(cache, dict) and cache.get("date") == today.isoformat() and cache.get("instrument_key") == key:
         try:
             rows = cache.get("candles", [])
+            if isinstance(rows, list) and len(rows) > 900:
+                rows = rows[-900:]
+                cache["candles"] = rows
+                state["historical_seed"] = cache
             return parse_candles(rows)
         except Exception as exc:
             LOGGER.warning("HISTORICAL SEED CACHE INVALID; refetching: %s", exc)
@@ -1717,7 +1744,7 @@ def load_historical_seed(client: UpstoxClient, state: dict[str, Any], key: str, 
             ts = parse_timestamp(row.get("timestamp"))
             if ts:
                 rows_out.append([ts.isoformat(), row.get("open"), row.get("high"), row.get("low"), row.get("close"), row.get("volume", 0), row.get("oi")])
-        state["historical_seed"] = {"date": today.isoformat(), "instrument_key": key, "candles": rows_out[-4000:]}
+        state["historical_seed"] = {"date": today.isoformat(), "instrument_key": key, "candles": rows_out[-900:]}
         LOGGER.info("HISTORICAL INDICATOR SEED: loaded %d prior-session 1m bars.", len(frame))
         return frame
     except Exception as exc:
@@ -2454,7 +2481,20 @@ def detect_price_structure_candidate(frame: pd.DataFrame, indicators: IndicatorS
 def resolve_v68_direction(primary: Scenario, price_candidate: Optional[Scenario],
                           reversal_watch: Optional[Scenario], indicators: IndicatorSet,
                           oi: OIAnalysis, future_regime: str) -> Scenario:
-    """Resolve scenario disagreement without latching a stale bias or promoting a watch alone."""
+    """Resolve scenario conflicts with confirmed tested boundaries ahead of generic continuation."""
+    protected_states = {
+        "STRUCTURAL_SUPPORT_BOUNCE", "STRUCTURAL_RESISTANCE_REJECTION",
+        "STRUCTURAL_BOUNDARY_COMPRESSION", "CONFIRMED_BULLISH_BREAKOUT",
+        "CONFIRMED_BEARISH_BREAKDOWN",
+    }
+    if primary.state in protected_states:
+        # Tested reactions, boundary waits, and two-close boundary breaks are authoritative.
+        # A generic local 3-bar continuation cannot replace the structural classification.
+        return primary
+    if primary.features.get("setup_route") in {
+        "STRUCTURAL_LEVEL_INTERACTION", "STRUCTURAL_BOUNDARY_WAIT", "TESTED_STRUCTURAL_BOUNDARY_BREAK"
+    }:
+        return primary
     if finite(indicators.adx) and indicators.adx < 20.0 and oi.both_sides_building and price_candidate is None:
         return Scenario("SIDEWAYS_CHOP", "NEUTRAL", 0.0,
             "Low ADX and two-sided OI build indicate pinning; directional entries remain vetoed.",
@@ -2483,7 +2523,6 @@ def resolve_v68_direction(primary: Scenario, price_candidate: Optional[Scenario]
                 "watch_confidence_pct": reversal_watch.confidence, "price_structure_confirmed": False,
                 "oi_tactical_available": oi.tactical_available})
     return primary
-
 
 def confirm_wall_breakout_scenario(
     scenario: Scenario, frame: pd.DataFrame, indicators: IndicatorSet, oi: OIAnalysis,
@@ -2569,253 +2608,320 @@ def confirm_wall_breakout_scenario(
                     scenario.wall_level, scenario.wall_state, True, None, features)
 
 
+def _structure_test_count(bars: pd.DataFrame, level: float, side: str, tolerance: float,
+                          breakout_buffer: float = 0.0) -> int:
+    """Count separate test-and-retreat episodes, not candles within one continuous touch cluster.
+
+    A second test is counted only after price has moved materially away from the boundary.
+    This prevents a flat grind touching the same level for several candles from being treated
+    as several independent rejections. A close accepted beyond the boundary is not a rejection.
+    """
+    if bars is None or bars.empty or not finite(level):
+        return 0
+    side = str(side or "").upper()
+    if side not in {"RESISTANCE", "SUPPORT"}:
+        return 0
+    tested = 0
+    in_touch_cluster = False
+    separation = max(1.5 * max(0.0, tolerance), max(0.5 * max(0.0, breakout_buffer), 1.0))
+    for _, bar in bars.iterrows():
+        high = safe_float(bar.get("high"), float("nan"))
+        low = safe_float(bar.get("low"), float("nan"))
+        close = safe_float(bar.get("close"), float("nan"))
+        if not all(finite(v) for v in (high, low, close)):
+            continue
+        if side == "RESISTANCE":
+            hit = high >= level - tolerance and high <= level + max(2.0 * tolerance, breakout_buffer)
+            accepted = close > level + breakout_buffer
+            moved_away = close <= level - separation and high < level - tolerance
+        else:
+            hit = low <= level + tolerance and low >= level - max(2.0 * tolerance, breakout_buffer)
+            accepted = close < level - breakout_buffer
+            moved_away = close >= level + separation and low > level + tolerance
+        if accepted:
+            in_touch_cluster = False
+            continue
+        if hit and not in_touch_cluster:
+            tested += 1
+            in_touch_cluster = True
+        elif in_touch_cluster and moved_away:
+            in_touch_cluster = False
+    return tested
+
+
+def _merge_structure_levels(raw: Sequence[tuple[float, str, str]], tolerance: float) -> list[tuple[float, str, str]]:
+    """Deduplicate clustered price/OI levels; prefer an observed OI wall when levels overlap."""
+    candidates = [(float(level), str(source), str(state)) for level, source, state in raw if finite(level) and level > 0]
+    candidates.sort(key=lambda item: (0 if "OI_WALL" in item[1] else 1, item[0]))
+    merged: list[tuple[float, str, str]] = []
+    for level, source, state in candidates:
+        existing = next((idx for idx, (known, _, _) in enumerate(merged) if abs(known - level) <= tolerance), None)
+        if existing is None:
+            merged.append((level, source, state))
+            continue
+        known, known_source, known_state = merged[existing]
+        if "OI_WALL" in source and "OI_WALL" not in known_source:
+            merged[existing] = (level, source, state)
+        elif "OI_WALL" not in known_source and "5M_PIVOT" in source:
+            merged[existing] = (level, source, state)
+        else:
+            merged[existing] = (known, known_source, known_state)
+    return merged
+
+
 def detect_structural_wall_reaction(
     frame: pd.DataFrame, indicators: IndicatorSet, oi: OIAnalysis,
-    now: datetime, config: Config,
+    now: datetime, config: Config, future_regime: str = "UNKNOWN",
 ) -> Optional[Scenario]:
-    """Detect a completed 1m bounce/rejection at an intact OI wall without waiting for a 3m close.
+    """Classify a tested support/resistance as reaction, confirmed breach, or wait-only compression.
 
-    Wall reaction may bypass a low-ADX *classification* only when the global
-    sideways/pinning hard veto is not active. Without valid tactical COI it is a
-    watch, not an executable setup.
+    Levels come from intact OI walls, completed 5m pivots, confirmed recent 1m pivots, and
+    session extremes. Rejection/bounce requires at least two separate completed-bar tests,
+    a completed price turn, independent directional evidence, and no strong flow/futures veto.
+    Breakout/breakdown requires two completed closes beyond a previously tested boundary.
     """
-    bars = completed_one_minute_candles(frame, now).tail(5)
-    if len(bars) < 2 or not finite(indicators.atr) or indicators.atr <= 0:
+    bars = completed_one_minute_candles(frame, now)
+    if len(bars) < 7 or not finite(indicators.atr) or indicators.atr <= 0:
         return None
     if not finite(indicators.spot) or indicators.spot <= 0:
         return None
+
     step = infer_strike_step(list(oi.rows))
-    touch_tolerance = min(max(0.06 * indicators.atr, 0.08 * step, 1.0), 0.15 * step)
-    displacement = max(0.05 * indicators.atr, 1.0)
-    recent = bars.tail(3)
-    previous, last = bars.iloc[-2], bars.iloc[-1]
-    close = safe_float(last.get("close"), float("nan"))
-    opn = safe_float(last.get("open"), float("nan"))
-    high = safe_float(last.get("high"), float("nan"))
-    low = safe_float(last.get("low"), float("nan"))
-    prev_close = safe_float(previous.get("close"), float("nan"))
-    if not all(finite(v) for v in (close, opn, high, low, prev_close)):
+    tolerance = min(max(0.10 * indicators.atr, 0.12 * step, 2.0), 0.22 * step)
+    displacement = max(0.10 * indicators.atr, 2.0)
+    buffer = max(0.08 * indicators.atr, 0.08 * step, 2.0)
+    recent = bars.tail(24).copy().reset_index(drop=True)
+    if len(recent) < 7:
+        return None
+    for col in ("open", "high", "low", "close"):
+        recent[col] = pd.to_numeric(recent[col], errors="coerce")
+    recent = recent.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    if len(recent) < 7:
         return None
 
-    reactions: list[Scenario] = []
-    for wall in oi.walls_support:
-        if wall.state not in {"BUILDING", "STABLE"} or wall.strike >= indicators.spot + touch_tolerance:
-            continue
-        if indicators.spot - wall.strike > max(1.5 * step, 1.5 * indicators.atr):
-            continue
-        recent_test_low = safe_float(recent["low"].min())
-        tested = finite(recent_test_low) and wall.strike - touch_tolerance <= recent_test_low <= wall.strike + touch_tolerance
-        held = close >= wall.strike + displacement and indicators.spot >= wall.strike
-        price_turn = close > opn or close > prev_close
-        flow_ok = oi.tactical_available and (
-            (finite(oi.put_coi_pct) and oi.put_coi_pct >= config.oi_velocity_trigger)
-            or (finite(oi.call_coi_pct) and oi.call_coi_pct <= -config.oi_velocity_trigger)
-        )
-        vwap_ok = (finite(indicators.vwap) and indicators.spot >= indicators.vwap) or (
-            finite(indicators.vwap) and finite(indicators.vwap_slope) and indicators.vwap_slope > 0
-            and indicators.spot >= indicators.vwap - 0.15 * indicators.atr
-        )
-        if tested and held and price_turn:
-            confidence = min(89.0, 61.0 + (8.0 if wall.state == "BUILDING" else 4.0)
-                             + (8.0 if flow_ok else 0.0) + (5.0 if vwap_ok else 0.0))
-            executable = bool(flow_ok and vwap_ok)
-            reactions.append(Scenario(
-                "STRUCTURAL_SUPPORT_BOUNCE", "BULLISH", confidence,
-                f"1m support bounce at intact Put-OI wall {wall.strike:.0f}: recent low tested within {touch_tolerance:.2f} points and latest completed 1m close held {close:.2f}; wall={wall.state}; tactical flow={'confirmed' if flow_ok else 'unavailable/uncorroborated'}; VWAP alignment={'passed' if vwap_ok else 'watch only'}.",
-                wall.strike, wall.state, executable, None,
-                {"reaction": "SUPPORT_BOUNCE", "wall_strike": wall.strike, "wall_state": wall.state,
-                 "touch_tolerance": touch_tolerance, "wall_tested": bool(tested),
-                 "wall_hold_confirmed": bool(held), "price_turn_confirmed": bool(price_turn),
-                 "completed_1m_close": close, "tactical_flow_confirmed": bool(flow_ok),
-                 "vwap_alignment": bool(vwap_ok), "adx": indicators.adx},
-            ))
-            break
-
+    resistance_raw: list[tuple[float, str, str]] = []
+    support_raw: list[tuple[float, str, str]] = []
     for wall in oi.walls_resistance:
-        if wall.state not in {"BUILDING", "STABLE"} or wall.strike <= indicators.spot - touch_tolerance:
-            continue
-        if wall.strike - indicators.spot > max(1.5 * step, 1.5 * indicators.atr):
-            continue
-        recent_test_high = safe_float(recent["high"].max())
-        tested = finite(recent_test_high) and wall.strike - touch_tolerance <= recent_test_high <= wall.strike + touch_tolerance
-        rejected = close <= wall.strike - displacement and indicators.spot <= wall.strike
-        price_turn = close < opn or close < prev_close
-        flow_ok = oi.tactical_available and (
-            (finite(oi.call_coi_pct) and oi.call_coi_pct >= config.oi_velocity_trigger)
-            or (finite(oi.put_coi_pct) and oi.put_coi_pct <= -config.oi_velocity_trigger)
-        )
-        vwap_ok = (finite(indicators.vwap) and indicators.spot <= indicators.vwap) or (
-            finite(indicators.vwap) and finite(indicators.vwap_slope) and indicators.vwap_slope < 0
-            and indicators.spot <= indicators.vwap + 0.15 * indicators.atr
-        )
-        if tested and rejected and price_turn:
-            confidence = min(89.0, 61.0 + (8.0 if wall.state == "BUILDING" else 4.0)
-                             + (8.0 if flow_ok else 0.0) + (5.0 if vwap_ok else 0.0))
-            executable = bool(flow_ok and vwap_ok)
-            reactions.append(Scenario(
-                "STRUCTURAL_RESISTANCE_REJECTION", "BEARISH", confidence,
-                f"1m resistance rejection at intact Call-OI wall {wall.strike:.0f}: recent high tested within {touch_tolerance:.2f} points and latest completed 1m close rejected to {close:.2f}; wall={wall.state}; tactical flow={'confirmed' if flow_ok else 'unavailable/uncorroborated'}; VWAP alignment={'passed' if vwap_ok else 'watch only'}.",
-                wall.strike, wall.state, executable, None,
-                {"reaction": "RESISTANCE_REJECTION", "wall_strike": wall.strike, "wall_state": wall.state,
-                 "touch_tolerance": touch_tolerance, "wall_tested": bool(tested),
-                 "wall_rejection_confirmed": bool(rejected), "price_turn_confirmed": bool(price_turn),
-                 "completed_1m_close": close, "tactical_flow_confirmed": bool(flow_ok),
-                 "vwap_alignment": bool(vwap_ok), "adx": indicators.adx},
-            ))
-            break
-    if not reactions:
-        return None
-    return max(reactions, key=lambda item: (item.confidence, item.executable_candidate))
+        if wall.state in {"BUILDING", "STABLE", "WEAKENING"}:
+            resistance_raw.append((wall.strike, "CALL_OI_WALL", wall.state))
+    for wall in oi.walls_support:
+        if wall.state in {"BUILDING", "STABLE", "WEAKENING"}:
+            support_raw.append((wall.strike, "PUT_OI_WALL", wall.state))
 
+    if finite(indicators.swing_high_5m):
+        resistance_raw.append((indicators.swing_high_5m, "CONFIRMED_5M_PIVOT", "PRICE_ACTION"))
+    if finite(indicators.swing_low_5m):
+        support_raw.append((indicators.swing_low_5m, "CONFIRMED_5M_PIVOT", "PRICE_ACTION"))
+    if finite(indicators.swing_high):
+        resistance_raw.append((indicators.swing_high, "RECENT_1M_SWING_HIGH", "PRICE_ACTION"))
+    if finite(indicators.swing_low):
+        support_raw.append((indicators.swing_low, "RECENT_1M_SWING_LOW", "PRICE_ACTION"))
+    if finite(indicators.session_high):
+        resistance_raw.append((indicators.session_high, "SESSION_HIGH", "PRICE_ACTION"))
+    if finite(indicators.session_low):
+        support_raw.append((indicators.session_low, "SESSION_LOW", "PRICE_ACTION"))
+
+    # Add confirmed local extrema: two bars on each side confirm the pivot, preventing look-ahead.
+    highs = recent["high"].astype(float).tolist()
+    lows = recent["low"].astype(float).tolist()
+    for idx in range(2, len(recent) - 2):
+        if highs[idx] >= max(highs[idx - 2:idx]) and highs[idx] >= max(highs[idx + 1:idx + 3]):
+            resistance_raw.append((highs[idx], "CONFIRMED_1M_PIVOT", "PRICE_ACTION"))
+        if lows[idx] <= min(lows[idx - 2:idx]) and lows[idx] <= min(lows[idx + 1:idx + 3]):
+            support_raw.append((lows[idx], "CONFIRMED_1M_PIVOT", "PRICE_ACTION"))
+
+    resistance_levels = _merge_structure_levels(resistance_raw, tolerance)
+    support_levels = _merge_structure_levels(support_raw, tolerance)
+    # Keep reaction zones local: wide strike-step proximity was repeatedly tagging stale pivots.
+    proximity = max(0.75 * step, 1.5 * indicators.atr)
+    tactical = bool(oi.tactical_available and finite(oi.call_coi_pct) and finite(oi.put_coi_pct))
+    trigger = max(config.oi_velocity_trigger, 0.0001)
+
+    # Independent market-context confirmations; OI is corroboration, not a standalone direction call.
+    vwap_bull = finite(indicators.vwap) and indicators.spot >= indicators.vwap
+    vwap_bear = finite(indicators.vwap) and indicators.spot <= indicators.vwap
+    momentum_bull = ((finite(indicators.momentum_1m_pct) and indicators.momentum_1m_pct > 0.0)
+                     and (not finite(indicators.momentum_3m_pct) or indicators.momentum_3m_pct >= -0.00010))
+    momentum_bear = ((finite(indicators.momentum_1m_pct) and indicators.momentum_1m_pct < 0.0)
+                     and (not finite(indicators.momentum_3m_pct) or indicators.momentum_3m_pct <= 0.00010))
+    di_bull = (finite(indicators.adx) and indicators.adx >= 18.0 and finite(indicators.plus_di)
+               and finite(indicators.minus_di) and indicators.plus_di > indicators.minus_di + 1.0)
+    di_bear = (finite(indicators.adx) and indicators.adx >= 18.0 and finite(indicators.plus_di)
+               and finite(indicators.minus_di) and indicators.minus_di > indicators.plus_di + 1.0)
+    flow_bull = tactical and ((oi.put_coi_pct >= trigger) or (oi.call_coi_pct <= -trigger))
+    flow_bear = tactical and ((oi.call_coi_pct >= trigger) or (oi.put_coi_pct <= -trigger))
+    flow_bull_conflict = tactical and oi.put_coi_pct <= -2.0 * trigger and oi.call_coi_pct >= trigger
+    flow_bear_conflict = tactical and oi.call_coi_pct <= -2.0 * trigger and oi.put_coi_pct >= trigger
+
+    latest = recent.iloc[-1]
+    previous = recent.iloc[-2]
+    latest_close = safe_float(latest["close"])
+    latest_open = safe_float(latest["open"])
+    previous_close = safe_float(previous["close"])
+    last_two = recent.tail(2)
+    last_two_closes = pd.to_numeric(last_two["close"], errors="coerce").tolist()
+    recent_touch_window = recent.tail(14)
+    pre_break_window = recent.iloc[:-2].tail(14)
+
+    # 1) Confirm structural breach first; a breakout after repeated tests outranks a fading-wall watch.
+    for side, levels in (("RESISTANCE", resistance_levels), ("SUPPORT", support_levels)):
+        for level, source, wall_state in levels:
+            distance = abs(indicators.spot - level)
+            if distance > max(4.0 * indicators.atr, 3.0 * step):
+                continue
+            prior_tests = _structure_test_count(pre_break_window, level, side, tolerance, buffer)
+            if prior_tests < 2 or len(last_two_closes) != 2 or not all(finite(v) for v in last_two_closes):
+                continue
+            if side == "RESISTANCE":
+                crossed = all(v >= level + buffer for v in last_two_closes) and indicators.spot >= level + buffer
+                flow_ok, flow_conflict = flow_bull, flow_bear_conflict
+                aligned = vwap_bull and momentum_bull and (di_bull or (finite(indicators.rsi) and indicators.rsi >= 52.0))
+                direction, state = "BULLISH", "CONFIRMED_BULLISH_BREAKOUT"
+            else:
+                crossed = all(v <= level - buffer for v in last_two_closes) and indicators.spot <= level - buffer
+                flow_ok, flow_conflict = flow_bear, flow_bull_conflict
+                aligned = vwap_bear and momentum_bear and (di_bear or (finite(indicators.rsi) and indicators.rsi <= 48.0))
+                direction, state = "BEARISH", "CONFIRMED_BEARISH_BREAKDOWN"
+            if not crossed or not aligned or not flow_ok or flow_conflict or futures_regime_conflicts(direction, future_regime):
+                continue
+            # The final readiness gate rechecks futures, option quote/score, and structural risk.
+            close_stamp = parse_timestamp(last_two.iloc[-1].get("timestamp"))
+            return Scenario(
+                state, direction, 82.0,
+                f"Confirmed {direction.lower()} breach of tested {side.lower()} boundary {level:.2f}: two completed 1m closes and live spot cleared the level; VWAP, momentum, directional DI/RSI, and tactical OI agree.",
+                float(level), wall_state, True, None,
+                {"setup_route": "TESTED_STRUCTURAL_BOUNDARY_BREAK", "structure_confirmed": True,
+                 "awaiting_completed_1m_breakout_close": False,
+                 "structure_source": source, "wall_level": float(level), "wall_state": wall_state,
+                 "repeated_test_count": prior_tests, "completed_1m_close": latest_close,
+                 "completed_bar_timestamp": ist_iso(close_stamp or now),
+                 "breakout_confirmation": {"close_crossed_wall": True, "tactical_flow_confirmed": bool(flow_ok),
+                     "vwap_alignment": True, "one_minute_momentum_alignment": True,
+                     "futures_non_conflicting": True, "two_distinct_closes_confirmed": True,
+                     "structure_source": source},
+                 "flow_conflict": False, "price_action_confirmations": 3 + int(bool(flow_ok))},
+            )
+
+    # 2) Repeated rejection/bounce at a boundary; never infer it from a single touch or OI wall alone.
+    reactions: list[Scenario] = []
+    for level, source, wall_state in resistance_levels:
+        if level < indicators.spot - tolerance or level - indicators.spot > proximity:
+            continue
+        tests = _structure_test_count(recent_touch_window, level, "RESISTANCE", tolerance, buffer)
+        if tests < 2:
+            continue
+        closes_below = latest_close <= level - displacement and indicators.spot <= level - 0.25 * displacement
+        price_turn = latest_close < latest_open or latest_close < previous_close
+        confirmations = int(vwap_bear) + int(momentum_bear) + int(di_bear) + int(flow_bear)
+        directional_context = vwap_bear and momentum_bear and (di_bear or flow_bear)
+        if not (closes_below and price_turn) or not directional_context or flow_bear_conflict or futures_regime_conflicts("BEARISH", future_regime):
+            continue
+        confidence = min(91.0, 66.0 + min(8.0, 2.0 * (tests - 2))
+                         + 4.0 * int(vwap_bear) + 4.0 * int(momentum_bear)
+                         + 4.0 * int(di_bear) + 4.0 * int(flow_bear))
+        reactions.append(Scenario(
+            "STRUCTURAL_RESISTANCE_REJECTION", "BEARISH", confidence,
+            f"Repeated resistance rejection at {level:.2f} ({source}): {tests} distinct completed 1m tests, latest close {latest_close:.2f} moved away from the level; {confirmations} independent directional confirmations.",
+            float(level), wall_state, True, None,
+            {"setup_route": "STRUCTURAL_LEVEL_INTERACTION", "reaction": "RESISTANCE_REJECTION",
+             "structure_source": source, "wall_level": float(level), "wall_strike": float(level),
+             "wall_state": wall_state, "wall_tested": True, "repeated_test_count": tests,
+             "wall_rejection_confirmed": True, "price_turn_confirmed": True,
+             "completed_1m_close": latest_close, "completed_bar_timestamp": ist_iso(parse_timestamp(latest.get("timestamp")) or now),
+             "tactical_flow_confirmed": bool(flow_bear), "vwap_alignment": bool(vwap_bear),
+             "momentum_alignment": bool(momentum_bear), "directional_di_alignment": bool(di_bear),
+             "structure_confirmation_count": confirmations, "flow_conflict": False,
+             "price_action_confirmations": int(vwap_bear) + int(momentum_bear) + int(di_bear)},
+        ))
+        break
+
+    for level, source, wall_state in support_levels:
+        if level > indicators.spot + tolerance or indicators.spot - level > proximity:
+            continue
+        tests = _structure_test_count(recent_touch_window, level, "SUPPORT", tolerance, buffer)
+        if tests < 2:
+            continue
+        closes_above = latest_close >= level + displacement and indicators.spot >= level + 0.25 * displacement
+        price_turn = latest_close > latest_open or latest_close > previous_close
+        confirmations = int(vwap_bull) + int(momentum_bull) + int(di_bull) + int(flow_bull)
+        directional_context = vwap_bull and momentum_bull and (di_bull or flow_bull)
+        if not (closes_above and price_turn) or not directional_context or flow_bull_conflict or futures_regime_conflicts("BULLISH", future_regime):
+            continue
+        confidence = min(91.0, 66.0 + min(8.0, 2.0 * (tests - 2))
+                         + 4.0 * int(vwap_bull) + 4.0 * int(momentum_bull)
+                         + 4.0 * int(di_bull) + 4.0 * int(flow_bull))
+        reactions.append(Scenario(
+            "STRUCTURAL_SUPPORT_BOUNCE", "BULLISH", confidence,
+            f"Repeated support bounce at {level:.2f} ({source}): {tests} distinct completed 1m tests, latest close {latest_close:.2f} moved away from the level; {confirmations} independent directional confirmations.",
+            float(level), wall_state, True, None,
+            {"setup_route": "STRUCTURAL_LEVEL_INTERACTION", "reaction": "SUPPORT_BOUNCE",
+             "structure_source": source, "wall_level": float(level), "wall_strike": float(level),
+             "wall_state": wall_state, "wall_tested": True, "repeated_test_count": tests,
+             "wall_hold_confirmed": True, "price_turn_confirmed": True,
+             "completed_1m_close": latest_close, "completed_bar_timestamp": ist_iso(parse_timestamp(latest.get("timestamp")) or now),
+             "tactical_flow_confirmed": bool(flow_bull), "vwap_alignment": bool(vwap_bull),
+             "momentum_alignment": bool(momentum_bull), "directional_di_alignment": bool(di_bull),
+             "structure_confirmation_count": confirmations, "flow_conflict": False,
+             "price_action_confirmations": int(vwap_bull) + int(momentum_bull) + int(di_bull)},
+        ))
+        break
+
+    if reactions:
+        return max(reactions, key=lambda item: (item.confidence, item.executable_candidate))
+
+    # 3) A repeatedly tested boundary with no confirmed directional response is wait-only.
+    # The detector applies this even when the whole-session compression flag is false.
+    last_five = recent_touch_window.tail(5)
+    compressed_range = safe_float(last_five["high"].max() - last_five["low"].min())
+    compression_limit = max(1.5 * indicators.atr, 0.35 * step)
+    range_compressing = finite(compressed_range) and compressed_range <= compression_limit
+    closes = pd.to_numeric(last_five["close"], errors="coerce").dropna().tolist()
+    net_progress_limit = max(0.65 * indicators.atr, 0.25 * step)
+    local_stall = bool(len(closes) >= 4 and abs(closes[-1] - closes[0]) <= net_progress_limit)
+    is_compressing = bool(indicators.compressed or range_compressing)
+    is_waiting = bool(is_compressing or local_stall)
+    for side, levels in (("RESISTANCE", resistance_levels), ("SUPPORT", support_levels)):
+        for level, source, wall_state in levels:
+            distance = abs(indicators.spot - level)
+            if distance > proximity:
+                continue
+            # A broken level behind spot is no longer an untouched boundary. Let the
+            # confirmed-break logic above own that case; do not call it compression.
+            if side == "RESISTANCE" and level < indicators.spot - tolerance:
+                continue
+            if side == "SUPPORT" and level > indicators.spot + tolerance:
+                continue
+            tests = _structure_test_count(recent_touch_window, level, side, tolerance, buffer)
+            if tests < 2 or not is_waiting:
+                continue
+            side_text = "resistance" if side == "RESISTANCE" else "support"
+            state_label = "compressing" if is_compressing else "stalling near"
+            return Scenario(
+                "STRUCTURAL_BOUNDARY_COMPRESSION", "NEUTRAL", 0.0,
+                f"NIFTY is {state_label} {side_text} {level:.2f} after {tests} separate completed-candle test episodes, but no confirmed rejection/bounce or two-close breach exists. Wait for a confirmed break with VWAP, momentum, directional/OI flow, and non-conflicting futures.",
+                float(level), wall_state, False, "STRUCTURAL_BOUNDARY_COMPRESSION",
+                {"setup_route": "STRUCTURAL_BOUNDARY_WAIT", "structure_source": source,
+                 "boundary_side": side, "wall_level": float(level), "wall_state": wall_state,
+                 "repeated_test_count": tests, "waiting_for_confirmed_breach": True,
+                 "completed_1m_close": latest_close, "compression_range": compressed_range,
+                 "compression_limit": compression_limit, "compression_detected": is_compressing},
+            )
+    return None
 
 def predictive_prebreakout_selection_gate(
     scenario: Scenario, indicators: IndicatorSet, oi: OIAnalysis, risk: RiskPlan,
     now: datetime, future_regime: str, config: Config,
 ) -> tuple[bool, str, dict[str, Any]]:
-    """Allow tightly qualified pre-breakout strike selection before wall crossing.
-
-    This is intentionally narrower than a provisional watch. It applies only to
-    the scanner's explicit compression/wall-weakening scenarios and still leaves
-    quote, option score, delta, premium-VWAP, spread, risk and readiness gates intact.
-    A pass means a predictive recommendation is qualified, not that a breakout is
-    guaranteed or already confirmed.
-    """
+    """Keep pre-breakout watches diagnostic-only until a tested boundary is confirmed."""
     state = str(scenario.state or "").upper()
-    eligible = {
-        "PREDICTIVE_BULLISH_BREAKOUT", "PREDICTIVE_BEARISH_BREAKDOWN", "GAMMA_SQUEEZE"
+    eligible = state in {"PREDICTIVE_BULLISH_BREAKOUT", "PREDICTIVE_BEARISH_BREAKDOWN", "GAMMA_SQUEEZE"}
+    reason = ("PREBREAKOUT_SELECTION_DISABLED_WAIT_FOR_CONFIRMED_BOUNDARY_BREAK"
+              if eligible else "NOT_APPLICABLE_NO_PREDICTIVE_PREBREAKOUT_SELECTION")
+    return False, reason, {
+        "eligible_scenario": eligible, "passed": False,
+        "selection_policy": "WAIT_FOR_CONFIRMED_BOUNDARY_REJECTION_BOUNCE_OR_TWO_CLOSE_BREAK",
+        "rejection_reason": reason, "scenario": state, "checks": {},
     }
-    evidence: dict[str, Any] = {"eligible_scenario": state in eligible, "checks": {}}
-
-    def reject(reason: str) -> tuple[bool, str, dict[str, Any]]:
-        evidence["passed"] = False
-        evidence["rejection_reason"] = reason
-        return False, reason, evidence
-
-    if state not in eligible:
-        return reject("NOT_A_SUPPORTED_PREBREAKOUT_SCENARIO")
-    if scenario.direction not in {"BULLISH", "BEARISH"}:
-        return reject("NO_DIRECTIONAL_SETUP")
-    if scenario.hard_veto:
-        return reject(f"MARKET_HARD_VETO:{scenario.hard_veto}")
-    if scenario.confidence < config.predictive_selection_min_confidence:
-        evidence["confidence_pct"] = scenario.confidence
-        evidence["required_confidence_pct"] = config.predictive_selection_min_confidence
-        return reject("PREDICTIVE_CONFIDENCE_BELOW_SELECTION_FLOOR")
-    local_time = now.astimezone(IST).time() if now.tzinfo else now.replace(tzinfo=IST).time()
-    if not (ENTRY_START <= local_time < ENTRY_CUTOFF):
-        return reject("OUTSIDE_NEW_SELECTION_WINDOW")
-    if not risk.valid:
-        return reject("STRUCTURAL_RISK_PLAN_INVALID")
-    if not finite(indicators.adx):
-        return reject("ADX_UNAVAILABLE")
-    if indicators.adx < 12.0:
-        evidence["adx"] = indicators.adx
-        return reject("ADX_TOO_LOW_FOR_PREBREAKOUT_SELECTION")
-    if not oi.tactical_available or not finite(oi.call_coi_pct) or not finite(oi.put_coi_pct):
-        return reject("TACTICAL_COI_UNAVAILABLE")
-    if not finite(oi.tactical_age_minutes) or oi.tactical_age_minutes < 0.0 or oi.tactical_age_minutes > 8.0:
-        evidence["tactical_age_minutes"] = oi.tactical_age_minutes if finite(oi.tactical_age_minutes) else None
-        return reject("TACTICAL_COI_AGE_UNAVAILABLE_OR_TOO_OLD_FOR_PREBREAKOUT_SELECTION")
-    if futures_regime_conflicts(scenario.direction, future_regime):
-        return reject(f"FUTURES_REGIME_CONFLICT:{str(future_regime).upper()}")
-
-    trigger = config.oi_velocity_trigger
-    momentum = safe_float(indicators.momentum_1m_pct, float("nan"))
-    spot = safe_float(indicators.spot, float("nan"))
-    vwap = safe_float(indicators.vwap, float("nan"))
-    wall = safe_float(scenario.wall_level, float("nan"))
-    atr = safe_float(indicators.atr, float("nan"))
-    bullish = scenario.direction == "BULLISH"
-    if bullish:
-        flow_ok = oi.call_coi_pct <= -trigger and oi.put_coi_pct >= 0.0
-        price_ok = finite(spot) and finite(vwap) and spot > vwap and finite(momentum) and momentum > 0.0
-        wall_side = "CALL"
-        wall_still_ahead = finite(wall) and wall > spot
-        wall_collection = oi.walls_resistance
-        local_change_key = "call_coi_pct"
-        opposite_momentum = finite(indicators.momentum_3m_pct) and indicators.momentum_3m_pct < -0.0005
-        di_conflict = (finite(indicators.plus_di) and finite(indicators.minus_di)
-                       and indicators.minus_di > indicators.plus_di + 5.0)
-    else:
-        flow_ok = oi.put_coi_pct <= -trigger and oi.call_coi_pct >= 0.0
-        price_ok = finite(spot) and finite(vwap) and spot < vwap and finite(momentum) and momentum < 0.0
-        wall_side = "PUT"
-        wall_still_ahead = finite(wall) and wall < spot
-        wall_collection = oi.walls_support
-        local_change_key = "put_coi_pct"
-        opposite_momentum = finite(indicators.momentum_3m_pct) and indicators.momentum_3m_pct > 0.0005
-        di_conflict = (finite(indicators.plus_di) and finite(indicators.minus_di)
-                       and indicators.plus_di > indicators.minus_di + 5.0)
-    evidence["checks"].update({
-        "aggregate_tactical_flow_aligned": bool(flow_ok),
-        "spot_vwap_and_1m_momentum_aligned": bool(price_ok),
-        "futures_non_conflicting": True,
-        "spot": spot if finite(spot) else None,
-        "vwap": vwap if finite(vwap) else None,
-        "momentum_1m_pct": momentum if finite(momentum) else None,
-        "adx": indicators.adx,
-    })
-    if not flow_ok:
-        return reject("AGGREGATE_TACTICAL_COI_NOT_ALIGNED")
-    if not price_ok:
-        return reject("VWAP_OR_1M_MOMENTUM_NOT_ALIGNED")
-    if opposite_momentum or di_conflict:
-        return reject("HIGHER_INTRADAY_MOMENTUM_OR_DI_CONFLICT")
-    if not wall_still_ahead:
-        return reject("STRUCTURAL_WALL_NOT_AHEAD_OF_SPOT")
-
-    matching_walls = [w for w in wall_collection
-                      if finite(w.strike) and abs(float(w.strike) - wall) <= 0.51]
-    wall_obj = matching_walls[0] if matching_walls else None
-    if wall_obj is None:
-        return reject(f"{wall_side}_WALL_NOT_FOUND_IN_CURRENT_OI_STRUCTURE")
-    distance = abs(wall - spot)
-    step = infer_strike_step(list(oi.rows))
-    max_distance = max(
-        (config.wall_proximity_atr * atr * 1.5) if finite(atr) and atr > 0 else 0.0,
-        1.5 * step if finite(step) and step > 0 else 0.0,
-        5.0,
-    )
-    evidence["checks"].update({
-        "wall_strike": wall,
-        "wall_state": wall_obj.state,
-        "wall_distance_points": distance,
-        "maximum_wall_distance_points": max_distance,
-        "wall_change_pct": wall_obj.change_pct,
-        "wall_side": wall_side,
-    })
-    if distance > max_distance:
-        return reject("STRUCTURAL_WALL_TOO_FAR_FOR_PREBREAKOUT_ENTRY")
-
-    # Require direct evidence that the actual wall and its exact strike are weakening,
-    # not merely that aggregate OI is moving.
-    nearest_strike = min(oi.rows, key=lambda k: abs(float(k) - wall)) if oi.rows else None
-    wall_row = oi.rows.get(nearest_strike, {}) if nearest_strike is not None else {}
-    local_change = safe_float(wall_row.get(local_change_key), float("nan")) if isinstance(wall_row, Mapping) else float("nan")
-    wall_weakening = str(wall_obj.state).upper() == "WEAKENING"
-    local_unwind = finite(local_change) and local_change <= -(0.5 * trigger)
-    evidence["checks"].update({
-        "wall_local_coi_pct": local_change if finite(local_change) else None,
-        "wall_is_weakening": wall_weakening,
-        "wall_local_oi_unwind": local_unwind,
-    })
-    if not wall_weakening:
-        return reject("STRUCTURAL_WALL_NOT_CLASSIFIED_AS_WEAKENING")
-    if not local_unwind:
-        return reject("WALL_STRIKE_LOCAL_OI_UNWIND_NOT_CONFIRMED")
-
-    # Only explicit compression setups can pre-select. A regular continuation must
-    # use the existing completed-structure entry rule instead.
-    compressed = bool(scenario.features.get("compressed", False)) or state == "GAMMA_SQUEEZE"
-    if not compressed:
-        return reject("COMPRESSION_NOT_CONFIRMED")
-
-    evidence["passed"] = True
-    evidence["rejection_reason"] = None
-    evidence["tactical_age_minutes"] = oi.tactical_age_minutes
-    evidence["oi_source"] = oi.tactical_source
-    return True, f"QUALIFIED_EARLY_PREDICTIVE_SELECTION:{state}", evidence
-
 
 def selection_trigger_confirmation(
     scenario: Scenario, indicators: IndicatorSet, oi: OIAnalysis, config: Config,
@@ -2841,40 +2947,30 @@ def selection_trigger_confirmation(
 
     features = scenario.features if isinstance(scenario.features, Mapping) else {}
     state = str(scenario.state or "").upper()
-    if state in {"CONFIRMED_BULLISH_CONTINUATION", "CONFIRMED_BEARISH_CONTINUATION"}:
-        expected = "BULLISH" if state == "CONFIRMED_BULLISH_CONTINUATION" else "BEARISH"
-        confirmation = features.get("price_structure_confirmation")
-        passed = bool(
-            direction == expected and features.get("setup_route") == "PRICE_STRUCTURE_CONTINUATION"
-            and features.get("structure_confirmed") is True and isinstance(confirmation, Mapping)
-            and confirmation.get("break_confirmed") is True
-            and confirmation.get("momentum_confirmed") is True
-            and confirmation.get("follow_through_confirmed") is True
-            and str(features.get("completed_bar_timestamp") or "").strip()
-        )
-        return (True, "CONFIRMED_PRICE_STRUCTURE_CONTINUATION") if passed else (False, "PRICE_STRUCTURE_CONFIRMATION_INCOMPLETE")
+    if state in {"CONFIRMED_BULLISH_CONTINUATION", "CONFIRMED_BEARISH_CONTINUATION", "BULLISH_CONTINUATION", "BEARISH_CONTINUATION"}:
+        return False, "GENERIC_CONTINUATION_NOT_TESTED_STRUCTURAL_BOUNDARY"
     if state == "STRUCTURAL_SUPPORT_BOUNCE" and direction == "BULLISH":
+        wall_state = str(features.get("wall_state", scenario.wall_state)).upper()
         confirmed = bool(
             features.get("reaction") == "SUPPORT_BOUNCE"
-            and features.get("wall_tested")
-            and features.get("wall_hold_confirmed")
-            and features.get("price_turn_confirmed")
-            and features.get("tactical_flow_confirmed")
-            and features.get("vwap_alignment")
-            and str(features.get("wall_state", scenario.wall_state)).upper() in {"BUILDING", "STABLE"}
+            and features.get("wall_tested") and int(safe_float(features.get("repeated_test_count"), 0)) >= 2
+            and features.get("wall_hold_confirmed") and features.get("price_turn_confirmed")
+            and int(safe_float(features.get("structure_confirmation_count"), 0)) >= 2
+            and not features.get("flow_conflict")
+            and (wall_state in {"BUILDING", "STABLE", "WEAKENING", "PRICE_ACTION"})
             and finite(features.get("wall_strike", scenario.wall_level))
         )
         return (True, "CONFIRMED_SUPPORT_BOUNCE") if confirmed else (False, "SUPPORT_BOUNCE_CONFIRMATION_INCOMPLETE")
 
     if state == "STRUCTURAL_RESISTANCE_REJECTION" and direction == "BEARISH":
+        wall_state = str(features.get("wall_state", scenario.wall_state)).upper()
         confirmed = bool(
             features.get("reaction") == "RESISTANCE_REJECTION"
-            and features.get("wall_tested")
-            and features.get("wall_rejection_confirmed")
-            and features.get("price_turn_confirmed")
-            and features.get("tactical_flow_confirmed")
-            and features.get("vwap_alignment")
-            and str(features.get("wall_state", scenario.wall_state)).upper() in {"BUILDING", "STABLE"}
+            and features.get("wall_tested") and int(safe_float(features.get("repeated_test_count"), 0)) >= 2
+            and features.get("wall_rejection_confirmed") and features.get("price_turn_confirmed")
+            and int(safe_float(features.get("structure_confirmation_count"), 0)) >= 2
+            and not features.get("flow_conflict")
+            and (wall_state in {"BUILDING", "STABLE", "WEAKENING", "PRICE_ACTION"})
             and finite(features.get("wall_strike", scenario.wall_level))
         )
         return (True, "CONFIRMED_RESISTANCE_REJECTION") if confirmed else (False, "RESISTANCE_REJECTION_CONFIRMATION_INCOMPLETE")
@@ -2894,20 +2990,7 @@ def selection_trigger_confirmation(
         return (True, "CONFIRMED_STRUCTURAL_BREAKOUT") if confirmed else (False, "BREAKOUT_CONFIRMATION_INCOMPLETE")
 
     if state == "EXHAUSTION_REVERSAL":
-        sigma_side = str(features.get("sigma_side", ""))
-        trigger = config.oi_velocity_trigger
-        momentum = safe_float(indicators.momentum_1m_pct)
-        if direction == "BEARISH":
-            boundary_ok = sigma_side == "+2" and finite(indicators.upper_2sd) and indicators.spot > indicators.upper_2sd
-            flow_ok = oi.tactical_available and finite(oi.put_coi_pct) and oi.put_coi_pct <= -trigger
-            momentum_ok = finite(momentum) and momentum < 0.0
-        else:
-            boundary_ok = sigma_side == "-2" and finite(indicators.lower_2sd) and indicators.spot < indicators.lower_2sd
-            flow_ok = oi.tactical_available and finite(oi.call_coi_pct) and oi.call_coi_pct <= -trigger
-            momentum_ok = finite(momentum) and momentum > 0.0
-        if boundary_ok and flow_ok and momentum_ok:
-            return True, "CONFIRMED_2SD_EXHAUSTION_REVERSAL"
-        return False, "EXHAUSTION_REQUIRES_LIVE_2SD_BOUNDARY_TACTICAL_COI_AND_REVERSING_1M_MOMENTUM"
+        return False, "EXHAUSTION_SETUP_REQUIRES_CONFIRMED_STRUCTURAL_BOUNDARY_INTERACTION"
 
     return False, "NO_CONFIRMED_SUPPORT_RESISTANCE_INTERACTION"
 
@@ -3324,7 +3407,7 @@ def apply_direction_flip_guard(
             strong_flow = finite(oi.call_coi_pct) and finite(oi.put_coi_pct) and oi.call_coi_pct <= -1.5 * trigger and oi.put_coi_pct >= -0.25 * trigger and momentum > 0.0002
         else:
             strong_flow = finite(oi.put_coi_pct) and finite(oi.call_coi_pct) and oi.put_coi_pct <= -1.5 * trigger and oi.call_coi_pct >= -0.25 * trigger and momentum < -0.0002
-    structural_override = scenario.state in {"PREDICTIVE_BULLISH_BREAKOUT", "PREDICTIVE_BEARISH_BREAKDOWN", "GAMMA_SQUEEZE", "MORNING_GAP_GO", "EXHAUSTION_REVERSAL"} and strong_flow
+    structural_override = scenario.state in {"PREDICTIVE_BULLISH_BREAKOUT", "PREDICTIVE_BEARISH_BREAKDOWN", "CONFIRMED_BULLISH_BREAKOUT", "CONFIRMED_BEARISH_BREAKDOWN", "GAMMA_SQUEEZE", "MORNING_GAP_GO", "EXHAUSTION_REVERSAL"} and strong_flow
     pending = state.get("direction_flip_pending") if isinstance(state.get("direction_flip_pending"), dict) else {}
     if structural_override:
         confirmed = True
@@ -3999,163 +4082,156 @@ def route_targets_and_stop(
     scenario: Scenario, spot: float, indicators: IndicatorSet, oi: OIAnalysis, config: Config,
     *, now: Optional[datetime] = None,
 ) -> RiskPlan:
-    """Route structural NIFTY levels, cap target reachability, and enforce minimum T1 R:R.
-
-    Targets remain opposing OI walls or observed session extremes, never synthetic prices.
-    The time/volatility ceiling is a plausibility filter, not a probability forecast.
-    """
+    """Route the nearest usable observed support/resistance level with structural stop and R:R gates."""
     if scenario.direction not in {"BULLISH", "BEARISH"}:
         return RiskPlan(False, None, None, None, "", "", "", (), "No directional scenario.")
     atr_stop, atr_source = structural_stop_atr(indicators)
     if not finite(atr_stop) or atr_stop <= 0:
         return RiskPlan(False, None, None, None, "", "", "", (), "ATR unavailable; cannot place a volatility-buffered structural stop.")
+
     local_now = now or now_ist()
     remaining_minutes = remaining_regular_session_minutes(local_now)
-    # Square-root time scaling approximates how far a directional target can reasonably
-    # be considered within the remaining session. It is deliberately only a ceiling.
     time_bars = max(1.0, remaining_minutes / 5.0)
     max_target_distance = max(1.5 * atr_stop, config.max_t1_expected_move_multiple * atr_stop * math.sqrt(time_bars))
     bullish = scenario.direction == "BULLISH"
     target_walls = oi.walls_resistance if bullish else oi.walls_support
     stop_walls = oi.walls_support if bullish else oi.walls_resistance
-    candidates = sorted(
-        [w for w in target_walls if (w.strike > spot if bullish else w.strike < spot)],
-        key=lambda w: w.strike if bullish else -w.strike,
-    )
+    short_atr = indicators.atr if finite(indicators.atr) and indicators.atr > 0 else atr_stop / math.sqrt(5.0)
+    step = infer_strike_step(list(oi.rows))
+    min_distance = max(0.20 * short_atr, 0.25 * step, 1.0)
+
     skipped_weak: list[float] = []
     skipped_unreachable: list[float] = []
-    intact: list[StructuralWall] = []
-    for wall in candidates:
+    target_candidates: list[tuple[float, str, int]] = []
+    for wall in target_walls:
+        level = float(wall.strike)
+        ahead = level > spot + min_distance if bullish else level < spot - min_distance
+        if not ahead:
+            continue
         if wall.state == "WEAKENING":
-            skipped_weak.append(wall.strike)
+            skipped_weak.append(level)
             continue
         if wall.state not in {"BUILDING", "STABLE"}:
             continue
-        distance = abs(float(wall.strike) - spot)
-        if distance > max_target_distance:
-            skipped_unreachable.append(float(wall.strike))
+        if abs(level - spot) > max_target_distance:
+            skipped_unreachable.append(level)
             continue
-        intact.append(wall)
+        target_candidates.append((level, f"INTACT_{wall.side}_OI_WALL_{wall.state}", 0))
 
-    short_atr = indicators.atr if finite(indicators.atr) and indicators.atr > 0 else atr_stop / math.sqrt(5.0)
-    min_distance = max(0.20 * short_atr, 1.0)
-    t1: Optional[float] = None
-    t2: Optional[float] = None
-    t1_source = ""
-    t2_source = ""
-    valid_intact = [w for w in intact if abs(float(w.strike) - spot) >= min_distance]
-    if valid_intact:
-        t1 = float(valid_intact[0].strike)
-        t1_source = f"INTACT_{valid_intact[0].side}_OI_WALL_{valid_intact[0].state}"
-        next_wall = next((w for w in valid_intact[1:]
-                          if (w.strike > t1 if bullish else w.strike < t1)), None)
-        if next_wall is not None:
-            t2 = float(next_wall.strike)
-            t2_source = f"NEXT_INTACT_{next_wall.side}_OI_WALL_{next_wall.state}"
-
-    # Fall back to a real current-session extreme only if it is ahead, non-trivial,
-    # and remains inside the time/volatility plausibility ceiling.
-    swing_target = indicators.session_high if bullish else indicators.session_low
-    swing_ahead = finite(swing_target) and (
-        swing_target > spot + min_distance if bullish else swing_target < spot - min_distance
+    # Price-derived levels are real completed-session observations, not synthetic offsets.
+    # The 5m pivot is confirmed; the 1m swing is a recent completed-candle extreme.
+    price_levels = (
+        [(indicators.swing_high_5m, "CONFIRMED_5M_RESISTANCE_PIVOT", 1),
+         (indicators.swing_high, "RECENT_1M_RESISTANCE_EXTREME", 2),
+         (indicators.session_high, "CURRENT_SESSION_RESISTANCE_EXTREME", 3)] if bullish else
+        [(indicators.swing_low_5m, "CONFIRMED_5M_SUPPORT_PIVOT", 1),
+         (indicators.swing_low, "RECENT_1M_SUPPORT_EXTREME", 2),
+         (indicators.session_low, "CURRENT_SESSION_SUPPORT_EXTREME", 3)]
     )
-    if t1 is None and swing_ahead:
-        swing_distance = abs(float(swing_target) - spot)
-        if swing_distance <= max_target_distance:
-            t1 = float(swing_target)
-            t1_source = "CURRENT_SESSION_1M_SWING_EXTREME"
-        else:
-            skipped_unreachable.append(float(swing_target))
+    for value, source, priority in price_levels:
+        if not finite(value):
+            continue
+        level = float(value)
+        ahead = level > spot + min_distance if bullish else level < spot - min_distance
+        if not ahead:
+            continue
+        distance = abs(level - spot)
+        if distance > max_target_distance:
+            skipped_unreachable.append(level)
+            continue
+        target_candidates.append((level, source, priority))
 
-    # T2 is optional. Prefer the next eligible OI wall beyond T1; otherwise use a
-    # real session extreme beyond T1. Both must remain inside the same reachability cap.
-    if t1 is not None and t2 is None:
-        next_wall = next((w for w in valid_intact
-                          if (w.strike > t1 + min_distance if bullish else w.strike < t1 - min_distance)), None)
-        if next_wall is not None:
-            t2 = float(next_wall.strike)
-            t2_source = f"NEXT_INTACT_{next_wall.side}_OI_WALL_{next_wall.state}"
-        elif finite(swing_target) and (
-            swing_target > t1 + min_distance if bullish else swing_target < t1 - min_distance
-        ):
-            swing_distance = abs(float(swing_target) - spot)
-            if swing_distance <= max_target_distance:
-                t2 = float(swing_target)
-                t2_source = "CURRENT_SESSION_1M_SWING_BEYOND_T1"
-            else:
-                t2_source = "UNAVAILABLE_EXPECTED_MOVE_LIMIT"
-        elif skipped_unreachable:
-            t2_source = "UNAVAILABLE_EXPECTED_MOVE_LIMIT"
-        else:
-            t2_source = "UNAVAILABLE_NO_SECOND_STRUCTURAL_LEVEL"
-
-    # SL uses the closest available anchor: a confirmed completed 5m pivot or an intact OI wall.
+    # Stop is anchored to the nearest protective structural level. For a confirmed rejection
+    # or bounce, its tested boundary is a valid anchor even if the level originated in price action.
+    stop_anchors: list[tuple[float, str]] = []
     local_pivot = indicators.swing_low_5m if bullish else indicators.swing_high_5m
-    structural = None
-    stop_candidates = [w for w in stop_walls
-                       if (w.strike < spot if bullish else w.strike > spot)
-                       and w.state in {"BUILDING", "STABLE"}]
-    if stop_candidates:
-        structural = max(stop_candidates, key=lambda w: w.strike) if bullish else min(stop_candidates, key=lambda w: w.strike)
-    support_levels = []
     if finite(local_pivot) and (local_pivot < spot if bullish else local_pivot > spot):
-        support_levels.append(float(local_pivot))
-    if structural and (structural.strike < spot if bullish else structural.strike > spot):
-        support_levels.append(float(structural.strike))
-    if not support_levels:
-        return RiskPlan(False, t1, t2, None, "", t1_source, t2_source, tuple(skipped_weak),
-                        "No confirmed 5-minute pivot or intact structural wall for stop placement.",
+        stop_anchors.append((float(local_pivot), "CONFIRMED_5M_PIVOT"))
+    for wall in stop_walls:
+        if wall.state not in {"BUILDING", "STABLE"}:
+            continue
+        if wall.strike < spot if bullish else wall.strike > spot:
+            stop_anchors.append((float(wall.strike), f"INTACT_{wall.side}_OI_WALL_{wall.state}"))
+    reaction = str((scenario.features or {}).get("reaction", "")).upper()
+    reaction_level = safe_float(scenario.wall_level, float("nan"))
+    if finite(reaction_level) and ((bullish and reaction == "SUPPORT_BOUNCE" and reaction_level < spot)
+                                   or (not bullish and reaction == "RESISTANCE_REJECTION" and reaction_level > spot)):
+        stop_anchors.append((float(reaction_level), f"TESTED_{'SUPPORT' if bullish else 'RESISTANCE'}_BOUNDARY"))
+    if not stop_anchors:
+        return RiskPlan(False, None, None, None, "", "", "", tuple(sorted(set(skipped_weak))),
+                        "No confirmed 5-minute pivot, intact structural wall, or tested reaction boundary for stop placement.",
                         max_t1_distance_points=max_target_distance, remaining_session_minutes=remaining_minutes,
                         stop_atr_points=atr_stop, stop_atr_source=atr_source,
-                        skipped_unreachable_walls=tuple(skipped_unreachable))
-    base = max(support_levels) if bullish else min(support_levels)
+                        skipped_unreachable_walls=tuple(sorted(set(skipped_unreachable))))
+    base, base_source = (max(stop_anchors, key=lambda row: row[0]) if bullish
+                         else min(stop_anchors, key=lambda row: row[0]))
     atr_buffer = dynamic_atr_buffer_multiple(indicators)
     stop = base - atr_buffer * atr_stop if bullish else base + atr_buffer * atr_stop
-    stop_source = (f"CONFIRMED_5M_PIVOT_OR_INTACT_PUT_SUPPORT_MINUS_{atr_buffer:.2f}_{atr_source}" if bullish
-                   else f"CONFIRMED_5M_PIVOT_OR_INTACT_CALL_RESISTANCE_PLUS_{atr_buffer:.2f}_{atr_source}")
-    t1_ok = t1 is not None and (t1 > spot if bullish else t1 < spot)
-    t2_ok = t2 is None or (t1 is not None and (t2 > t1 if bullish else t2 < t1))
+    stop_source = f"{base_source}_PLUS_MINUS_{atr_buffer:.2f}_{atr_source}"
     stop_ok = finite(stop) and (stop < spot if bullish else stop > spot)
-    if not (t1_ok and t2_ok and stop_ok):
-        missing = []
-        if t1 is None:
-            missing.append("T1 unavailable inside remaining-session expected-move limit")
-        elif not t1_ok:
-            missing.append("T1 on wrong side of spot")
-        if t2 is not None and not t2_ok:
-            missing.append("T2 order invalid")
-        if not stop_ok:
-            missing.append("stop on wrong side of spot")
-        return RiskPlan(False, t1, t2, float(stop) if finite(stop) else None, stop_source, t1_source, t2_source,
-                        tuple(skipped_weak), "; ".join(missing) or "Invalid target/stop geometry.",
-                        max_t1_distance_points=max_target_distance, remaining_session_minutes=remaining_minutes,
+    if not stop_ok:
+        return RiskPlan(False, None, None, float(stop) if finite(stop) else None, stop_source, "", "",
+                        tuple(sorted(set(skipped_weak))), "Structural stop is not on the protective side of spot.",
+                        max_target_distance_points=max_target_distance, remaining_session_minutes=remaining_minutes,
                         stop_atr_points=atr_stop, stop_atr_source=atr_source,
-                        skipped_unreachable_walls=tuple(skipped_unreachable))
+                        skipped_unreachable_walls=tuple(sorted(set(skipped_unreachable))))
+
+    risk_points = abs(spot - stop)
+    if not finite(risk_points) or risk_points <= 0:
+        return RiskPlan(False, None, None, float(stop), stop_source, "", "", tuple(sorted(set(skipped_weak))),
+                        "Structural stop risk is zero or invalid.", max_t1_distance_points=max_target_distance,
+                        remaining_session_minutes=remaining_minutes, stop_atr_points=atr_stop,
+                        stop_atr_source=atr_source, skipped_unreachable_walls=tuple(sorted(set(skipped_unreachable))))
+
+    # Sort by distance, then by level type. Skip nearby levels that cannot satisfy the hard R:R floor
+    # instead of rejecting the entire setup before checking the next real support/resistance.
+    target_candidates.sort(key=lambda row: (abs(row[0] - spot), row[2]))
+    unique_targets: list[tuple[float, str, int]] = []
+    for item in target_candidates:
+        if not any(abs(item[0] - prior[0]) <= min_distance for prior in unique_targets):
+            unique_targets.append(item)
+    eligible_targets: list[tuple[float, str, int]] = []
+    for item in unique_targets:
+        reward = abs(item[0] - spot)
+        if reward / risk_points >= config.min_t1_reward_risk_ratio:
+            eligible_targets.append(item)
+    if not eligible_targets:
+        return RiskPlan(False, None, None, float(stop), stop_source, "", "",
+                        tuple(sorted(set(skipped_weak))),
+                        f"No observed structural target within {max_target_distance:.2f} points meets the required {config.min_t1_reward_risk_ratio:.2f}:1 T1 reward/risk floor.",
+                        risk_points=risk_points, max_t1_distance_points=max_target_distance,
+                        remaining_session_minutes=remaining_minutes, stop_atr_points=atr_stop,
+                        stop_atr_source=atr_source, skipped_unreachable_walls=tuple(sorted(set(skipped_unreachable))))
+
+    t1, t1_source, _ = eligible_targets[0]
+    t2 = None
+    t2_source = "UNAVAILABLE_NO_SECOND_STRUCTURAL_LEVEL"
+    for candidate_level, candidate_source, _priority in eligible_targets[1:]:
+        beyond = candidate_level > t1 + min_distance if bullish else candidate_level < t1 - min_distance
+        if beyond:
+            t2 = float(candidate_level)
+            t2_source = f"NEXT_{candidate_source}"
+            break
+    # If T2 is unavailable among targets with a valid T1 R:R, retain one farther in-range observed level
+    # only when it is structurally ordered beyond T1; otherwise leave T2 explicitly blank.
+    if t2 is None and skipped_unreachable:
+        t2_source = "UNAVAILABLE_EXPECTED_MOVE_LIMIT"
 
     reward_points = abs(float(t1) - spot)
-    risk_points = abs(spot - float(stop))
-    rr = reward_points / risk_points if risk_points > 0 else float("nan")
-    if not finite(rr) or rr < config.min_t1_reward_risk_ratio:
-        reason = (f"T1 reward/risk {rr:.2f}:1 is below required "
-                  f"{config.min_t1_reward_risk_ratio:.2f}:1; reward={reward_points:.2f} points, risk={risk_points:.2f} points.")
-        return RiskPlan(False, float(t1), float(t2) if t2 is not None else None, float(stop), stop_source,
-                        t1_source, t2_source, tuple(skipped_weak), reason,
-                        reward_points=reward_points, risk_points=risk_points, reward_risk_ratio=rr,
-                        max_t1_distance_points=max_target_distance, remaining_session_minutes=remaining_minutes,
-                        stop_atr_points=atr_stop, stop_atr_source=atr_source,
-                        skipped_unreachable_walls=tuple(skipped_unreachable))
-
+    rr = reward_points / risk_points
+    t2_ok = t2 is None or (t2 > t1 if bullish else t2 < t1)
+    if not t2_ok:
+        t2, t2_source = None, "UNAVAILABLE_INVALID_LEVEL_ORDER"
     target_detail = ("T1 and structural stop passed the minimum reward/risk gate; T2 available."
                      if t2 is not None else
                      "T1 and structural stop passed the minimum reward/risk gate; T2 unavailable and intentionally left unset.")
     return RiskPlan(True, float(t1), float(t2) if t2 is not None else None, float(stop), stop_source,
-                    t1_source, t2_source, tuple(skipped_weak),
+                    t1_source, t2_source, tuple(sorted(set(skipped_weak))),
                     f"Valid structural plan. T1 reward/risk={rr:.2f}:1; target ceiling={max_target_distance:.2f} points; {target_detail}",
                     reward_points=reward_points, risk_points=risk_points, reward_risk_ratio=rr,
                     max_t1_distance_points=max_target_distance, remaining_session_minutes=remaining_minutes,
                     stop_atr_points=atr_stop, stop_atr_source=atr_source,
-                    skipped_unreachable_walls=tuple(skipped_unreachable))
-
+                    skipped_unreachable_walls=tuple(sorted(set(skipped_unreachable))))
 
 def _scan_intrabar_level_crossings(
     tracker: dict[str, Any], frame: Optional[pd.DataFrame], now: datetime,
@@ -4655,6 +4731,360 @@ def _assess_active_signal_regime(
     return assessment
 
 
+
+def _dynamic_level_context_ok(
+    tracker: Mapping[str, Any], indicators: IndicatorSet, oi: OIAnalysis,
+    scenario: Optional[Scenario], future_regime: str,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Decide whether evolving levels are supported by multi-factor market context.
+
+    This does not demand every factor to agree. A completed 3-minute momentum reading
+    must support the active direction, with at least one independent confirmation from
+    VWAP, directional DI/ADX, tactical COI or futures; a clear contrary signal pauses
+    level extension/re-anchoring. Hard SL crossing remains unconditional.
+    """
+    direction = str(tracker.get("direction", "")).upper()
+    assessment = tracker.get("regime_assessment") if isinstance(tracker.get("regime_assessment"), Mapping) else {}
+    evidence = assessment.get("evidence") if isinstance(assessment.get("evidence"), Mapping) else {}
+    vwap_status = str(evidence.get("vwap", "UNAVAILABLE")).upper()
+    momentum_3m_status = str(evidence.get("momentum_3m", "UNAVAILABLE")).upper()
+    di_status = str(evidence.get("directional_di_adx", "UNAVAILABLE")).upper()
+    coi_status = str(evidence.get("tactical_coi", "UNAVAILABLE")).upper()
+    futures_status = str(evidence.get("futures", "UNAVAILABLE_OR_NEUTRAL")).upper()
+    statuses = {
+        "vwap": vwap_status, "momentum_3m": momentum_3m_status,
+        "directional_di_adx": di_status, "tactical_coi": coi_status,
+        "futures": futures_status,
+    }
+    if direction not in {"BULLISH", "BEARISH"}:
+        return False, "INVALID_ACTIVE_DIRECTION", statuses
+    if scenario is None:
+        return False, "CURRENT_SCENARIO_UNAVAILABLE", statuses
+    if bool(scenario.hard_veto):
+        return False, "CURRENT_SCENARIO_HARD_VETO", statuses
+    scenario_direction = str(scenario.direction or "NEUTRAL").upper()
+    if scenario_direction not in {direction, "NEUTRAL", "NONE", ""}:
+        return False, "CURRENT_SCENARIO_OPPOSES_ACTIVE_SIGNAL", statuses
+    # The 3m momentum and one independent market factor are minimum context. Missing
+    # inputs are tolerated and one secondary disagreement may be noise; a conflicting
+    # futures regime or multiple independent opposing inputs pauses level changes.
+    if momentum_3m_status != "ALIGNED":
+        return False, "COMPLETED_3M_MOMENTUM_NOT_ALIGNED", statuses
+    aligned = [key for key, value in statuses.items() if value == "ALIGNED"]
+    opposing = [key for key, value in statuses.items() if value == "OPPOSING"]
+    if futures_status == "OPPOSING":
+        return False, "FUTURES_CONTEXT_OPPOSES_ACTIVE_SIGNAL", statuses
+    if len(opposing) >= 2:
+        return False, "MULTIPLE_CONFLICTING_MARKET_FACTORS:" + ",".join(opposing), statuses
+    if len(aligned) < 2:
+        return False, "INSUFFICIENT_INDEPENDENT_CONFIRMATION", statuses
+    # Explicitly require multi-timeframe evidence and not merely the 1m candle path.
+    # A neutral/transition scenario is allowed if that independent evidence still aligns.
+    return True, "COMPLETED_3M_MOMENTUM_PLUS_INDEPENDENT_CONFIRMATION", statuses
+
+
+def _target_source_is_intact(
+    level: float, source: str, direction: str, spot: float, oi: OIAnalysis,
+    max_distance: float, min_distance: float,
+) -> bool:
+    """Check whether a persisted target still references a valid level in front of spot."""
+    if not finite(level) or not finite(spot):
+        return False
+    # Existing levels remain valid right up to an actual crossing. min_distance applies
+    # when adding/reordering *new* levels; using it here could silently push an existing
+    # target farther away during a near-touch whipsaw (e.g. spot 22712 vs T1 22700).
+    ahead = level > spot + 0.01 if direction == "BULLISH" else level < spot - 0.01
+    if not ahead or abs(level - spot) > max_distance:
+        return False
+    source_upper = str(source or "").upper()
+    if "OI_WALL" in source_upper:
+        walls = oi.walls_resistance if direction == "BULLISH" else oi.walls_support
+        tolerance = max(1.0, infer_strike_step(list(oi.rows)) * 0.25)
+        return any(abs(float(wall.strike) - level) <= tolerance and wall.state in {"BUILDING", "STABLE"}
+                   for wall in walls)
+    # Completed price pivots/extremes remain usable if still ahead and within the refreshed
+    # volatility/time ceiling. They are not invalidated merely because a rolling pivot moved.
+    return True
+
+
+def _reassess_active_structural_levels(
+    tracker: dict[str, Any], spot: float, indicators: IndicatorSet, oi: OIAnalysis,
+    now: datetime, scenario: Optional[Scenario], future_regime: str,
+    config: Optional[Config], index_candles: Optional[pd.DataFrame],
+) -> Optional[dict[str, Any]]:
+    """Refresh virtual T1/T2 and favorable-only SL from confirmed evolving structure.
+
+    Processing order is important: the caller must first test the *previously active* levels
+    against newly completed 1m OHLC bars, resolve stop/target events and then call this function.
+    Any level adjustment therefore applies prospectively to the next monitoring interval and
+    cannot rewrite the level that generated a just-recorded milestone.
+    """
+    if str(tracker.get("status", "TRACKING")).upper() != "TRACKING":
+        return None
+    if config is None:
+        tracker["target_reassessment_status"] = "HELD_NO_CONFIG"
+        return None
+    integrity = str(tracker.get("target_event_integrity", "UNASSESSED")).upper()
+    monitor_status = str(tracker.get("monitoring_data_status", "UNAVAILABLE")).upper()
+    if integrity == "UNRESOLVED_AFTER_DATA_GAP" or monitor_status in {"GAP_UNRESOLVED", "CANDLE_FEED_STALE"}:
+        tracker["target_reassessment_status"] = "HELD_UNRESOLVED_CANDLE_CHRONOLOGY"
+        tracker["target_reassessment_reason"] = "Level changes paused because an unseen stop/target crossing cannot be ruled out."
+        return None
+    if index_candles is None or index_candles.empty:
+        tracker["target_reassessment_status"] = "HELD_CANDLES_UNAVAILABLE"
+        tracker["target_reassessment_reason"] = "Targets/stops remain unchanged until completed multi-minute structure is available."
+        return None
+
+    completed_3m = completed_resampled_candles(index_candles, 3, now)
+    if completed_3m.empty:
+        tracker["target_reassessment_status"] = "WAITING_FOR_COMPLETED_3M_BAR"
+        return None
+    latest_stamp = parse_timestamp(completed_3m.iloc[-1].get("timestamp"))
+    created = parse_timestamp(tracker.get("created_at"))
+    if latest_stamp is None:
+        tracker["target_reassessment_status"] = "WAITING_FOR_VALID_3M_TIMESTAMP"
+        return None
+    latest_stamp = latest_stamp.astimezone(IST)
+    if created is not None and latest_stamp < created.astimezone(IST):
+        tracker["target_reassessment_status"] = "WAITING_FOR_POST_SELECTION_3M_BAR"
+        return None
+    bar_end = latest_stamp + timedelta(minutes=3)
+    current = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
+    if bar_end > current or (current - bar_end).total_seconds() > 300:
+        tracker["target_reassessment_status"] = "HELD_STALE_3M_BAR"
+        return None
+    previous_bar = parse_timestamp(tracker.get("last_dynamic_levels_3m_bar_timestamp"))
+    if previous_bar is not None and latest_stamp <= previous_bar.astimezone(IST):
+        tracker["target_reassessment_status"] = "NO_NEW_COMPLETED_3M_BAR"
+        return None
+
+    # Store the bar even if context is not supportive: the same completed candle must not
+    # be reconsidered repeatedly as if it were new evidence on every cron invocation.
+    tracker["last_dynamic_levels_3m_bar_timestamp"] = ist_iso(latest_stamp)
+    context_ok, context_reason, context_statuses = _dynamic_level_context_ok(
+        tracker, indicators, oi, scenario, future_regime
+    )
+    tracker["target_reassessment_context"] = context_statuses
+    if not context_ok:
+        tracker["target_reassessment_status"] = "HELD_MARKET_CONTEXT"
+        tracker["target_reassessment_reason"] = context_reason
+        return None
+
+    direction = str(tracker.get("direction", "")).upper()
+    synthetic_scenario = Scenario(
+        state=str(tracker.get("scenario", "ACTIVE_SIGNAL_REASSESSMENT")),
+        direction=direction,
+        confidence=safe_float(tracker.get("confidence_pct", tracker.get("latest_signal_confidence_pct")), 0.0),
+        trigger_reason="Active signal structural target/stop reassessment on a distinct completed 3-minute bar.",
+        wall_level=None, wall_state="", executable_candidate=True, hard_veto=None,
+        features={},
+    )
+    plan = route_targets_and_stop(synthetic_scenario, spot, indicators, oi, config, now=now)
+    if not plan.valid or not finite(plan.stop_loss):
+        tracker["target_reassessment_status"] = "HELD_NO_VALID_STRUCTURAL_PLAN"
+        tracker["target_reassessment_reason"] = str(plan.reason or "No valid current structural plan.")[:260]
+        return None
+
+    active_stop = safe_float(tracker.get("trailing_stop", tracker.get("stop_loss")), float("nan"))
+    active_t1 = safe_float(tracker.get("target_1"), float("nan"))
+    active_t2 = safe_float(tracker.get("target_2"), float("nan"))
+    if not finite(active_stop) or not finite(active_t1):
+        tracker["target_reassessment_status"] = "HELD_INVALID_PERSISTED_LEVELS"
+        return None
+    atr_for_distance = safe_float(indicators.atr_5m, float("nan"))
+    if not finite(atr_for_distance) or atr_for_distance <= 0:
+        atr_for_distance = safe_float(indicators.atr, 1.0) * math.sqrt(5.0)
+    min_distance = max(2.0, 0.10 * atr_for_distance if finite(atr_for_distance) else 2.0,
+                       0.25 * infer_strike_step(list(oi.rows)))
+    max_distance = max(min_distance, safe_float(plan.max_t1_distance_points, float("nan")))
+    if not finite(max_distance):
+        tracker["target_reassessment_status"] = "HELD_INVALID_TARGET_CEILING"
+        return None
+
+    old_t1_source = str(tracker.get("T1_source", tracker.get("target_1_source", "")))
+    old_t2_source = str(tracker.get("T2_source", tracker.get("target_2_source", "")))
+    old_t1_valid = _target_source_is_intact(active_t1, old_t1_source, direction, spot, oi, max_distance, min_distance)
+    old_t2_valid = _target_source_is_intact(active_t2, old_t2_source, direction, spot, oi, max_distance, min_distance) if finite(active_t2) else False
+    candidate_t1 = safe_float(plan.target_1, float("nan"))
+    candidate_t2 = safe_float(plan.target_2, float("nan"))
+    # Determine whether the current completed-3m structure justifies a favourable-only
+    # stop ratchet before checking target reward/risk. If the stop can safely tighten on
+    # this same reassessment, targets are checked against that *prospective* stop; the
+    # ratchet still takes effect only after this scan's prior levels have been processed.
+    original_stop = safe_float(tracker.get("stop_loss"), float("nan"))
+    entry_spot = safe_float(tracker.get("nifty_entry_reference"), float("nan"))
+    favourable_progress = ((spot - entry_spot) if direction == "BULLISH" else (entry_spot - spot)) if finite(entry_spot) else float("nan")
+    min_progress = max(0.50 * atr_for_distance if finite(atr_for_distance) else 0.0,
+                       0.00035 * spot if finite(spot) else 0.0)
+    min_stop_gap = max(0.15 * atr_for_distance if finite(atr_for_distance) else 0.0, 2.0)
+    min_stop_change = max(0.10 * atr_for_distance if finite(atr_for_distance) else 0.0, 2.0)
+    candidate_stop = safe_float(plan.stop_loss, float("nan"))
+    favourable_enough = bool(finite(favourable_progress) and favourable_progress >= min_progress)
+    prospective_stop = active_stop
+    prospective_stop_tightening = False
+    if favourable_enough and finite(active_stop) and finite(candidate_stop):
+        if direction == "BULLISH":
+            proposal_stop = max(active_stop, candidate_stop)
+            safe_side = proposal_stop < spot - min_stop_gap
+            improved = proposal_stop > active_stop + min_stop_change
+            preserves_initial_risk_limit = not finite(original_stop) or proposal_stop >= original_stop
+        else:
+            proposal_stop = min(active_stop, candidate_stop)
+            safe_side = proposal_stop > spot + min_stop_gap
+            improved = proposal_stop < active_stop - min_stop_change
+            preserves_initial_risk_limit = not finite(original_stop) or proposal_stop <= original_stop
+        if safe_side and improved and preserves_initial_risk_limit:
+            prospective_stop = float(proposal_stop)
+            prospective_stop_tightening = True
+    current_risk = abs(prospective_stop - spot)
+
+    def valid_target_for_active_stop(level: float) -> bool:
+        ahead = level > spot + min_distance if direction == "BULLISH" else level < spot - min_distance
+        if not finite(level) or not ahead or abs(level - spot) > max_distance or current_risk <= 0:
+            return False
+        return abs(level - spot) / current_risk >= config.min_t1_reward_risk_ratio
+
+    candidate_t1_valid = valid_target_for_active_stop(candidate_t1)
+    target_changed = False
+    previous_t1 = active_t1
+    previous_t2 = active_t2 if finite(active_t2) else None
+    next_t1 = active_t1
+    next_t1_source = old_t1_source
+    t1_hit = bool(tracker.get("target_1_hit", False))
+
+    if not t1_hit and candidate_t1_valid:
+        old_distance = abs(active_t1 - spot)
+        candidate_distance = abs(candidate_t1 - spot)
+        delta_threshold = max(0.20 * atr_for_distance if finite(atr_for_distance) else 0.0,
+                              0.25 * infer_strike_step(list(oi.rows)), 2.0)
+        should_replace_t1 = (not old_t1_valid or candidate_distance < old_distance - delta_threshold)
+        # A target can move farther only when its prior OI wall has weakened/disappeared or
+        # the old price level is no longer valid. This prevents targets being chased away.
+        old_oi_target_invalid = ("OI_WALL" in old_t1_source.upper() and not old_t1_valid)
+        if should_replace_t1 or old_oi_target_invalid:
+            next_t1 = candidate_t1
+            next_t1_source = plan.target_1_source
+            if abs(next_t1 - active_t1) >= 0.01:
+                target_changed = True
+
+    # Build structurally ordered T2 choices from the refreshed plan and the previous target
+    # levels. This can move T2 closer to a newly formed wall, or further only if its prior
+    # anchor becomes invalid. It never moves a level behind spot or across T1.
+    candidate_pool: list[tuple[float, str, bool]] = []
+    for level, source, is_valid in (
+        (active_t1, old_t1_source, old_t1_valid),
+        (active_t2, old_t2_source, old_t2_valid),
+        (candidate_t1, plan.target_1_source, candidate_t1_valid),
+        (candidate_t2, plan.target_2_source, valid_target_for_active_stop(candidate_t2)),
+    ):
+        if finite(level):
+            candidate_pool.append((float(level), str(source or ""), bool(is_valid)))
+    if t1_hit:
+        # Once T1 has been hit, it is immutable historical evidence; the next valid structure
+        # in the active direction is the evolving T2. Do not reset the T1 milestone.
+        ordered = [row for row in candidate_pool
+                   if row[2] and (row[0] > spot + min_distance if direction == "BULLISH" else row[0] < spot - min_distance)]
+        ordered.sort(key=lambda row: abs(row[0] - spot))
+        if ordered:
+            nearest_level, nearest_source, _ = ordered[0]
+            current_t2_valid_ahead = old_t2_valid and finite(active_t2) and (
+                active_t2 > spot + 0.01 if direction == "BULLISH" else active_t2 < spot - 0.01
+            ) and (active_t2 > active_t1 if direction == "BULLISH" else active_t2 < active_t1)
+            new_t2 = active_t2 if current_t2_valid_ahead else nearest_level
+            new_t2_source = old_t2_source if current_t2_valid_ahead else nearest_source
+            # Prefer a newly confirmed closer opposing level to a farther old T2.
+            if current_t2_valid_ahead and abs(nearest_level - spot) < abs(active_t2 - spot) - min_distance:
+                new_t2, new_t2_source = nearest_level, nearest_source
+        else:
+            new_t2, new_t2_source = (active_t2, old_t2_source) if old_t2_valid else (float("nan"), "UNAVAILABLE_NO_VALID_FORWARD_STRUCTURE")
+    else:
+        ordered = [row for row in candidate_pool
+                   if row[2] and (row[0] > next_t1 + min_distance if direction == "BULLISH" else row[0] < next_t1 - min_distance)
+                   and (row[0] > spot + min_distance if direction == "BULLISH" else row[0] < spot - min_distance)]
+        ordered.sort(key=lambda row: abs(row[0] - spot))
+        current_t2_ordered = old_t2_valid and finite(active_t2) and (
+            active_t2 > next_t1 + min_distance if direction == "BULLISH" else active_t2 < next_t1 - min_distance
+        ) and (active_t2 > spot + min_distance if direction == "BULLISH" else active_t2 < spot - min_distance)
+        if ordered:
+            nearest_level, nearest_source, _ = ordered[0]
+            new_t2, new_t2_source = (active_t2, old_t2_source) if current_t2_ordered else (nearest_level, nearest_source)
+            if current_t2_ordered and abs(nearest_level - spot) < abs(active_t2 - spot) - min_distance:
+                new_t2, new_t2_source = nearest_level, nearest_source
+        else:
+            new_t2, new_t2_source = (active_t2, old_t2_source) if current_t2_ordered else (float("nan"), "UNAVAILABLE_NO_VALID_FORWARD_STRUCTURE")
+
+    # If T1 itself was unchanged and valid, do not permit a T2 level to collide with it.
+    if finite(new_t2):
+        good_order = new_t2 > next_t1 + min_distance if direction == "BULLISH" else new_t2 < next_t1 - min_distance
+        if not good_order:
+            new_t2 = float("nan")
+            new_t2_source = "UNAVAILABLE_INVALID_LEVEL_ORDER"
+    if not (finite(new_t2) and valid_target_for_active_stop(new_t2)):
+        # T2 is optional, but never retain a breached/out-of-range or structurally invalid level.
+        new_t2 = float("nan")
+        new_t2_source = "UNAVAILABLE_NO_VALID_FORWARD_STRUCTURE"
+
+    if not t1_hit and abs(next_t1 - active_t1) >= 0.01:
+        tracker.setdefault("initial_reward_risk_ratio", tracker.get("reward_risk_ratio"))
+        tracker["target_1"] = float(next_t1)
+        tracker["T1_source"] = next_t1_source
+        tracker["target_1_source"] = next_t1_source
+        tracker["t1_distance_points"] = abs(next_t1 - spot)
+        if current_risk > 0:
+            tracker["reward_risk_ratio"] = abs(next_t1 - spot) / current_risk
+        target_changed = True
+    if ((finite(active_t2) and (not finite(new_t2) or abs(new_t2 - active_t2) >= 0.01))
+            or (not finite(active_t2) and finite(new_t2))):
+        tracker["target_2"] = float(new_t2) if finite(new_t2) else None
+        tracker["T2_source"] = str(new_t2_source)
+        tracker["target_2_source"] = str(new_t2_source)
+        target_changed = True
+
+    # Dynamic SL: tighten only after favourable price progress AND aligned multi-factor
+    # context; never widen risk. A touched hard stop remains terminal and is never undone.
+    # Apply only the favorable stop proposal that was already checked above against
+    # progress, protective-side clearance, minimum improvement and original-stop limits.
+    stop_tightened = bool(prospective_stop_tightening)
+    if stop_tightened:
+        tracker["trailing_stop"] = float(prospective_stop)
+        tracker["trailing_stop_source"] = f"DYNAMIC_3M_STRUCTURAL_RATCHET_{plan.stop_source}"
+        tracker["trailing_stop_updated_at"] = ist_iso(now)
+
+    if stop_tightened:
+        tracker.setdefault("initial_stop_loss", original_stop)
+        tracker["sl_distance_points"] = abs(spot - safe_float(tracker.get("trailing_stop"), active_stop))
+    if target_changed or stop_tightened:
+        tracker["target_update_count"] = max(0, int(safe_float(tracker.get("target_update_count"), 0))) + 1
+        tracker["last_target_update_at"] = ist_iso(now)
+        tracker["target_reassessment_status"] = "LEVELS_UPDATED"
+        tracker["target_reassessment_reason"] = context_reason
+        changes = tracker.get("target_adjustment_history")
+        changes = [dict(row) for row in changes if isinstance(row, dict)] if isinstance(changes, list) else []
+        changes.append({
+            "timestamp": ist_iso(now), "3m_bar_timestamp": ist_iso(latest_stamp),
+            "spot": round(float(spot), 2) if finite(spot) else None,
+            "previous_T1": previous_t1, "new_T1": tracker.get("target_1"),
+            "previous_T2": previous_t2, "new_T2": tracker.get("target_2"),
+            "previous_SL": active_stop, "new_SL": tracker.get("trailing_stop", active_stop),
+            "context": {key: value for key, value in context_statuses.items()},
+        })
+        tracker["target_adjustment_history"] = changes[-8:]
+        return {
+            "event_type": "ACTIVE_LEVELS_REASSESSED", "event_at": ist_iso(now),
+            "tracker_fingerprint": tracker.get("signal_fingerprint", ""),
+            "direction": direction, "trading_symbol": tracker.get("trading_symbol", ""),
+            "strike": tracker.get("strike"), "spot": spot,
+            "previous_T1": previous_t1, "new_T1": tracker.get("target_1"),
+            "previous_T2": previous_t2, "new_T2": tracker.get("target_2"),
+            "previous_trailing_SL": active_stop, "new_trailing_SL": tracker.get("trailing_stop"),
+            "target_reassessment_reason": context_reason,
+            "message": "Active NIFTY levels updated prospectively after a distinct completed 3-minute bar and aligned multi-factor context. The prior 1-minute OHLC interval was processed against its then-active levels.",
+        }
+    tracker["target_reassessment_status"] = "LEVELS_REASSESSED_NO_CHANGE"
+    tracker["target_reassessment_reason"] = context_reason
+    return None
+
+
 def update_recommendation_tracker(
     state: dict[str, Any], spot: float, indicators: IndicatorSet,
     oi: OIAnalysis, now: datetime,
@@ -4820,26 +5250,12 @@ def update_recommendation_tracker(
             tracker["target_1_hit"] = True
             tracker["target_1_hit_at"] = intrabar.get("t1_timestamp") or ist_iso(now)
 
+        # Freeze the currently active SL for this scan's event determination. A refreshed
+        # structural stop is applied only after the current completed-candle interval has
+        # been evaluated; this prevents retroactive stop movement within the same scan.
         old_stop = stored_stop
         stop = old_stop
         trailing_changed = False
-        trailing_atr, trailing_atr_source = structural_stop_atr(indicators)
-        if bool(tracker.get("target_1_hit", False)) and finite(trailing_atr) and trailing_atr > 0:
-            wall_rows = oi.walls_support if direction == "BULLISH" else oi.walls_resistance
-            side_walls = [w for w in wall_rows if w.state in {"BUILDING", "STABLE"}
-                          and (w.strike < spot if direction == "BULLISH" else w.strike > spot)]
-            if side_walls:
-                wall = max(side_walls, key=lambda w: w.strike) if direction == "BULLISH" else min(side_walls, key=lambda w: w.strike)
-                atr_buffer = dynamic_atr_buffer_multiple(indicators)
-                new_stop = wall.strike - atr_buffer * trailing_atr if direction == "BULLISH" else wall.strike + atr_buffer * trailing_atr
-                ratcheted = max(stop, new_stop) if direction == "BULLISH" else min(stop, new_stop)
-                if ((direction == "BULLISH" and ratcheted < spot and ratcheted > stop)
-                        or (direction == "BEARISH" and ratcheted > spot and ratcheted < stop)):
-                    stop = float(ratcheted)
-                    tracker["trailing_stop"] = stop
-                    tracker["trailing_stop_source"] = f"POST_T1_CURRENT_{wall.side}_WALL_MINUS_PLUS_{atr_buffer:.2f}_{trailing_atr_source}"
-                    tracker["trailing_stop_updated_at"] = ist_iso(now)
-                    trailing_changed = abs(stop - old_stop) >= 0.01
 
         common_event = {
             "event_at": ist_iso(now), "tracker_fingerprint": tracker.get("signal_fingerprint", ""),
@@ -4847,6 +5263,7 @@ def update_recommendation_tracker(
             "instrument_key": instrument_key, "trading_symbol": tracker.get("trading_symbol", ""),
             "option_type": tracker.get("option_type", ""), "strike": tracker.get("strike"),
             "spot": spot, "option_ltp": option_ltp, "option_quote_status": quote_status,
+            "confidence_pct": tracker.get("confidence_pct", tracker.get("latest_signal_confidence_pct")),
             "option_quote_age_seconds": quote.age_seconds if quote is not None else None,
             "T1": t1, "T2": t2 if finite(t2) else None,
             "SL": tracker.get("stop_loss"), "trailing_SL": stop,
@@ -4879,11 +5296,7 @@ def update_recommendation_tracker(
         }
         if t1_newly_hit:
             events.append({**common_event, "event_type": "T1_REACHED",
-                           "message": (f"Completed 1m NIFTY candle reached T1 at {intrabar.get('t1_timestamp')}. " if intrabar.get("t1_hit") else "NIFTY reached T1. ") + "The virtual trailing stop is updated to the current intact structural OI wall where a favorable ratchet is available."})
-        elif trailing_changed:
-            events.append({**common_event, "event_type": "TRAILING_STOP_UPDATED",
-                           "previous_trailing_SL": old_stop, "new_trailing_SL": stop,
-                           "message": "NIFTY structural support/resistance changed; the virtual trailing stop moved only in the favorable direction."})
+                           "message": (f"Completed 1m NIFTY candle reached T1 at {intrabar.get('t1_timestamp')}. " if intrabar.get("t1_hit") else "NIFTY reached T1. ") + "Further target/stop reassessment will use a new completed 3-minute structure bar and aligned market context."})
 
         stop_hit = bool(intrabar.get("stop_hit")) or (direction == "BULLISH" and spot <= stop) or (direction == "BEARISH" and spot >= stop)
         t2_hit = (not chronology_uncertain) and (bool(intrabar.get("t2_hit")) or
@@ -4920,6 +5333,19 @@ def update_recommendation_tracker(
             )
             if stagnation.get("warning"):
                 events.append(stagnation["warning"])
+
+            # Dynamic T1/T2 and favorable-only SL updates happen after this scan's old
+            # levels have already been checked for crossings. The reassessment is gated
+            # by a distinct completed 3m candle plus market context (VWAP/momentum/DI/COI/
+            # futures); it cannot trigger on a 1m wick alone.
+            level_event = _reassess_active_structural_levels(
+                tracker, spot, indicators, oi, now, scenario, future_regime, config, index_candles
+            )
+            if level_event:
+                events.append(level_event)
+            t1 = safe_float(tracker.get("target_1"), t1)
+            t2 = safe_float(tracker.get("target_2"), float("nan"))
+            stop = safe_float(tracker.get("trailing_stop", tracker.get("stop_loss")), stop)
         else:
             stagnation = {"status": "NOT_APPLICABLE", "warning": None}
 
@@ -4945,11 +5371,16 @@ def update_recommendation_tracker(
             "monitoring_gap_minutes": tracker.get("monitoring_gap_minutes"),
             "monitoring_data_note": tracker.get("monitoring_data_note", ""),
             "active_regime_assessment": tracker.get("regime_assessment", {}),
+            "target_reassessment_status": tracker.get("target_reassessment_status", "NOT_YET_ASSESSED"),
+            "target_reassessment_reason": tracker.get("target_reassessment_reason", ""),
+            "target_update_count": tracker.get("target_update_count", 0),
+            "last_target_update_at": tracker.get("last_target_update_at"),
+            "last_dynamic_levels_3m_bar_timestamp": tracker.get("last_dynamic_levels_3m_bar_timestamp"),
             "opposite_scenario_consecutive_bars": tracker.get("opposite_scenario_consecutive_bars", 0),
         })
 
     # Keep only a bounded same-session history; the latest recommendation is the legacy view.
-    state["recommendation_trackers"] = trackers[-60:]
+    state["recommendation_trackers"] = _compact_persisted_tracker_history(trackers)
     if trackers:
         primary_fp = str(state.get("last_signal_fingerprint", ""))
         primary = next((x for x in reversed(trackers) if str(x.get("signal_fingerprint", "")) == primary_fp), trackers[-1])
@@ -4981,7 +5412,7 @@ def register_recommendation_tracker(
 ) -> dict[str, Any]:
     """Register a signal for virtual monitoring without resetting an identical tracker.
 
-    V74's main scan guard suppresses new selection while any recommendation is active.
+    V77's main scan guard suppresses new selection while any recommendation is active.
     The tracker-list compatibility remains for older persisted states; active legacy
     records continue to be monitored rather than silently discarded during migration.
     """
@@ -5033,6 +5464,7 @@ def register_recommendation_tracker(
             "direction": signal["direction"], "scenario": signal.get("scenario", ""),
             "instrument_key": signal["instrument_key"], "trading_symbol": signal["trading_symbol"],
             "strike": signal["strike"], "option_type": signal["option_type"],
+            "confidence_pct": signal.get("confidence_pct"),
             "entry_reference_ltp": signal["option_ltp"],
             "last_option_ltp_observed": signal["option_ltp"],
             "last_option_quote_status": "FRESH",
@@ -5071,7 +5503,7 @@ def register_recommendation_tracker(
                 "direction": oldest.get("direction"), "retired_at": now.isoformat(),
             })
 
-    trackers = trackers[-60:]
+    trackers = _compact_persisted_tracker_history(trackers)
     state["recommendation_trackers"] = trackers
     state["recommendation_tracker"] = primary
     state["last_signal_fingerprint"] = fingerprint
@@ -5220,7 +5652,7 @@ def enqueue_email_alert(
     """Queue one-time selection, T1/T2 milestone, and confirmed failure emails."""
     event_type = str(event_type or "").upper()
     if event_type not in EMAIL_ALLOWED_EVENT_TYPES:
-        LOGGER.debug("EMAIL SUPPRESSED BY V74 POLICY: event=%s", event_type or "UNKNOWN")
+        LOGGER.debug("EMAIL SUPPRESSED BY V77 POLICY: event=%s", event_type or "UNKNOWN")
         return None
     dedupe = state.setdefault("alert_dedupe", {})
     if not isinstance(dedupe, dict):
@@ -5233,7 +5665,7 @@ def enqueue_email_alert(
             return None
         if (now - prior_ts).total_seconds() < max(1, cooldown_minutes) * 60:
             return None
-    serial_payload = json_safe(dict(payload))
+    serial_payload = _compact_email_payload(payload)
     event_seed = f"{dedupe_key}|{ist_iso(now)}"
     event_id = hashlib.sha256(event_seed.encode("utf-8")).hexdigest()
     alert = {
@@ -5271,241 +5703,105 @@ def _alert_display_value(value: Any, *, fallback: str = "Not available") -> str:
 
 
 def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]], str]:
-    raw = alert.get("payload", {})
-    payload = raw if isinstance(raw, Mapping) else {}
+    """Build the minimal user-requested signal/level email fields only."""
+    payload_raw = alert.get("payload", {})
+    payload = payload_raw if isinstance(payload_raw, Mapping) else {}
     event_type = str(alert.get("event_type", "SCANNER_ALERT")).upper()
-    created = str(payload.get("event_at") or alert.get("created_at") or payload.get("timestamp", ""))
-    created_dt = parse_timestamp(created)
-    created_display = created_dt.astimezone(IST).strftime("%d %b %Y, %I:%M:%S %p IST") if created_dt else created
-
-    watch_events = {"PREDICTIVE_WATCH", "REVERSAL_WATCH", "PREDICTIVE_WATCH_INVALIDATED", "DIRECTIONAL_SHIFT_WATCH"}
-    is_watch = event_type in watch_events
-    title = event_type.replace("_", " ").title()
-    if event_type == "SIGNAL_READY":
-        title = "STRIKE SELECTED — VIRTUAL PLAN ACTIVE"
-    elif event_type == "MARKET_REVERSAL_CONFIRMED":
-        title = "CONFIRMED MARKET REVERSAL — RECOMMENDATION INVALIDATED"
-    elif event_type == "INITIAL_STOP_LOSS_REACHED":
-        title = "INITIAL STOP LOSS REACHED — RECOMMENDATION ENDED"
-    elif event_type == "TRAILING_STOP_REACHED":
-        title = "TRAILING STOP REACHED — RECOMMENDATION ENDED"
-    elif event_type == "PREDICTIVE_WATCH":
-        title = "MARKET WATCH — NO OPTION SELECTED"
-    elif event_type == "REVERSAL_WATCH":
-        title = "REVERSAL WATCH — NO OPTION SELECTED"
-    elif event_type == "DIRECTIONAL_SHIFT_WATCH":
-        title = "DIRECTION SHIFT WATCH — NO OPTION SELECTED"
-    elif event_type == "PREDICTIVE_WATCH_INVALIDATED":
-        title = "MARKET WATCH INVALIDATED — NO TRADE WAS OPENED"
-    elif event_type == "T1_REACHED":
-        title = "T1 REACHED — FIRST STRUCTURAL NIFTY TARGET TOUCHED"
-    elif event_type == "T2_REACHED":
-        title = "T2 REACHED — VIRTUAL MONITORING COMPLETE"
-
     selected = payload.get("selected_option") if isinstance(payload.get("selected_option"), Mapping) else {}
     best = payload.get("best_candidate") if isinstance(payload.get("best_candidate"), Mapping) else {}
     tracker = payload.get("tracker") if isinstance(payload.get("tracker"), Mapping) else {}
-    previous_watch = payload.get("previous_watch") if isinstance(payload.get("previous_watch"), Mapping) else {}
-    # Never render option previews, old V65 candidates, targets, or stops as if a watch selected a trade.
-    candidate = {} if is_watch else (selected or best or {})
     levels = payload.get("nifty_levels") if isinstance(payload.get("nifty_levels"), Mapping) else {}
     risk = payload.get("risk_plan") if isinstance(payload.get("risk_plan"), Mapping) else {}
-    readiness = payload.get("readiness") if isinstance(payload.get("readiness"), Mapping) else {}
 
     def first(*values: Any) -> Any:
         return next((value for value in values if value is not None and value != ""), None)
 
-    symbol = first(payload.get("trading_symbol"), candidate.get("trading_symbol"), tracker.get("trading_symbol"))
-    option_type = first(payload.get("option_type"), candidate.get("option_type"), tracker.get("option_type"))
-    strike = first(payload.get("strike"), candidate.get("strike"), tracker.get("strike"))
-    ltp = first(payload.get("option_ltp"), payload.get("ltp"), candidate.get("ltp"), tracker.get("last_option_ltp_observed"))
-    delta = first(payload.get("delta"), candidate.get("delta"), tracker.get("delta"))
-    premium_vwap = first(payload.get("option_premium_vwap"), payload.get("premium_vwap"), candidate.get("premium_vwap"))
-    spot = first(payload.get("nifty_spot"), payload.get("spot"), payload.get("last_nifty_spot"), levels.get("spot"), candidate.get("spot"))
-    vwap = first(payload.get("vwap"), payload.get("index_vwap"))
-    scenario = first(payload.get("scenario"), payload.get("market_state"), payload.get("state"), payload.get("current_scenario"))
-    direction = first(payload.get("direction"), payload.get("bias"), previous_watch.get("direction"), payload.get("current_direction"))
-    confidence = first(payload.get("confidence_pct"), payload.get("confidence"), previous_watch.get("confidence_pct"))
-    score = first(payload.get("score"), candidate.get("score"), candidate.get("total_score"))
-    t1 = first(payload.get("T1"), payload.get("target_1"), levels.get("T1"), risk.get("target_1"), tracker.get("target_1"))
-    t2 = first(payload.get("T2"), payload.get("target_2"), levels.get("T2"), risk.get("target_2"), tracker.get("target_2"))
-    sl = first(payload.get("SL"), payload.get("stop_loss"), levels.get("SL"), risk.get("stop_loss"), tracker.get("stop_loss"))
-    trailing = first(payload.get("trailing_SL"), payload.get("trailing_stop"), levels.get("trailing_SL"), tracker.get("trailing_stop"))
-    wall = first(payload.get("wall_level"), payload.get("wall_strike"), previous_watch.get("wall_level"))
-    wall_state = first(payload.get("wall_state"), payload.get("wall_status"), previous_watch.get("wall_state"))
-    rationale = first(payload.get("invalidation_reason"), payload.get("trigger_reason"), payload.get("trigger_rationale"), payload.get("reason"), payload.get("message"), payload.get("note"))
+    symbol = first(payload.get("trading_symbol"), selected.get("trading_symbol"), best.get("trading_symbol"), tracker.get("trading_symbol"))
+    option_type = first(payload.get("option_type"), selected.get("option_type"), best.get("option_type"), tracker.get("option_type"))
+    strike = first(payload.get("strike"), selected.get("strike"), best.get("strike"), tracker.get("strike"))
+    if symbol is None and (option_type is not None or strike is not None):
+        symbol = f"{first(option_type, 'OPTION')} {safe_float(strike, float('nan')):.0f}" if finite(safe_float(strike)) else str(option_type or "OPTION")
 
-    if is_watch:
-        # Ignore all option-level data even if an older V65 outbox payload contains it.
-        symbol = option_type = strike = ltp = delta = premium_vwap = score = None
-        t1 = t2 = sl = trailing = None
+    confidence = first(payload.get("confidence_pct"), payload.get("confidence"), selected.get("confidence_pct"),
+                       tracker.get("confidence_pct"), best.get("confidence_pct"))
+    entry_spot = first(payload.get("nifty_entry_reference"), payload.get("nifty_spot"), selected.get("nifty_spot"),
+                       tracker.get("nifty_entry_reference"), payload.get("spot"))
+    t1 = first(payload.get("T1"), payload.get("target_1"), levels.get("T1"), risk.get("target_1"), tracker.get("target_1"), selected.get("T1"))
+    t2 = first(payload.get("T2"), payload.get("target_2"), levels.get("T2"), risk.get("target_2"), tracker.get("target_2"), selected.get("T2"))
+    initial_sl = first(payload.get("SL"), payload.get("stop_loss"), levels.get("SL"), risk.get("stop_loss"), tracker.get("stop_loss"), selected.get("SL"))
+    trailing_sl = first(payload.get("trailing_SL"), payload.get("trailing_stop"), tracker.get("trailing_stop"))
+    sl = trailing_sl if event_type in {"T1_REACHED", "T2_REACHED", "TRAILING_STOP_REACHED"} and trailing_sl is not None else initial_sl
 
-    blocker_list = first(payload.get("readiness_blockers"), payload.get("candidate_blockers"),
-                         candidate.get("blocking_reasons"), candidate.get("vetoes"),
-                         readiness.get("blocking_reasons"), previous_watch.get("readiness_blockers"))
-    if isinstance(blocker_list, str):
-        blocker_text = blocker_list
-    elif isinstance(blocker_list, (list, tuple)):
-        blocker_text = "; ".join(str(x) for x in blocker_list) if blocker_list else "None"
-    else:
-        blocker_text = "Not provided"
-
-    if is_watch:
-        option_text = "No contract selected — market/setup or option gates are not all confirmed."
-        ltp_text = delta_text = premium_text = score_text = "Not issued — no selected contract"
-        t1_text = t2_text = sl_text = trailing_text = "Not issued — no trade-ready plan"
-    else:
-        if symbol or strike:
-            option_text = f"{_alert_display_value(symbol, fallback='N/A')} — {_alert_display_value(option_type, fallback='Option')} {_alert_display_value(strike, fallback='')}"
-        else:
-            option_text = "Not applicable / no selected contract"
-        ltp_text = f"₹{_alert_display_value(ltp)}" if ltp is not None else "Not available"
-        delta_text = _alert_display_value(delta)
-        premium_text = f"₹{_alert_display_value(premium_vwap)}" if premium_vwap is not None else "Not available / not evaluated"
-        score_text = _alert_display_value(score)
-        t1_text = _alert_display_value(t1, fallback="Not established")
-        t2_text = _alert_display_value(t2, fallback="Unavailable / optional")
-        sl_text = _alert_display_value(sl, fallback="Not established")
-        trailing_text = _alert_display_value(trailing, fallback="Not established")
-
-    entry_spot = first(payload.get("nifty_entry_reference"), payload.get("nifty_spot"), payload.get("spot"), tracker.get("nifty_entry_reference"))
-    reward_risk = first(payload.get("reward_risk_ratio"), risk.get("reward_risk_ratio"), tracker.get("reward_risk_ratio"))
-    t1_distance = first(payload.get("t1_distance_points"), risk.get("reward_points"), tracker.get("t1_distance_points"))
-    sl_distance = first(payload.get("sl_distance_points"), risk.get("risk_points"), tracker.get("sl_distance_points"))
-    reachability_limit = first(payload.get("max_t1_distance_points"), risk.get("max_t1_distance_points"), tracker.get("max_t1_distance_points"))
-    remaining_minutes = first(payload.get("remaining_session_minutes"), risk.get("remaining_session_minutes"), tracker.get("remaining_session_minutes_at_signal"))
-    stop_atr_points = first(payload.get("stop_atr_points"), risk.get("stop_atr_points"), tracker.get("stop_atr_points"))
-    stop_atr_source = first(payload.get("stop_atr_source"), risk.get("stop_atr_source"), tracker.get("stop_atr_source"))
-    t1_source = first(payload.get("T1_source"), payload.get("target_1_source"), tracker.get("T1_source"))
-    t2_source = first(payload.get("T2_source"), payload.get("target_2_source"), tracker.get("T2_source"))
-    sl_source = first(payload.get("SL_source"), payload.get("stop_source"), tracker.get("SL_source"))
-    trailing_sl_source = first(payload.get("trailing_SL_source"), tracker.get("trailing_stop_source"), sl_source)
-    nifty_progress = first(payload.get("nifty_move_from_signal_points"), tracker.get("nifty_move_from_signal_points"))
-    option_change_pct = first(payload.get("option_ltp_change_pct_from_signal"), tracker.get("option_ltp_change_pct_from_signal"))
-    crossed_at = None
+    event_time = None
     if event_type == "T1_REACHED":
-        crossed_at = payload.get("intrabar_t1_timestamp")
+        event_time = payload.get("intrabar_t1_timestamp")
     elif event_type == "T2_REACHED":
-        crossed_at = payload.get("intrabar_t2_timestamp")
+        event_time = payload.get("intrabar_t2_timestamp")
     elif event_type in {"INITIAL_STOP_LOSS_REACHED", "TRAILING_STOP_REACHED"}:
-        crossed_at = payload.get("intrabar_stop_timestamp")
-    crossed_dt = parse_timestamp(crossed_at) if crossed_at else None
-    crossed_display = crossed_dt.astimezone(IST).strftime("%d %b %Y, %I:%M:%S %p IST") if crossed_dt else "No completed-candle crossing timestamp available"
-    event_level = None
-    if event_type == "T1_REACHED":
-        event_level = t1
-    elif event_type == "T2_REACHED":
-        event_level = t2
-    elif event_type == "INITIAL_STOP_LOSS_REACHED":
-        event_level = sl
-    elif event_type == "TRAILING_STOP_REACHED":
-        event_level = trailing
+        event_time = payload.get("intrabar_stop_timestamp")
+    event_time = first(event_time, payload.get("timestamp"), payload.get("event_at"), alert.get("created_at"))
+    event_dt = parse_timestamp(event_time) if event_time else None
+    time_text = event_dt.astimezone(IST).strftime("%d %b %Y, %I:%M:%S %p IST") if event_dt else str(event_time or "Not available")
 
+    title_map = {
+        "SIGNAL_READY": "STRIKE SELECTED",
+        "T1_REACHED": "T1 REACHED",
+        "T2_REACHED": "T2 REACHED",
+        "INITIAL_STOP_LOSS_REACHED": "STOP LOSS REACHED",
+        "TRAILING_STOP_REACHED": "TRAILING STOP REACHED",
+        "MARKET_REVERSAL_CONFIRMED": "MARKET STRUCTURE REVERSAL CONFIRMED",
+    }
+    title = title_map.get(event_type, event_type.replace("_", " ").strip().title())
+
+    def fmt(value: Any, fallback: str = "Not available") -> str:
+        if value is None:
+            return fallback
+        try:
+            number = float(value)
+            if not math.isfinite(number):
+                return fallback
+            return f"{number:.2f}"
+        except (TypeError, ValueError):
+            return str(value).strip() or fallback
+
+    confidence_text = "Not available"
+    if confidence is not None:
+        try:
+            confidence_value = float(confidence)
+            if math.isfinite(confidence_value):
+                confidence_text = f"{confidence_value:.1f}%" if abs(confidence_value - round(confidence_value)) > 0.05 else f"{confidence_value:.0f}%"
+        except (TypeError, ValueError):
+            confidence_text = str(confidence).strip() or "Not available"
     fields = [
-        ("Event time (IST)", created_display),
-        ("Market scenario", _alert_display_value(scenario)),
-        ("Direction", _alert_display_value(direction)),
-        ("Confidence (heuristic)", f"{_alert_display_value(confidence)}%" if confidence is not None else "Not calibrated"),
-        ("NIFTY spot at signal", _alert_display_value(entry_spot)),
-        ("NIFTY spot observed at alert", _alert_display_value(spot)),
-        ("Level-crossing candle time (IST)", crossed_display if event_type in {"T1_REACHED", "T2_REACHED", "INITIAL_STOP_LOSS_REACHED", "TRAILING_STOP_REACHED"} else "Not applicable"),
-        ("NIFTY VWAP", _alert_display_value(vwap)),
-        ("Structural wall", f"{_alert_display_value(wall)} ({_alert_display_value(wall_state)})" if wall is not None else "Not identified"),
-        ("Option", option_text),
-        ("Option LTP", ltp_text),
-        ("Option delta", delta_text),
-        ("Option premium VWAP", premium_text),
-        ("Candidate score", score_text),
-        ("NIFTY T1", t1_text),
-        ("NIFTY T2", t2_text),
-        ("NIFTY initial SL", sl_text),
-        ("NIFTY trailing SL", trailing_text),
-        ("T1 distance from signal", f"{_alert_display_value(t1_distance)} NIFTY points" if t1_distance is not None else "Not available"),
-        ("Initial SL risk from signal", f"{_alert_display_value(sl_distance)} NIFTY points" if sl_distance is not None else "Not available"),
-        ("T1 reward / risk", f"{_alert_display_value(reward_risk)}:1" if reward_risk is not None else "Not available"),
-        ("T1 reachability ceiling", f"{_alert_display_value(reachability_limit)} NIFTY points; {_alert_display_value(remaining_minutes)} minutes remained at signal" if reachability_limit is not None else "Not available"),
-        ("Stop volatility basis", f"{_alert_display_value(stop_atr_source)} ({_alert_display_value(stop_atr_points)} points)" if stop_atr_source is not None else "Not available"),
-        ("T1 structural source", _alert_display_value(t1_source)),
-        ("T2 structural source", _alert_display_value(t2_source)),
-        ("SL structural source", _alert_display_value(sl_source)),
-        ("Trailing SL source", _alert_display_value(trailing_sl_source)),
-        ("NIFTY progress since signal", f"{safe_float(nifty_progress):+.2f} points (direction-adjusted)" if finite(nifty_progress) else "Not applicable"),
-        ("Option premium change since signal", f"{_alert_display_value(option_change_pct)}% (quote freshness still applies)" if option_change_pct is not None else "Not available"),
-        ("Event level crossed", _alert_display_value(event_level) if event_level is not None else "Not applicable"),
-        ("Readiness blockers", blocker_text),
-        ("Active-signal context state", _alert_display_value(
-            (payload.get("active_regime_assessment") or {}).get("context_state")
-            if isinstance(payload.get("active_regime_assessment"), Mapping) else None)),
-        ("Active-signal scenario relation", _alert_display_value(
-            (payload.get("active_regime_assessment") or {}).get("scenario_relation")
-            if isinstance(payload.get("active_regime_assessment"), Mapping) else None)),
-        ("VWAP / momentum / directional DI-ADX / tactical COI / futures", "; ".join(
-            f"{key}={value}" for key, value in
-            ((payload.get("active_regime_assessment") or {}).get("evidence", {}) if
-             isinstance(payload.get("active_regime_assessment"), Mapping) and
-             isinstance((payload.get("active_regime_assessment") or {}).get("evidence", {}), Mapping) else {}).items()
-            if key in {"vwap", "momentum_3m", "directional_di_adx", "tactical_coi", "futures_alignment"}) or "Not available"),
-        ("Candle monitoring integrity", _alert_display_value(payload.get("monitoring_data_status"))),
-        ("Target-event integrity", _alert_display_value(payload.get("target_event_integrity"))),
-        ("Target monitoring degraded since", _alert_display_value(payload.get("target_event_integrity_since"))),
-        ("Candle-gap duration (minutes)", _alert_display_value(payload.get("monitoring_gap_minutes"))),
-        ("Monitoring data note", _alert_display_value(payload.get("monitoring_data_note"))),
-        ("Rationale", _alert_display_value(rationale)),
+        ("Strike selection", str(symbol or "Not available")),
+        ("Strike selection spot price", fmt(entry_spot)),
+        ("Confidence", confidence_text),
+        ("Time (IST)", time_text),
+        ("Nifty T1", fmt(t1)),
+        ("Nifty T2", fmt(t2)),
+        ("Nifty SL", fmt(sl)),
     ]
-    if event_type == "MARKET_REVERSAL_CONFIRMED":
-        fields.extend([
-            ("Invalidated recommendation direction", _alert_display_value(first(payload.get("invalidated_direction"), direction))),
-            ("Confirmed opposite direction", _alert_display_value(payload.get("replacement_direction"))),
-            ("Failure reason", _alert_display_value(payload.get("message"), fallback="Opposite structure confirmed")),
-        ])
-    if event_type == "PREDICTIVE_WATCH_INVALIDATED":
-        fields.extend([
-            ("Previous watch direction", _alert_display_value(first(payload.get("previous_direction"), previous_watch.get("direction")))),
-            ("Current observed direction", _alert_display_value(payload.get("current_direction"))),
-            ("Invalidation type", _alert_display_value(payload.get("invalidation_type"))),
-            ("Confirmation count", f"neutral={_alert_display_value(payload.get('neutral_scan_count'), fallback='0')}/{_alert_display_value(payload.get('required_neutral_scans'), fallback='N/A')}; opposite={_alert_display_value(payload.get('opposite_scan_count'), fallback='0')}/{_alert_display_value(payload.get('required_opposite_scans'), fallback='N/A')}"),
-            ("Invalidation reason", _alert_display_value(payload.get("invalidation_reason"), fallback="Not specified")),
-        ])
-    if is_watch:
-        disclaimer = (
-            "MARKET WATCH ONLY. No option contract was selected. T1/T2/SL are not issued because the setup is not trade-ready. "
-            "An invalidated watch is not a trade exit. No broker order was placed."
-            if event_type == "PREDICTIVE_WATCH_INVALIDATED" else
-            "WATCH ONLY — NOT TRADE READY. No option contract was selected; T1/T2/SL are not issued as trade levels until all market, risk and option gates pass. No broker order was placed."
-        )
-    else:
-        disclaimer = (
-            "This is a scanner recommendation and virtual monitoring alert only. No order was placed and no actual position is inferred. "
-            "T1/T2/SL are NIFTY index levels (index points), not option-premium exit prices; option premiums can differ because of delta, gamma, IV, theta and spread."
-        )
-    return title, fields, disclaimer
+    return title, fields, ""
+
 
 def _alert_body(alert: Mapping[str, Any]) -> str:
-    title, fields, disclaimer = _alert_fields(alert)
-    lines = [f"NIFTY 50 Predictive Scanner V74 — {title}", "", disclaimer, ""]
-    lines.extend(f"{label}: {value}" for label, value in fields)
-    lines.extend(["", f"Scanner version: {SCANNER_VERSION}"])
-    return "\n".join(lines)
+    title, fields, _ = _alert_fields(alert)
+    return "\n".join([title, "", *(f"{label}: {value}" for label, value in fields)])
 
 
 def _alert_html_body(alert: Mapping[str, Any]) -> str:
-    title, fields, disclaimer = _alert_fields(alert)
+    title, fields, _ = _alert_fields(alert)
     rows = "".join(
-        '<tr><td style="width:31%;padding:8px 12px;border-bottom:1px solid #e5e7eb;font-weight:600;vertical-align:top;overflow-wrap:anywhere;">'
-        + html_lib.escape(label) + '</td><td style="width:69%;padding:8px 12px;border-bottom:1px solid #e5e7eb;vertical-align:top;overflow-wrap:anywhere;word-break:normal;">'
-        + html_lib.escape(value) + '</td></tr>'
+        "<tr><td style='padding:5px 8px;font-weight:600;border-bottom:1px solid #e5e7eb;'>"
+        + html_lib.escape(label) + "</td><td style='padding:5px 8px;border-bottom:1px solid #e5e7eb;'>"
+        + html_lib.escape(value) + "</td></tr>"
         for label, value in fields
     )
-    event_type = str(alert.get("event_type", "SCANNER_ALERT")).upper()
-    banner = "#7f1d1d" if event_type in {"INITIAL_STOP_LOSS_REACHED", "TRAILING_STOP_REACHED", "MARKET_REVERSAL_CONFIRMED"} else "#1d4ed8" if event_type == "SIGNAL_READY" else "#92400e" if "WATCH" in event_type else "#374151"
-    safe_title = html_lib.escape(title)
     return (
-        '<!doctype html><html><body style="margin:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.45;">'
-        '<div style="max-width:780px;margin:0 auto;padding:16px;"><div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">'
-        f'<div style="background:{banner};padding:16px 20px;color:#ffffff;"><div style="font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.9;">NIFTY 50 Predictive Scanner · V74</div><h2 style="margin:6px 0 0;font-size:21px;line-height:1.3;">{safe_title}</h2></div>'
-        f'<div style="padding:16px 20px;"><p style="margin:0 0 14px;padding:11px 13px;background:#f9fafb;border-left:4px solid {banner};border-radius:4px;overflow-wrap:anywhere;">{html_lib.escape(disclaimer)}</p>'
-        f'<table role="presentation" style="border-collapse:collapse;width:100%;table-layout:fixed;font-size:14px;"><colgroup><col style="width:31%;"><col style="width:69%;"></colgroup><tbody>{rows}</tbody></table>'
-        f'<p style="color:#6b7280;font-size:12px;margin:16px 0 0;">Scanner version: {html_lib.escape(SCANNER_VERSION)} · Recommendation-only; no order was placed.</p></div></div></div></body></html>'
+        "<!doctype html><html><body style='font-family:Arial,Helvetica,sans-serif;color:#111827;'>"
+        f"<h3 style='margin:0 0 10px;'>{html_lib.escape(title)}</h3>"
+        f"<table role='presentation' style='border-collapse:collapse;font-size:14px;'>{rows}</table>"
+        "</body></html>"
     )
 
 def _schedule_email_retry(alert: dict[str, Any], now: datetime) -> None:
@@ -5527,7 +5823,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
                 and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
             alert["status"] = "SUPPRESSED_POLICY"
             alert["suppressed_at"] = ist_iso(now)
-            alert["last_error"] = "Suppressed by V74 email policy."
+            alert["last_error"] = "Suppressed by V77 email policy."
             alert.pop("next_attempt_at", None)
     all_pending = [x for x in outbox if isinstance(x, dict) and str(x.get("status", "PENDING")).upper() == "PENDING"]
     if not all_pending:
@@ -5564,7 +5860,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
             alert["attempts"] = int(alert.get("attempts", 0)) + 1
             try:
                 message = MIMEMultipart("alternative")
-                message["Subject"] = str(alert.get("subject", "NIFTY V74 scanner alert"))
+                message["Subject"] = str(alert.get("subject", "NIFTY V77 scanner alert"))
                 message["From"] = config.email_sender
                 message["To"] = config.email_receiver
                 message.attach(MIMEText(_alert_body(alert), "plain", "utf-8"))
@@ -5607,6 +5903,414 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
                         if isinstance(x, dict) and str(x.get("status", "")).upper() == "PENDING" and x.get("next_attempt_at")), default=None)
     return {"status": status, "attempted": attempted, "sent": sent_count, "pending": pending_count,
             "smtp_configured": True, "next_attempt_at": next_attempt}
+
+
+
+def _mapping_subset(value: Any, keys: Sequence[str]) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {key: value.get(key) for key in keys if key in value}
+
+
+def _compact_quote_payload(value: Any) -> dict[str, Any]:
+    return _mapping_subset(value, (
+        "instrument_key", "symbol", "ltp", "bid", "ask", "bid_qty", "ask_qty",
+        "volume", "oi", "previous_oi", "previous_close", "timestamp",
+        "last_trade_time", "freshness", "age_seconds", "last_trade_age_seconds",
+        "delta", "gamma", "theta", "vega", "iv", "greeks_source", "source",
+    ))
+
+
+def _compact_candidate_payload(value: Any) -> dict[str, Any]:
+    return _mapping_subset(value, (
+        "route_status", "instrument_key", "trading_symbol", "option_type", "strike",
+        "moneyness", "ltp", "delta", "delta_source", "score", "total_score",
+        "flow_score", "vwap_lift_score", "coi_score", "premium_vwap",
+        "option_premium_vwap", "spread_ratio", "quote_freshness", "quote_age_seconds",
+        "execution_eligible", "selected_for_execution", "best_candidate_for_review",
+        "provisional_only", "vetoes", "reason", "score_basis",
+    ))
+
+
+def _compact_audit_scan(scan: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a full in-memory scan into a compact, decision-relevant audit record.
+
+    The live state and detector still use the full option chain and candle data. Only the
+    GitHub-persisted audit is reduced: raw chain rows, quote payload blobs, long historical
+    seed candles, and full candidate internals are replaced by compact market-structure
+    summaries. Set AUDIT_DETAIL_LEVEL=full to retain the legacy detailed record when needed.
+    """
+    levels = scan.get("nifty_levels") if isinstance(scan.get("nifty_levels"), Mapping) else {}
+    indicators = scan.get("indicators") if isinstance(scan.get("indicators"), Mapping) else {}
+    oi = scan.get("oi") if isinstance(scan.get("oi"), Mapping) else {}
+    futures = scan.get("futures") if isinstance(scan.get("futures"), Mapping) else {}
+    risk = scan.get("risk") if isinstance(scan.get("risk"), Mapping) else {}
+    selected = scan.get("selected_option") if isinstance(scan.get("selected_option"), Mapping) else None
+    ranking = scan.get("candidate_ranking") if isinstance(scan.get("candidate_ranking"), Mapping) else {}
+    readiness = scan.get("trade_readiness") if isinstance(scan.get("trade_readiness"), Mapping) else {}
+    report: dict[str, Any] = {
+        "scanner_version": scan.get("scanner_version"),
+        "timestamp": scan.get("timestamp"),
+        "market_state": scan.get("market_state"),
+        "scenario": scan.get("scenario"),
+        "direction": scan.get("direction"),
+        "confidence_pct": scan.get("confidence_pct"),
+        "trigger_rationale": str(scan.get("trigger_rationale", ""))[:500],
+        "signal_ready": bool(scan.get("signal_ready", False)),
+        "execution_mode": scan.get("execution_mode"),
+        "market_status": scan.get("market_status"),
+        "execution_gap_minutes": scan.get("execution_gap_minutes"),
+        "execution_gap_reset": scan.get("execution_gap_reset"),
+        "nifty_levels": _mapping_subset(levels, ("spot", "T1", "T2", "SL", "trailing_SL")),
+        "indicators": _mapping_subset(indicators, (
+            "spot", "vwap", "vwap_slope", "atr", "atr_5m", "adx", "plus_di", "minus_di",
+            "rsi", "momentum_1m_pct", "momentum_3m_pct", "recent_range", "prior_range",
+            "compressed", "swing_low", "swing_high", "swing_low_5m", "swing_high_5m",
+            "session_high", "session_low", "candles_count", "indicators_seeded", "volume_source",
+        )),
+        "oi": {
+            **_mapping_subset(oi, (
+                "expiry", "atm", "strike_step", "call_total_oi", "put_total_oi", "pcr",
+                "pcr_previous", "pcr_spiking", "call_coi_tactical_pct", "put_coi_tactical_pct",
+                "call_coi_1m_pct", "put_coi_1m_pct", "call_coi_3m_pct", "put_coi_3m_pct",
+                "call_coi_5m_pct", "put_coi_5m_pct", "call_coi_session_pct", "put_coi_session_pct",
+                "tactical_source", "tactical_available", "tactical_age_minutes", "baseline_quality",
+                "session_baseline_source", "wall_change_source", "change_oi_fallback_available",
+                "both_sides_building", "pin_strikes", "reasons",
+            )),
+            "resistance_walls": [_mapping_subset(row, ("strike", "side", "oi", "change_pct", "state", "source", "distance"))
+                                   for row in (oi.get("resistance_walls", [])[:8]
+                                               if isinstance(oi.get("resistance_walls"), list) else []) if isinstance(row, Mapping)],
+            "support_walls": [_mapping_subset(row, ("strike", "side", "oi", "change_pct", "state", "source", "distance"))
+                               for row in (oi.get("support_walls", [])[:8]
+                                           if isinstance(oi.get("support_walls"), list) else []) if isinstance(row, Mapping)],
+        },
+        "futures": _mapping_subset(futures, (
+            "quote_freshness", "quote_age_seconds", "regime", "alignment", "oi_change_pct",
+            "price_change_pct", "last_price", "previous_close", "source", "reasons",
+        )),
+        "risk": _mapping_subset(risk, (
+            "valid", "target_1", "target_2", "stop_loss", "stop_source", "target_1_source",
+            "target_2_source", "reason", "reward_points", "risk_points", "reward_risk_ratio",
+            "max_t1_distance_points", "remaining_session_minutes", "stop_atr_points",
+            "stop_atr_source", "skipped_weak_walls", "skipped_unreachable_walls",
+        )),
+        "selected_option": _mapping_subset(selected, (
+            "timestamp", "scenario", "direction", "confidence_pct", "trigger_reason",
+            "entry_trigger_confirmation", "selection_mode", "option_type", "strike",
+            "trading_symbol", "instrument_key", "delta", "delta_source", "option_ltp",
+            "option_premium_vwap", "score", "flow_score", "vwap_lift_score", "coi_score",
+            "nifty_spot", "T1", "T2", "SL", "trailing_SL", "T1_source", "T2_source",
+            "SL_source", "reward_risk_ratio", "active_regime_assessment",
+        )) if selected else None,
+        "predictive_detection": _mapping_subset(scan.get("predictive_detection"), (
+            "detected", "stage", "scenario", "direction", "confidence_pct", "execution_candidate",
+            "entry_trigger_confirmed", "entry_trigger_reason", "selection_mode",
+            "provisional_ranking_allowed", "provisional_ranking_direction", "confidence_type",
+        )),
+        "candidate_ranking": {
+            "best_candidate": _compact_candidate_payload(ranking.get("best_candidate")),
+            "provisional_candidate": _compact_candidate_payload(ranking.get("provisional_candidate")),
+            "best_candidate_for_review": _compact_candidate_payload(ranking.get("best_candidate_for_review")),
+            "ranking_basis": ranking.get("ranking_basis"),
+            "expected_underlying_move_points": ranking.get("expected_underlying_move_points"),
+            "expected_move_source": ranking.get("expected_move_source"),
+            "option_gate_eligible_count": ranking.get("option_gate_eligible_count"),
+            "candidate_count": ranking.get("candidate_count"),
+            "provisional_only": ranking.get("provisional_only"),
+        },
+        "trade_readiness": {
+            **_mapping_subset(readiness, ("ready", "status", "selection_mode", "blocking_reasons", "minimum_score", "candidate_count")),
+        },
+        "candidate_diagnostics": [
+            _compact_candidate_payload(row) for row in (
+                scan.get("candidate_diagnostics", [])[:4]
+                if isinstance(scan.get("candidate_diagnostics"), list) else []
+            ) if isinstance(row, Mapping)
+        ],
+        "vetoes": [str(value)[:220] for value in (scan.get("vetoes", [])[:6]
+                   if isinstance(scan.get("vetoes"), list) else [])],
+        "market_data_quality": _mapping_subset(scan.get("market_data_quality"), (
+            "index_1m_candles", "new_entries", "existing_virtual_monitoring", "quote", "option_chain",
+            "nifty_future_1m_candles", "change_oi_fallback", "oi_analysis",
+        )),
+        "active_regime_reassessment": _mapping_subset(scan.get("active_regime_reassessment"), (
+            "current_resolved_scenario", "current_resolved_direction", "current_direction_flip_guard",
+            "active_signal_count", "policy",
+        )),
+        "active_recommendation_guard": _mapping_subset(scan.get("active_recommendation_guard"), (
+            "active_tracker_count", "new_selection_suppressed", "policy",
+        )),
+        "v68_direction_resolution": _mapping_subset(scan.get("v68_direction_resolution"), (
+            "primary_scenario_before_resolution", "price_structure_candidate",
+            "price_structure_candidate_direction", "reversal_watch", "resolved_scenario",
+            "resolved_direction", "price_led_route",
+        )),
+        "scenario_features": _mapping_subset(scan.get("scenario_features"), (
+            "reaction", "boundary_role", "boundary_level", "touch_count", "rejection_count",
+            "breakout_confirmation_count", "setup_route", "market_structure", "structure_state",
+            "compression", "reason_codes", "price_action_confirmed", "directional_confirmation",
+        )),
+        "recommendation_tracker": _mapping_subset(scan.get("recommendation_tracker"), (
+            "status", "direction", "target_1_hit", "target_1", "target_2", "trailing_stop",
+            "active_tracker_count", "message",
+        )),
+    }
+    monitored = scan.get("monitoring") if isinstance(scan.get("monitoring"), Mapping) else {}
+    tracker_rows = monitored.get("active_and_recent_trackers", [])
+    report["monitoring"] = {
+        "active_and_recent_trackers": [
+            _mapping_subset(row, (
+                "status", "direction", "scenario", "trading_symbol", "option_type", "strike",
+                "last_nifty_spot", "target_1_hit", "T1", "T2", "SL", "trailing_SL",
+                "monitoring_data_status", "target_event_integrity", "monitoring_gap_minutes",
+                "opposite_scenario_consecutive_bars", "target_reassessment_status", "target_update_count",
+            )) for row in (tracker_rows[-6:] if isinstance(tracker_rows, list) else []) if isinstance(row, Mapping)
+        ],
+        "events_this_scan": [
+            _mapping_subset(event, (
+                "event_type", "event_at", "intrabar_t1_timestamp", "intrabar_t2_timestamp",
+                "intrabar_stop_timestamp", "direction", "strike", "spot", "T1", "T2", "SL",
+                "trailing_SL", "previous_T1", "new_T1", "previous_T2", "new_T2",
+                "previous_trailing_SL", "new_trailing_SL", "target_reassessment_reason",
+                "monitoring_data_status", "target_event_integrity",
+            )) for event in (monitored.get("events_this_scan", []) if isinstance(monitored.get("events_this_scan"), list) else [])
+            if isinstance(event, Mapping)
+        ],
+    }
+    audit_inputs = scan.get("audit_inputs") if isinstance(scan.get("audit_inputs"), Mapping) else {}
+    spot = safe_float(levels.get("spot", indicators.get("spot")), float("nan"))
+    strike_step = max(1.0, safe_float(oi.get("strike_step"), 50.0))
+    band = max(500.0, strike_step * 10.0)
+    oi_by_strike = audit_inputs.get("oi_by_strike") if isinstance(audit_inputs.get("oi_by_strike"), Mapping) else {}
+    local_rows: list[dict[str, Any]] = []
+    if finite(spot):
+        for strike_text, row in oi_by_strike.items():
+            strike = safe_float(strike_text, float("nan"))
+            if not finite(strike) or not isinstance(row, Mapping):
+                continue
+            if abs(strike - spot) <= band:
+                local_rows.append({"strike": strike, **_mapping_subset(row, (
+                    "call_oi", "put_oi", "call_prev_oi", "put_prev_oi", "call_coi_pct", "put_coi_pct",
+                ))})
+        local_rows.sort(key=lambda row: row["strike"])
+    chain = audit_inputs.get("option_chain", [])
+    live_quotes = audit_inputs.get("live_quotes", {})
+    index_quote = audit_inputs.get("index_quote", {})
+    change_data = audit_inputs.get("change_oi_fallback_data", {})
+    fallback_rows = change_data.get("by_strike", {}) if isinstance(change_data, Mapping) else {}
+    compact_fallback_rows: list[dict[str, Any]] = []
+    if isinstance(fallback_rows, Mapping) and finite(spot):
+        rows = []
+        for strike_text, row in fallback_rows.items():
+            strike = safe_float(strike_text, float("nan"))
+            if finite(strike) and isinstance(row, Mapping):
+                rows.append((abs(strike - spot), strike, row))
+        for _distance, strike, row in sorted(rows)[:12]:
+            compact_fallback_rows.append({"strike": strike, **_mapping_subset(row, (
+                "call_change_oi", "put_change_oi", "call_change", "put_change", "call_oi_change", "put_oi_change",
+            ))})
+    candles = audit_inputs.get("candles_1m", {}) if isinstance(audit_inputs.get("candles_1m"), Mapping) else {}
+    option_candle_map = candles.get("option_candidates", {}) if isinstance(candles.get("option_candidates"), Mapping) else {}
+    selected_key = str((selected or {}).get("instrument_key", ""))
+    option_candle_rows: dict[str, Any] = {}
+    ordered_option_keys = []
+    if selected_key and selected_key in option_candle_map:
+        ordered_option_keys.append(selected_key)
+    ordered_option_keys.extend(key for key in option_candle_map if key not in ordered_option_keys)
+    for key in ordered_option_keys[:2]:
+        item = option_candle_map.get(key)
+        if isinstance(item, Mapping):
+            option_candle_rows[key] = {
+                "candle_status": item.get("candle_status"),
+                "candles": (item.get("candles", [])[-8:] if isinstance(item.get("candles"), list) else []),
+            }
+    report["audit_inputs"] = {
+        "capture_version": audit_inputs.get("capture_version"),
+        "capture_scope": audit_inputs.get("capture_scope"),
+        "data_coverage": _mapping_subset(audit_inputs.get("data_coverage"), (
+            "index_quote", "option_chain", "option_chain_expiry", "option_chain_strikes",
+            "option_chain_contract_sides", "live_quote_instruments", "nifty_index_1m_candles",
+            "nifty_future_1m_candles", "change_oi_fallback", "oi_analysis",
+        )),
+        "index_quote": _compact_quote_payload(index_quote),
+        "option_chain_summary": {
+            "row_count": len(chain) if isinstance(chain, list) else 0,
+            "min_strike": min((safe_float(row.get("strike_price"), float("inf")) for row in chain if isinstance(row, Mapping)), default=None) if isinstance(chain, list) else None,
+            "max_strike": max((safe_float(row.get("strike_price"), float("-inf")) for row in chain if isinstance(row, Mapping)), default=None) if isinstance(chain, list) else None,
+            "local_oi_rows": local_rows,
+        },
+        "oi_comparison_snapshot_timestamps": audit_inputs.get("oi_comparison_snapshot_timestamps", [])[-6:] if isinstance(audit_inputs.get("oi_comparison_snapshot_timestamps"), list) else [],
+        "change_oi_fallback_summary": {
+            **_mapping_subset(change_data, ("total_call_change_oi", "total_put_change_oi", "interval_days", "date", "expiry", "source")),
+            "nearest_strike_rows": compact_fallback_rows,
+        },
+        "live_quotes": {},
+        "historical_seed_info": _mapping_subset(audit_inputs.get("historical_seed_info"), (
+            "date", "instrument_key", "candle_count", "first_timestamp", "last_timestamp", "sha256",
+        )),
+        "candles_1m": {
+            "nifty_index_recent": candles.get("nifty_index_recent", [])[-8:] if isinstance(candles.get("nifty_index_recent"), list) else [],
+            "nifty_future_recent": candles.get("nifty_future_recent", [])[-8:] if isinstance(candles.get("nifty_future_recent"), list) else [],
+            "option_candidates": option_candle_rows,
+        },
+    }
+    compact_quote_keys: list[str] = []
+    if selected_key:
+        compact_quote_keys.append(selected_key)
+    for candidate_field in ("best_candidate", "provisional_candidate", "best_candidate_for_review"):
+        candidate = ranking.get(candidate_field) if isinstance(ranking.get(candidate_field), Mapping) else {}
+        candidate_key = str(candidate.get("instrument_key", ""))
+        if candidate_key and candidate_key not in compact_quote_keys:
+            compact_quote_keys.append(candidate_key)
+    if isinstance(live_quotes, Mapping):
+        for key in live_quotes:
+            key_text = str(key)
+            if key_text not in compact_quote_keys:
+                compact_quote_keys.append(key_text)
+            if len(compact_quote_keys) >= 6:
+                break
+        report["audit_inputs"]["live_quotes"] = {
+            key: _compact_quote_payload(live_quotes[key]) for key in compact_quote_keys[:6]
+            if key in live_quotes and isinstance(live_quotes[key], Mapping)
+        }
+
+    # Keep important direction/watch lifecycle fields, but never persist raw candle/chain dumps.
+    watch = scan.get("reversal_watch")
+    if isinstance(watch, Mapping):
+        report["reversal_watch"] = _mapping_subset(watch, (
+            "timestamp", "scenario", "direction", "confidence_pct", "trigger_reason", "nifty_spot",
+            "vwap", "adx", "rsi", "momentum_3m_pct", "plus_di", "minus_di",
+            "tactical_coi_available", "tactical_coi_source", "call_coi_tactical_pct", "put_coi_tactical_pct",
+            "current_scenario", "current_hard_veto",
+        ))
+    else:
+        report["reversal_watch"] = None
+    lifecycle = scan.get("directional_watch_lifecycle") if isinstance(scan.get("directional_watch_lifecycle"), Mapping) else {}
+    active_watch = lifecycle.get("active_watch") if isinstance(lifecycle.get("active_watch"), Mapping) else {}
+    report["directional_watch_lifecycle"] = {
+        "active_watch": _mapping_subset(active_watch, (
+            "direction", "scenario", "started_at", "last_seen_at", "last_nifty_spot",
+            "last_vwap", "last_adx", "readiness_blockers", "last_tactical_coi_source",
+            "last_tactical_coi_available",
+        )),
+        "policy": _mapping_subset(lifecycle.get("policy"), (
+            "neutral_scans_to_invalidate", "opposite_scans_to_invalidate", "max_age_minutes",
+            "strong_tactical_opposite_flow_overrides",
+        )),
+    }
+    report["audit_compaction"] = {
+        "mode": "COMPACT_DECISION_AND_NEAR_SPOT_MARKET_DATA",
+        "raw_option_chain_rows_omitted": True,
+        "full_historical_seed_snapshot_omitted": True,
+        "note": "Full calculations use unabridged live data; this persisted audit keeps indicator values, structural walls, near-spot OI, recent candles, quote health, gates and event chronology.",
+    }
+    return json_safe(report)
+
+
+def _compact_email_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Persist only the values consumed by the minimal email renderer; retain retry safety."""
+    out = _mapping_subset(payload, (
+        "timestamp", "event_at", "intrabar_t1_timestamp", "intrabar_t2_timestamp",
+        "intrabar_stop_timestamp", "trading_symbol", "option_type", "strike", "direction",
+        "confidence_pct", "confidence", "nifty_entry_reference", "nifty_spot", "spot",
+        "T1", "T2", "SL", "trailing_SL", "target_1", "target_2", "stop_loss",
+        "trailing_stop", "replacement_direction", "invalidated_direction", "message",
+    ))
+    for key in ("selected_option", "best_candidate"):
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            out[key] = _mapping_subset(value, (
+                "trading_symbol", "option_type", "strike", "confidence_pct", "nifty_spot",
+                "T1", "T2", "SL", "trailing_SL",
+            ))
+    for key in ("tracker",):
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            out[key] = _mapping_subset(value, (
+                "trading_symbol", "option_type", "strike", "confidence_pct", "nifty_entry_reference",
+                "target_1", "target_2", "stop_loss", "trailing_stop",
+            ))
+    for key in ("nifty_levels", "risk_plan"):
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            out[key] = _mapping_subset(value, ("spot", "T1", "T2", "SL", "target_1", "target_2", "stop_loss"))
+    return json_safe(out)
+
+
+def _compact_persisted_tracker_history(trackers: Any, terminal_keep: int = 12) -> list[dict[str, Any]]:
+    rows = [dict(item) for item in trackers if isinstance(item, dict)] if isinstance(trackers, list) else []
+    active = [item for item in rows if str(item.get("status", "")).upper() == "TRACKING"]
+    terminal = [item for item in rows if str(item.get("status", "")).upper() != "TRACKING"][-max(0, terminal_keep):]
+    active_ids = {str(item.get("signal_fingerprint", "")) for item in active}
+    return sorted(active + [item for item in terminal if str(item.get("signal_fingerprint", "")) not in active_ids],
+                  key=lambda item: str(item.get("created_at", "")))
+
+
+def _compact_existing_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert one legacy full audit record to the current compact schema without losing its decision trail."""
+    raw_scan = record.get("scan") if isinstance(record.get("scan"), Mapping) else record.get("scan_report")
+    if not isinstance(raw_scan, Mapping):
+        raise ValueError("Legacy audit row has no scan mapping; refusing to rewrite the audit file.")
+    compact_scan = _compact_audit_scan(raw_scan)
+    context = record.get("state_context") if isinstance(record.get("state_context"), Mapping) else {}
+    raw_trackers = context.get("active_or_recent_trackers", [])
+    tracker_keys = (
+        "signal_fingerprint", "status", "direction", "scenario", "option_type", "strike",
+        "trading_symbol", "instrument_key", "created_at", "completed_at", "completion_reason",
+        "target_1", "target_2", "stop_loss", "trailing_stop", "target_1_hit", "target_2_hit",
+        "last_nifty_spot", "last_option_ltp_observed", "last_option_quote_status",
+        "last_intrabar_bar_timestamp", "target_update_count", "last_target_update_at",
+        "last_dynamic_levels_3m_bar_timestamp", "target_reassessment_status",
+    )
+    compact_trackers = [
+        _mapping_subset(item, tracker_keys) for item in raw_trackers[-8:]
+        if isinstance(item, Mapping)
+    ] if isinstance(raw_trackers, list) else []
+    selected = compact_scan.get("selected_option") if isinstance(compact_scan.get("selected_option"), Mapping) else {}
+    monitoring = compact_scan.get("monitoring") if isinstance(compact_scan.get("monitoring"), Mapping) else {}
+    outcome_old = record.get("scan_outcome") if isinstance(record.get("scan_outcome"), Mapping) else {}
+    raw_events = monitoring.get("events_this_scan", [])
+    scan_outcome = {
+        "scenario": compact_scan.get("scenario"),
+        "market_state": compact_scan.get("market_state"),
+        "direction": compact_scan.get("direction"),
+        "confidence_pct": compact_scan.get("confidence_pct"),
+        "signal_ready": bool(compact_scan.get("signal_ready", False)),
+        "selected_option": _mapping_subset(selected, (
+            "trading_symbol", "option_type", "strike", "option_ltp", "nifty_spot",
+            "confidence_pct", "T1", "T2", "SL", "score",
+        )),
+        "vetoes": compact_scan.get("vetoes", [])[:6] if isinstance(compact_scan.get("vetoes"), list) else [],
+        "monitoring_events": [
+            _mapping_subset(item, ("event_type", "event_at", "spot", "T1", "T2", "SL",
+                                   "previous_T1", "new_T1", "previous_T2", "new_T2",
+                                   "previous_trailing_SL", "new_trailing_SL"))
+            for item in (raw_events if isinstance(raw_events, list) else [])[:8]
+            if isinstance(item, Mapping)
+        ],
+        "email_delivery": _mapping_subset(outcome_old.get("email_delivery"),
+                                           ("status", "attempted", "sent", "pending", "smtp_configured")),
+    }
+    return json_safe({
+        "audit_schema_version": 2,
+        "audit_detail_level": "compact",
+        "record_id": record.get("record_id"),
+        "recorded_at": record.get("recorded_at"),
+        "scanner_version": record.get("scanner_version", compact_scan.get("scanner_version", SCANNER_VERSION)),
+        "scan_outcome": scan_outcome,
+        "state_context": {
+            "session_date": context.get("session_date"),
+            "option_expiry": context.get("option_expiry"),
+            "session_oi_baseline_source": context.get("session_oi_baseline_source"),
+            "session_oi_baseline_timestamp": context.get("session_oi_baseline_timestamp"),
+            "recent_chain_snapshot_timestamps": context.get("recent_chain_snapshot_timestamps", [])[-12:]
+                if isinstance(context.get("recent_chain_snapshot_timestamps"), list) else [],
+            "active_or_recent_trackers": compact_trackers,
+            "last_signal_fingerprint": context.get("last_signal_fingerprint"),
+        },
+        "scan": compact_scan,
+    })
 
 
 class ScanAuditWriter:
@@ -5652,13 +6356,95 @@ class ScanAuditWriter:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
             return None
 
+    @staticmethod
+    def _is_compact_file(path: Path) -> bool:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                line = handle.readline()
+            row = json.loads(line) if line.strip() else {}
+            return bool(isinstance(row, Mapping)
+                        and str(row.get("audit_detail_level", "")).lower() == "compact"
+                        and int(safe_float(row.get("audit_schema_version"), 0)) >= 2)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+
+    def _compact_existing_file(self, path: Path) -> bool:
+        """Rewrite a legacy full same-day audit once, preserving all scans in compact form.
+
+        This prevents V77 from only compacting *new* lines while leaving a large V74/V76
+        audit file tracked in GitHub. A parse/conversion failure aborts atomically, leaving
+        the original untouched; the scanner can continue writing a new compact record.
+        """
+        if not path.exists() or path.stat().st_size == 0:
+            return False
+        try:
+            with path.open("r", encoding="utf-8") as source:
+                first_line = source.readline()
+            first = json.loads(first_line) if first_line.strip() else {}
+            if (isinstance(first, Mapping) and str(first.get("audit_detail_level", "")).lower() == "compact"
+                    and int(safe_float(first.get("audit_schema_version"), 0)) >= 2):
+                return False
+            old_size = path.stat().st_size
+            fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".compact.tmp", dir=str(path.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as target, path.open("r", encoding="utf-8") as source:
+                    for line_number, line in enumerate(source, start=1):
+                        if not line.strip():
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                            raise ValueError(f"Invalid JSON at audit line {line_number}; rewrite cancelled.") from exc
+                        if not isinstance(row, Mapping):
+                            raise ValueError(f"Non-object audit row at line {line_number}; rewrite cancelled.")
+                        if (str(row.get("audit_detail_level", "")).lower() == "compact"
+                                and int(safe_float(row.get("audit_schema_version"), 0)) >= 2):
+                            compact_row = json_safe(row)
+                        else:
+                            compact_row = _compact_existing_audit_record(row)
+                        target.write(json.dumps(compact_row, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
+                    target.flush()
+                    os.fsync(target.fileno())
+                os.replace(tmp_name, path)
+                new_size = path.stat().st_size
+                LOGGER.info("LEGACY AUDIT COMPACTED: %s bytes=%d->%d reduction=%.1f%%", path.name, old_size, new_size,
+                            (1.0 - new_size / old_size) * 100.0 if old_size else 0.0)
+                return True
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            LOGGER.warning("LEGACY AUDIT COMPACTION SKIPPED; original retained: %s", exc)
+            return False
+
     def append(self, now: datetime, report: Mapping[str, Any], state: Mapping[str, Any]) -> dict[str, Any]:
         local_now = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
         day = local_now.date().isoformat()
         path = self.directory / f"market_scan_{day}.jsonl"
         record_id = self._record_id(report)
+        audit_detail_level = os.getenv("AUDIT_DETAIL_LEVEL", "compact").strip().lower()
+        if audit_detail_level not in {"compact", "full"}:
+            audit_detail_level = "compact"
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
+            if audit_detail_level == "compact":
+                migration_done = bool(state.get("audit_v77_legacy_compaction_done", False))
+                if not migration_done and isinstance(state, dict):
+                    compaction_complete = True
+                    # Compact all legacy daily audit files, not only today's file. This matters
+                    # when V77 is first deployed on a later date than the large audit being fixed.
+                    for existing_path in sorted(self.directory.glob("market_scan_*.jsonl")):
+                        if not self._is_compact_file(existing_path):
+                            self._compact_existing_file(existing_path)
+                        if not self._is_compact_file(existing_path):
+                            compaction_complete = False
+                    if compaction_complete:
+                        state["audit_v77_legacy_compaction_done"] = True
+                elif path.exists() and not self._is_compact_file(path):
+                    self._compact_existing_file(path)
             if path.exists() and self._last_record_id(path) == record_id:
                 return {"status": "ALREADY_PRESENT", "path": str(path), "record_id": record_id}
 
@@ -5674,19 +6460,17 @@ class ScanAuditWriter:
                                 "strike", "trading_symbol", "instrument_key", "created_at", "completed_at",
                                 "completion_reason", "target_1", "target_2", "stop_loss", "trailing_stop",
                                 "target_1_hit", "target_2_hit", "last_nifty_spot", "last_option_ltp_observed",
-                                "last_option_quote_status", "last_intrabar_bar_timestamp")
+                                "last_option_quote_status", "last_intrabar_bar_timestamp", "target_update_count",
+                                "last_target_update_at", "last_dynamic_levels_3m_bar_timestamp", "target_reassessment_status")
                     if key in item
                 }
                 for item in trackers_raw if isinstance(item, dict)
             ] if isinstance(trackers_raw, list) else []
             snapshots = state.get("chain_snapshots", [])
             snapshot_times = [str(row.get("timestamp", "")) for row in snapshots if isinstance(row, dict)] if isinstance(snapshots, list) else []
-            record = {
-                "audit_schema_version": 1,
-                "record_id": record_id,
-                "recorded_at": ist_iso(local_now),
-                "scanner_version": str(report.get("scanner_version", SCANNER_VERSION)),
-                "scan_outcome": {
+            persisted_scan = scan_report if audit_detail_level == "full" else _compact_audit_scan(scan_report)
+            if audit_detail_level == "full":
+                scan_outcome = {
                     "scenario": report.get("scenario"),
                     "market_state": report.get("market_state"),
                     "direction": report.get("direction"),
@@ -5699,7 +6483,38 @@ class ScanAuditWriter:
                     "monitoring_events": ((report.get("monitoring") or {}).get("events_this_scan", [])
                                            if isinstance(report.get("monitoring"), Mapping) else []),
                     "email_delivery": report.get("email_delivery"),
-                },
+                }
+            else:
+                compact_selected = persisted_scan.get("selected_option") if isinstance(persisted_scan.get("selected_option"), Mapping) else {}
+                compact_monitor = persisted_scan.get("monitoring") if isinstance(persisted_scan.get("monitoring"), Mapping) else {}
+                raw_monitor_events = compact_monitor.get("events_this_scan", [])
+                scan_outcome = {
+                    "scenario": persisted_scan.get("scenario"),
+                    "market_state": persisted_scan.get("market_state"),
+                    "direction": persisted_scan.get("direction"),
+                    "confidence_pct": persisted_scan.get("confidence_pct"),
+                    "signal_ready": bool(persisted_scan.get("signal_ready", False)),
+                    "selected_option": _mapping_subset(compact_selected, (
+                        "trading_symbol", "option_type", "strike", "option_ltp", "nifty_spot",
+                        "confidence_pct", "T1", "T2", "SL", "score",
+                    )),
+                    "vetoes": persisted_scan.get("vetoes", [])[:6] if isinstance(persisted_scan.get("vetoes"), list) else [],
+                    "monitoring_events": [
+                        _mapping_subset(event, ("event_type", "event_at", "spot", "T1", "T2", "SL",
+                                                 "previous_T1", "new_T1", "previous_T2", "new_T2",
+                                                 "previous_trailing_SL", "new_trailing_SL"))
+                        for event in (raw_monitor_events if isinstance(raw_monitor_events, list) else [])[:8]
+                        if isinstance(event, Mapping)
+                    ],
+                    "email_delivery": _mapping_subset(report.get("email_delivery"), ("status", "attempted", "sent", "pending", "smtp_configured")),
+                }
+            record = {
+                "audit_schema_version": 1 if audit_detail_level == "full" else 2,
+                "audit_detail_level": audit_detail_level,
+                "record_id": record_id,
+                "recorded_at": ist_iso(local_now),
+                "scanner_version": str(report.get("scanner_version", SCANNER_VERSION)),
+                "scan_outcome": scan_outcome,
                 "state_context": {
                     "session_date": state.get("session_date"),
                     "option_expiry": state.get("option_expiry"),
@@ -5710,9 +6525,9 @@ class ScanAuditWriter:
                     "active_or_recent_trackers": trackers,
                     "last_signal_fingerprint": state.get("last_signal_fingerprint"),
                 },
-                # Preserve the full normalized report, all candidate diagnostics, selected
-                # strike details, and the current scan's captured input snapshots.
-                "scan": json_safe(scan_report),
+                # Default compact projection preserves decision evidence without full-chain/history bloat.
+                # AUDIT_DETAIL_LEVEL=full is available for short-lived deep diagnostics.
+                "scan": json_safe(persisted_scan),
             }
             line = json.dumps(json_safe(record), ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
             with path.open("a", encoding="utf-8", newline="") as handle:
@@ -5772,13 +6587,10 @@ class PredictiveScanner:
             else:
                 identity = f"{event_type}|{tracker_id}"
                 cooldown = None
-            strike = safe_float(event.get("strike"), 0.0)
-            direction = str(event.get("direction", "")).upper()
-            subject_suffix = f" {direction} {safe_float(event.get('strike'), 0.0):.0f}" if strike else f" {direction}" if direction else ""
             if event_type == "MARKET_REVERSAL_CONFIRMED":
-                subject = f"NIFTY V74 MARKET REVERSAL CONFIRMED — {direction} RECOMMENDATION INVALIDATED"
+                subject = "NIFTY 50 — MARKET REVERSAL CONFIRMED"
             else:
-                subject = f"NIFTY V74 {event_type.replace('_', ' ')}{subject_suffix}"
+                subject = f"NIFTY 50 — {event_type.replace('_', ' ')}"
             enqueue_email_alert(
                 state, now=now, event_type=event_type,
                 dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{identity}",
@@ -5788,30 +6600,51 @@ class PredictiveScanner:
     def _finish(self, state: dict[str, Any], report: dict[str, Any], now: datetime) -> dict[str, Any]:
         """Persist outbox, the last full report and bounded summaries before/after delivery."""
         def state_report_copy(item: Mapping[str, Any]) -> dict[str, Any]:
-            """Keep active JSON state compact; full input snapshots live in daily JSONL."""
-            stored = dict(item)
-            audit_inputs = stored.pop("audit_inputs", None)
-            if isinstance(audit_inputs, Mapping):
-                candles = audit_inputs.get("candles_1m") if isinstance(audit_inputs.get("candles_1m"), Mapping) else {}
-                quote_map = audit_inputs.get("live_quotes") if isinstance(audit_inputs.get("live_quotes"), Mapping) else {}
-                chain = audit_inputs.get("option_chain") if isinstance(audit_inputs.get("option_chain"), list) else []
-                oi_rows = audit_inputs.get("oi_by_strike") if isinstance(audit_inputs.get("oi_by_strike"), Mapping) else {}
-                index_bars = candles.get("nifty_index_recent", []) if isinstance(candles.get("nifty_index_recent"), list) else []
-                future_bars = candles.get("nifty_future_recent", []) if isinstance(candles.get("nifty_future_recent"), list) else []
-                option_candles = candles.get("option_candidates", {}) if isinstance(candles.get("option_candidates"), Mapping) else {}
-                stored["audit_input_summary"] = {
-                    "capture_version": audit_inputs.get("capture_version"),
-                    "capture_scope": audit_inputs.get("capture_scope"),
-                    "data_coverage": audit_inputs.get("data_coverage", {}),
-                    "option_chain_strikes": len(chain),
-                    "live_quote_instruments": len(quote_map),
-                    "oi_strikes_analysed": len(oi_rows),
-                    "nifty_index_candles_captured": len(index_bars),
-                    "nifty_future_candles_captured": len(future_bars),
-                    "option_candle_instruments_captured": len(option_candles),
-                    "historical_seed_info": audit_inputs.get("historical_seed_info"),
-                }
-            return json_safe(stored)
+            """Persist a small last-scan summary; compact JSONL is the durable scan audit."""
+            levels = item.get("nifty_levels") if isinstance(item.get("nifty_levels"), Mapping) else {}
+            indicators = item.get("indicators") if isinstance(item.get("indicators"), Mapping) else {}
+            oi = item.get("oi") if isinstance(item.get("oi"), Mapping) else {}
+            risk = item.get("risk") if isinstance(item.get("risk"), Mapping) else {}
+            selected = item.get("selected_option") if isinstance(item.get("selected_option"), Mapping) else None
+            readiness = item.get("trade_readiness") if isinstance(item.get("trade_readiness"), Mapping) else {}
+            monitoring = item.get("monitoring") if isinstance(item.get("monitoring"), Mapping) else {}
+            return json_safe({
+                "scanner_version": item.get("scanner_version"), "timestamp": item.get("timestamp"),
+                "market_state": item.get("market_state"), "scenario": item.get("scenario"),
+                "direction": item.get("direction"), "confidence_pct": item.get("confidence_pct"),
+                "trigger_rationale": str(item.get("trigger_rationale", ""))[:350],
+                "signal_ready": bool(item.get("signal_ready", False)),
+                "nifty_levels": _mapping_subset(levels, ("spot", "T1", "T2", "SL", "trailing_SL")),
+                "indicators": _mapping_subset(indicators, (
+                    "spot", "vwap", "atr", "atr_5m", "adx", "plus_di", "minus_di", "rsi",
+                    "momentum_1m_pct", "momentum_3m_pct", "swing_low_5m", "swing_high_5m",
+                    "session_high", "session_low", "candles_count", "indicators_seeded",
+                )),
+                "oi": _mapping_subset(oi, (
+                    "expiry", "atm", "strike_step", "pcr", "tactical_source", "tactical_available",
+                    "call_coi_tactical_pct", "put_coi_tactical_pct", "call_coi_1m_pct", "put_coi_1m_pct",
+                    "call_coi_3m_pct", "put_coi_3m_pct", "call_coi_5m_pct", "put_coi_5m_pct",
+                    "baseline_quality", "session_baseline_source",
+                )),
+                "risk": _mapping_subset(risk, (
+                    "valid", "target_1", "target_2", "stop_loss", "target_1_source", "target_2_source",
+                    "stop_source", "reward_risk_ratio", "reason",
+                )),
+                "selected_option": _mapping_subset(selected, (
+                    "trading_symbol", "option_type", "strike", "direction", "confidence_pct", "nifty_spot",
+                    "option_ltp", "T1", "T2", "SL", "trailing_SL", "score",
+                )) if selected else None,
+                "trade_readiness": _mapping_subset(readiness, ("ready", "status", "selection_mode", "blocking_reasons")),
+                "monitoring": {
+                    "status": monitoring.get("status"), "events_this_scan": [
+                        _mapping_subset(event, ("event_type", "event_at", "direction", "strike", "spot", "T1", "T2", "SL", "trailing_SL", "previous_T1", "new_T1", "previous_T2", "new_T2"))
+                        for event in monitoring.get("events_this_scan", [])[:8] if isinstance(event, Mapping)
+                    ] if isinstance(monitoring.get("events_this_scan"), list) else [],
+                },
+                "vetoes": [str(value)[:180] for value in (item.get("vetoes", [])[:4] if isinstance(item.get("vetoes"), list) else [])],
+                "email_delivery": _mapping_subset(item.get("email_delivery"), ("status", "attempted", "sent", "pending", "smtp_configured")),
+                "audit_status": ((item.get("audit_log") or {}).get("status") if isinstance(item.get("audit_log"), Mapping) else None),
+            })
 
         def summarize(item: Mapping[str, Any]) -> dict[str, Any]:
             levels = item.get("nifty_levels") if isinstance(item.get("nifty_levels"), Mapping) else {}
@@ -5849,7 +6682,7 @@ class PredictiveScanner:
                 history[-1] = summary
             else:
                 history.append(summary)
-            state["scan_history"] = history[-120:]
+            state["scan_history"] = history[-60:]
             state["last_scan_summary"] = summary
             state["last_scan_report"] = state_report_copy(report)
             self.store.save()
@@ -5883,7 +6716,7 @@ class PredictiveScanner:
             history = state.get("scan_history", [])
             if isinstance(history, list) and history:
                 history[-1] = summary
-                state["scan_history"] = history[-120:]
+                state["scan_history"] = history[-60:]
             self.store.save()
         except Exception as exc:
             LOGGER.error("STATE PERSISTENCE FAILURE after email delivery: %s", exc)
@@ -5894,7 +6727,7 @@ class PredictiveScanner:
         enqueue_email_alert(
             state, now=now, event_type=error_kind,
             dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{error_kind}|{type(exc).__name__}",
-            subject=f"NIFTY V74 scanner {error_kind.replace('_', ' ').lower()}",
+            subject=f"NIFTY V77 scanner {error_kind.replace('_', ' ').lower()}",
             payload={"timestamp": ist_iso(now), "scanner_version": SCANNER_VERSION,
                      "error_type": type(exc).__name__, "error": str(exc)[:1200],
                      "note": "No new recommendation was produced by the failed scan."},
@@ -5978,7 +6811,7 @@ class PredictiveScanner:
                 }
                 self._queue_monitor_events(state, [event], current)
             if isinstance(state.get("recommendation_trackers"), list):
-                state["recommendation_trackers"] = trackers[-60:]
+                state["recommendation_trackers"] = _compact_persisted_tracker_history(trackers)
                 primary = state.get("recommendation_tracker")
                 if isinstance(primary, dict):
                     for item in trackers:
@@ -6212,19 +7045,26 @@ class PredictiveScanner:
             sideways_dual_build = bool(finite(indicators.adx) and indicators.adx < 20.0 and oi.both_sides_building)
             wall_exception_confirmed = False
             if index_candles_available:
-                wall_reaction = detect_structural_wall_reaction(index_session, indicators, oi, current, self.config)
+                wall_reaction = detect_structural_wall_reaction(
+                    index_session, indicators, oi, current, self.config, future_regime=future_regime
+                )
                 if wall_reaction is not None:
                     preserve_confirmed_boundary_scenario = scenario.state in {
                         "CONFIRMED_BULLISH_BREAKOUT", "CONFIRMED_BEARISH_BREAKDOWN"
                     }
-                    if wall_reaction.executable_candidate and not preserve_confirmed_boundary_scenario:
-                        # A verified support bounce/resistance rejection outranks a generic
-                        # continuation/gap label because the requested entry trigger is the wall.
+                    if (wall_reaction.state == "STRUCTURAL_BOUNDARY_COMPRESSION"
+                            and not preserve_confirmed_boundary_scenario):
+                        # Repeated unresolved boundary tests must neutralize generic direction.
+                        scenario = wall_reaction
+                        wall_exception_confirmed = False
+                    elif wall_reaction.executable_candidate and not preserve_confirmed_boundary_scenario:
+                        # Confirmed reaction/break outranks generic continuation labels.
                         scenario = wall_reaction
                         wall_exception_confirmed = True
                     elif scenario.direction == "NEUTRAL" and not sideways_dual_build:
                         scenario = wall_reaction
-            if sideways_dual_build and scenario.state != "EXHAUSTION_REVERSAL" and not wall_exception_confirmed:
+            if (sideways_dual_build and scenario.state not in {"EXHAUSTION_REVERSAL", "STRUCTURAL_BOUNDARY_COMPRESSION"}
+                    and not wall_exception_confirmed):
                 scenario = Scenario(
                     "SIDEWAYS_CHOP", "NEUTRAL", 0.0,
                     f"Dynamic sideways veto: ADX={indicators.adx:.1f}<20 and aggregate Call and Put OI are simultaneously building. Continuation/breakout entries are blocked; only confirmed 1m wall rejection/bounce or exhaustion-reversal setups bypass this veto.",
@@ -6312,7 +7152,7 @@ class PredictiveScanner:
                 "policy": "Diagnostic-only context review; no aggregate voting and no exit from regime weakness alone. Structural stops and the established confirmation guard remain authoritative.",
             }
 
-            # V74 follows an existing recommendation to completion before issuing another
+            # V77 follows an existing recommendation to completion before issuing another
             # one. The active recommendation is monitored above on every scan; a different
             # contract cannot replace it merely because its rank fluctuates between runs.
             active_tracker_rows = state.get("recommendation_trackers", [])
@@ -6331,9 +7171,8 @@ class PredictiveScanner:
                 "policy": "Monitor active selection until T2, SL, or confirmed structural invalidation; no per-scan re-selection email.",
             }
 
-            # V74 separates predictive shortlist from final selection. A meaningful
-            # directional watch can rank same-side contracts before the underlying break
-            # is confirmed; this shortlist is diagnostic-only and never triggers email.
+            # Candidate ranking may remain diagnostic while an unconfirmed setup is watched;
+            # only a resolved structural interaction can pass the final selection route.
             risk = route_targets_and_stop(scenario, spot, indicators, oi, self.config, now=current) if scenario.direction in {"BULLISH", "BEARISH"} else RiskPlan(False, None, None, None, "", "", "", (), "No directional scenario.")
             # Preserve the final resolved scenario as the only scenario allowed to
             # determine readiness. A neutralized reversal watch can be used only to
@@ -6350,29 +7189,15 @@ class PredictiveScanner:
             entry_trigger_ok, entry_trigger_reason = selection_trigger_confirmation(
                 scenario, indicators, oi, self.config, future_regime=future_regime
             )
-            predictive_selection_ok, predictive_selection_reason, predictive_selection_evidence = (
-                predictive_prebreakout_selection_gate(
-                    scenario, indicators, oi, risk, current, future_regime, self.config
-                )
+            _, _, predictive_selection_evidence = predictive_prebreakout_selection_gate(
+                scenario, indicators, oi, risk, current, future_regime, self.config
             )
-            # A narrowly qualified compression/wall-weakening setup may select early,
-            # before a completed candle crosses the wall. This does not weaken the
-            # final option/risk gates and is tracked explicitly as a predictive entry.
+            # Structural interaction/confirmed break is the single route to selection.
+            # Predictive evidence remains diagnostic-only; it cannot bypass this gate.
             routing_scenario = scenario
-            if predictive_selection_ok and not entry_trigger_ok:
-                routing_scenario = replace(
-                    scenario,
-                    executable_candidate=True,
-                    trigger_reason=(scenario.trigger_reason + " Predictive pre-breakout gate passed; "
-                                    "final option, quote and risk gates still apply."),
-                    features={**(scenario.features if isinstance(scenario.features, Mapping) else {}),
-                              "predictive_prebreakout_selection": predictive_selection_evidence},
-                )
-                entry_trigger_ok = True
-                entry_trigger_reason = predictive_selection_reason
             route_market_confirmed = bool(
                 scenario.direction in {"BULLISH", "BEARISH"}
-                and (scenario.executable_candidate or predictive_selection_ok)
+                and scenario.executable_candidate
                 and not scenario.hard_veto and risk.valid
                 and entry_trigger_ok and not active_recommendation_in_progress
             )
@@ -6478,7 +7303,7 @@ class PredictiveScanner:
                 "scenario_features": scenario.features,
             })
             if reversal_watch is not None and (scenario.hard_veto is not None or scenario.direction != reversal_watch.direction or scenario.direction == "NEUTRAL"):
-                # Reversal watches remain internal diagnostics only; V74 never emails watch-only alerts.
+                # Reversal watches remain internal diagnostics only; V77 never emails watch-only alerts.
                 watch_payload = {
                     "timestamp": current.isoformat(), "scenario": reversal_watch.state,
                     "direction": reversal_watch.direction, "confidence_pct": round(reversal_watch.confidence, 1),
@@ -6517,8 +7342,7 @@ class PredictiveScanner:
             # STAGE 1 — directional market prediction is reported before any option-quality gate.
             report["predictive_detection"] = {
                 "detected": scenario.direction in {"BULLISH", "BEARISH"},
-                "stage": ("EARLY_PREDICTIVE_SELECTION_GATE_PASSED" if predictive_selection_ok and route_market_confirmed
-                          else "ENTRY_TRIGGER_CONFIRMED" if entry_trigger_ok
+                "stage": ("ENTRY_TRIGGER_CONFIRMED" if entry_trigger_ok
                           else "WAITING_FOR_STRUCTURAL_INTERACTION")
                          if scenario.direction in {"BULLISH", "BEARISH"} else "NO_DIRECTIONAL_SETUP",
                 "scenario": scenario.state, "direction": scenario.direction,
@@ -6527,8 +7351,7 @@ class PredictiveScanner:
                 "execution_candidate": bool(route_market_confirmed),
                 "entry_trigger_confirmed": entry_trigger_ok,
                 "entry_trigger_reason": entry_trigger_reason,
-                "selection_mode": ("EARLY_PREDICTIVE_PREBREAKOUT" if predictive_selection_ok and route_market_confirmed
-                                   else "CONFIRMED_STRUCTURAL_INTERACTION" if route_market_confirmed else "WATCH_ONLY"),
+                "selection_mode": "CONFIRMED_STRUCTURAL_INTERACTION" if route_market_confirmed else "WATCH_ONLY",
                 "predictive_prebreakout_gate": predictive_selection_evidence,
                 "provisional_ranking_allowed": bool(provisional_rank_allowed),
                 "provisional_ranking_direction": (ranking_scenario.direction if provisional_rank_allowed and scenario.direction == "NEUTRAL" and ranking_scenario is not None else None),
@@ -6609,11 +7432,7 @@ class PredictiveScanner:
             readiness = evaluate_trade_readiness(current, routing_scenario, indicators, oi, risk,
                                                  index_quote, future_regime, candidate, self.config,
                                                  candidate_diagnostics=readiness_diagnostics)
-            readiness["selection_mode"] = (
-                "EARLY_PREDICTIVE_PREBREAKOUT" if predictive_selection_ok and route_market_confirmed
-                else "CONFIRMED_STRUCTURAL_INTERACTION" if route_market_confirmed
-                else "WATCH_ONLY"
-            )
+            readiness["selection_mode"] = "CONFIRMED_STRUCTURAL_INTERACTION" if route_market_confirmed else "WATCH_ONLY"
             readiness["predictive_prebreakout_gate"] = predictive_selection_evidence
             if not entry_trigger_ok:
                 readiness["blocking_reasons"] = list(dict.fromkeys(
@@ -6665,7 +7484,7 @@ class PredictiveScanner:
                 "option_move_estimate_method": "DELTA_GAMMA_ESTIMATE_EXCLUDES_IV_CHANGE_AND_TIME_DECAY",
                 "option_gate_eligible_count": sum(1 for item in diagnostics if item.get("execution_eligible")),
                 "candidate_count": sum(1 for item in diagnostics if item.get("strike") is not None),
-                "note": "Provisional candidate is a non-actionable shortlist only. A narrowly qualified high-confidence pre-breakout setup may issue an early predictive selection only after the predictive gate and all final option/risk/quote gates pass. Delta/gamma option-move estimates exclude IV change and time decay. Watch scans do not create trackers or emails.",
+                "note": "Provisional candidates are diagnostics only and never create trackers or emails. New selections require a confirmed repeated support bounce, resistance rejection, or a tested boundary broken by two completed 1-minute closes with aligned market context. Delta/gamma estimates exclude IV change and time decay.",
             }
             active_watch = state.get("active_directional_watch")
             if isinstance(active_watch, dict) and str(active_watch.get("direction", "")).upper() == scenario.direction:
@@ -6689,14 +7508,13 @@ class PredictiveScanner:
             state["market_history"] = (state.get("market_history", []) + [{
                 "timestamp": ist_iso(current), "spot": spot, "direction": scenario.direction,
                 "scenario": scenario.state, "confidence_pct": scenario.confidence,
-            }])[-300:]
+            }])[-120:]
             if readiness["ready"] and candidate and risk.valid:
                 signal_payload = {
                     "timestamp": current.isoformat(), "scenario": scenario.state, "direction": scenario.direction,
                     "confidence_pct": round(scenario.confidence, 1), "trigger_reason": scenario.trigger_reason,
                     "entry_trigger_confirmation": entry_trigger_reason,
                     "selection_mode": readiness.get("selection_mode", "CONFIRMED_STRUCTURAL_INTERACTION"),
-                    "predictive_prebreakout_gate": predictive_selection_evidence if predictive_selection_ok else None,
                     "option_type": candidate.option_type, "strike": candidate.strike,
                     "trading_symbol": candidate.trading_symbol, "instrument_key": candidate.instrument_key,
                     "delta": candidate.delta, "delta_source": candidate.delta_source,
@@ -6805,7 +7623,7 @@ class PredictiveScanner:
                 enqueue_email_alert(
                     state, now=current, event_type="SIGNAL_READY",
                     dedupe_key=f"{current.date().isoformat()}|SIGNAL_READY|{fingerprint}",
-                    subject=f"NIFTY V74 STRIKE SELECTED — {scenario.direction} {candidate.option_type} {candidate.strike:.0f}",
+                    subject="NIFTY 50 — STRIKE SELECTED",
                     payload={**signal_payload, "alert_type": "TRADE_READY_RECOMMENDATION",
                              "execution_mode": "VIRTUAL_SIGNAL_ONLY_NO_ORDER_PLACEMENT",
                              "readiness": readiness,
@@ -6823,7 +7641,7 @@ class PredictiveScanner:
                     )
                 else:
                     report["market_state"] = scenario.state
-                # No watch/blocked-candidate emails are permitted in V74. Blockers remain
+                # No watch/blocked-candidate emails are permitted in V77. Blockers remain
                 # in the JSON/console diagnostics; email is reserved for confirmed selection
                 # and post-selection failure events only.
                 LOGGER.info("NO EMAIL: signal not trade-ready; market_state=%s blockers=%s",
@@ -6913,7 +7731,7 @@ def scan_exit_code(report: Mapping[str, Any]) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V74")
+    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V77")
     parser.add_argument("--loop", action="store_true", help="Scan approximately once per minute during market hours.")
     parser.add_argument("--interval", type=float, default=60.0, help="Loop interval seconds (minimum 15).")
     args = parser.parse_args(argv)
@@ -6935,7 +7753,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enqueue_email_alert(
                 state, now=current, event_type="CONFIGURATION_ERROR",
                 dedupe_key=f"{current.date().isoformat()}|CONFIGURATION_ERROR|{type(exc).__name__}",
-                subject="NIFTY V74 scanner configuration error",
+                subject="NIFTY V77 scanner configuration error",
                 payload={"timestamp": current.isoformat(), "scanner_version": SCANNER_VERSION,
                          "error_type": type(exc).__name__, "error": str(exc),
                          "note": "The scan was stopped before market analysis; no recommendation or order was produced."},
@@ -6959,7 +7777,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_report(report)
         return scan_exit_code(report)
     interval = max(15.0, float(args.interval))
-    LOGGER.info("V74 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
+    LOGGER.info("V77 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
     while True:
         cycle_start = time_module.monotonic()
         report = scanner.scan_once()
