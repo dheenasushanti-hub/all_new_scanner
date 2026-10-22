@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""NIFTY 50 Predictive Market Scanner & Strike Router — V79.
+"""NIFTY 50 Predictive Market Scanner & Strike Router — V81.
 
-Production hardening of V77 using the 22 Oct 2026 live-scan audit. The
+Integrated redesign of V80 using the 22 Oct 2026 live-scan audit. The
 scanner keeps one scenario engine, one strike router, one structural risk engine, one
 state store, and one reporting path; it does not place, modify, or cancel orders.
 
@@ -20,10 +20,11 @@ Core behavior
   handling when a bar's internal order cannot be known from OHLC alone.
 * Guards ordinary opposite-direction flips using distinct 1m evidence, while strong
   aligned tactical COI/momentum can override; no prior direction is latched.
-* Reassesses the active signal against the current resolved scenario, VWAP, momentum,
-  directional DI/ADX, tactical COI, and futures regime on every scan. This is diagnostic
-  context, not a weighted exit vote: only structural stops or the existing confirmed
-  direction-flip guard can end a signal early.
+* Separates active-signal protection from target reassessment. After a meaningful favorable
+  excursion and volatility-sized retracement, a confirmed post-entry 3-minute swing pivot
+  can ratchet the protective stop even when directional context is weakening. If the completed
+  3-minute close breaks an already-confirmed pivot, early invalidation still requires at least
+  two independent adverse context factors; one red 1-minute bar is never enough.
 * Detects when completed 1m candle history has gaps or falls outside the supported
   replay window. It labels that uncertainty explicitly and never invents hidden OHLC
   crossings; a candleless feed still permits clearly labelled live-spot level monitoring.
@@ -42,12 +43,9 @@ Core behavior
 * Restricts normal option candidates to ATM, ITM1, ITM2; permits one-step OTM only for
   a confirmed high-momentum afternoon squeeze. Option quality score is exactly
   40% flow + 30% premium-VWAP lift + 30% tactical COI acceleration.
-* Derives index targets/stops from intact opposing OI walls and completed 5-minute pivots.
-  A weakening opposing wall is skipped for T1; targets are filtered by a conservative,
-  remaining-time/volatility reachability ceiling. Every active signal reassesses T1/T2 and
-  favorable-only SL after each distinct completed 3-minute bar when multi-factor context is
-  sufficiently aligned. Level changes apply prospectively; the just-completed OHLC interval
-  is always evaluated against the levels that were active during it.
+* Derives entry targets/stops from intact opposing OI walls and completed price pivots. Dynamic
+  T1/T2 reassessment is separate from the protective-stop manager. New levels are prospective;
+  each just-completed OHLC interval is evaluated against levels that were active during it.
 * Selection and milestone emails contain only the contract/strike, signal spot, confidence, IST
   time, and NIFTY T1/T2/SL levels.
 * Uses an atomic JSON store with trading-date resets and no sticky directional latch.
@@ -87,7 +85,7 @@ API sources checked during design (official Upstox docs):
 Important measurement limitation: the option-chain endpoint returns OI snapshots, not a
 continuous OI time series. Intraday COI velocity is therefore computed from this scanner's
 own timestamped snapshots. For 09:16 velocity availability, schedule the first scan at
-09:15. If a process starts later with no same-session baseline, V79 reports COI as
+09:15. If a process starts later with no same-session baseline, V81 reports COI as
 unavailable/session-proxy and will not describe the proxy as tactical velocity.
 """
 from __future__ import annotations
@@ -124,7 +122,7 @@ import requests
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com"
-SCANNER_VERSION = "2026-10-22-V79-OI-BOUNDARY-RECLAIM-EARLY-ENTRY"
+SCANNER_VERSION = "2026-10-22-V81-UNIFIED-ACTIVE-REVERSAL-ROUTING"
 MARKET_START = time(9, 15)
 ENTRY_START = time(9, 16)
 MORNING_END = time(10, 30)
@@ -141,11 +139,12 @@ EMAIL_ALLOWED_EVENT_TYPES = frozenset({
     "MARKET_REVERSAL_CONFIRMED",
     "INITIAL_STOP_LOSS_REACHED",
     "TRAILING_STOP_REACHED",
+    "STRUCTURAL_STOP_LOSS_REACHED",
 })
 DEFAULT_NIFTY_KEY = "NSE_INDEX|Nifty 50"
 DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-LOGGER = logging.getLogger("nifty_v78")
+LOGGER = logging.getLogger("nifty_v81")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(message)s",
                     stream=sys.stderr)
@@ -768,10 +767,10 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
         state["market_history"] = state["market_history"][-120:]
     if isinstance(state.get("futures_snapshots"), list):
         state["futures_snapshots"] = state["futures_snapshots"][-32:]
-    state["schema_version"] = 79
+    state["schema_version"] = 81
     state["scanner_version"] = SCANNER_VERSION
     state["session_date"] = today_iso
-    # V79 diagnostics are additive and bounded; preserve all valid active trackers.
+    # V81 protection fields migrate lazily; valid active V79 trackers remain monitorable.
     tracker_rows = state.get("recommendation_trackers")
     if isinstance(tracker_rows, list):
         for tracker in tracker_rows:
@@ -794,7 +793,7 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
         legacy_tracker.setdefault("target_event_integrity", "UNASSESSED")
         if legacy_tracker.get("confidence_pct") is None:
             legacy_tracker["confidence_pct"] = legacy_tracker.get("latest_signal_confidence_pct", legacy_tracker.get("confidence"))
-    # Remove legacy directional latches so V79 classifies live structure afresh.
+    # Remove legacy directional latches so V81 classifies live structure afresh.
     for key in ("persistent_direction", "continuation_phase", "continuation_count", "continuation_last_bar"):
         state.pop(key, None)
 
@@ -834,7 +833,7 @@ class StateStore:
                         and str(alert.get("status", "PENDING")).upper() == "PENDING"
                         and str(alert.get("event_type", "")).upper() == "VIRTUAL_RECOMMENDATION_INVALIDATED_BY_STRUCTURE"):
                     alert["event_type"] = "MARKET_REVERSAL_CONFIRMED"
-                    alert["subject"] = "NIFTY V79 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
+                    alert["subject"] = "NIFTY V81 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
                     payload = alert.get("payload") if isinstance(alert.get("payload"), dict) else {}
                     payload.setdefault("invalidated_direction", payload.get("direction"))
                     payload.setdefault("replacement_direction", "Not available in legacy alert")
@@ -861,7 +860,7 @@ class StateStore:
                           and str(x.get("event_type", "")).upper() not in {"T1_REACHED", "T2_REACHED"}] if isinstance(self.state.get("alert_outbox"), list) else []
             old_dedupe = self.state.get("alert_dedupe", {}) if isinstance(self.state.get("alert_dedupe"), dict) else {}
             self.state = {
-                "schema_version": 79,
+                "schema_version": 81,
                 "scanner_version": SCANNER_VERSION,
                 "session_date": today_iso,
                 "audit_v77_legacy_compaction_done": old_audit_compaction_done,
@@ -958,9 +957,9 @@ class StateStore:
                     and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
                 alert["status"] = "SUPPRESSED_POLICY"
                 alert["suppressed_at"] = now_ist().isoformat()
-                alert["last_error"] = "Suppressed by V79: only selected-strike and discrete milestone/failure emails are permitted."
+                alert["last_error"] = "Suppressed by V81: only selected-strike, milestone, and confirmed stop/failure emails are permitted."
                 alert.pop("next_attempt_at", None)
-        # V79 no longer performs holiday-calendar lookups; discard a legacy persisted cache.
+        # V81 no longer performs holiday-calendar lookups; discard a legacy persisted cache.
         self.state.pop("nse_holiday_calendar", None)
         # Remove obsolete direction latches. Every decision is recomputed from current structure.
         self.state.pop("persistent_direction", None)
@@ -2685,7 +2684,10 @@ def detect_structural_wall_reaction(
     Breakout/breakdown requires two completed closes beyond a previously tested boundary.
     """
     bars = completed_one_minute_candles(frame, now)
-    if len(bars) < 7 or not finite(indicators.atr) or indicators.atr <= 0:
+    # Three complete 1m bars are sufficient for a tested-boundary reclaim when two
+    # distinct lows/highs plus two closes are already present. Do not impose a fixed
+    # seven-bar delay after a valid early support/resistance reaction.
+    if len(bars) < 3 or not finite(indicators.atr) or indicators.atr <= 0:
         return None
     if not finite(indicators.spot) or indicators.spot <= 0:
         return None
@@ -2695,12 +2697,12 @@ def detect_structural_wall_reaction(
     displacement = max(0.10 * indicators.atr, 2.0)
     buffer = max(0.08 * indicators.atr, 0.08 * step, 2.0)
     recent = bars.tail(24).copy().reset_index(drop=True)
-    if len(recent) < 7:
+    if len(recent) < 3:
         return None
     for col in ("open", "high", "low", "close"):
         recent[col] = pd.to_numeric(recent[col], errors="coerce")
     recent = recent.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
-    if len(recent) < 7:
+    if len(recent) < 3:
         return None
 
     resistance_raw: list[tuple[float, str, str]] = []
@@ -2744,9 +2746,19 @@ def detect_structural_wall_reaction(
     # Independent market-context confirmations; OI is corroboration, not a standalone direction call.
     vwap_bull = finite(indicators.vwap) and indicators.spot >= indicators.vwap
     vwap_bear = finite(indicators.vwap) and indicators.spot <= indicators.vwap
-    momentum_bull = ((finite(indicators.momentum_1m_pct) and indicators.momentum_1m_pct > 0.0)
+    # Indicators are preferred; if their 1m momentum field is unavailable, derive the
+    # very-short-term direction from the last two completed 1m closes. This is not a
+    # substitute for the independent OI/VWAP/DI checks below, but avoids a needless late
+    # entry solely because an optional precomputed field is missing.
+    close_series = pd.to_numeric(recent["close"], errors="coerce").dropna()
+    derived_momentum_1m = ((float(close_series.iloc[-1]) / float(close_series.iloc[-2]) - 1.0)
+                           if len(close_series) >= 2 and float(close_series.iloc[-2]) > 0 else float("nan"))
+    momentum_1m = safe_float(indicators.momentum_1m_pct, float("nan"))
+    if not finite(momentum_1m):
+        momentum_1m = derived_momentum_1m
+    momentum_bull = ((finite(momentum_1m) and momentum_1m > 0.0)
                      and (not finite(indicators.momentum_3m_pct) or indicators.momentum_3m_pct >= -0.00010))
-    momentum_bear = ((finite(indicators.momentum_1m_pct) and indicators.momentum_1m_pct < 0.0)
+    momentum_bear = ((finite(momentum_1m) and momentum_1m < 0.0)
                      and (not finite(indicators.momentum_3m_pct) or indicators.momentum_3m_pct <= 0.00010))
     di_bull = (finite(indicators.adx) and indicators.adx >= 18.0 and finite(indicators.plus_di)
                and finite(indicators.minus_di) and indicators.plus_di > indicators.minus_di + 1.0)
@@ -2967,6 +2979,7 @@ def directional_oi_structure_confirmation(
     applicable_states = {
         "STRUCTURAL_SUPPORT_BOUNCE", "STRUCTURAL_RESISTANCE_REJECTION",
         "CONFIRMED_BULLISH_BREAKOUT", "CONFIRMED_BEARISH_BREAKDOWN",
+        "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BULLISH", "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BEARISH",
     }
     evidence: dict[str, Any] = {
         "applicable": state in applicable_states,
@@ -3067,8 +3080,54 @@ def directional_oi_structure_confirmation(
                 "change_fraction": wall.change_pct, "state": wall.state,
                 "distance_from_spot": round(abs(float(wall.strike) - indicators.spot), 2)}
 
+    # A structurally failed active signal can seed an opposite setup in the same scan.
+    # Its previous tracker already required a completed 3m pivot break and two independent
+    # adverse factors. The replacement must still be on the broken side of that pivot and
+    # the *current* tactical OI must support the new direction. Here the nearest OI wall
+    # in the new direction is a possible target, not an automatic entry veto; route_targets_and_stop
+    # enforces target ordering and minimum reward/risk against that exact wall.
+    if state in {"ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BULLISH", "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BEARISH"}:
+        expected_direction = "BULLISH" if state.endswith("BULLISH") else "BEARISH"
+        distance = abs(indicators.spot - boundary) if finite(boundary) else float("inf")
+        aligned_global = bool(global_bull if direction == "BULLISH" else global_bear)
+        aligned_local = bool(boundary_bull if direction == "BULLISH" else boundary_bear)
+        opposite_local = bool(boundary_bear if direction == "BULLISH" else boundary_bull)
+        global_strength = max(abs(call_agg), abs(put_agg)) if finite(call_agg) and finite(put_agg) else 0.0
+        strong_global_alignment = aligned_global and global_strength >= 2.0 * trigger
+        current_price_beyond_pivot = (
+            finite(boundary) and
+            (indicators.spot > boundary + max(1.0, 0.05 * atr5) if direction == "BULLISH"
+             else indicators.spot < boundary - max(1.0, 0.05 * atr5))
+        )
+        evidence.update({
+            "active_signal_reversal": True,
+            "expected_direction": expected_direction,
+            "active_failure_pivot": boundary,
+            "active_failure_close": safe_float((scenario.features or {}).get("structural_break_close"), float("nan")),
+            "breakout_distance_points": round(distance, 2) if finite(distance) else None,
+            "current_global_flow_aligned": aligned_global,
+            "current_local_flow_aligned": aligned_local,
+            "current_local_flow_conflicts": opposite_local,
+            "strong_global_alignment_overrides_local_noise": bool(strong_global_alignment),
+        })
+        if direction != expected_direction:
+            reason = "ACTIVE_REVERSAL_DIRECTION_MISMATCH"
+        elif not bool((scenario.features or {}).get("active_signal_reversal_confirmed")) or not bool((scenario.features or {}).get("structural_break_confirmed")):
+            reason = "ACTIVE_REVERSAL_LACKS_CONFIRMED_STRUCTURAL_FAILURE"
+        elif not current_price_beyond_pivot:
+            reason = "PRICE_RECLAIMED_FAILED_PIVOT_ACTIVE_REVERSAL_CANCELLED"
+        elif distance > breakout_chase_limit:
+            reason = f"ACTIVE_REVERSAL_ALREADY_EXTENDED_{distance:.1f}_POINTS_OVER_LIMIT_{breakout_chase_limit:.1f}"
+        elif opposite_local and not strong_global_alignment:
+            reason = "LOCAL_OI_FLOW_CONFLICTS_WITH_ACTIVE_REVERSAL"
+        elif not (aligned_global or aligned_local):
+            reason = "CURRENT_TACTICAL_OI_DOES_NOT_CONFIRM_ACTIVE_REVERSAL"
+        else:
+            reason = "CONFIRMED_STRUCTURAL_FAILURE_AND_CURRENT_DIRECTIONAL_OI_ALIGNED"
+        passed = reason == "CONFIRMED_STRUCTURAL_FAILURE_AND_CURRENT_DIRECTIONAL_OI_ALIGNED"
+
     # A valid directional entry may not run directly into an intact opposing wall.
-    if state == "STRUCTURAL_SUPPORT_BOUNCE" and direction == "BULLISH":
+    elif state == "STRUCTURAL_SUPPORT_BOUNCE" and direction == "BULLISH":
         support = closest_wall(oi.walls_support, boundary, anchor_radius)
         support_strike = float(support.strike) if support else float("nan")
         _, support_row = row_at(support_strike)
@@ -3243,6 +3302,39 @@ def selection_trigger_confirmation(
         )
         structural_reason = (("CONFIRMED_STRUCTURAL_BREAKOUT" if direction == "BULLISH" else "CONFIRMED_STRUCTURAL_BREAKDOWN")
                              if structural_ok else "BREAKOUT_CONFIRMATION_INCOMPLETE")
+
+    elif state in {"ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BULLISH", "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BEARISH"}:
+        expected_direction = "BULLISH" if state.endswith("BULLISH") else "BEARISH"
+        pivot = safe_float(scenario.wall_level, float("nan"))
+        atr5, _atr_source = structural_stop_atr(indicators)
+        if not finite(atr5) or atr5 <= 0:
+            atr5 = indicators.atr * math.sqrt(5.0) if finite(indicators.atr) and indicators.atr > 0 else 0.0
+        pivot_buffer = max(1.0, min(0.05 * atr5, 2.0)) if atr5 > 0 else 1.0
+        current_beyond_pivot = finite(pivot) and (
+            indicators.spot > pivot + pivot_buffer if direction == "BULLISH"
+            else indicators.spot < pivot - pivot_buffer
+        )
+        momentum3 = safe_float(indicators.momentum_3m_pct, float("nan"))
+        momentum1 = safe_float(indicators.momentum_1m_pct, float("nan"))
+        momentum_aligned = (
+            (finite(momentum3) and (momentum3 >= 0.00010 if direction == "BULLISH" else momentum3 <= -0.00010))
+            or (finite(momentum1) and (momentum1 >= 0.00010 if direction == "BULLISH" else momentum1 <= -0.00010))
+        )
+        failure_evidence = features.get("structural_failure_evidence") if isinstance(features.get("structural_failure_evidence"), Mapping) else {}
+        prior_confirmation = bool(
+            sum(bool(value) for value in failure_evidence.values()) >= 2
+            and (failure_evidence.get("MOMENTUM_3M") or failure_evidence.get("TACTICAL_OI"))
+        )
+        structural_ok = bool(
+            direction == expected_direction
+            and features.get("active_signal_reversal_confirmed")
+            and features.get("structural_break_confirmed")
+            and features.get("current_directional_oi_confirmed")
+            and prior_confirmation
+            and current_beyond_pivot
+            and momentum_aligned
+        )
+        structural_reason = "CONFIRMED_ACTIVE_SIGNAL_REVERSAL" if structural_ok else "ACTIVE_SIGNAL_REVERSAL_CONFIRMATION_INCOMPLETE"
 
     elif state == "EXHAUSTION_REVERSAL":
         return False, "EXHAUSTION_SETUP_REQUIRES_CONFIRMED_STRUCTURAL_BOUNDARY_INTERACTION"
@@ -3666,11 +3758,35 @@ def apply_direction_flip_guard(
             strong_flow = finite(oi.call_coi_pct) and finite(oi.put_coi_pct) and oi.call_coi_pct <= -1.5 * trigger and oi.put_coi_pct >= -0.25 * trigger and momentum > 0.0002
         else:
             strong_flow = finite(oi.put_coi_pct) and finite(oi.call_coi_pct) and oi.put_coi_pct <= -1.5 * trigger and oi.call_coi_pct >= -0.25 * trigger and momentum < -0.0002
-    structural_override = scenario.state in {"PREDICTIVE_BULLISH_BREAKOUT", "PREDICTIVE_BEARISH_BREAKDOWN", "CONFIRMED_BULLISH_BREAKOUT", "CONFIRMED_BEARISH_BREAKDOWN", "GAMMA_SQUEEZE", "MORNING_GAP_GO", "EXHAUSTION_REVERSAL"} and strong_flow
+    active_reversal_override = bool(
+        scenario.state in {"ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BULLISH", "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BEARISH"}
+        and isinstance(scenario.features, Mapping)
+        and scenario.features.get("active_signal_reversal_confirmed")
+        and scenario.features.get("structural_break_confirmed")
+        and scenario.features.get("current_directional_oi_confirmed")
+    )
+    # The entry-trigger gate itself already enforces repeated support/resistance tests,
+    # completed closes for breakouts, local/aggregate tactical OI, and non-conflicting
+    # futures. Requiring two *additional* 1m observations after that confirmation delays
+    # the reversal and can leave the old tracker active while the move accelerates.
+    confirmed_structural_states = {
+        "STRUCTURAL_SUPPORT_BOUNCE", "STRUCTURAL_RESISTANCE_REJECTION",
+        "CONFIRMED_BULLISH_BREAKOUT", "CONFIRMED_BEARISH_BREAKDOWN",
+        "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BULLISH", "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BEARISH",
+    }
+    confirmed_structural_setup = bool(trigger_confirmed and scenario.state in confirmed_structural_states)
+    structural_override = active_reversal_override or confirmed_structural_setup or (
+        scenario.state in {"PREDICTIVE_BULLISH_BREAKOUT", "PREDICTIVE_BEARISH_BREAKDOWN", "GAMMA_SQUEEZE", "MORNING_GAP_GO", "EXHAUSTION_REVERSAL"}
+        and strong_flow
+    )
     pending = state.get("direction_flip_pending") if isinstance(state.get("direction_flip_pending"), dict) else {}
     if structural_override:
         confirmed = True
-        confirm_reason = "STRONG_TACTICAL_COI_PRICE_ALIGNMENT_OVERRIDE"
+        confirm_reason = (
+            "CONFIRMED_ACTIVE_STRUCTURAL_REVERSAL_AND_CURRENT_OI" if active_reversal_override else
+            "CONFIRMED_STRUCTURAL_SETUP_IMMEDIATE_OVERRIDE" if confirmed_structural_setup else
+            "STRONG_TACTICAL_COI_PRICE_ALIGNMENT_OVERRIDE"
+        )
         count = config.direction_flip_confirmations
     else:
         same_pending = str(pending.get("direction", "")).upper() == scenario.direction
@@ -4413,9 +4529,15 @@ def route_targets_and_stop(
             stop_anchors.append((float(wall.strike), f"INTACT_{wall.side}_OI_WALL_{wall.state}"))
     reaction = str((scenario.features or {}).get("reaction", "")).upper()
     reaction_level = safe_float(scenario.wall_level, float("nan"))
-    if finite(reaction_level) and ((bullish and reaction == "SUPPORT_BOUNCE" and reaction_level < spot)
-                                   or (not bullish and reaction == "RESISTANCE_REJECTION" and reaction_level > spot)):
-        stop_anchors.append((float(reaction_level), f"TESTED_{'SUPPORT' if bullish else 'RESISTANCE'}_BOUNDARY"))
+    if finite(reaction_level) and (
+        (bullish and reaction == "SUPPORT_BOUNCE" and reaction_level < spot)
+        or (not bullish and reaction == "RESISTANCE_REJECTION" and reaction_level > spot)
+        or (bullish and reaction == "STRUCTURAL_BREAK_RETEST" and reaction_level < spot)
+        or (not bullish and reaction == "STRUCTURAL_BREAK_RETEST" and reaction_level > spot)
+    ):
+        anchor_label = ("FAILED_STRUCTURAL_PIVOT" if reaction == "STRUCTURAL_BREAK_RETEST"
+                        else f"TESTED_{'SUPPORT' if bullish else 'RESISTANCE'}_BOUNDARY")
+        stop_anchors.append((float(reaction_level), anchor_label))
     if not stop_anchors:
         return RiskPlan(False, None, None, None, "", "", "", tuple(sorted(set(skipped_weak))),
                         "No confirmed 5-minute pivot, intact structural wall, or tested reaction boundary for stop placement.",
@@ -4436,6 +4558,15 @@ def route_targets_and_stop(
     )
     if confirmed_reaction:
         atr_buffer = min(atr_buffer, 0.65)
+    active_reversal_reaction = (
+        scenario.state in {"ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BULLISH", "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BEARISH"}
+        and reaction == "STRUCTURAL_BREAK_RETEST"
+    )
+    if active_reversal_reaction:
+        # The failed pivot is an explicit invalidation boundary for the new direction.
+        # Cap, rather than widen, the generic ATR buffer; the R:R planner still decides
+        # whether this protective stop makes the nearest observed target viable.
+        atr_buffer = min(atr_buffer, 0.30)
     stop = base - atr_buffer * atr_stop if bullish else base + atr_buffer * atr_stop
     stop_source = f"{base_source}_PLUS_MINUS_{atr_buffer:.2f}_{atr_source}"
     stop_ok = finite(stop) and (stop < spot if bullish else stop > spot)
@@ -5109,12 +5240,656 @@ def _target_source_is_intact(
     return True
 
 
+def _latest_confirmed_post_entry_pivot(
+    completed_3m: pd.DataFrame, direction: str, created_at: Optional[datetime],
+    *, max_bars: int = 15,
+) -> Optional[dict[str, Any]]:
+    """Return the newest confirmed post-entry 3m swing pivot with one full right bar.
+
+    A pivot is usable only after the bar to its right has fully completed. The current
+    partial/last bar is never used as its own confirmation. This function is shared by
+    proactive stop ratcheting and the independent structural-failure fallback.
+    """
+    if completed_3m is None or completed_3m.empty:
+        return None
+    direction = str(direction or "").upper()
+    if direction not in {"BULLISH", "BEARISH"}:
+        return None
+    frame = completed_3m.copy()
+    if "timestamp" not in frame.columns:
+        return None
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+    frame = frame.dropna(subset=["timestamp"]).sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    for col in ("high", "low", "close"):
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    frame = frame.dropna(subset=["high", "low", "close"]).tail(max(3, int(max_bars))).reset_index(drop=True)
+    if created_at is not None:
+        created_local = created_at.astimezone(IST) if created_at.tzinfo else created_at.replace(tzinfo=IST)
+        frame = frame.loc[frame["timestamp"].dt.tz_convert(IST) >= pd.Timestamp(created_local.astimezone(ZoneInfo("UTC")))].reset_index(drop=True)
+    if len(frame) < 3:
+        return None
+    # A resampled bar is safe only when the recent completed 3m bars are contiguous.
+    recent_stamps = frame["timestamp"].tail(min(8, len(frame))).tolist()
+    if any((b - a).total_seconds() > 180.5 for a, b in zip(recent_stamps, recent_stamps[1:])):
+        return None
+    # Iterate newest to oldest. i+1 is the fully completed bar that confirmed the pivot.
+    for i in range(len(frame) - 2, 0, -1):
+        row = frame.iloc[i]
+        left = frame.iloc[i - 1]
+        right = frame.iloc[i + 1]
+        if direction == "BULLISH":
+            value = safe_float(row["low"])
+            left_value, right_value = safe_float(left["low"]), safe_float(right["low"])
+            pivot_ok = finite(value) and finite(left_value) and finite(right_value) and (
+                (value < left_value and value <= right_value) or (value <= left_value and value < right_value)
+            )
+            reaction = safe_float(right["close"]) - value if pivot_ok else float("nan")
+        else:
+            value = safe_float(row["high"])
+            left_value, right_value = safe_float(left["high"]), safe_float(right["high"])
+            pivot_ok = finite(value) and finite(left_value) and finite(right_value) and (
+                (value > left_value and value >= right_value) or (value >= left_value and value > right_value)
+            )
+            reaction = value - safe_float(right["close"]) if pivot_ok else float("nan")
+        if not pivot_ok:
+            continue
+        try:
+            pivot_ts = frame.iloc[i]["timestamp"].to_pydatetime().astimezone(IST)
+            confirm_ts = frame.iloc[i + 1]["timestamp"].to_pydatetime().astimezone(IST)
+        except (AttributeError, ValueError, TypeError):
+            continue
+        return {
+            "timestamp": ist_iso(pivot_ts), "confirmation_timestamp": ist_iso(confirm_ts),
+            "level": float(value), "reaction_points": float(reaction),
+            "confirmation_close": safe_float(right["close"]),
+        }
+    return None
+
+
+def _update_protective_structural_trailing_stop(
+    tracker: dict[str, Any], spot: float, indicators: IndicatorSet, now: datetime,
+    index_candles: Optional[pd.DataFrame],
+) -> Optional[dict[str, Any]]:
+    """Ratchet the active virtual stop behind a confirmed 3m swing after progress + pullback.
+
+    Unlike target reassessment this protective function does not require bullish/bearish
+    context to remain aligned: a confirmed swing and a meaningful retracement are risk
+    information in their own right. It never loosens a stop, never uses an unfinished 3m
+    bar, and never derives a new stop from a history interval already marked uncertain.
+    """
+    if str(tracker.get("status", "TRACKING")).upper() != "TRACKING":
+        return None
+    direction = str(tracker.get("direction", "")).upper()
+    if direction not in {"BULLISH", "BEARISH"} or not finite(spot) or spot <= 0:
+        tracker["protective_trail_status"] = "HELD_INVALID_DIRECTION_OR_SPOT"
+        return None
+    integrity = str(tracker.get("target_event_integrity", "UNASSESSED")).upper()
+    monitor_status = str(tracker.get("monitoring_data_status", "UNAVAILABLE")).upper()
+    if integrity == "UNRESOLVED_AFTER_DATA_GAP" or monitor_status in {
+        "GAP_UNRESOLVED", "CANDLE_FEED_STALE", "CANDLES_UNAVAILABLE_LIVE_SPOT_ONLY", "UNAVAILABLE"
+    }:
+        tracker["protective_trail_status"] = "HELD_UNCERTAIN_CANDLE_HISTORY"
+        return None
+    created = parse_timestamp(tracker.get("created_at"))
+    if created is None or index_candles is None or index_candles.empty:
+        tracker["protective_trail_status"] = "HELD_CANDLES_UNAVAILABLE"
+        return None
+    created = created.astimezone(IST) if created.tzinfo else created.replace(tzinfo=IST)
+    atr = safe_float(indicators.atr_5m, float("nan"))
+    if not finite(atr) or atr <= 0:
+        # Explicitly convert the available 1m ATR to an approximate 5m scale; do not mix
+        # point distances from different timeframes without conversion.
+        atr_1m = safe_float(indicators.atr, float("nan"))
+        if not finite(atr_1m) or atr_1m <= 0:
+            tracker["protective_trail_status"] = "HELD_ATR_UNAVAILABLE"
+            return None
+        atr = atr_1m * math.sqrt(5.0)
+    one_min = completed_one_minute_candles(index_candles, now)
+    if one_min.empty:
+        tracker["protective_trail_status"] = "HELD_NO_COMPLETED_1M_CANDLES"
+        return None
+    stamps = pd.to_datetime(one_min["timestamp"], utc=True, errors="coerce")
+    created_utc = pd.Timestamp(created.astimezone(ZoneInfo("UTC")))
+    post_entry = one_min.loc[stamps >= created_utc].copy()
+    if post_entry.empty:
+        tracker["protective_trail_status"] = "WAITING_FOR_POST_ENTRY_CANDLES"
+        return None
+    for col in ("high", "low", "close"):
+        post_entry[col] = pd.to_numeric(post_entry[col], errors="coerce")
+    post_entry = post_entry.dropna(subset=["high", "low", "close"])
+    if post_entry.empty:
+        tracker["protective_trail_status"] = "HELD_INVALID_POST_ENTRY_CANDLES"
+        return None
+    entry = safe_float(tracker.get("nifty_entry_reference"), float("nan"))
+    if not finite(entry) or entry <= 0:
+        tracker["protective_trail_status"] = "HELD_INVALID_ENTRY_REFERENCE"
+        return None
+
+    prior_extreme = safe_float(tracker.get("max_favorable_spot"), entry)
+    if direction == "BULLISH":
+        observed_extreme = safe_float(post_entry["high"].max(), entry)
+        favorable_extreme = max(entry, prior_extreme, observed_extreme, spot)
+        favorable_points = favorable_extreme - entry
+        pullback_points = favorable_extreme - spot
+    else:
+        observed_extreme = safe_float(post_entry["low"].min(), entry)
+        # For a bearish signal, the most favorable extreme is the minimum price.
+        favorable_extreme = min(entry, prior_extreme if finite(prior_extreme) else entry,
+                                observed_extreme, spot)
+        favorable_points = entry - favorable_extreme
+        pullback_points = spot - favorable_extreme
+    previous_recorded = safe_float(tracker.get("max_favorable_spot"), float("nan"))
+    if not finite(previous_recorded) or abs(favorable_extreme - previous_recorded) > 0.001:
+        extreme_row = None
+        extreme_col = "high" if direction == "BULLISH" else "low"
+        extreme_idx = post_entry[extreme_col].idxmax() if direction == "BULLISH" else post_entry[extreme_col].idxmin()
+        if extreme_idx in post_entry.index:
+            extreme_row = post_entry.loc[extreme_idx]
+        extreme_ts = parse_timestamp(extreme_row.get("timestamp")) if isinstance(extreme_row, pd.Series) else None
+        tracker["max_favorable_spot_at"] = ist_iso(extreme_ts.astimezone(IST)) if extreme_ts is not None else ist_iso(now)
+    tracker["max_favorable_spot"] = float(favorable_extreme)
+    tracker["max_favorable_excursion_points"] = round(float(max(0.0, favorable_points)), 3)
+    tracker["last_protective_trail_assessed_at"] = ist_iso(now)
+
+    min_favorable_excursion = 1.25 * atr
+    min_retracement = 0.50 * atr
+    if favorable_points < min_favorable_excursion:
+        tracker["protective_trail_status"] = "WAITING_FOR_MEANINGFUL_FAVORABLE_EXCURSION"
+        return None
+    if pullback_points < min_retracement:
+        tracker["protective_trail_status"] = "WAITING_FOR_STRUCTURAL_PULLBACK"
+        return None
+
+    completed_3m = completed_resampled_candles(index_candles, 3, now)
+    if completed_3m.empty:
+        tracker["protective_trail_status"] = "HELD_NO_COMPLETED_3M_BARS"
+        return None
+    completed_3m = completed_3m.loc[
+        pd.to_datetime(completed_3m["timestamp"], utc=True, errors="coerce") >= created_utc
+    ].reset_index(drop=True)
+    pivot = _latest_confirmed_post_entry_pivot(completed_3m, direction, created, max_bars=15)
+    if pivot is None:
+        tracker["protective_trail_status"] = "WAITING_FOR_CONFIRMED_POST_ENTRY_SWING"
+        return None
+    if safe_float(pivot.get("reaction_points"), 0.0) < 0.25 * atr:
+        tracker["protective_trail_status"] = "HELD_WEAK_PIVOT_REACTION"
+        return None
+
+    # The small buffer protects against a one-tick/rounding touch of the swing itself.
+    pivot_level = safe_float(pivot.get("level"), float("nan"))
+    buffer_points = max(1.0, min(0.05 * atr, 2.0))
+    proposed = pivot_level - buffer_points if direction == "BULLISH" else pivot_level + buffer_points
+    min_spot_gap = max(0.10 * atr, 2.0)
+    active_stop = safe_float(tracker.get("trailing_stop", tracker.get("stop_loss")), float("nan"))
+    initial_stop = safe_float(tracker.get("initial_stop_loss", tracker.get("stop_loss")), float("nan"))
+    min_improvement = max(2.0, 0.05 * atr)
+    if not finite(active_stop) or not finite(proposed):
+        tracker["protective_trail_status"] = "HELD_INVALID_STOP_LEVEL"
+        return None
+    if direction == "BULLISH":
+        safe_side = proposed < spot - min_spot_gap
+        improves = proposed > active_stop + min_improvement
+        preserves_initial_risk = not finite(initial_stop) or proposed >= initial_stop
+    else:
+        safe_side = proposed > spot + min_spot_gap
+        improves = proposed < active_stop - min_improvement
+        preserves_initial_risk = not finite(initial_stop) or proposed <= initial_stop
+    if not safe_side:
+        tracker["protective_trail_status"] = "HELD_PIVOT_STOP_TOO_CLOSE_OR_BREACHED"
+        return None
+    if not improves or not preserves_initial_risk:
+        tracker["protective_trail_status"] = "NO_TIGHTER_PROTECTIVE_STOP_AVAILABLE"
+        return None
+
+    previous_stop = active_stop
+    tracker.setdefault("initial_stop_loss", initial_stop if finite(initial_stop) else tracker.get("stop_loss"))
+    tracker["trailing_stop"] = float(proposed)
+    tracker["trailing_stop_source"] = "PROTECTIVE_3M_SWING_TRAIL_AFTER_MFE_RETRACEMENT"
+    tracker["trailing_stop_updated_at"] = ist_iso(now)
+    tracker["trailing_stop_pivot_timestamp"] = pivot.get("timestamp")
+    tracker["trailing_stop_pivot_level"] = float(pivot_level)
+    tracker["trailing_stop_pivot_confirmation_timestamp"] = pivot.get("confirmation_timestamp")
+    tracker["trailing_stop_buffer_points"] = round(float(buffer_points), 3)
+    tracker["trailing_stop_retracement_points"] = round(float(pullback_points), 3)
+    tracker["protective_trail_status"] = "STOP_TIGHTENED_FROM_CONFIRMED_SWING"
+    tracker["sl_distance_points"] = round(abs(spot - proposed), 3)
+    history = tracker.get("protective_stop_history")
+    history = [dict(x) for x in history if isinstance(x, dict)] if isinstance(history, list) else []
+    history.append({
+        "timestamp": ist_iso(now), "direction": direction, "previous_stop": round(previous_stop, 3),
+        "new_stop": round(float(proposed), 3), "pivot_timestamp": pivot.get("timestamp"),
+        "pivot_level": round(float(pivot_level), 3), "mfe_points": round(float(favorable_points), 3),
+        "pullback_points": round(float(pullback_points), 3), "atr_5m": round(float(atr), 3),
+    })
+    tracker["protective_stop_history"] = history[-8:]
+    return {
+        "event_type": "ACTIVE_PROTECTIVE_STOP_TIGHTENED", "event_at": ist_iso(now),
+        "tracker_fingerprint": tracker.get("signal_fingerprint", ""), "direction": direction,
+        "trading_symbol": tracker.get("trading_symbol", ""), "option_type": tracker.get("option_type", ""),
+        "strike": tracker.get("strike"), "spot": float(spot),
+        "previous_trailing_SL": float(previous_stop), "new_trailing_SL": float(proposed),
+        "pivot_timestamp": pivot.get("timestamp"), "pivot_level": float(pivot_level),
+        "mfe_points": round(float(favorable_points), 3), "pullback_points": round(float(pullback_points), 3),
+        "message": "Protective NIFTY stop ratcheted after a confirmed post-entry 3m swing pivot, meaningful favorable excursion and volatility-sized retracement. The prior OHLC interval was already processed against its prior active levels.",
+    }
+
+
+def _detect_confirmed_structural_failure(
+    tracker: dict[str, Any], indicators: IndicatorSet, oi: OIAnalysis,
+    future_regime: str, scenario: Optional[Scenario], now: datetime,
+    index_candles: Optional[pd.DataFrame], config: Optional[Config],
+) -> Optional[dict[str, Any]]:
+    """Detect a completed 3m structural break only with two independent adverse factors.
+
+    This is a fallback to the proactive trail, not a one-red-candle exit. It requires a
+    closing break of a previously confirmed post-entry swing and at least two adverse
+    inputs among 3m momentum, tactical OI flow, decisive DI, VWAP, futures or a confirmed
+    opposite scenario. Uncertain candle chronology suppresses this path.
+    """
+    if str(tracker.get("status", "TRACKING")).upper() != "TRACKING":
+        return None
+    direction = str(tracker.get("direction", "")).upper()
+    if direction not in {"BULLISH", "BEARISH"} or index_candles is None or index_candles.empty:
+        return None
+    if (str(tracker.get("target_event_integrity", "")).upper() == "UNRESOLVED_AFTER_DATA_GAP"
+            or str(tracker.get("monitoring_data_status", "")).upper() in {
+                "GAP_UNRESOLVED", "CANDLE_FEED_STALE", "CANDLES_UNAVAILABLE_LIVE_SPOT_ONLY", "UNAVAILABLE"
+            }):
+        return None
+    created = parse_timestamp(tracker.get("created_at"))
+    if created is None:
+        return None
+    completed = completed_resampled_candles(index_candles, 3, now)
+    if completed.empty:
+        return None
+    completed = completed.loc[
+        pd.to_datetime(completed["timestamp"], utc=True, errors="coerce") >= pd.Timestamp(
+            (created.astimezone(IST) if created.tzinfo else created.replace(tzinfo=IST)).astimezone(ZoneInfo("UTC"))
+        )
+    ].reset_index(drop=True)
+    if len(completed) < 4:
+        return None
+    latest_stamp = parse_timestamp(completed.iloc[-1].get("timestamp"))
+    if latest_stamp is None:
+        return None
+    latest_stamp = latest_stamp.astimezone(IST)
+    current = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
+    if latest_stamp + timedelta(minutes=3) > current:
+        return None
+    previous_check = parse_timestamp(tracker.get("last_structural_failure_bar_timestamp"))
+    if previous_check is not None and latest_stamp <= previous_check.astimezone(IST):
+        return None
+    tracker["last_structural_failure_bar_timestamp"] = ist_iso(latest_stamp)
+
+    atr = safe_float(indicators.atr_5m, float("nan"))
+    if not finite(atr) or atr <= 0:
+        atr_1m = safe_float(indicators.atr, float("nan"))
+        if not finite(atr_1m) or atr_1m <= 0:
+            return None
+        atr = atr_1m * math.sqrt(5.0)
+    # The latest bar is the possible failure bar; search for a pivot before it, already
+    # confirmed by an earlier completed bar. That avoids using the failure candle itself
+    # to define the level it allegedly broke.
+    pivot = _latest_confirmed_post_entry_pivot(completed.iloc[:-1].copy(), direction, created, max_bars=15)
+    if pivot is None:
+        return None
+    pivot_level = safe_float(pivot.get("level"), float("nan"))
+    close = safe_float(completed.iloc[-1].get("close"), float("nan"))
+    if not finite(pivot_level) or not finite(close):
+        return None
+    buffer_points = max(1.0, min(0.05 * atr, 2.0))
+    invalidation_level = pivot_level - buffer_points if direction == "BULLISH" else pivot_level + buffer_points
+    structural_break = close <= invalidation_level if direction == "BULLISH" else close >= invalidation_level
+    if not structural_break:
+        return None
+
+    trigger = max(0.0001, config.oi_velocity_trigger if config is not None else 0.0015)
+    momentum = safe_float(indicators.momentum_3m_pct, float("nan"))
+    momentum_opposing = ((momentum <= -0.00015) if direction == "BULLISH" else (momentum >= 0.00015)) if finite(momentum) else False
+    oi_opposing = False
+    if oi.tactical_available and finite(oi.call_coi_pct) and finite(oi.put_coi_pct):
+        call_change, put_change = float(oi.call_coi_pct), float(oi.put_coi_pct)
+        if direction == "BULLISH":
+            oi_opposing = ((call_change >= trigger and put_change <= 0.25 * trigger)
+                           or (put_change <= -trigger and call_change <= 0.25 * trigger))
+        else:
+            oi_opposing = ((put_change >= trigger and call_change <= 0.25 * trigger)
+                           or (call_change <= -trigger and put_change <= 0.25 * trigger))
+    di_diff = (safe_float(indicators.plus_di) - safe_float(indicators.minus_di)
+               if finite(indicators.plus_di) and finite(indicators.minus_di) else float("nan"))
+    adx = safe_float(indicators.adx, float("nan"))
+    di_opposing = finite(di_diff) and finite(adx) and (
+        (direction == "BULLISH" and di_diff <= -6.0 and (adx >= 16.0 or di_diff <= -12.0))
+        or (direction == "BEARISH" and di_diff >= 6.0 and (adx >= 16.0 or di_diff >= 12.0))
+    )
+    vwap = safe_float(indicators.vwap, float("nan"))
+    spot = safe_float(indicators.spot, float("nan"))
+    vwap_opposing = finite(vwap) and finite(spot) and (
+        (direction == "BULLISH" and spot < vwap - 0.10 * atr)
+        or (direction == "BEARISH" and spot > vwap + 0.10 * atr)
+    )
+    future = str(future_regime or "UNKNOWN").upper()
+    futures_opposing = futures_regime_conflicts(direction, future)
+    scenario_opposing = bool(
+        scenario is not None and str(scenario.direction or "").upper() in {"BULLISH", "BEARISH"}
+        and str(scenario.direction or "").upper() != direction
+        and bool(scenario.executable_candidate) and not bool(scenario.hard_veto)
+    )
+    evidence = {
+        "MOMENTUM_3M": bool(momentum_opposing), "TACTICAL_OI": bool(oi_opposing),
+        "DIRECTIONAL_DI_ADX": bool(di_opposing), "VWAP": bool(vwap_opposing),
+        "FUTURES": bool(futures_opposing), "OPPOSITE_SCENARIO": bool(scenario_opposing),
+    }
+    adverse_count = sum(bool(value) for value in evidence.values())
+    # Momentum or local OI must contribute at least one independent directional signal;
+    # this avoids closing solely on an indicator combination that ignores price dynamics.
+    if adverse_count < 2 or not (momentum_opposing or oi_opposing):
+        return None
+    return {
+        "timestamp": ist_iso(latest_stamp + timedelta(minutes=3)),
+        "bar_timestamp": ist_iso(latest_stamp), "close": float(close),
+        "pivot_timestamp": pivot.get("timestamp"), "pivot_level": float(pivot_level),
+        "stop_level": float(invalidation_level), "buffer_points": float(buffer_points),
+        "evidence": evidence,
+    }
+
+
+def _derive_structural_reversal_event_from_stop(
+    state: Mapping[str, Any], events: Sequence[Mapping[str, Any]],
+    indicators: IndicatorSet, oi: OIAnalysis, future_regime: str,
+    scenario: Optional[Scenario], now: datetime,
+    index_candles: Optional[pd.DataFrame], config: Config,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Re-test a terminal SL event for a confirmed structural failure before rerouting.
+
+    A protective 1m stop can close the old tracker before the active-tracker structural
+    fallback runs. In that case the scan still must not miss a legitimate same-scan reversal.
+    We use a copy of that terminal tracker and independently require the completed-3m pivot
+    break plus two adverse factors. The original stop event is not changed or re-emailed.
+    """
+    normalized = [dict(item) for item in (events or []) if isinstance(item, Mapping)]
+    explicit = next((item for item in reversed(normalized)
+                     if str(item.get("event_type", "")).upper() == "STRUCTURAL_STOP_LOSS_REACHED"), None)
+    if explicit is not None:
+        return [explicit], {"source": "TRACKER_STRUCTURAL_FAILURE_EVENT", "source_stop_event_type": explicit.get("event_type")}
+
+    stop_types = {"INITIAL_STOP_LOSS_REACHED", "TRAILING_STOP_REACHED"}
+    stop_events = [item for item in normalized if str(item.get("event_type", "")).upper() in stop_types]
+    if not stop_events:
+        return [], {"source": "NONE", "reason": "NO_STRUCTURAL_FAILURE_OR_STOP_EVENT"}
+    tracker_rows = state.get("recommendation_trackers", []) if isinstance(state, Mapping) else []
+    tracker_by_fp = {str(item.get("signal_fingerprint", "")): item for item in tracker_rows
+                     if isinstance(item, Mapping) and item.get("signal_fingerprint")}
+    for stop_event in reversed(stop_events):
+        fingerprint = str(stop_event.get("tracker_fingerprint", ""))
+        saved = tracker_by_fp.get(fingerprint)
+        if not isinstance(saved, Mapping):
+            continue
+        replay_tracker = dict(saved)
+        replay_tracker["status"] = "TRACKING"
+        failure = _detect_confirmed_structural_failure(
+            replay_tracker, indicators, oi, future_regime, scenario, now, index_candles, config
+        )
+        if not isinstance(failure, Mapping):
+            continue
+        synthetic = dict(stop_event)
+        synthetic.update({
+            "event_type": "STRUCTURAL_STOP_LOSS_REACHED",
+            "reversal_source_stop_event_type": str(stop_event.get("event_type", "")),
+            "structural_failure_timestamp": failure.get("timestamp"),
+            "structural_failure_bar_timestamp": failure.get("bar_timestamp"),
+            "structural_failure_close": failure.get("close"),
+            "structural_pivot_timestamp": failure.get("pivot_timestamp"),
+            "structural_pivot_level": failure.get("pivot_level"),
+            "structural_failure_evidence": failure.get("evidence", {}),
+            "message": "Existing stop event independently corroborated by a completed 3m structural pivot break and at least two adverse context factors; eligible for same-scan opposite-side evaluation.",
+        })
+        return [synthetic], {
+            "source": "STOP_EVENT_PLUS_INDEPENDENT_STRUCTURAL_REPLAY",
+            "source_stop_event_type": stop_event.get("event_type"),
+            "structural_failure_confirmed": True,
+            "structural_failure_bar_timestamp": failure.get("bar_timestamp"),
+        }
+    return [], {
+        "source": "STOP_EVENT_WITHOUT_CONFIRMED_STRUCTURAL_REPLAY",
+        "reason": "STOP_CLOSED_PRIOR_SIGNAL_BUT_COMPLETED_3M_BREAK_AND_TWO_ADVERSE_FACTORS_NOT_CONFIRMED",
+    }
+
+
+def _build_confirmed_active_reversal_scenario(
+    events: Sequence[Mapping[str, Any]], spot: float, indicators: IndicatorSet,
+    oi: OIAnalysis, future_regime: str, now: datetime, config: Config,
+) -> tuple[Optional[Scenario], dict[str, Any]]:
+    """Turn a *confirmed* active-tracker structural failure into an opposite setup.
+
+    The old tracker has already passed a completed-3m pivot break and two independent
+    adverse factors. This coordinator does not treat a reversal watch as an entry: it
+    requires the current spot to remain beyond the broken pivot, current tactical OI to
+    align with the replacement direction, present 1m/3m momentum to agree, a non-conflicting
+    futures regime, and limited extension. The ordinary risk planner and option-quality
+    gates still run afterward. If any prerequisite is missing, the old signal stays closed
+    but no opposite strike is forced.
+    """
+    info: dict[str, Any] = {
+        "transition_detected": False, "reversal_candidate_created": False,
+        "action": "MAINTAIN_CURRENT_SCENARIO", "reason": "NO_CONFIRMED_STRUCTURAL_FAILURE_EVENT",
+    }
+    event = next((dict(item) for item in reversed(list(events or []))
+                  if isinstance(item, Mapping)
+                  and str(item.get("event_type", "")).upper() == "STRUCTURAL_STOP_LOSS_REACHED"), None)
+    if event is None:
+        return None, info
+
+    info["transition_detected"] = True
+    old_direction = str(event.get("direction", "")).upper()
+    new_direction = "BEARISH" if old_direction == "BULLISH" else "BULLISH" if old_direction == "BEARISH" else "NEUTRAL"
+    pivot = safe_float(event.get("structural_pivot_level"), float("nan"))
+    failure_close = safe_float(event.get("structural_failure_close"), float("nan"))
+    event_time = parse_timestamp(event.get("structural_failure_timestamp") or event.get("event_at"))
+    evidence = event.get("structural_failure_evidence") if isinstance(event.get("structural_failure_evidence"), Mapping) else {}
+    evidence_clean = {str(key): bool(value) for key, value in evidence.items()}
+    evidence_count = sum(evidence_clean.values())
+    info.update({
+        "action": "INVALIDATE_FAILED_SIGNAL_AND_EVALUATE_OPPOSITE",
+        "invalidated_direction": old_direction, "replacement_direction": new_direction,
+        "source_tracker_fingerprint": event.get("tracker_fingerprint", ""),
+        "source_option": event.get("trading_symbol", ""),
+        "structural_pivot_level": pivot if finite(pivot) else None,
+        "structural_failure_close": failure_close if finite(failure_close) else None,
+        "structural_failure_timestamp": event.get("structural_failure_timestamp"),
+        "failure_evidence": evidence_clean,
+    })
+
+    if new_direction not in {"BULLISH", "BEARISH"}:
+        info["reason"] = "SOURCE_TRACKER_DIRECTION_INVALID"
+        return None, info
+    if not finite(pivot) or not finite(failure_close):
+        info["reason"] = "STRUCTURAL_FAILURE_PIVOT_OR_CLOSE_MISSING"
+        return None, info
+    if evidence_count < 2 or not (evidence_clean.get("MOMENTUM_3M") or evidence_clean.get("TACTICAL_OI")):
+        info["reason"] = "STRUCTURAL_FAILURE_EVIDENCE_INCOMPLETE"
+        return None, info
+    if event_time is None:
+        info["reason"] = "STRUCTURAL_FAILURE_TIMESTAMP_MISSING"
+        return None, info
+    current = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
+    age_seconds = (current - event_time.astimezone(IST)).total_seconds()
+    info["failure_event_age_seconds"] = round(age_seconds, 2)
+    if age_seconds < -30.0 or age_seconds > 240.0:
+        info["reason"] = "STRUCTURAL_FAILURE_EVENT_STALE_OR_FUTURE_DATED"
+        return None, info
+
+    atr5, atr_source = structural_stop_atr(indicators)
+    if not finite(atr5) or atr5 <= 0:
+        info["reason"] = "ATR_UNAVAILABLE_FOR_REVERSAL_BUFFER"
+        return None, info
+    break_buffer = max(1.0, min(0.05 * atr5, 2.0))
+    pivot_broken_now = (spot < pivot - break_buffer if new_direction == "BEARISH"
+                        else spot > pivot + break_buffer)
+    distance = abs(float(spot) - pivot) if finite(spot) else float("inf")
+    strike_step = infer_strike_step(list(oi.rows)) if isinstance(oi.rows, dict) and oi.rows else float("nan")
+    chase_limit = max(float(strike_step) if finite(strike_step) else 0.0, 1.25 * atr5)
+    info.update({
+        "current_spot": float(spot) if finite(spot) else None,
+        "pivot_buffer_points": round(break_buffer, 2),
+        "spot_distance_from_failed_pivot": round(distance, 2) if finite(distance) else None,
+        "max_entry_extension_points": round(chase_limit, 2),
+        "atr5_source": atr_source,
+    })
+    if not finite(spot) or not pivot_broken_now:
+        info["reason"] = "PRICE_RECLAIMED_FAILED_PIVOT_NO_OPPOSITE_ENTRY"
+        return None, info
+    if distance > chase_limit:
+        info["reason"] = "REVERSAL_MOVE_ALREADY_EXTENDED_NO_CHASE"
+        return None, info
+    if not oi.tactical_available or not finite(oi.call_coi_pct) or not finite(oi.put_coi_pct):
+        info["reason"] = "CURRENT_TACTICAL_OI_UNAVAILABLE_NO_OPPOSITE_ENTRY"
+        return None, info
+
+    trigger = max(config.oi_velocity_trigger, 0.0002)
+    noise = 0.50 * trigger
+    call_change = float(oi.call_coi_pct)
+    put_change = float(oi.put_coi_pct)
+    global_bull = ((call_change <= -trigger and put_change >= -noise)
+                   or (put_change >= trigger and call_change >= -noise))
+    global_bear = ((put_change <= -trigger and call_change >= -noise)
+                   or (call_change >= trigger and put_change >= -noise))
+    global_aligned = global_bull if new_direction == "BULLISH" else global_bear
+
+    # Use the nearest actual option strike to the failed pivot for local COI. Missing local
+    # values are not silently converted to zero; aggregate tactical flow can confirm only
+    # if it is currently directional and the old structural-break evidence included OI.
+    local_strike: Optional[float] = None
+    local_row: Optional[Mapping[str, Any]] = None
+    local_bull = local_bear = False
+    local_call = local_put = float("nan")
+    if isinstance(oi.rows, dict) and oi.rows:
+        try:
+            closest = min(oi.rows, key=lambda key: abs(float(key) - pivot))
+            tolerance = max(0.70 * strike_step, 3.0) if finite(strike_step) else 3.0
+            if abs(float(closest) - pivot) <= tolerance:
+                local_strike = float(closest)
+                candidate_row = oi.rows.get(closest)
+                if isinstance(candidate_row, Mapping):
+                    local_row = candidate_row
+                    local_call = safe_float(local_row.get("call_coi_pct"), float("nan"))
+                    local_put = safe_float(local_row.get("put_coi_pct"), float("nan"))
+                    if finite(local_call) and finite(local_put):
+                        local_bull = ((local_call <= -trigger and local_put >= -noise)
+                                      or (local_put >= trigger and local_call <= noise))
+                        local_bear = ((local_put <= -trigger and local_call >= -noise)
+                                      or (local_call >= trigger and local_put <= noise))
+        except (TypeError, ValueError):
+            local_strike = None
+    local_aligned = local_bull if new_direction == "BULLISH" else local_bear
+    local_opposite = local_bear if new_direction == "BULLISH" else local_bull
+    oi_aligned = global_aligned or local_aligned
+    global_strength = max(abs(call_change), abs(put_change))
+    strong_global_alignment = global_aligned and global_strength >= 2.0 * trigger
+    info.update({
+        "oi_tactical_source": oi.tactical_source,
+        "aggregate_call_coi_pct": round(call_change * 100.0, 4),
+        "aggregate_put_coi_pct": round(put_change * 100.0, 4),
+        "aggregate_oi_aligned": bool(global_aligned),
+        "local_oi_strike": local_strike,
+        "local_call_coi_pct": round(local_call * 100.0, 4) if finite(local_call) else None,
+        "local_put_coi_pct": round(local_put * 100.0, 4) if finite(local_put) else None,
+        "local_oi_aligned": bool(local_aligned),
+        "local_oi_opposite": bool(local_opposite),
+        "oi_trigger_fraction": trigger,
+    })
+    if local_opposite and not strong_global_alignment:
+        info["reason"] = "LOCAL_OI_FLOW_CONFLICTS_WITH_OPPOSITE_ENTRY"
+        return None, info
+    if not oi_aligned:
+        info["reason"] = "CURRENT_LOCAL_OR_AGGREGATE_OI_DOES_NOT_CONFIRM_OPPOSITE_ENTRY"
+        return None, info
+
+    momentum3 = safe_float(indicators.momentum_3m_pct, float("nan"))
+    momentum1 = safe_float(indicators.momentum_1m_pct, float("nan"))
+    threshold = 0.00010
+    momentum3_aligned = finite(momentum3) and (momentum3 >= threshold if new_direction == "BULLISH" else momentum3 <= -threshold)
+    momentum1_aligned = finite(momentum1) and (momentum1 >= threshold if new_direction == "BULLISH" else momentum1 <= -threshold)
+    momentum_aligned = momentum3_aligned or momentum1_aligned
+    di_diff = (indicators.plus_di - indicators.minus_di) if finite(indicators.plus_di) and finite(indicators.minus_di) else float("nan")
+    di_aligned = finite(di_diff) and (di_diff >= 4.0 if new_direction == "BULLISH" else di_diff <= -4.0)
+    if not momentum_aligned and not (strong_global_alignment and di_aligned):
+        info["reason"] = "CURRENT_MOMENTUM_NOT_ALIGNED_WITH_OPPOSITE_FLOW"
+        info["momentum_3m_aligned"] = bool(momentum3_aligned)
+        info["momentum_1m_aligned"] = bool(momentum1_aligned)
+        info["directional_di_aligned"] = bool(di_aligned)
+        return None, info
+    if futures_regime_conflicts(new_direction, future_regime):
+        info["reason"] = f"FUTURES_REGIME_CONFLICT_{str(future_regime).upper()}"
+        return None, info
+
+    # Confidence is a rule-based confluence score, never a calibrated probability.
+    evidence_count = sum(evidence_clean.values())
+    confidence = min(88.0, 76.0 + 2.0 * max(0, evidence_count - 2)
+                     + (2.0 if strong_global_alignment else 0.0)
+                     + (2.0 if momentum3_aligned else 0.0)
+                     + (1.0 if di_aligned else 0.0))
+    features = {
+        "setup_route": "ACTIVE_SIGNAL_STRUCTURAL_REVERSAL",
+        "reaction": "STRUCTURAL_BREAK_RETEST",
+        "wall_tested": True,
+        "wall_level": float(pivot),
+        "wall_strike": local_strike if local_strike is not None else float(pivot),
+        "wall_state": "BROKEN_BOUNDARY",
+        "active_signal_reversal": True,
+        "active_signal_reversal_confirmed": True,
+        "structural_break_confirmed": True,
+        "current_directional_oi_confirmed": True,
+        "source_tracker_fingerprint": str(event.get("tracker_fingerprint", "")),
+        "source_direction": old_direction,
+        "source_option": str(event.get("trading_symbol", "")),
+        "structural_pivot_level": float(pivot),
+        "structural_break_close": float(failure_close),
+        "structural_break_bar_timestamp": event.get("structural_failure_bar_timestamp"),
+        "structural_failure_timestamp": event.get("structural_failure_timestamp"),
+        "structural_failure_evidence": evidence_clean,
+        "current_aggregate_oi_aligned": bool(global_aligned),
+        "current_local_oi_aligned": bool(local_aligned),
+        "current_local_oi_opposite": bool(local_opposite),
+        "current_global_oi_strong": bool(strong_global_alignment),
+        "current_momentum_3m_aligned": bool(momentum3_aligned),
+        "current_momentum_1m_aligned": bool(momentum1_aligned),
+        "current_directional_di_aligned": bool(di_aligned),
+        "pivot_buffer_points": float(break_buffer),
+        "max_entry_extension_points": float(chase_limit),
+        "evidence": [key for key, value in evidence_clean.items() if value],
+    }
+    scenario = Scenario(
+        state=f"ACTIVE_SIGNAL_REVERSAL_CONFIRMED_{new_direction}",
+        direction=new_direction,
+        confidence=confidence,
+        trigger_reason=(
+            f"Active {old_direction} virtual signal invalidated by a confirmed completed-3m pivot break at "
+            f"{pivot:.2f} (close {failure_close:.2f}); current price, tactical local/aggregate OI and "
+            f"momentum confirm {new_direction}. Opposite strike must still pass the normal structural-risk, "
+            "fresh-quote, liquidity, premium VWAP and score gates."
+        ),
+        wall_level=float(pivot), wall_state="BROKEN_BOUNDARY",
+        executable_candidate=True, hard_veto=None, features=features,
+    )
+    info.update({
+        "reversal_candidate_created": True,
+        "reason": "CONFIRMED_STRUCTURAL_REVERSAL_OI_AND_MOMENTUM_ALIGNED",
+        "scenario": scenario.state,
+        "confidence_pct": round(confidence, 1),
+        "current_momentum_3m_aligned": bool(momentum3_aligned),
+        "current_momentum_1m_aligned": bool(momentum1_aligned),
+        "current_directional_di_aligned": bool(di_aligned),
+    })
+    return scenario, info
+
+
 def _reassess_active_structural_levels(
     tracker: dict[str, Any], spot: float, indicators: IndicatorSet, oi: OIAnalysis,
     now: datetime, scenario: Optional[Scenario], future_regime: str,
     config: Optional[Config], index_candles: Optional[pd.DataFrame],
 ) -> Optional[dict[str, Any]]:
-    """Refresh virtual T1/T2 and favorable-only SL from confirmed evolving structure.
+    """Refresh virtual T1/T2 from confirmed evolving structure; stop management is separate.
 
     Processing order is important: the caller must first test the *previously active* levels
     against newly completed 1m OHLC bars, resolve stop/target events and then call this function.
@@ -5209,36 +5984,10 @@ def _reassess_active_structural_levels(
     old_t2_valid = _target_source_is_intact(active_t2, old_t2_source, direction, spot, oi, max_distance, min_distance) if finite(active_t2) else False
     candidate_t1 = safe_float(plan.target_1, float("nan"))
     candidate_t2 = safe_float(plan.target_2, float("nan"))
-    # Determine whether the current completed-3m structure justifies a favourable-only
-    # stop ratchet before checking target reward/risk. If the stop can safely tighten on
-    # this same reassessment, targets are checked against that *prospective* stop; the
-    # ratchet still takes effect only after this scan's prior levels have been processed.
-    original_stop = safe_float(tracker.get("stop_loss"), float("nan"))
-    entry_spot = safe_float(tracker.get("nifty_entry_reference"), float("nan"))
-    favourable_progress = ((spot - entry_spot) if direction == "BULLISH" else (entry_spot - spot)) if finite(entry_spot) else float("nan")
-    min_progress = max(0.50 * atr_for_distance if finite(atr_for_distance) else 0.0,
-                       0.00035 * spot if finite(spot) else 0.0)
-    min_stop_gap = max(0.15 * atr_for_distance if finite(atr_for_distance) else 0.0, 2.0)
-    min_stop_change = max(0.10 * atr_for_distance if finite(atr_for_distance) else 0.0, 2.0)
-    candidate_stop = safe_float(plan.stop_loss, float("nan"))
-    favourable_enough = bool(finite(favourable_progress) and favourable_progress >= min_progress)
-    prospective_stop = active_stop
-    prospective_stop_tightening = False
-    if favourable_enough and finite(active_stop) and finite(candidate_stop):
-        if direction == "BULLISH":
-            proposal_stop = max(active_stop, candidate_stop)
-            safe_side = proposal_stop < spot - min_stop_gap
-            improved = proposal_stop > active_stop + min_stop_change
-            preserves_initial_risk_limit = not finite(original_stop) or proposal_stop >= original_stop
-        else:
-            proposal_stop = min(active_stop, candidate_stop)
-            safe_side = proposal_stop > spot + min_stop_gap
-            improved = proposal_stop < active_stop - min_stop_change
-            preserves_initial_risk_limit = not finite(original_stop) or proposal_stop <= original_stop
-        if safe_side and improved and preserves_initial_risk_limit:
-            prospective_stop = float(proposal_stop)
-            prospective_stop_tightening = True
-    current_risk = abs(prospective_stop - spot)
+    # The currently active protective stop is owned by
+    # _update_protective_structural_trailing_stop(). Keep target risk calculations tied to
+    # that stop, rather than deriving a second, competing stop inside the target routine.
+    current_risk = abs(active_stop - spot)
 
     def valid_target_for_active_stop(level: float) -> bool:
         ahead = level > spot + min_distance if direction == "BULLISH" else level < spot - min_distance
@@ -5342,20 +6091,7 @@ def _reassess_active_structural_levels(
         tracker["target_2_source"] = str(new_t2_source)
         target_changed = True
 
-    # Dynamic SL: tighten only after favourable price progress AND aligned multi-factor
-    # context; never widen risk. A touched hard stop remains terminal and is never undone.
-    # Apply only the favorable stop proposal that was already checked above against
-    # progress, protective-side clearance, minimum improvement and original-stop limits.
-    stop_tightened = bool(prospective_stop_tightening)
-    if stop_tightened:
-        tracker["trailing_stop"] = float(prospective_stop)
-        tracker["trailing_stop_source"] = f"DYNAMIC_3M_STRUCTURAL_RATCHET_{plan.stop_source}"
-        tracker["trailing_stop_updated_at"] = ist_iso(now)
-
-    if stop_tightened:
-        tracker.setdefault("initial_stop_loss", original_stop)
-        tracker["sl_distance_points"] = abs(spot - safe_float(tracker.get("trailing_stop"), active_stop))
-    if target_changed or stop_tightened:
+    if target_changed:
         tracker["target_update_count"] = max(0, int(safe_float(tracker.get("target_update_count"), 0))) + 1
         tracker["last_target_update_at"] = ist_iso(now)
         tracker["target_reassessment_status"] = "LEVELS_UPDATED"
@@ -5380,7 +6116,7 @@ def _reassess_active_structural_levels(
             "previous_T2": previous_t2, "new_T2": tracker.get("target_2"),
             "previous_trailing_SL": active_stop, "new_trailing_SL": tracker.get("trailing_stop"),
             "target_reassessment_reason": context_reason,
-            "message": "Active NIFTY levels updated prospectively after a distinct completed 3-minute bar and aligned multi-factor context. The prior 1-minute OHLC interval was processed against its then-active levels.",
+            "message": "Active T1/T2 levels were updated prospectively after a distinct completed 3-minute bar and aligned market context. Protective stop management runs independently against confirmed swing structure.",
         }
     tracker["target_reassessment_status"] = "LEVELS_REASSESSED_NO_CHANGE"
     tracker["target_reassessment_reason"] = context_reason
@@ -5541,12 +6277,25 @@ def update_recommendation_tracker(
         chronology_uncertain = (str(intrabar.get("monitoring_data_status", "")).upper() in {
             "GAP_UNRESOLVED", "CANDLE_FEED_STALE"
         } or str(tracker.get("target_event_integrity", "")).upper() == "UNRESOLVED_AFTER_DATA_GAP")
+        active_stop_was_crossed = bool(intrabar.get("stop_hit")) or (
+            (direction == "BULLISH" and spot <= stored_stop) or
+            (direction == "BEARISH" and spot >= stored_stop)
+        )
+        structural_failure = None
+        if not active_stop_was_crossed and not chronology_uncertain:
+            structural_failure = _detect_confirmed_structural_failure(
+                tracker, indicators, oi, future_regime, scenario, now, index_candles, config
+            )
         t1_newly_hit = (not was_t1_hit and not bool(intrabar.get("ambiguous_bar"))
                         and not chronology_uncertain
                         and (spot_t1_cross or bool(intrabar.get("t1_hit"))))
-        trailing_stop_active_before_scan = bool(tracker.get("trailing_stop_source")) or (
-            finite(tracker.get("trailing_stop")) and finite(tracker.get("stop_loss"))
-            and abs(safe_float(tracker.get("trailing_stop")) - safe_float(tracker.get("stop_loss"))) > 0.01
+        initial_stop_before_scan = safe_float(tracker.get("initial_stop_loss", tracker.get("stop_loss")), float("nan"))
+        active_stop_before_scan = safe_float(tracker.get("trailing_stop", tracker.get("stop_loss")), float("nan"))
+        trailing_stop_active_before_scan = bool(
+            finite(initial_stop_before_scan) and finite(active_stop_before_scan) and (
+                (direction == "BULLISH" and active_stop_before_scan > initial_stop_before_scan + 0.01)
+                or (direction == "BEARISH" and active_stop_before_scan < initial_stop_before_scan - 0.01)
+            )
         )
         if t1_newly_hit:
             tracker["target_1_hit"] = True
@@ -5604,14 +6353,42 @@ def update_recommendation_tracker(
         t2_hit = (not chronology_uncertain) and (bool(intrabar.get("t2_hit")) or
                   (finite(t2) and ((direction == "BULLISH" and spot >= t2) or (direction == "BEARISH" and spot <= t2))))
         if stop_hit:
-            # Label a stop as trailing only if a favorable trailing level was already
-            # active before this scan. A T1 and stop hit on separate missed candles must
-            # not retroactively relabel a crossing of the original SL as a trailing stop.
-            event_type = "TRAILING_STOP_REACHED" if was_t1_hit and trailing_stop_active_before_scan else "INITIAL_STOP_LOSS_REACHED"
+            # Classify by the stop actually crossed, not by whether T1 happened first.
+            # A tightened structural stop protects a signal before T1 just as it does after T1.
+            event_type = "TRAILING_STOP_REACHED" if trailing_stop_active_before_scan else "INITIAL_STOP_LOSS_REACHED"
             tracker["status"] = "VIRTUAL_TRAILING_STOP_REACHED" if event_type == "TRAILING_STOP_REACHED" else "VIRTUAL_STOP_LOSS_REACHED"
             tracker["completed_at"] = ist_iso(now)
             events.append({**common_event, "event_type": event_type,
-                           "message": ("A completed 1m NIFTY candle crossed the recommendation's structural stop; stop is processed before targets when one OHLC bar spans both levels. " if intrabar.get("stop_hit") else "NIFTY reached the recommendation's structural stop level. ") + "This is a virtual signal-monitor event, not an order or actual-position confirmation."})
+                           "message": ("A completed 1m NIFTY candle crossed the active protective stop; when one OHLC bar spans a stop and target, stop is processed first. " if intrabar.get("stop_hit") else "NIFTY reached the active protective stop level. ") + "This is a virtual signal-monitor event, not an order or actual-position confirmation."})
+        elif structural_failure is not None:
+            # Fallback for a confirmed multi-minute structure failure when the spot did not
+            # touch the prior hard stop. The exit level is the already-confirmed pivot with
+            # its volatility buffer; a single 1m wick cannot trigger this path.
+            active_before_failure = safe_float(tracker.get("trailing_stop", tracker.get("stop_loss")), stop)
+            failed_level = safe_float(structural_failure.get("stop_level"), float("nan"))
+            if finite(failed_level):
+                if direction == "BULLISH":
+                    effective_level = max(active_before_failure, failed_level)
+                else:
+                    effective_level = min(active_before_failure, failed_level)
+                tracker["trailing_stop"] = float(effective_level)
+                tracker["trailing_stop_source"] = "CONFIRMED_3M_STRUCTURAL_FAILURE_EXIT"
+                tracker["trailing_stop_updated_at"] = ist_iso(now)
+                tracker["trailing_stop_pivot_timestamp"] = structural_failure.get("pivot_timestamp")
+                tracker["trailing_stop_pivot_level"] = structural_failure.get("pivot_level")
+                tracker["structural_failure_confirmed_at"] = structural_failure.get("timestamp")
+                tracker["structural_failure_evidence"] = structural_failure.get("evidence", {})
+                tracker["status"] = "VIRTUAL_TRAILING_STOP_REACHED"
+                tracker["completed_at"] = ist_iso(now)
+                events.append({**common_event, "event_type": "STRUCTURAL_STOP_LOSS_REACHED",
+                               "trailing_SL": float(effective_level),
+                               "structural_failure_timestamp": structural_failure.get("timestamp"),
+                               "structural_failure_bar_timestamp": structural_failure.get("bar_timestamp"),
+                               "structural_failure_close": structural_failure.get("close"),
+                               "structural_pivot_timestamp": structural_failure.get("pivot_timestamp"),
+                               "structural_pivot_level": structural_failure.get("pivot_level"),
+                               "structural_failure_evidence": structural_failure.get("evidence", {}),
+                               "message": "A completed 3m NIFTY close broke a previously confirmed post-entry swing pivot and at least two independent context factors opposed the active signal. Virtual signal invalidated; no order was placed."})
         elif t2_hit:
             # If a scan gap jumps past T2 and the T1 event was not previously observed,
             # emit T1 before T2 so the alert history follows the proper level sequence.
@@ -5636,10 +6413,15 @@ def update_recommendation_tracker(
             if stagnation.get("warning"):
                 events.append(stagnation["warning"])
 
-            # Dynamic T1/T2 and favorable-only SL updates happen after this scan's old
-            # levels have already been checked for crossings. The reassessment is gated
-            # by a distinct completed 3m candle plus market context (VWAP/momentum/DI/COI/
-            # futures); it cannot trigger on a 1m wick alone.
+            # The old levels were already processed above. Tighten the protective stop from
+            # confirmed swing structure first (without waiting for directional context to
+            # remain bullish/bearish), then let the independent target routine use that stop
+            # when checking the evolving T1/T2 risk/reward plan.
+            protective_stop_event = _update_protective_structural_trailing_stop(
+                tracker, spot, indicators, now, index_candles
+            )
+            if protective_stop_event:
+                events.append(protective_stop_event)
             level_event = _reassess_active_structural_levels(
                 tracker, spot, indicators, oi, now, scenario, future_regime, config, index_candles
             )
@@ -5714,7 +6496,7 @@ def register_recommendation_tracker(
 ) -> dict[str, Any]:
     """Register a signal for virtual monitoring without resetting an identical tracker.
 
-    V79's main scan guard suppresses new selection while any recommendation is active.
+    The active-recommendation guard suppresses unrelated new selections, but permits same-scan opposite-side evaluation after a confirmed structural failure.
     The tracker-list compatibility remains for older persisted states; active legacy
     records continue to be monitored rather than silently discarded during migration.
     """
@@ -5773,7 +6555,7 @@ def register_recommendation_tracker(
             "last_nifty_spot": signal["nifty_spot"],
             "nifty_entry_reference": signal["nifty_spot"],
             "target_1": signal["T1"], "target_2": signal.get("T2"),
-            "stop_loss": signal["SL"], "trailing_stop": signal["SL"],
+            "stop_loss": signal["SL"], "initial_stop_loss": signal["SL"], "trailing_stop": signal["SL"],
             "T1_source": signal.get("T1_source"), "T2_source": signal.get("T2_source"),
             "SL_source": signal.get("SL_source"), "reward_risk_ratio": signal.get("reward_risk_ratio"),
             "t1_distance_points": signal.get("t1_distance_points"), "sl_distance_points": signal.get("sl_distance_points"),
@@ -5781,6 +6563,9 @@ def register_recommendation_tracker(
             "remaining_session_minutes_at_signal": signal.get("remaining_session_minutes"),
             "stop_atr_points": signal.get("stop_atr_points"), "stop_atr_source": signal.get("stop_atr_source"),
             "target_1_hit": False, "alerted_events": [],
+            "max_favorable_spot": safe_float(signal.get("nifty_spot"), float("nan")),
+            "max_favorable_excursion_points": 0.0,
+            "protective_trail_status": "WAITING_FOR_FAVORABLE_EXCURSION",
             "latest_signal_score": signal.get("score"),
             "latest_signal_confidence_pct": signal.get("confidence_pct"),
             "tracker_notice": "Hypothetical signal monitoring only; this is not evidence of an actual open position.",
@@ -5954,7 +6739,7 @@ def enqueue_email_alert(
     """Queue one-time selection, T1/T2 milestone, and confirmed failure emails."""
     event_type = str(event_type or "").upper()
     if event_type not in EMAIL_ALLOWED_EVENT_TYPES:
-        LOGGER.debug("EMAIL SUPPRESSED BY V79 POLICY: event=%s", event_type or "UNKNOWN")
+        LOGGER.debug("EMAIL SUPPRESSED BY V81 POLICY: event=%s", event_type or "UNKNOWN")
         return None
     dedupe = state.setdefault("alert_dedupe", {})
     if not isinstance(dedupe, dict):
@@ -6032,7 +6817,7 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
     t2 = first(payload.get("T2"), payload.get("target_2"), levels.get("T2"), risk.get("target_2"), tracker.get("target_2"), selected.get("T2"))
     initial_sl = first(payload.get("SL"), payload.get("stop_loss"), levels.get("SL"), risk.get("stop_loss"), tracker.get("stop_loss"), selected.get("SL"))
     trailing_sl = first(payload.get("trailing_SL"), payload.get("trailing_stop"), tracker.get("trailing_stop"))
-    sl = trailing_sl if event_type in {"T1_REACHED", "T2_REACHED", "TRAILING_STOP_REACHED"} and trailing_sl is not None else initial_sl
+    sl = trailing_sl if event_type in {"T1_REACHED", "T2_REACHED", "TRAILING_STOP_REACHED", "STRUCTURAL_STOP_LOSS_REACHED"} and trailing_sl is not None else initial_sl
 
     event_time = None
     if event_type == "T1_REACHED":
@@ -6041,6 +6826,8 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
         event_time = payload.get("intrabar_t2_timestamp")
     elif event_type in {"INITIAL_STOP_LOSS_REACHED", "TRAILING_STOP_REACHED"}:
         event_time = payload.get("intrabar_stop_timestamp")
+    elif event_type == "STRUCTURAL_STOP_LOSS_REACHED":
+        event_time = payload.get("structural_failure_timestamp")
     event_time = first(event_time, payload.get("timestamp"), payload.get("event_at"), alert.get("created_at"))
     event_dt = parse_timestamp(event_time) if event_time else None
     time_text = event_dt.astimezone(IST).strftime("%d %b %Y, %I:%M:%S %p IST") if event_dt else str(event_time or "Not available")
@@ -6051,6 +6838,7 @@ def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]],
         "T2_REACHED": "T2 REACHED",
         "INITIAL_STOP_LOSS_REACHED": "STOP LOSS REACHED",
         "TRAILING_STOP_REACHED": "TRAILING STOP REACHED",
+        "STRUCTURAL_STOP_LOSS_REACHED": "STRUCTURAL STOP LOSS REACHED",
         "MARKET_REVERSAL_CONFIRMED": "MARKET STRUCTURE REVERSAL CONFIRMED",
     }
     title = title_map.get(event_type, event_type.replace("_", " ").strip().title())
@@ -6125,7 +6913,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
                 and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
             alert["status"] = "SUPPRESSED_POLICY"
             alert["suppressed_at"] = ist_iso(now)
-            alert["last_error"] = "Suppressed by V79 email policy."
+            alert["last_error"] = "Suppressed by V81 email policy."
             alert.pop("next_attempt_at", None)
     all_pending = [x for x in outbox if isinstance(x, dict) and str(x.get("status", "PENDING")).upper() == "PENDING"]
     if not all_pending:
@@ -6162,7 +6950,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
             alert["attempts"] = int(alert.get("attempts", 0)) + 1
             try:
                 message = MIMEMultipart("alternative")
-                message["Subject"] = str(alert.get("subject", "NIFTY V79 scanner alert"))
+                message["Subject"] = str(alert.get("subject", "NIFTY V81 scanner alert"))
                 message["From"] = config.email_sender
                 message["To"] = config.email_receiver
                 message.attach(MIMEText(_alert_body(alert), "plain", "utf-8"))
@@ -6517,7 +7305,7 @@ def _compact_email_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Persist only the values consumed by the minimal email renderer; retain retry safety."""
     out = _mapping_subset(payload, (
         "timestamp", "event_at", "intrabar_t1_timestamp", "intrabar_t2_timestamp",
-        "intrabar_stop_timestamp", "trading_symbol", "option_type", "strike", "direction",
+        "intrabar_stop_timestamp", "structural_failure_timestamp", "trading_symbol", "option_type", "strike", "direction",
         "confidence_pct", "confidence", "nifty_entry_reference", "nifty_spot", "spot",
         "T1", "T2", "SL", "trailing_SL", "target_1", "target_2", "stop_loss",
         "trailing_stop", "replacement_direction", "invalidated_direction", "message",
@@ -6676,7 +7464,7 @@ class ScanAuditWriter:
     def _compact_existing_file(self, path: Path) -> bool:
         """Rewrite a legacy full same-day audit once, preserving all scans in compact form.
 
-        This prevents V79 from only compacting *new* lines while leaving a large V74/V76
+        This prevents V81 from only compacting *new* lines while leaving a large V74/V76
         audit file tracked in GitHub. A parse/conversion failure aborts atomically, leaving
         the original untouched; the scanner can continue writing a new compact record.
         """
@@ -6740,7 +7528,7 @@ class ScanAuditWriter:
                 if not migration_done and isinstance(state, dict):
                     compaction_complete = True
                     # Compact all legacy daily audit files, not only today's file. This matters
-                    # when V79 is first deployed on a later date than the large audit being fixed.
+                    # when V81 is first deployed on a later date than the large audit being fixed.
                     for existing_path in sorted(self.directory.glob("market_scan_*.jsonl")):
                         if not self._is_compact_file(existing_path):
                             self._compact_existing_file(existing_path)
@@ -7032,7 +7820,7 @@ class PredictiveScanner:
         enqueue_email_alert(
             state, now=now, event_type=error_kind,
             dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{error_kind}|{type(exc).__name__}",
-            subject=f"NIFTY V79 scanner {error_kind.replace('_', ' ').lower()}",
+            subject=f"NIFTY V81 scanner {error_kind.replace('_', ' ').lower()}",
             payload={"timestamp": ist_iso(now), "scanner_version": SCANNER_VERSION,
                      "error_type": type(exc).__name__, "error": str(exc)[:1200],
                      "note": "No new recommendation was produced by the failed scan."},
@@ -7402,9 +8190,25 @@ class PredictiveScanner:
                 scenario=scenario, future_regime=future_regime, config=self.config,
             )
             self._queue_monitor_events(state, tracked.get("events", []), current)
+            # Unified active-signal lifecycle: first close/monitor the prior signal using
+            # its original levels, then allow a confirmed 3m structural failure to seed an
+            # opposite-direction setup in this same scan. Reversal watches alone never do
+            # this; the builder also requires current tactical OI and momentum alignment.
+            reversal_events, reversal_event_source = _derive_structural_reversal_event_from_stop(
+                state, tracked.get("events", []), indicators, oi, future_regime,
+                scenario, current, index_session, self.config,
+            )
+            active_reversal_scenario, active_transition = _build_confirmed_active_reversal_scenario(
+                reversal_events, spot, indicators, oi, future_regime, current, self.config
+            )
+            active_transition["event_derivation"] = reversal_event_source
+            report["active_signal_state_machine"] = active_transition
+            if active_reversal_scenario is not None:
+                scenario = active_reversal_scenario
             # Apply the direction-flip guard only after monitoring the prior recommendation
             # on this scan; this prevents a reversal from suppressing a level event that
-            # was already crossed in the latest completed 1m candle.
+            # was already crossed in the latest completed 1m candle. A confirmed active
+            # structural reversal can invalidate any remaining old-direction trackers now.
             scenario, flip_events = apply_direction_flip_guard(
                 state, scenario, oi, indicators, index_session, current, self.config,
                 future_regime=future_regime,
@@ -7457,7 +8261,7 @@ class PredictiveScanner:
                 "policy": "Diagnostic-only context review; no aggregate voting and no exit from regime weakness alone. Structural stops and the established confirmation guard remain authoritative.",
             }
 
-            # V79 follows an existing recommendation to completion before issuing another
+            # V81 follows an existing recommendation to completion unless a confirmed structural failure authorizes an opposite-side evaluation
             # one. The active recommendation is monitored above on every scan; a different
             # contract cannot replace it merely because its rank fluctuates between runs.
             active_tracker_rows = state.get("recommendation_trackers", [])
@@ -7473,7 +8277,7 @@ class PredictiveScanner:
                     if isinstance(item, dict) and str(item.get("status", "")).upper() == "TRACKING"
                 ),
                 "new_selection_suppressed": active_recommendation_in_progress,
-                "policy": "Monitor active selection until T2, SL, or confirmed structural invalidation; no per-scan re-selection email.",
+                "policy": "Monitor active signal each scan; on confirmed 3m structural failure plus current directional OI/momentum, invalidate old direction and evaluate the opposite setup in the same scan. The opposite contract still requires a valid structural risk plan and all option-quality gates.",
             }
 
             # Candidate ranking may remain diagnostic while an unconfirmed setup is watched;
@@ -7616,7 +8420,7 @@ class PredictiveScanner:
                 "scenario_features": scenario.features,
             })
             if reversal_watch is not None and (scenario.hard_veto is not None or scenario.direction != reversal_watch.direction or scenario.direction == "NEUTRAL"):
-                # Reversal watches remain internal diagnostics only; V79 never emails watch-only alerts.
+                # Reversal watches remain internal diagnostics only; V81 never emails watch-only alerts.
                 watch_payload = {
                     "timestamp": current.isoformat(), "scenario": reversal_watch.state,
                     "direction": reversal_watch.direction, "confidence_pct": round(reversal_watch.confidence, 1),
@@ -7958,7 +8762,7 @@ class PredictiveScanner:
                     )
                 else:
                     report["market_state"] = scenario.state
-                # No watch/blocked-candidate emails are permitted in V79. Blockers remain
+                # No watch/blocked-candidate emails are permitted in V81. Blockers remain
                 # in the JSON/console diagnostics; email is reserved for confirmed selection
                 # and post-selection failure events only.
                 LOGGER.info("NO EMAIL: signal not trade-ready; market_state=%s blockers=%s",
@@ -8048,7 +8852,7 @@ def scan_exit_code(report: Mapping[str, Any]) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V79")
+    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V81")
     parser.add_argument("--loop", action="store_true", help="Scan approximately once per minute during market hours.")
     parser.add_argument("--interval", type=float, default=60.0, help="Loop interval seconds (minimum 15).")
     args = parser.parse_args(argv)
@@ -8070,7 +8874,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enqueue_email_alert(
                 state, now=current, event_type="CONFIGURATION_ERROR",
                 dedupe_key=f"{current.date().isoformat()}|CONFIGURATION_ERROR|{type(exc).__name__}",
-                subject="NIFTY V79 scanner configuration error",
+                subject="NIFTY V81 scanner configuration error",
                 payload={"timestamp": current.isoformat(), "scanner_version": SCANNER_VERSION,
                          "error_type": type(exc).__name__, "error": str(exc),
                          "note": "The scan was stopped before market analysis; no recommendation or order was produced."},
@@ -8094,7 +8898,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_report(report)
         return scan_exit_code(report)
     interval = max(15.0, float(args.interval))
-    LOGGER.info("V79 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
+    LOGGER.info("V81 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
     while True:
         cycle_start = time_module.monotonic()
         report = scanner.scan_once()
