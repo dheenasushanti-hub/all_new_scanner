@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""NIFTY 50 Predictive Market Scanner & Strike Router — V77.
+"""NIFTY 50 Predictive Market Scanner & Strike Router — V79.
 
-Production hardening of the supplied V74 scanner using the 21 Oct 2026 scan audit. The
+Production hardening of V77 using the 22 Oct 2026 live-scan audit. The
 scanner keeps one scenario engine, one strike router, one structural risk engine, one
 state store, and one reporting path; it does not place, modify, or cancel orders.
 
@@ -13,6 +13,8 @@ Core behavior
 * Uses Upstox V2 option-chain/contract APIs plus V3 live quotes and candles. The V2
   interval-in-days Change-OI endpoint is a validated wall/session fallback, never 1m velocity.
 * Detects repeated price/OI support bounces and resistance rejections, plus confirmed two-close boundary breaks.
+  A narrow clustered-reclaim path accepts two distinct lows/highs at a tested OI wall only after two completed
+  1m closes reclaim the correct side and VWAP, momentum, tactical local OI, DI/RSI and futures checks align.
 * Waits at repeatedly tested boundaries when price is compressing or evidence conflicts; generic 3-bar continuation alone cannot select a strike.
 * Monitors complete 1m OHLC ranges for virtual T1/T2/SL crossings, with stop-first
   handling when a bar's internal order cannot be known from OHLC alone.
@@ -29,9 +31,11 @@ Core behavior
   VWAP/COI/progress has deteriorated; the warning is not an exit or invalidation.
 * Gives valid tactical OI velocity from the nearest 1m/3m/5m snapshot interval priority over session
   aggregate bias. It never invents tactical velocity when no historical snapshot exists.
-* Uses weakening/building OI walls for context and provisional diagnostics, but never selects
-  before a repeated boundary rejection/bounce or a tested boundary break confirmed by two completed
-  1m closes. Every route retains the final quote, premium-VWAP,
+* Uses weakening/building OI walls for context and provisional diagnostics. Final entry authorization
+  also requires local tactical OI evidence at the tested boundary; aggregate COI cannot override an
+  opposing local OI transition, and entries avoid intact/unknown OI barriers immediately ahead. It never
+  selects before a repeated boundary rejection/bounce or a tested boundary break confirmed by two
+  completed 1m closes. Every route retains the final quote, premium-VWAP,
   spread, delta, score, structural risk, directional regime, and timing gates.
 * Implements morning Gap & Go, Gamma Squeeze / Pre-Breakout Compression, Exhaustion
   Reversal, Continuation, and a hard Sideways/Pinning veto.
@@ -83,7 +87,7 @@ API sources checked during design (official Upstox docs):
 Important measurement limitation: the option-chain endpoint returns OI snapshots, not a
 continuous OI time series. Intraday COI velocity is therefore computed from this scanner's
 own timestamped snapshots. For 09:16 velocity availability, schedule the first scan at
-09:15. If a process starts later with no same-session baseline, V77 reports COI as
+09:15. If a process starts later with no same-session baseline, V79 reports COI as
 unavailable/session-proxy and will not describe the proxy as tactical velocity.
 """
 from __future__ import annotations
@@ -120,7 +124,7 @@ import requests
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com"
-SCANNER_VERSION = "2026-10-21-V77-DYNAMIC-STRUCTURAL-TARGETS-COMPACT-AUDIT"
+SCANNER_VERSION = "2026-10-22-V79-OI-BOUNDARY-RECLAIM-EARLY-ENTRY"
 MARKET_START = time(9, 15)
 ENTRY_START = time(9, 16)
 MORNING_END = time(10, 30)
@@ -141,7 +145,7 @@ EMAIL_ALLOWED_EVENT_TYPES = frozenset({
 DEFAULT_NIFTY_KEY = "NSE_INDEX|Nifty 50"
 DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state" / "market_state.json"
 
-LOGGER = logging.getLogger("nifty_v77")
+LOGGER = logging.getLogger("nifty_v78")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(message)s",
                     stream=sys.stderr)
@@ -764,10 +768,10 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
         state["market_history"] = state["market_history"][-120:]
     if isinstance(state.get("futures_snapshots"), list):
         state["futures_snapshots"] = state["futures_snapshots"][-32:]
-    state["schema_version"] = 77
+    state["schema_version"] = 79
     state["scanner_version"] = SCANNER_VERSION
     state["session_date"] = today_iso
-    # V77 diagnostics are additive and bounded; preserve all valid active trackers.
+    # V79 diagnostics are additive and bounded; preserve all valid active trackers.
     tracker_rows = state.get("recommendation_trackers")
     if isinstance(tracker_rows, list):
         for tracker in tracker_rows:
@@ -790,7 +794,7 @@ def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
         legacy_tracker.setdefault("target_event_integrity", "UNASSESSED")
         if legacy_tracker.get("confidence_pct") is None:
             legacy_tracker["confidence_pct"] = legacy_tracker.get("latest_signal_confidence_pct", legacy_tracker.get("confidence"))
-    # Remove legacy directional latches so V74 classifies live structure afresh.
+    # Remove legacy directional latches so V79 classifies live structure afresh.
     for key in ("persistent_direction", "continuation_phase", "continuation_count", "continuation_last_bar"):
         state.pop(key, None)
 
@@ -830,7 +834,7 @@ class StateStore:
                         and str(alert.get("status", "PENDING")).upper() == "PENDING"
                         and str(alert.get("event_type", "")).upper() == "VIRTUAL_RECOMMENDATION_INVALIDATED_BY_STRUCTURE"):
                     alert["event_type"] = "MARKET_REVERSAL_CONFIRMED"
-                    alert["subject"] = "NIFTY V77 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
+                    alert["subject"] = "NIFTY V79 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
                     payload = alert.get("payload") if isinstance(alert.get("payload"), dict) else {}
                     payload.setdefault("invalidated_direction", payload.get("direction"))
                     payload.setdefault("replacement_direction", "Not available in legacy alert")
@@ -857,7 +861,7 @@ class StateStore:
                           and str(x.get("event_type", "")).upper() not in {"T1_REACHED", "T2_REACHED"}] if isinstance(self.state.get("alert_outbox"), list) else []
             old_dedupe = self.state.get("alert_dedupe", {}) if isinstance(self.state.get("alert_dedupe"), dict) else {}
             self.state = {
-                "schema_version": 77,
+                "schema_version": 79,
                 "scanner_version": SCANNER_VERSION,
                 "session_date": today_iso,
                 "audit_v77_legacy_compaction_done": old_audit_compaction_done,
@@ -954,9 +958,9 @@ class StateStore:
                     and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
                 alert["status"] = "SUPPRESSED_POLICY"
                 alert["suppressed_at"] = now_ist().isoformat()
-                alert["last_error"] = "Suppressed by V77: only selected-strike and discrete milestone/failure emails are permitted."
+                alert["last_error"] = "Suppressed by V79: only selected-strike and discrete milestone/failure emails are permitted."
                 alert.pop("next_attempt_at", None)
-        # V77 no longer performs holiday-calendar lookups; discard a legacy persisted cache.
+        # V79 no longer performs holiday-calendar lookups; discard a legacy persisted cache.
         self.state.pop("nse_holiday_calendar", None)
         # Remove obsolete direction latches. Every decision is recomputed from current structure.
         self.state.pop("persistent_direction", None)
@@ -2808,7 +2812,18 @@ def detect_structural_wall_reaction(
         if level < indicators.spot - tolerance or level - indicators.spot > proximity:
             continue
         tests = _structure_test_count(recent_touch_window, level, "RESISTANCE", tolerance, buffer)
-        if tests < 2:
+        # A continuous cluster of tests must not be mistaken for separate rejection episodes.
+        # However, two distinct highs inside the boundary zone followed by two completed closes
+        # back below an OI resistance is a valid reclaim/rejection pattern and should not wait
+        # for price to retest the wall a third time.
+        cluster_depth = max(2.0 * tolerance, 0.30 * step, 2.0 * buffer)
+        cluster_touches = int(((pd.to_numeric(recent_touch_window["high"], errors="coerce") >= level - tolerance)
+                               & (pd.to_numeric(recent_touch_window["high"], errors="coerce") <= level + cluster_depth)).sum())
+        reclaim_closes = bool(len(last_two_closes) == 2 and all(finite(v) and v <= level - max(displacement, buffer) for v in last_two_closes))
+        clustered_reclaim = bool("CALL_OI_WALL" in source and cluster_touches >= 2 and reclaim_closes
+                                 and latest_close < previous_close and indicators.spot <= level - 0.25 * displacement)
+        effective_tests = max(tests, cluster_touches if clustered_reclaim else tests)
+        if effective_tests < 2:
             continue
         closes_below = latest_close <= level - displacement and indicators.spot <= level - 0.25 * displacement
         price_turn = latest_close < latest_open or latest_close < previous_close
@@ -2816,17 +2831,18 @@ def detect_structural_wall_reaction(
         directional_context = vwap_bear and momentum_bear and (di_bear or flow_bear)
         if not (closes_below and price_turn) or not directional_context or flow_bear_conflict or futures_regime_conflicts("BEARISH", future_regime):
             continue
-        confidence = min(91.0, 66.0 + min(8.0, 2.0 * (tests - 2))
+        confidence = min(91.0, 66.0 + min(8.0, 2.0 * (effective_tests - 2))
                          + 4.0 * int(vwap_bear) + 4.0 * int(momentum_bear)
                          + 4.0 * int(di_bear) + 4.0 * int(flow_bear))
         reactions.append(Scenario(
             "STRUCTURAL_RESISTANCE_REJECTION", "BEARISH", confidence,
-            f"Repeated resistance rejection at {level:.2f} ({source}): {tests} distinct completed 1m tests, latest close {latest_close:.2f} moved away from the level; {confirmations} independent directional confirmations.",
+            f"Repeated resistance rejection at {level:.2f} ({source}): {effective_tests} observed boundary tests, latest close {latest_close:.2f} moved away from the level; {confirmations} independent directional confirmations.",
             float(level), wall_state, True, None,
             {"setup_route": "STRUCTURAL_LEVEL_INTERACTION", "reaction": "RESISTANCE_REJECTION",
              "structure_source": source, "wall_level": float(level), "wall_strike": float(level),
-             "wall_state": wall_state, "wall_tested": True, "repeated_test_count": tests,
+             "wall_state": wall_state, "wall_tested": True, "repeated_test_count": effective_tests,
              "wall_rejection_confirmed": True, "price_turn_confirmed": True,
+             "clustered_reclaim_confirmed": bool(clustered_reclaim),
              "completed_1m_close": latest_close, "completed_bar_timestamp": ist_iso(parse_timestamp(latest.get("timestamp")) or now),
              "tactical_flow_confirmed": bool(flow_bear), "vwap_alignment": bool(vwap_bear),
              "momentum_alignment": bool(momentum_bear), "directional_di_alignment": bool(di_bear),
@@ -2839,7 +2855,18 @@ def detect_structural_wall_reaction(
         if level > indicators.spot + tolerance or indicators.spot - level > proximity:
             continue
         tests = _structure_test_count(recent_touch_window, level, "SUPPORT", tolerance, buffer)
-        if tests < 2:
+        # Early entries after an OI-wall reclaim should not require a fully separated second
+        # retest. Require multiple distinct 1m lows in a tightly bounded zone, then two completed
+        # closes and live spot back above the boundary. Directional OI/VWAP/momentum/DI and
+        # futures confirmation remain mandatory below, so this does not authorize a wick-only buy.
+        cluster_depth = max(2.0 * tolerance, 0.30 * step, 2.0 * buffer)
+        cluster_touches = int(((pd.to_numeric(recent_touch_window["low"], errors="coerce") <= level + tolerance)
+                               & (pd.to_numeric(recent_touch_window["low"], errors="coerce") >= level - cluster_depth)).sum())
+        reclaim_closes = bool(len(last_two_closes) == 2 and all(finite(v) and v >= level + max(displacement, buffer) for v in last_two_closes))
+        clustered_reclaim = bool("PUT_OI_WALL" in source and cluster_touches >= 2 and reclaim_closes
+                                 and latest_close > previous_close and indicators.spot >= level + 0.25 * displacement)
+        effective_tests = max(tests, cluster_touches if clustered_reclaim else tests)
+        if effective_tests < 2:
             continue
         closes_above = latest_close >= level + displacement and indicators.spot >= level + 0.25 * displacement
         price_turn = latest_close > latest_open or latest_close > previous_close
@@ -2847,17 +2874,18 @@ def detect_structural_wall_reaction(
         directional_context = vwap_bull and momentum_bull and (di_bull or flow_bull)
         if not (closes_above and price_turn) or not directional_context or flow_bull_conflict or futures_regime_conflicts("BULLISH", future_regime):
             continue
-        confidence = min(91.0, 66.0 + min(8.0, 2.0 * (tests - 2))
+        confidence = min(91.0, 66.0 + min(8.0, 2.0 * (effective_tests - 2))
                          + 4.0 * int(vwap_bull) + 4.0 * int(momentum_bull)
                          + 4.0 * int(di_bull) + 4.0 * int(flow_bull))
         reactions.append(Scenario(
             "STRUCTURAL_SUPPORT_BOUNCE", "BULLISH", confidence,
-            f"Repeated support bounce at {level:.2f} ({source}): {tests} distinct completed 1m tests, latest close {latest_close:.2f} moved away from the level; {confirmations} independent directional confirmations.",
+            f"Repeated support bounce/reclaim at {level:.2f} ({source}): {effective_tests} observed boundary tests, latest close {latest_close:.2f} moved away from the level; {confirmations} independent directional confirmations.",
             float(level), wall_state, True, None,
             {"setup_route": "STRUCTURAL_LEVEL_INTERACTION", "reaction": "SUPPORT_BOUNCE",
              "structure_source": source, "wall_level": float(level), "wall_strike": float(level),
-             "wall_state": wall_state, "wall_tested": True, "repeated_test_count": tests,
+             "wall_state": wall_state, "wall_tested": True, "repeated_test_count": effective_tests,
              "wall_hold_confirmed": True, "price_turn_confirmed": True,
+             "clustered_reclaim_confirmed": bool(clustered_reclaim),
              "completed_1m_close": latest_close, "completed_bar_timestamp": ist_iso(parse_timestamp(latest.get("timestamp")) or now),
              "tactical_flow_confirmed": bool(flow_bull), "vwap_alignment": bool(vwap_bull),
              "momentum_alignment": bool(momentum_bull), "directional_di_alignment": bool(di_bull),
@@ -2923,17 +2951,240 @@ def predictive_prebreakout_selection_gate(
         "rejection_reason": reason, "scenario": state, "checks": {},
     }
 
+def directional_oi_structure_confirmation(
+    scenario: Scenario, indicators: IndicatorSet, oi: OIAnalysis, config: Config,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Require the local OI structure at the actual setup boundary to support the entry.
+
+    Aggregate COI is context, not a substitute for the strike-level wall being traded.
+    For a bounce/rejection the corresponding PUT support/CALL resistance must exist and
+    not be weakening. For a confirmed break, the OI change at the crossed strike (or an
+    equivalent local wall transition) must support the direction. A nearby intact wall
+    directly ahead blocks entry until price clears it or the wall begins weakening.
+    """
+    state = str(scenario.state or "").upper()
+    direction = str(scenario.direction or "").upper()
+    applicable_states = {
+        "STRUCTURAL_SUPPORT_BOUNCE", "STRUCTURAL_RESISTANCE_REJECTION",
+        "CONFIRMED_BULLISH_BREAKOUT", "CONFIRMED_BEARISH_BREAKDOWN",
+    }
+    evidence: dict[str, Any] = {
+        "applicable": state in applicable_states,
+        "scenario": state,
+        "direction": direction,
+        "passed": False,
+        "boundary_level": safe_float(scenario.wall_level, float("nan")),
+        "tactical_available": bool(oi.tactical_available),
+    }
+    if state not in applicable_states:
+        return False, "OI_STRUCTURE_NOT_APPLICABLE_TO_THIS_SCENARIO", evidence
+    if direction not in {"BULLISH", "BEARISH"}:
+        evidence["reason"] = "NO_DIRECTIONAL_SETUP"
+        return False, "OI_STRUCTURE_NO_DIRECTIONAL_SETUP", evidence
+    if (not oi.tactical_available or not isinstance(oi.rows, dict) or not oi.rows
+            or not finite(oi.call_coi_pct) or not finite(oi.put_coi_pct)):
+        evidence["reason"] = "TACTICAL_OI_BASELINE_UNAVAILABLE"
+        return False, "OI_STRUCTURE_TACTICAL_BASELINE_UNAVAILABLE", evidence
+
+    step = infer_strike_step(list(oi.rows))
+    atr5, atr_source = structural_stop_atr(indicators)
+    if not finite(step) or step <= 0:
+        evidence["reason"] = "STRIKE_STEP_UNAVAILABLE"
+        return False, "OI_STRUCTURE_STRIKE_STEP_UNAVAILABLE", evidence
+    if not finite(atr5) or atr5 <= 0:
+        atr5 = max(1.0, safe_float(indicators.atr, step / math.sqrt(5.0)) * math.sqrt(5.0))
+        atr_source = "ATR_1M_SQRT5_FALLBACK"
+
+    trigger = max(config.oi_velocity_trigger, 0.0002)
+    noise = 0.50 * trigger
+    anchor_radius = max(1.00 * step, 1.00 * atr5)
+    wall_clearance = max(1.00 * step, 0.75 * atr5)
+    breakout_chase_limit = max(1.00 * step, 1.25 * atr5)
+    boundary = safe_float(scenario.wall_level, float("nan"))
+
+    def closest_wall(walls: Sequence[StructuralWall], level: float, radius: float) -> Optional[StructuralWall]:
+        if not finite(level):
+            return None
+        candidates = [w for w in walls if finite(w.strike) and abs(float(w.strike) - level) <= radius]
+        return min(candidates, key=lambda w: abs(float(w.strike) - level)) if candidates else None
+
+    def row_at(level: float) -> tuple[Optional[float], Optional[Mapping[str, Any]]]:
+        if not finite(level) or not oi.rows:
+            return None, None
+        try:
+            key = min(oi.rows, key=lambda k: abs(float(k) - level))
+            if abs(float(key) - level) > max(0.70 * step, 3.0):
+                return None, None
+            row = oi.rows.get(key)
+            return (float(key), row if isinstance(row, Mapping) else None)
+        except (TypeError, ValueError):
+            return None, None
+
+    def local_flow(row: Optional[Mapping[str, Any]]) -> tuple[bool, bool, Optional[float], Optional[float]]:
+        if not isinstance(row, Mapping):
+            return False, False, None, None
+        call_change = safe_float(row.get("call_coi_pct"), float("nan"))
+        put_change = safe_float(row.get("put_coi_pct"), float("nan"))
+        call_value = call_change if finite(call_change) else None
+        put_value = put_change if finite(put_change) else None
+        if not (finite(call_change) and finite(put_change)):
+            return False, False, call_value, put_value
+        bullish_flow = ((call_change <= -trigger and put_change >= -noise)
+                        or (put_change >= trigger and call_change <= noise))
+        bearish_flow = ((put_change <= -trigger and call_change >= -noise)
+                        or (call_change >= trigger and put_change <= noise))
+        return bullish_flow, bearish_flow, call_value, put_value
+
+    call_agg, put_agg = oi.call_coi_pct, oi.put_coi_pct
+    global_bull = ((call_agg <= -trigger and put_agg >= -noise)
+                   or (put_agg >= trigger and call_agg >= -noise))
+    global_bear = ((put_agg <= -trigger and call_agg >= -noise)
+                   or (call_agg >= trigger and put_agg >= -noise))
+
+    boundary_strike, boundary_row = row_at(boundary)
+    boundary_bull, boundary_bear, boundary_call_change, boundary_put_change = local_flow(boundary_row)
+    evidence.update({
+        "oi_trigger_fraction": trigger,
+        "aggregate_call_change_fraction": call_agg,
+        "aggregate_put_change_fraction": put_agg,
+        "aggregate_bullish_flow": bool(global_bull),
+        "aggregate_bearish_flow": bool(global_bear),
+        "boundary_oi_strike": boundary_strike,
+        "boundary_call_change_fraction": boundary_call_change,
+        "boundary_put_change_fraction": boundary_put_change,
+        "boundary_local_bullish_flow": bool(boundary_bull),
+        "boundary_local_bearish_flow": bool(boundary_bear),
+        "anchor_radius_points": round(anchor_radius, 2),
+        "wall_clearance_points": round(wall_clearance, 2),
+        "breakout_chase_limit_points": round(breakout_chase_limit, 2),
+        "atr5_source": atr_source,
+    })
+
+    def wall_dict(wall: Optional[StructuralWall]) -> Optional[dict[str, Any]]:
+        if wall is None:
+            return None
+        return {"strike": float(wall.strike), "side": wall.side, "oi": float(wall.oi),
+                "change_fraction": wall.change_pct, "state": wall.state,
+                "distance_from_spot": round(abs(float(wall.strike) - indicators.spot), 2)}
+
+    # A valid directional entry may not run directly into an intact opposing wall.
+    if state == "STRUCTURAL_SUPPORT_BOUNCE" and direction == "BULLISH":
+        support = closest_wall(oi.walls_support, boundary, anchor_radius)
+        support_strike = float(support.strike) if support else float("nan")
+        _, support_row = row_at(support_strike)
+        support_bull, support_bear, support_call_change, support_put_change = local_flow(support_row)
+        overhead = [w for w in oi.walls_resistance
+                    if w.strike > indicators.spot and w.state in {"BUILDING", "STABLE", "UNKNOWN"}
+                    and (float(w.strike) - indicators.spot) <= wall_clearance]
+        blocking = min(overhead, key=lambda w: w.strike) if overhead else None
+        evidence.update({"tested_put_support": wall_dict(support), "support_local_bullish_flow": support_bull,
+                         "support_local_bearish_flow": support_bear, "support_call_change_fraction": support_call_change,
+                         "support_put_change_fraction": support_put_change, "nearby_overhead_call_wall": wall_dict(blocking)})
+        if support is None:
+            reason = "NO_MATERIAL_PUT_OI_SUPPORT_AT_TESTED_BOUNDARY"
+        elif support.state not in {"BUILDING", "STABLE"}:
+            reason = f"PUT_OI_SUPPORT_{support.state}_AT_{support.strike:.0f}"
+        elif support_bear:
+            reason = "LOCAL_PUT_SUPPORT_OI_CONFLICTS_WITH_BULLISH_BOUNCE"
+        elif blocking is not None:
+            reason = f"INTACT_CALL_OI_WALL_{blocking.state}_{blocking.strike:.0f}_ONLY_{blocking.strike-indicators.spot:.1f}_POINTS_AHEAD"
+        elif not (support_bull or global_bull):
+            reason = "PUT_SUPPORT_NOT_CONFIRMED_BY_LOCAL_OR_AGGREGATE_TACTICAL_OI_FLOW"
+        else:
+            reason = "LOCAL_PUT_SUPPORT_AND_DIRECTIONAL_OI_FLOW_CONFIRMED"
+        passed = reason == "LOCAL_PUT_SUPPORT_AND_DIRECTIONAL_OI_FLOW_CONFIRMED"
+
+    elif state == "STRUCTURAL_RESISTANCE_REJECTION" and direction == "BEARISH":
+        resistance = closest_wall(oi.walls_resistance, boundary, anchor_radius)
+        resistance_strike = float(resistance.strike) if resistance else float("nan")
+        _, resistance_row = row_at(resistance_strike)
+        resistance_bull, resistance_bear, resistance_call_change, resistance_put_change = local_flow(resistance_row)
+        evidence.update({"tested_call_resistance": wall_dict(resistance),
+                         "resistance_local_bullish_flow": resistance_bull,
+                         "resistance_local_bearish_flow": resistance_bear,
+                         "resistance_call_change_fraction": resistance_call_change,
+                         "resistance_put_change_fraction": resistance_put_change})
+        if resistance is None:
+            reason = "NO_MATERIAL_CALL_OI_RESISTANCE_AT_TESTED_BOUNDARY"
+        elif resistance.state not in {"BUILDING", "STABLE"}:
+            reason = f"CALL_OI_RESISTANCE_{resistance.state}_AT_{resistance.strike:.0f}"
+        elif resistance_bull:
+            reason = "LOCAL_CALL_RESISTANCE_OI_CONFLICTS_WITH_BEARISH_REJECTION"
+        elif not (resistance_bear or global_bear):
+            reason = "CALL_RESISTANCE_NOT_CONFIRMED_BY_DIRECTIONAL_TACTICAL_OI_FLOW"
+        else:
+            reason = "LOCAL_CALL_RESISTANCE_AND_DIRECTIONAL_OI_FLOW_CONFIRMED"
+        passed = reason == "LOCAL_CALL_RESISTANCE_AND_DIRECTIONAL_OI_FLOW_CONFIRMED"
+
+    elif state == "CONFIRMED_BULLISH_BREAKOUT" and direction == "BULLISH":
+        overhead = [w for w in oi.walls_resistance
+                    if w.strike > indicators.spot and w.state in {"BUILDING", "STABLE", "UNKNOWN"}
+                    and (float(w.strike) - indicators.spot) <= wall_clearance]
+        blocking = min(overhead, key=lambda w: w.strike) if overhead else None
+        support = closest_wall(oi.walls_support, boundary, anchor_radius)
+        support_bull = False
+        if support is not None:
+            _, support_row = row_at(float(support.strike))
+            support_bull, _, _, _ = local_flow(support_row)
+        distance = abs(indicators.spot - boundary) if finite(boundary) else float("inf")
+        evidence.update({"nearby_overhead_call_wall": wall_dict(blocking), "boundary_put_support": wall_dict(support),
+                         "support_local_bullish_flow": support_bull, "breakout_distance_points": round(distance, 2) if finite(distance) else None})
+        if not finite(boundary):
+            reason = "BREAKOUT_BOUNDARY_UNAVAILABLE"
+        elif distance > breakout_chase_limit:
+            reason = f"BREAKOUT_ALREADY_EXTENDED_{distance:.1f}_POINTS_OVER_LIMIT_{breakout_chase_limit:.1f}"
+        elif blocking is not None:
+            reason = f"INTACT_CALL_OI_WALL_{blocking.state}_{blocking.strike:.0f}_TOO_CLOSE_AHEAD"
+        elif boundary_bear:
+            reason = "BROKEN_BOUNDARY_LOCAL_OI_CONFLICTS_WITH_BULLISH_BREAKOUT"
+        elif not (boundary_bull or global_bull or (support is not None and support.state == "BUILDING" and support_bull)):
+            reason = "BROKEN_BOUNDARY_LACKS_LOCAL_BULLISH_OI_TRANSITION"
+        else:
+            reason = "LOCAL_BULLISH_OI_TRANSITION_AND_BREAKOUT_CLEARANCE_CONFIRMED"
+        passed = reason == "LOCAL_BULLISH_OI_TRANSITION_AND_BREAKOUT_CLEARANCE_CONFIRMED"
+
+    elif state == "CONFIRMED_BEARISH_BREAKDOWN" and direction == "BEARISH":
+        below = [w for w in oi.walls_support
+                 if w.strike < indicators.spot and w.state in {"BUILDING", "STABLE", "UNKNOWN"}
+                 and (indicators.spot - float(w.strike)) <= wall_clearance]
+        blocking = max(below, key=lambda w: w.strike) if below else None
+        resistance = closest_wall(oi.walls_resistance, boundary, anchor_radius)
+        _, resistance_row = row_at(float(resistance.strike)) if resistance is not None else (None, None)
+        resistance_bull, resistance_bear, _, _ = local_flow(resistance_row)
+        distance = abs(indicators.spot - boundary) if finite(boundary) else float("inf")
+        evidence.update({"nearby_below_put_wall": wall_dict(blocking), "boundary_call_resistance": wall_dict(resistance),
+                         "resistance_local_bearish_flow": resistance_bear, "breakout_distance_points": round(distance, 2) if finite(distance) else None})
+        if not finite(boundary):
+            reason = "BREAKDOWN_BOUNDARY_UNAVAILABLE"
+        elif distance > breakout_chase_limit:
+            reason = f"BREAKDOWN_ALREADY_EXTENDED_{distance:.1f}_POINTS_OVER_LIMIT_{breakout_chase_limit:.1f}"
+        elif blocking is not None:
+            reason = f"INTACT_PUT_OI_WALL_{blocking.state}_{blocking.strike:.0f}_TOO_CLOSE_BELOW"
+        elif boundary_bull or resistance_bull:
+            reason = "BROKEN_BOUNDARY_LOCAL_OI_CONFLICTS_WITH_BEARISH_BREAKDOWN"
+        elif not (boundary_bear or global_bear or (resistance is not None and resistance.state == "BUILDING" and resistance_bear)):
+            reason = "BROKEN_BOUNDARY_LACKS_LOCAL_BEARISH_OI_TRANSITION"
+        else:
+            reason = "LOCAL_BEARISH_OI_TRANSITION_AND_BREAKDOWN_CLEARANCE_CONFIRMED"
+        passed = reason == "LOCAL_BEARISH_OI_TRANSITION_AND_BREAKDOWN_CLEARANCE_CONFIRMED"
+    else:
+        reason, passed = "SCENARIO_DIRECTION_MISMATCH", False
+
+    evidence["reason"] = reason
+    evidence["passed"] = bool(passed)
+    return bool(passed), reason, evidence
+
+
 def selection_trigger_confirmation(
     scenario: Scenario, indicators: IndicatorSet, oi: OIAnalysis, config: Config,
     future_regime: str = "UNKNOWN",
 ) -> tuple[bool, str]:
-    """Authorize strike routing only after a confirmed structural boundary interaction.
+    """Require price/market confirmation and directional OI at the traded boundary.
 
-    Generic continuation, gap-and-go, compression, and early predictive labels can remain
-    visible in internal diagnostics, but cannot select a strike by themselves. Entry is
-    limited to a confirmed OI-wall bounce/rejection, confirmed breakout/breakdown, or a
-    counter-trend reversal that is still beyond its 2-sigma VWAP boundary with aligned
-    tactical OI and 1m momentum. This is a market-entry gate, additional to option/risk gates.
+    The OI structure gate is local to the tested boundary, not merely aggregate PCR/COI.
+    This prevents a price-action pivot from being mistaken for defended OI support and
+    avoids entry directly beneath an intact opposing wall. It deliberately accepts a
+    confirmed local OI transition even when aggregate call and put OI both decrease.
     """
     direction = str(scenario.direction or "").upper()
     if direction not in {"BULLISH", "BEARISH"}:
@@ -2949,36 +3200,39 @@ def selection_trigger_confirmation(
     state = str(scenario.state or "").upper()
     if state in {"CONFIRMED_BULLISH_CONTINUATION", "CONFIRMED_BEARISH_CONTINUATION", "BULLISH_CONTINUATION", "BEARISH_CONTINUATION"}:
         return False, "GENERIC_CONTINUATION_NOT_TESTED_STRUCTURAL_BOUNDARY"
+
+    structural_ok = False
+    structural_reason = "NO_CONFIRMED_SUPPORT_RESISTANCE_INTERACTION"
     if state == "STRUCTURAL_SUPPORT_BOUNCE" and direction == "BULLISH":
         wall_state = str(features.get("wall_state", scenario.wall_state)).upper()
-        confirmed = bool(
+        structural_ok = bool(
             features.get("reaction") == "SUPPORT_BOUNCE"
             and features.get("wall_tested") and int(safe_float(features.get("repeated_test_count"), 0)) >= 2
             and features.get("wall_hold_confirmed") and features.get("price_turn_confirmed")
             and int(safe_float(features.get("structure_confirmation_count"), 0)) >= 2
             and not features.get("flow_conflict")
-            and (wall_state in {"BUILDING", "STABLE", "WEAKENING", "PRICE_ACTION"})
+            and wall_state in {"BUILDING", "STABLE", "WEAKENING", "PRICE_ACTION"}
             and finite(features.get("wall_strike", scenario.wall_level))
         )
-        return (True, "CONFIRMED_SUPPORT_BOUNCE") if confirmed else (False, "SUPPORT_BOUNCE_CONFIRMATION_INCOMPLETE")
+        structural_reason = "CONFIRMED_SUPPORT_BOUNCE" if structural_ok else "SUPPORT_BOUNCE_CONFIRMATION_INCOMPLETE"
 
-    if state == "STRUCTURAL_RESISTANCE_REJECTION" and direction == "BEARISH":
+    elif state == "STRUCTURAL_RESISTANCE_REJECTION" and direction == "BEARISH":
         wall_state = str(features.get("wall_state", scenario.wall_state)).upper()
-        confirmed = bool(
+        structural_ok = bool(
             features.get("reaction") == "RESISTANCE_REJECTION"
             and features.get("wall_tested") and int(safe_float(features.get("repeated_test_count"), 0)) >= 2
             and features.get("wall_rejection_confirmed") and features.get("price_turn_confirmed")
             and int(safe_float(features.get("structure_confirmation_count"), 0)) >= 2
             and not features.get("flow_conflict")
-            and (wall_state in {"BUILDING", "STABLE", "WEAKENING", "PRICE_ACTION"})
+            and wall_state in {"BUILDING", "STABLE", "WEAKENING", "PRICE_ACTION"}
             and finite(features.get("wall_strike", scenario.wall_level))
         )
-        return (True, "CONFIRMED_RESISTANCE_REJECTION") if confirmed else (False, "RESISTANCE_REJECTION_CONFIRMATION_INCOMPLETE")
+        structural_reason = "CONFIRMED_RESISTANCE_REJECTION" if structural_ok else "RESISTANCE_REJECTION_CONFIRMATION_INCOMPLETE"
 
-    if state in {"CONFIRMED_BULLISH_BREAKOUT", "CONFIRMED_BEARISH_BREAKDOWN"}:
+    elif state in {"CONFIRMED_BULLISH_BREAKOUT", "CONFIRMED_BEARISH_BREAKDOWN"}:
         conf = features.get("breakout_confirmation") if isinstance(features.get("breakout_confirmation"), Mapping) else {}
         expected_direction = "BULLISH" if state == "CONFIRMED_BULLISH_BREAKOUT" else "BEARISH"
-        confirmed = bool(
+        structural_ok = bool(
             direction == expected_direction
             and not features.get("awaiting_completed_1m_breakout_close", True)
             and conf.get("close_crossed_wall")
@@ -2987,13 +3241,18 @@ def selection_trigger_confirmation(
             and conf.get("one_minute_momentum_alignment")
             and conf.get("futures_non_conflicting")
         )
-        return (True, "CONFIRMED_STRUCTURAL_BREAKOUT") if confirmed else (False, "BREAKOUT_CONFIRMATION_INCOMPLETE")
+        structural_reason = (("CONFIRMED_STRUCTURAL_BREAKOUT" if direction == "BULLISH" else "CONFIRMED_STRUCTURAL_BREAKDOWN")
+                             if structural_ok else "BREAKOUT_CONFIRMATION_INCOMPLETE")
 
-    if state == "EXHAUSTION_REVERSAL":
+    elif state == "EXHAUSTION_REVERSAL":
         return False, "EXHAUSTION_SETUP_REQUIRES_CONFIRMED_STRUCTURAL_BOUNDARY_INTERACTION"
 
-    return False, "NO_CONFIRMED_SUPPORT_RESISTANCE_INTERACTION"
-
+    if not structural_ok:
+        return False, structural_reason
+    oi_ok, oi_reason, _evidence = directional_oi_structure_confirmation(scenario, indicators, oi, config)
+    if not oi_ok:
+        return False, f"OI_STRUCTURE_GATE:{oi_reason}"
+    return True, f"{structural_reason};OI_STRUCTURE:{oi_reason}"
 
 def detect_reversal_watch(
     frame: pd.DataFrame, indicators: IndicatorSet, oi: OIAnalysis,
@@ -4166,6 +4425,17 @@ def route_targets_and_stop(
     base, base_source = (max(stop_anchors, key=lambda row: row[0]) if bullish
                          else min(stop_anchors, key=lambda row: row[0]))
     atr_buffer = dynamic_atr_buffer_multiple(indicators)
+    # A confirmed, tested support bounce/resistance rejection has a concrete invalidation
+    # level. Do not apply the generic 0.80 ATR expansion widening on top of that level:
+    # it can make the first valid opposing OI wall fail the 1:1 floor by a few points and
+    # force the scanner to wait for a much later breakout. Keep the buffer at least 0.50 ATR
+    # and cap only the expansion multiplier at 0.65 for these confirmed reaction setups.
+    confirmed_reaction = (
+        (bullish and scenario.state == "STRUCTURAL_SUPPORT_BOUNCE" and reaction == "SUPPORT_BOUNCE")
+        or (not bullish and scenario.state == "STRUCTURAL_RESISTANCE_REJECTION" and reaction == "RESISTANCE_REJECTION")
+    )
+    if confirmed_reaction:
+        atr_buffer = min(atr_buffer, 0.65)
     stop = base - atr_buffer * atr_stop if bullish else base + atr_buffer * atr_stop
     stop_source = f"{base_source}_PLUS_MINUS_{atr_buffer:.2f}_{atr_source}"
     stop_ok = finite(stop) and (stop < spot if bullish else stop > spot)
@@ -4183,17 +4453,49 @@ def route_targets_and_stop(
                         remaining_session_minutes=remaining_minutes, stop_atr_points=atr_stop,
                         stop_atr_source=atr_source, skipped_unreachable_walls=tuple(sorted(set(skipped_unreachable))))
 
-    # Sort by distance, then by level type. Skip nearby levels that cannot satisfy the hard R:R floor
-    # instead of rejecting the entire setup before checking the next real support/resistance.
+    # An intact opposing OI wall is a real barrier, not an inconvenient target candidate.
+    # Never skip a too-close BUILDING/STABLE wall to manufacture an attractive R:R at a
+    # much farther level; wait for the barrier to weaken/break or for a better entry/stop.
+    intact_barriers = []
+    for wall in target_walls:
+        level = float(wall.strike)
+        ahead = level > spot + min_distance if bullish else level < spot - min_distance
+        if not ahead or wall.state not in {"BUILDING", "STABLE"}:
+            continue
+        if abs(level - spot) <= max_target_distance:
+            intact_barriers.append(wall)
+    if intact_barriers:
+        first_barrier = min(intact_barriers, key=lambda wall: abs(float(wall.strike) - spot))
+        barrier_reward = abs(float(first_barrier.strike) - spot)
+        barrier_rr = barrier_reward / risk_points
+        if barrier_rr + 1e-9 < config.min_t1_reward_risk_ratio:
+            return RiskPlan(
+                False, None, None, float(stop), stop_source, "", "",
+                tuple(sorted(set(skipped_weak))),
+                (f"Nearest intact opposing {first_barrier.side} OI wall {first_barrier.strike:.2f} "
+                 f"is only {barrier_rr:.2f}:1 reward/risk and lies before farther targets; "
+                 "refusing to skip this structural barrier. Wait for it to weaken/break or obtain a safer entry/stop."),
+                reward_points=barrier_reward, risk_points=risk_points,
+                reward_risk_ratio=barrier_rr, max_t1_distance_points=max_target_distance,
+                remaining_session_minutes=remaining_minutes, stop_atr_points=atr_stop,
+                stop_atr_source=atr_source,
+                skipped_unreachable_walls=tuple(sorted(set(skipped_unreachable))),
+            )
+
+    # Apply the R:R floor before deduplicating nearby observations. Otherwise a session
+    # high/low a few points closer than an adjacent OI wall can suppress that wall during
+    # deduplication, then fail the R:R test itself, leaving no T1 even though the actual
+    # OI wall is a valid target. Among viable levels, preserve nearest-first ordering and
+    # coalesce duplicate price/OI observations only after each level is independently tested.
     target_candidates.sort(key=lambda row: (abs(row[0] - spot), row[2]))
-    unique_targets: list[tuple[float, str, int]] = []
+    rr_eligible_candidates: list[tuple[float, str, int]] = []
     for item in target_candidates:
-        if not any(abs(item[0] - prior[0]) <= min_distance for prior in unique_targets):
-            unique_targets.append(item)
-    eligible_targets: list[tuple[float, str, int]] = []
-    for item in unique_targets:
         reward = abs(item[0] - spot)
         if reward / risk_points >= config.min_t1_reward_risk_ratio:
+            rr_eligible_candidates.append(item)
+    eligible_targets: list[tuple[float, str, int]] = []
+    for item in rr_eligible_candidates:
+        if not any(abs(item[0] - prior[0]) <= min_distance for prior in eligible_targets):
             eligible_targets.append(item)
     if not eligible_targets:
         return RiskPlan(False, None, None, float(stop), stop_source, "", "",
@@ -5412,7 +5714,7 @@ def register_recommendation_tracker(
 ) -> dict[str, Any]:
     """Register a signal for virtual monitoring without resetting an identical tracker.
 
-    V77's main scan guard suppresses new selection while any recommendation is active.
+    V79's main scan guard suppresses new selection while any recommendation is active.
     The tracker-list compatibility remains for older persisted states; active legacy
     records continue to be monitored rather than silently discarded during migration.
     """
@@ -5652,7 +5954,7 @@ def enqueue_email_alert(
     """Queue one-time selection, T1/T2 milestone, and confirmed failure emails."""
     event_type = str(event_type or "").upper()
     if event_type not in EMAIL_ALLOWED_EVENT_TYPES:
-        LOGGER.debug("EMAIL SUPPRESSED BY V77 POLICY: event=%s", event_type or "UNKNOWN")
+        LOGGER.debug("EMAIL SUPPRESSED BY V79 POLICY: event=%s", event_type or "UNKNOWN")
         return None
     dedupe = state.setdefault("alert_dedupe", {})
     if not isinstance(dedupe, dict):
@@ -5823,7 +6125,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
                 and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
             alert["status"] = "SUPPRESSED_POLICY"
             alert["suppressed_at"] = ist_iso(now)
-            alert["last_error"] = "Suppressed by V77 email policy."
+            alert["last_error"] = "Suppressed by V79 email policy."
             alert.pop("next_attempt_at", None)
     all_pending = [x for x in outbox if isinstance(x, dict) and str(x.get("status", "PENDING")).upper() == "PENDING"]
     if not all_pending:
@@ -5860,7 +6162,7 @@ def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *
             alert["attempts"] = int(alert.get("attempts", 0)) + 1
             try:
                 message = MIMEMultipart("alternative")
-                message["Subject"] = str(alert.get("subject", "NIFTY V77 scanner alert"))
+                message["Subject"] = str(alert.get("subject", "NIFTY V79 scanner alert"))
                 message["From"] = config.email_sender
                 message["To"] = config.email_receiver
                 message.attach(MIMEText(_alert_body(alert), "plain", "utf-8"))
@@ -5956,6 +6258,9 @@ def _compact_audit_scan(scan: Mapping[str, Any]) -> dict[str, Any]:
         "direction": scan.get("direction"),
         "confidence_pct": scan.get("confidence_pct"),
         "trigger_rationale": str(scan.get("trigger_rationale", ""))[:500],
+        "oi_structure_confirmation": _mapping_subset(scan.get("oi_structure_confirmation"), (
+            "applicable", "passed", "reason", "evidence",
+        )),
         "signal_ready": bool(scan.get("signal_ready", False)),
         "execution_mode": scan.get("execution_mode"),
         "market_status": scan.get("market_status"),
@@ -6371,7 +6676,7 @@ class ScanAuditWriter:
     def _compact_existing_file(self, path: Path) -> bool:
         """Rewrite a legacy full same-day audit once, preserving all scans in compact form.
 
-        This prevents V77 from only compacting *new* lines while leaving a large V74/V76
+        This prevents V79 from only compacting *new* lines while leaving a large V74/V76
         audit file tracked in GitHub. A parse/conversion failure aborts atomically, leaving
         the original untouched; the scanner can continue writing a new compact record.
         """
@@ -6435,7 +6740,7 @@ class ScanAuditWriter:
                 if not migration_done and isinstance(state, dict):
                     compaction_complete = True
                     # Compact all legacy daily audit files, not only today's file. This matters
-                    # when V77 is first deployed on a later date than the large audit being fixed.
+                    # when V79 is first deployed on a later date than the large audit being fixed.
                     for existing_path in sorted(self.directory.glob("market_scan_*.jsonl")):
                         if not self._is_compact_file(existing_path):
                             self._compact_existing_file(existing_path)
@@ -6727,7 +7032,7 @@ class PredictiveScanner:
         enqueue_email_alert(
             state, now=now, event_type=error_kind,
             dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{error_kind}|{type(exc).__name__}",
-            subject=f"NIFTY V77 scanner {error_kind.replace('_', ' ').lower()}",
+            subject=f"NIFTY V79 scanner {error_kind.replace('_', ' ').lower()}",
             payload={"timestamp": ist_iso(now), "scanner_version": SCANNER_VERSION,
                      "error_type": type(exc).__name__, "error": str(exc)[:1200],
                      "note": "No new recommendation was produced by the failed scan."},
@@ -7152,7 +7457,7 @@ class PredictiveScanner:
                 "policy": "Diagnostic-only context review; no aggregate voting and no exit from regime weakness alone. Structural stops and the established confirmation guard remain authoritative.",
             }
 
-            # V77 follows an existing recommendation to completion before issuing another
+            # V79 follows an existing recommendation to completion before issuing another
             # one. The active recommendation is monitored above on every scan; a different
             # contract cannot replace it merely because its rank fluctuates between runs.
             active_tracker_rows = state.get("recommendation_trackers", [])
@@ -7189,6 +7494,14 @@ class PredictiveScanner:
             entry_trigger_ok, entry_trigger_reason = selection_trigger_confirmation(
                 scenario, indicators, oi, self.config, future_regime=future_regime
             )
+            oi_structure_ok, oi_structure_reason, oi_structure_evidence = directional_oi_structure_confirmation(
+                scenario, indicators, oi, self.config
+            )
+            report["oi_structure_confirmation"] = {
+                "applicable": bool(oi_structure_evidence.get("applicable", False)),
+                "passed": bool(oi_structure_ok), "reason": oi_structure_reason,
+                "evidence": oi_structure_evidence,
+            }
             _, _, predictive_selection_evidence = predictive_prebreakout_selection_gate(
                 scenario, indicators, oi, risk, current, future_regime, self.config
             )
@@ -7303,7 +7616,7 @@ class PredictiveScanner:
                 "scenario_features": scenario.features,
             })
             if reversal_watch is not None and (scenario.hard_veto is not None or scenario.direction != reversal_watch.direction or scenario.direction == "NEUTRAL"):
-                # Reversal watches remain internal diagnostics only; V77 never emails watch-only alerts.
+                # Reversal watches remain internal diagnostics only; V79 never emails watch-only alerts.
                 watch_payload = {
                     "timestamp": current.isoformat(), "scenario": reversal_watch.state,
                     "direction": reversal_watch.direction, "confidence_pct": round(reversal_watch.confidence, 1),
@@ -7498,6 +7811,10 @@ class PredictiveScanner:
                 active_watch["last_tactical_coi_source"] = oi.tactical_source
                 active_watch["last_tactical_coi_available"] = oi.tactical_available
             hard_vetoes = list(readiness["blocking_reasons"])
+            if (scenario.direction in {"BULLISH", "BEARISH"} and not oi_structure_ok
+                    and oi_structure_evidence.get("applicable") and oi_structure_reason
+                    and not any(str(item).startswith("OI_STRUCTURE_GATE:") for item in hard_vetoes)):
+                hard_vetoes.append(f"OI_STRUCTURE_GATE:{oi_structure_reason}")
             report["vetoes"] = hard_vetoes
             current_chain_snapshot = make_chain_snapshot(chain, oi, current, expiry)
             self.store.append_chain_snapshot(current_chain_snapshot, current)
@@ -7641,7 +7958,7 @@ class PredictiveScanner:
                     )
                 else:
                     report["market_state"] = scenario.state
-                # No watch/blocked-candidate emails are permitted in V77. Blockers remain
+                # No watch/blocked-candidate emails are permitted in V79. Blockers remain
                 # in the JSON/console diagnostics; email is reserved for confirmed selection
                 # and post-selection failure events only.
                 LOGGER.info("NO EMAIL: signal not trade-ready; market_state=%s blockers=%s",
@@ -7731,7 +8048,7 @@ def scan_exit_code(report: Mapping[str, Any]) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V77")
+    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V79")
     parser.add_argument("--loop", action="store_true", help="Scan approximately once per minute during market hours.")
     parser.add_argument("--interval", type=float, default=60.0, help="Loop interval seconds (minimum 15).")
     args = parser.parse_args(argv)
@@ -7753,7 +8070,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enqueue_email_alert(
                 state, now=current, event_type="CONFIGURATION_ERROR",
                 dedupe_key=f"{current.date().isoformat()}|CONFIGURATION_ERROR|{type(exc).__name__}",
-                subject="NIFTY V77 scanner configuration error",
+                subject="NIFTY V79 scanner configuration error",
                 payload={"timestamp": current.isoformat(), "scanner_version": SCANNER_VERSION,
                          "error_type": type(exc).__name__, "error": str(exc),
                          "note": "The scan was stopped before market analysis; no recommendation or order was produced."},
@@ -7777,7 +8094,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_report(report)
         return scan_exit_code(report)
     interval = max(15.0, float(args.interval))
-    LOGGER.info("V77 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
+    LOGGER.info("V79 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
     while True:
         cycle_start = time_module.monotonic()
         report = scanner.scan_once()
