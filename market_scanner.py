@@ -1,98 +1,22 @@
 #!/usr/bin/env python3
-"""NIFTY 50 Predictive Market Scanner & Strike Router — V81.
+"""NIFTY 50 market-structure and option-strike scanner — V83.
 
-Integrated redesign of V80 using the 22 Oct 2026 live-scan audit. The
-scanner keeps one scenario engine, one strike router, one structural risk engine, one
-state store, and one reporting path; it does not place, modify, or cancel orders.
+V83 is a standalone redesign, not a patch on V82. It identifies price-tested levels,
+tracks local option OI and premium changes across this scanner's own snapshots, scores
+reversal/breakout setups, routes only liquid nearby 50-point NIFTY option strikes, and
+derives underlying T1/T2/SL from observed structure. It never places orders.
 
-Core behavior
--------------
-* Uses the NIFTY index as the price-action source and V3 minute candles for early
-  intraday structure. Historical 1-minute candles seed ATR/ADX so the scanner need
-  not wait for five completed 3-minute bars.
-* Uses Upstox V2 option-chain/contract APIs plus V3 live quotes and candles. The V2
-  interval-in-days Change-OI endpoint is a validated wall/session fallback, never 1m velocity.
-* Detects repeated price/OI support bounces and resistance rejections, plus confirmed two-close boundary breaks.
-  A narrow clustered-reclaim path accepts two distinct lows/highs at a tested OI wall only after two completed
-  1m closes reclaim the correct side and VWAP, momentum, tactical local OI, DI/RSI and futures checks align.
-* Waits at repeatedly tested boundaries when price is compressing or evidence conflicts; generic 3-bar continuation alone cannot select a strike.
-* Monitors complete 1m OHLC ranges for virtual T1/T2/SL crossings, with stop-first
-  handling when a bar's internal order cannot be known from OHLC alone.
-* Guards ordinary opposite-direction flips using distinct 1m evidence, while strong
-  aligned tactical COI/momentum can override; no prior direction is latched.
-* Separates active-signal protection from target reassessment. After a meaningful favorable
-  excursion and volatility-sized retracement, a confirmed post-entry 3-minute swing pivot
-  can ratchet the protective stop even when directional context is weakening. If the completed
-  3-minute close breaks an already-confirmed pivot, early invalidation still requires at least
-  two independent adverse context factors; one red 1-minute bar is never enough.
-* Detects when completed 1m candle history has gaps or falls outside the supported
-  replay window. It labels that uncertainty explicitly and never invents hidden OHLC
-  crossings; a candleless feed still permits clearly labelled live-spot level monitoring.
-* Issues stagnation-risk warnings after tight completed 5m ranges only when aligned
-  VWAP/COI/progress has deteriorated; the warning is not an exit or invalidation.
-* Gives valid tactical OI velocity from the nearest 1m/3m/5m snapshot interval priority over session
-  aggregate bias. It never invents tactical velocity when no historical snapshot exists.
-* Uses weakening/building OI walls for context and provisional diagnostics. Final entry authorization
-  also requires local tactical OI evidence at the tested boundary; aggregate COI cannot override an
-  opposing local OI transition, and entries avoid intact/unknown OI barriers immediately ahead. It never
-  selects before a repeated boundary rejection/bounce or a tested boundary break confirmed by two
-  completed 1m closes. Every route retains the final quote, premium-VWAP,
-  spread, delta, score, structural risk, directional regime, and timing gates.
-* Implements morning Gap & Go, Gamma Squeeze / Pre-Breakout Compression, Exhaustion
-  Reversal, Continuation, and a hard Sideways/Pinning veto.
-* Restricts normal option candidates to ATM, ITM1, ITM2; permits one-step OTM only for
-  a confirmed high-momentum afternoon squeeze. Option quality score is exactly
-  40% flow + 30% premium-VWAP lift + 30% tactical COI acceleration.
-* Derives entry targets/stops from intact opposing OI walls and completed price pivots. Dynamic
-  T1/T2 reassessment is separate from the protective-stop manager. New levels are prospective;
-  each just-completed OHLC interval is evaluated against levels that were active during it.
-* Selection and milestone emails contain only the contract/strike, signal spot, confidence, IST
-  time, and NIFTY T1/T2/SL levels.
-* Uses an atomic JSON store with trading-date resets and no sticky directional latch.
-* Allows qualified directional reversal watches to rank provisional same-side strikes even when the resolved market direction remains neutral; provisional ranking never authorizes readiness, tracker creation, or email. Uses liquidity-adjusted spread ceilings while preserving freshness/delta/score/risk gates.
-* Separates provisional strike ranking from final recommendation. Only a final selected-strike
-  email, one-time T1/T2 milestones, and confirmed stop/reversal failures are emailed; watches,
-  blocked candidates, and routine scans stay internal. Rejected contracts are never labelled selected.
-* Enforces 0.650 as the minimum aggregate score; the environment variable cannot lower it.
-  PREDICTIVE_SELECTION_MIN_CONFIDENCE is independently configurable (70–90, default 74).
-* T2 is optional: a valid T1 and structural stop are sufficient for readiness; missing T2 is
-  reported as unavailable rather than blocking a valid structural setup.
-* Persists compact active state in market_state.json and appends one compact JSONL audit record per run under AUDIT_DIR (default ./audit). The daily log preserves indicator/structure/OI evidence, near-spot strike rows, selected/leading candidates, quote health, recent candle tails, gates, and event chronology. Full-chain persistence is opt-in via AUDIT_DETAIL_LEVEL=full for short-lived diagnosis; console output remains compact.
+Required environment: UPSTOX_ANALYTICS_TOKEN
+Optional: NIFTY_INSTRUMENT_KEY, STATE_FILE, AUDIT_DIR, SCAN_INTERVAL_SECONDS,
+REQUEST_TIMEOUT, API_RETRIES, MAX_QUOTE_AGE_SECONDS, MAX_CANDLE_AGE_SECONDS, MIN_SIGNAL_SCORE,
+MIN_T1_REWARD_RISK_RATIO, REENTRY_COOLDOWN_MINUTES, MAX_SPREAD_RATIO, EMAIL_SENDER, EMAIL_PASSWORD,
+EMAIL_RECEIVER, SMTP_HOST, SMTP_PORT, LOG_LEVEL.
 
-Run:
-    python market_scanner.py
-    python market_scanner.py --loop
-
-Required environment:
-    UPSTOX_ANALYTICS_TOKEN
-
-Optional environment:
-    NIFTY_INSTRUMENT_KEY, STATE_FILE, REQUEST_TIMEOUT, API_RETRIES,
-    MIN_SCORE (hard minimum 0.650), MIN_COI_SCORE_LOW_ADX (0.40), MIN_COI_SCORE_NORMAL_ADX (0.35), MIN_COI_SCORE_HIGH_ADX (0.30), MIN_DIRECTIONAL_DELTA (0.55),
-    MIN_EXHAUSTION_DELTA (0.75), MAX_QUOTE_AGE_SECONDS, MAX_SPREAD_RATIO (global cap; default 0.25% with liquidity tiers), RISK_FREE_RATE,
-    MIN_T1_REWARD_RISK_RATIO (hard floor 1.0; default 1.0), MAX_T1_EXPECTED_MOVE_MULTIPLE (default 1.5),
-    FALLBACK_IV, CHANGE_OI_FALLBACK_ENABLED, AUDIT_DIR (default ./audit), MIN_OPPOSING_WALL_CLEARANCE_STEPS,
-    DIRECTION_FLIP_CONFIRMATIONS, INTRABAR_MONITOR_LOOKBACK, STAGNATION_RANGE_PCT,
-    STAGNATION_MIN_FAVORABLE_PROGRESS_PCT, STAGNATION_WARNING_COOLDOWN_MINUTES,
-    EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER, SMTP_HOST, SMTP_PORT.
-
-API sources checked during design (official Upstox docs):
-    /v2/option/contract, /v2/option/chain, /v2/market/status/:exchange,
-    /v2/instruments/search, /v3/market-quote/quotes,
-    /v3/historical-candle/intraday/:instrument_key/minutes/:interval,
-    /v3/historical-candle/:instrument_key/minutes/:interval/:to_date/:from_date.
-
-Important measurement limitation: the option-chain endpoint returns OI snapshots, not a
-continuous OI time series. Intraday COI velocity is therefore computed from this scanner's
-own timestamped snapshots. For 09:16 velocity availability, schedule the first scan at
-09:15. If a process starts later with no same-session baseline, V81 reports COI as
-unavailable/session-proxy and will not describe the proxy as tactical velocity.
+Dependencies: requests, pandas, numpy.
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
-import html as html_lib
 import json
 import logging
 import math
@@ -102,9 +26,8 @@ import ssl
 import sys
 import tempfile
 import time as time_module
-import traceback
 import urllib.parse
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -116,151 +39,42 @@ import numpy as np
 import pandas as pd
 import requests
 
-# =============================================================================
-# Constants and configuration
-# =============================================================================
-
-IST = ZoneInfo("Asia/Kolkata")
+VERSION = "V83-MARKET-STRUCTURE-OI-FLOW-LEAN"
 BASE_URL = "https://api.upstox.com"
-SCANNER_VERSION = "2026-10-22-V81-UNIFIED-ACTIVE-REVERSAL-ROUTING"
-MARKET_START = time(9, 15)
-ENTRY_START = time(9, 16)
-MORNING_END = time(10, 30)
-MIDDAY_END = time(13, 30)
+IST = ZoneInfo("Asia/Kolkata")
+NIFTY_KEY_DEFAULT = "NSE_INDEX|Nifty 50"
+MARKET_OPEN = time(9, 15)
+ENTRY_OPEN = time(9, 16)
 ENTRY_CUTOFF = time(15, 15)
-MARKET_END = time(15, 30)
-# Email policy: selected strike, confirmed market reversal of an active virtual signal,
-# plus one-time T1/T2 milestones and confirmed failure events. Watches and diagnostics
-# remain internal, so scheduled scans do not generate repeated email noise.
-EMAIL_ALLOWED_EVENT_TYPES = frozenset({
-    "SIGNAL_READY",
-    "T1_REACHED",
-    "T2_REACHED",
-    "MARKET_REVERSAL_CONFIRMED",
-    "INITIAL_STOP_LOSS_REACHED",
-    "TRAILING_STOP_REACHED",
-    "STRUCTURAL_STOP_LOSS_REACHED",
-})
-DEFAULT_NIFTY_KEY = "NSE_INDEX|Nifty 50"
-DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state" / "market_state.json"
-
-LOGGER = logging.getLogger("nifty_v81")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
-                    format="%(asctime)s | %(levelname)s | %(message)s",
-                    stream=sys.stderr)
+MARKET_CLOSE = time(15, 30)
+LOG = logging.getLogger("market_scanner_v83")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    stream=sys.stderr,
+)
 
 
 class ScannerError(RuntimeError):
-    """Expected data-quality, API, or signal-validation failure."""
+    """Expected configuration, API, or market-data failure."""
 
 
-@dataclass(frozen=True)
-class Config:
-    token: str = field(default_factory=lambda: os.getenv("UPSTOX_ANALYTICS_TOKEN", "").strip())
-    nifty_key: str = field(default_factory=lambda: os.getenv("NIFTY_INSTRUMENT_KEY", DEFAULT_NIFTY_KEY).strip())
-    timeout_seconds: float = field(default_factory=lambda: max(2.0, _env_float("REQUEST_TIMEOUT", 12.0)))
-    retries: int = field(default_factory=lambda: max(1, min(5, _env_int("API_RETRIES", 3))))
-    max_quote_age_seconds: float = field(default_factory=lambda: min(30.0, max(5.0, _env_float("MAX_QUOTE_AGE_SECONDS", 30.0))))
-    max_spread_ratio: float = field(default_factory=lambda: min(0.0030, max(0.0005, _env_float("MAX_SPREAD_RATIO", 0.0025))))
-    min_score: float = field(default_factory=lambda: min(1.0, max(0.650, _env_float("MIN_SCORE", 0.650))))
-    min_coi_score_low_adx: float = field(default_factory=lambda: min(1.0, max(0.0, _env_float("MIN_COI_SCORE_LOW_ADX", 0.40))))
-    min_coi_score_normal_adx: float = field(default_factory=lambda: min(1.0, max(0.0, _env_float("MIN_COI_SCORE_NORMAL_ADX", 0.35))))
-    min_coi_score_high_adx: float = field(default_factory=lambda: min(1.0, max(0.0, _env_float("MIN_COI_SCORE_HIGH_ADX", 0.30))))
-    min_directional_delta: float = field(default_factory=lambda: min(1.0, max(0.0, _env_float("MIN_DIRECTIONAL_DELTA", 0.55))))
-    min_exhaustion_delta: float = field(default_factory=lambda: min(1.0, max(0.0, _env_float("MIN_EXHAUSTION_DELTA", 0.75))))
-    strike_stickiness_tolerance: float = field(default_factory=lambda: min(0.20, max(0.0, _env_float("STRIKE_STICKINESS_SCORE_TOLERANCE", 0.05))))
-    atr_period: int = field(default_factory=lambda: max(3, _env_int("ATR_PERIOD", 14)))
-    adx_period: int = field(default_factory=lambda: max(3, _env_int("ADX_PERIOD", 14)))
-    rsi_period: int = field(default_factory=lambda: max(3, _env_int("RSI_PERIOD", 14)))
-    oi_velocity_trigger: float = field(default_factory=lambda: max(0.0002, _env_float("OI_VELOCITY_TRIGGER", 0.0015)))
-    compression_atr_multiple: float = field(default_factory=lambda: max(0.25, _env_float("COMPRESSION_ATR_MULTIPLE", 1.25)))
-    wall_proximity_atr: float = field(default_factory=lambda: max(0.10, _env_float("WALL_PROXIMITY_ATR", 0.55)))
-    gap_threshold_pct: float = field(default_factory=lambda: max(0.001, _env_float("GAP_THRESHOLD_PCT", 0.0025)))
-    pcr_spike_pct: float = field(default_factory=lambda: max(0.005, _env_float("PCR_SPIKE_PCT", 0.03)))
-    risk_free_rate: float = field(default_factory=lambda: _env_float("RISK_FREE_RATE", 0.065))
-    fallback_iv: float = field(default_factory=lambda: min(2.0, max(0.05, _env_float("FALLBACK_IV", 0.18))))
-    state_file: Path = field(default_factory=lambda: _resolve_state_path(os.getenv("STATE_FILE", "")))
-    email_sender: str = field(default_factory=lambda: os.getenv("EMAIL_SENDER", "").strip())
-    email_password: str = field(default_factory=lambda: os.getenv("EMAIL_PASSWORD", "").strip())
-    email_receiver: str = field(default_factory=lambda: os.getenv("EMAIL_RECEIVER", "").strip())
-    smtp_host: str = field(default_factory=lambda: os.getenv("SMTP_HOST", "smtp.gmail.com").strip())
-    smtp_port: int = field(default_factory=lambda: max(1, _env_int("SMTP_PORT", 465)))
-    watch_alert_min_confidence: float = field(default_factory=lambda: min(100.0, max(0.0, _env_float("WATCH_ALERT_MIN_CONFIDENCE", 55.0))))
-    predictive_selection_min_confidence: float = field(default_factory=lambda: min(90.0, max(70.0, _env_float("PREDICTIVE_SELECTION_MIN_CONFIDENCE", 74.0))))
-    watch_neutral_invalidation_scans: int = field(default_factory=lambda: min(5, max(2, _env_int("WATCH_NEUTRAL_INVALIDATION_SCANS", 3))))
-    watch_opposite_invalidation_scans: int = field(default_factory=lambda: min(3, max(2, _env_int("WATCH_OPPOSITE_INVALIDATION_SCANS", 2))))
-    watch_max_age_minutes: int = field(default_factory=lambda: min(60, max(5, _env_int("WATCH_MAX_AGE_MINUTES", 18))))
-    watch_invalidation_atr_buffer: float = field(default_factory=lambda: min(0.75, max(0.05, _env_float("WATCH_INVALIDATION_ATR_BUFFER", 0.15))))
-    monitor_quote_alert_cooldown_minutes: int = field(default_factory=lambda: min(120, max(1, _env_int("MONITOR_QUOTE_ALERT_COOLDOWN_MINUTES", 10))))
-    max_active_trackers: int = field(default_factory=lambda: min(12, max(1, _env_int("MAX_ACTIVE_RECOMMENDATION_TRACKERS", 5))))
-    reentry_cooldown_minutes: int = field(default_factory=lambda: min(60, max(1, _env_int("REENTRY_COOLDOWN_MINUTES", 6))))
-    opposing_wall_clearance_steps: float = field(default_factory=lambda: min(1.0, max(0.10, _env_float("MIN_OPPOSING_WALL_CLEARANCE_STEPS", 0.35))))
-    min_t1_reward_risk_ratio: float = field(default_factory=lambda: min(3.0, max(1.0, _env_float("MIN_T1_REWARD_RISK_RATIO", 1.0))))
-    max_t1_expected_move_multiple: float = field(default_factory=lambda: min(3.0, max(1.0, _env_float("MAX_T1_EXPECTED_MOVE_MULTIPLE", 1.5))))
-    direction_flip_confirmations: int = field(default_factory=lambda: min(3, max(2, _env_int("DIRECTION_FLIP_CONFIRMATIONS", 2))))
-    intrabar_monitor_lookback: int = field(default_factory=lambda: min(15, max(1, _env_int("INTRABAR_MONITOR_LOOKBACK", 15))))
-    stagnation_warning_cooldown_minutes: int = field(default_factory=lambda: min(120, max(5, _env_int("STAGNATION_WARNING_COOLDOWN_MINUTES", 15))))
-    stagnation_range_pct: float = field(default_factory=lambda: min(0.005, max(0.0001, _env_float("STAGNATION_RANGE_PCT", 0.001))))
-    stagnation_min_progress_pct: float = field(default_factory=lambda: min(0.01, max(0.0, _env_float("STAGNATION_MIN_FAVORABLE_PROGRESS_PCT", 0.0001))))
-    change_oi_fallback_enabled: bool = field(default_factory=lambda: _env_bool("CHANGE_OI_FALLBACK_ENABLED", True))
-
-    def validate(self, require_token: bool = True) -> None:
-        if require_token and not self.token:
-            raise ScannerError("UPSTOX_ANALYTICS_TOKEN is missing. Set it in the environment.")
-        if not self.nifty_key:
-            raise ScannerError("NIFTY_INSTRUMENT_KEY cannot be empty.")
-        if not (0.650 <= self.min_score <= 1.0):
-            raise ScannerError("MIN_SCORE must be between 0.650 and 1.0; the aggregate-score floor cannot be lowered.")
-        if not all(0.0 <= value <= 1.0 for value in (self.min_coi_score_low_adx, self.min_coi_score_normal_adx, self.min_coi_score_high_adx)):
-            raise ScannerError("COI component score thresholds must be between 0.0 and 1.0.")
-        if not (0.0 <= self.min_directional_delta <= 1.0 and 0.0 <= self.min_exhaustion_delta <= 1.0):
-            raise ScannerError("Configured delta thresholds must be between 0.0 and 1.0.")
-        if self.min_directional_delta < 0.55 or self.min_exhaustion_delta < 0.75:
-            LOGGER.warning("Delta floor is below the requested default; use only for historical calibration and risk analysis.")
-        if not (0.0 <= self.strike_stickiness_tolerance <= 0.20):
-            raise ScannerError("STRIKE_STICKINESS_SCORE_TOLERANCE must be between 0 and 0.20.")
-        if not (70.0 <= self.predictive_selection_min_confidence <= 90.0):
-            raise ScannerError("PREDICTIVE_SELECTION_MIN_CONFIDENCE must be between 70 and 90.")
-        if not (1.0 <= self.min_t1_reward_risk_ratio <= 3.0):
-            raise ScannerError("MIN_T1_REWARD_RISK_RATIO must be between 1.0 and 3.0; T1 reward cannot be configured below 1:1 risk.")
-        if not (1.0 <= self.max_t1_expected_move_multiple <= 3.0):
-            raise ScannerError("MAX_T1_EXPECTED_MOVE_MULTIPLE must be between 1.0 and 3.0.")
-
-
-def _env_float(key: str, default: float) -> float:
+def env_float(name: str, default: float) -> float:
     try:
-        value = float(os.getenv(key, str(default)))
+        value = float(os.getenv(name, str(default)))
         return value if math.isfinite(value) else default
-    except (ValueError, TypeError):
+    except (TypeError, ValueError):
         return default
 
 
-def _env_int(key: str, default: int) -> int:
+def env_int(name: str, default: int) -> int:
     try:
-        return int(os.getenv(key, str(default)))
-    except (ValueError, TypeError):
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
         return default
 
 
-def _env_bool(key: str, default: bool) -> bool:
-    raw = os.getenv(key)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
-
-
-def _resolve_state_path(raw: str) -> Path:
-    if not str(raw or "").strip():
-        return DEFAULT_STATE_PATH
-    path = Path(raw).expanduser()
-    return path if path.is_absolute() else (Path.cwd() / path).resolve()
-
-
-def now_ist() -> datetime:
-    return datetime.now(IST)
-
-
-def safe_float(value: Any, default: float = float("nan")) -> float:
+def number(value: Any, default: float = float("nan")) -> float:
     try:
         out = float(value)
         return out if math.isfinite(out) else default
@@ -275,180 +89,141 @@ def finite(value: Any) -> bool:
         return False
 
 
-def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
-    if not finite(value):
-        return low
-    return max(low, min(high, float(value)))
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value)) if finite(value) else low
 
 
 def parse_date(value: Any) -> Optional[date]:
-    """Parse ISO and common exchange date formats without losing date identity.
-
-    Upstox endpoints may represent the same expiry as either ``YYYY-MM-DD`` or
-    ``DD-MM-YYYY``. Normalize both to ``datetime.date`` before comparing dates.
-    Timestamp strings are accepted by parsing their leading ISO date component.
-    """
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
+    if isinstance(value, date) and not isinstance(value, datetime):
         return value
-    text = str(value).strip()
-    if not text:
-        return None
-    candidate = text[:10]
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d", "%d.%m.%Y"):
-        try:
-            return datetime.strptime(candidate, fmt).date()
-        except (ValueError, TypeError):
-            continue
-    return None
-
-
-def parse_timestamp(value: Any) -> Optional[datetime]:
-    """Parse Upstox ISO timestamps or epoch values into timezone-aware IST."""
-    if value is None or str(value).strip() == "":
+    if not value:
         return None
     try:
-        numeric = safe_float(value, float("nan"))
-        if math.isfinite(numeric) and numeric > 1_000_000_000:
-            if numeric >= 100_000_000_000_000_000:
-                unit = "ns"
-            elif numeric >= 100_000_000_000_000:
-                unit = "us"
-            elif numeric >= 100_000_000_000:
-                unit = "ms"
-            else:
-                unit = "s"
-            parsed = pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce")
-            if pd.isna(parsed):
-                return None
-            return parsed.to_pydatetime().astimezone(IST)
-        parsed = pd.Timestamp(value)
-        if pd.isna(parsed):
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.tz_localize(IST)
-        else:
-            parsed = parsed.tz_convert(IST)
-        return parsed.to_pydatetime()
-    except (ValueError, TypeError, OverflowError):
+        return date.fromisoformat(str(value)[:10])
+    except (ValueError, TypeError):
         return None
 
 
-def json_safe(value: Any) -> Any:
-    """Recursively convert pandas/numpy/datetime/non-finite values to JSON-safe values."""
+def parse_dt(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        dt = value
+    elif value:
+        text = str(value).strip()
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            # Upstox sometimes represents last_trade_time as a Unix timestamp in milliseconds.
+            try:
+                epoch = float(text)
+                if abs(epoch) >= 1_000_000_000_000:
+                    dt = datetime.fromtimestamp(epoch / 1000.0, tz=IST)
+                elif abs(epoch) >= 1_000_000_000:
+                    dt = datetime.fromtimestamp(epoch, tz=IST)
+                else:
+                    return None
+            except (ValueError, OverflowError, OSError):
+                return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=IST)
+    return dt.astimezone(IST)
+
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
+
+
+def safe_json(value: Any) -> Any:
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        f = float(value)
-        return f if math.isfinite(f) else None
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-    if isinstance(value, (datetime, date, pd.Timestamp)):
+    if isinstance(value, datetime):
+        return value.astimezone(IST).isoformat() if value.tzinfo else value.replace(tzinfo=IST).isoformat()
+    if isinstance(value, date):
         return value.isoformat()
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, pd.Series):
-        return [json_safe(x) for x in value.tolist()]
-    if isinstance(value, pd.DataFrame):
-        return [json_safe(x) for x in value.to_dict(orient="records")]
-    if hasattr(value, "item") and callable(value.item):
-        try:
-            return json_safe(value.item())
-        except Exception:
-            pass
     if isinstance(value, Mapping):
-        return {str(k): json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [json_safe(x) for x in value]
-    if hasattr(value, "__dataclass_fields__"):
-        return json_safe(asdict(value))
+        return {str(k): safe_json(v) for k, v in value.items()}
+    if isinstance(value, (tuple, list, set)):
+        return [safe_json(v) for v in value]
+    if isinstance(value, np.generic):
+        return safe_json(value.item())
+    if pd.isna(value) if not isinstance(value, (dict, list, tuple, set)) else False:
+        return None
     return str(value)
 
 
-def ist_iso(dt: datetime) -> str:
-    aware = dt if dt.tzinfo else dt.replace(tzinfo=IST)
-    return aware.astimezone(IST).isoformat()
+@dataclass(frozen=True)
+class Config:
+    token: str = field(default_factory=lambda: os.getenv("UPSTOX_ANALYTICS_TOKEN", "").strip())
+    nifty_key: str = field(default_factory=lambda: os.getenv("NIFTY_INSTRUMENT_KEY", NIFTY_KEY_DEFAULT).strip())
+    timeout: float = field(default_factory=lambda: clamp(env_float("REQUEST_TIMEOUT", 12.0), 2.0, 30.0))
+    retries: int = field(default_factory=lambda: int(clamp(env_int("API_RETRIES", 3), 1, 5)))
+    max_quote_age: float = field(default_factory=lambda: clamp(env_float("MAX_QUOTE_AGE_SECONDS", 30.0), 5.0, 90.0))
+    max_candle_age: float = field(default_factory=lambda: clamp(env_float("MAX_CANDLE_AGE_SECONDS", 180.0), 60.0, 300.0))
+    min_signal_score: float = field(default_factory=lambda: clamp(env_float("MIN_SIGNAL_SCORE", 66.0), 60.0, 85.0))
+    min_t1_rr: float = field(default_factory=lambda: clamp(env_float("MIN_T1_REWARD_RISK_RATIO", 1.0), 1.0, 3.0))
+    reentry_cooldown_minutes: int = field(default_factory=lambda: int(clamp(env_int("REENTRY_COOLDOWN_MINUTES", 6), 1, 30)))
+    max_spread: float = field(default_factory=lambda: clamp(env_float("MAX_SPREAD_RATIO", 0.0025), 0.0005, 0.01))
+    strike_step: float = 50.0
+    state_file: Path = field(default_factory=lambda: Path(os.getenv("STATE_FILE", "state/market_state_v83.json")))
+    audit_dir: Path = field(default_factory=lambda: Path(os.getenv("AUDIT_DIR", "audit_v83")))
+    email_sender: str = field(default_factory=lambda: os.getenv("EMAIL_SENDER", "").strip())
+    email_password: str = field(default_factory=lambda: os.getenv("EMAIL_PASSWORD", "").strip())
+    email_receiver: str = field(default_factory=lambda: os.getenv("EMAIL_RECEIVER", "").strip())
+    smtp_host: str = field(default_factory=lambda: os.getenv("SMTP_HOST", "smtp.gmail.com").strip())
+    smtp_port: int = field(default_factory=lambda: int(clamp(env_int("SMTP_PORT", 465), 1, 65535)))
+    scan_interval: int = field(default_factory=lambda: int(clamp(env_int("SCAN_INTERVAL_SECONDS", 180), 60, 900)))
 
+    def validate(self, require_token: bool = True) -> None:
+        if require_token and not self.token:
+            raise ScannerError("UPSTOX_ANALYTICS_TOKEN is missing.")
+        if not self.nifty_key:
+            raise ScannerError("NIFTY_INSTRUMENT_KEY cannot be empty.")
+        if not 60.0 <= self.min_signal_score <= 85.0:
+            raise ScannerError("MIN_SIGNAL_SCORE must be between 60 and 85.")
+        if not 1.0 <= self.min_t1_rr <= 3.0:
+            raise ScannerError("MIN_T1_REWARD_RISK_RATIO must be between 1 and 3.")
 
-def market_time_allowed(dt: datetime) -> tuple[bool, str]:
-    """Gate scanning by session, while allowing 09:15 baseline and post-cutoff monitoring.
-
-    09:15 must be processed to create the first option-OI snapshot for the 09:16
-    tactical window. After 15:15, the scanner continues observing/maintaining virtual
-    risk state, but a separate execution veto blocks all new directional recommendations.
-    """
-    local = dt.astimezone(IST) if dt.tzinfo else dt.replace(tzinfo=IST)
-    if local.weekday() >= 5:
-        return False, "WEEKEND"
-    if local.time() < MARKET_START:
-        return False, "BEFORE_NSE_MARKET_OPEN"
-    if local.time() >= MARKET_END:
-        return False, "OUTSIDE_NSE_MARKET_HOURS"
-    if local.time() < ENTRY_START:
-        return True, "BASELINE_WARMUP_09_15_NO_ENTRY"
-    if local.time() >= ENTRY_CUTOFF:
-        return True, "POST_15_15_MONITOR_ONLY_NO_NEW_ENTRIES"
-    return True, "ENTRY_WINDOW_OPEN"
-
-
-# =============================================================================
-# Typed data structures
-# =============================================================================
 
 @dataclass(frozen=True)
-class LiveQuote:
+class Quote:
     instrument_key: str
     symbol: str
     ltp: float
     bid: float
     ask: float
-    bid_qty: float
-    ask_qty: float
     volume: float
     oi: float
-    previous_oi: float
-    previous_close: float
+    prev_oi: float
     timestamp: Optional[str]
-    last_trade_time: Optional[str]
-    freshness: str
     age_seconds: Optional[float]
-    last_trade_age_seconds: Optional[float]
-    raw: dict[str, Any] = field(default_factory=dict, repr=False)
+    freshness: str
+    bid_qty: float = 0.0
+    ask_qty: float = 0.0
 
     @property
     def mid(self) -> float:
-        if finite(self.bid) and finite(self.ask) and self.bid > 0 and self.ask >= self.bid:
-            return (self.bid + self.ask) / 2.0
-        return float("nan")
+        return (self.bid + self.ask) / 2.0 if finite(self.bid) and finite(self.ask) and 0 < self.bid <= self.ask else float("nan")
 
     @property
     def spread_ratio(self) -> float:
         mid = self.mid
-        if not finite(mid) or mid <= 0:
-            return float("inf")
-        return (self.ask - self.bid) / mid
+        return (self.ask - self.bid) / mid if finite(mid) and mid > 0 else float("inf")
 
     @property
     def depth_imbalance(self) -> float:
-        denom = max(0.0, self.bid_qty) + max(0.0, self.ask_qty)
-        if denom <= 0:
-            return 0.0
-        return clamp((self.bid_qty - self.ask_qty) / denom, -1.0, 1.0)
+        total = max(0.0, self.bid_qty) + max(0.0, self.ask_qty)
+        return (self.bid_qty - self.ask_qty) / total if total > 0 else 0.0
 
 
 @dataclass(frozen=True)
-class OptionContract:
+class Contract:
     instrument_key: str
-    trading_symbol: str
-    option_type: str
+    symbol: str
     strike: float
+    side: str
     expiry: str
     ltp: float
     oi: float
@@ -459,520 +234,128 @@ class OptionContract:
     bid_qty: float
     ask_qty: float
     delta: float
-    theta: float
     iv: float
-    delta_source: str
-    spread_ratio: float
-    premium_vwap: float
-    flow_score: float
-    vwap_lift_score: float
-    coi_score: float
-    total_score: float
-    call_coi_pct: float
-    put_coi_pct: float
-    tactical_source: str
-    quote_freshness: str
-    quote_age_seconds: Optional[float]
-    premium_return_pct: float
-    volume_ratio: float
-    pin_disqualified: bool
-    vetoes: tuple[str, ...] = ()
-    score_basis: str = "FULL_40_30_30"
-    score_components_available: tuple[str, ...] = ()
-    gamma: float = float("nan")
-    vega: float = float("nan")
-    local_oi_score: float = float("nan")
-    delta_fit_score: float = float("nan")
-    theta_efficiency_score: float = float("nan")
-    ranking_score: float = float("nan")
-    expected_underlying_move_points: float = float("nan")
-    expected_option_move_rupees: float = float("nan")
-    expected_option_move_pct: float = float("nan")
-    projection_rank_score: float = float("nan")
+    theta: float
+    gamma: float
+    vega: float
 
 
 @dataclass(frozen=True)
-class StructuralWall:
-    strike: float
-    side: str  # CALL resistance / PUT support
-    oi: float
-    change_pct: Optional[float]
-    state: str  # BUILDING / WEAKENING / STABLE / UNKNOWN
-    source: str
-    distance: float
+class Level:
+    price: float
+    kind: str                 # SUPPORT or RESISTANCE
+    source: str               # PRICE_PIVOT, SESSION_EXTREME, OI_WALL, or composite
+    strength: float           # 0..1 structure/OI importance score
+    touches: int = 1
+    oi_change_pct: Optional[float] = None
+    oi_state: str = "UNKNOWN"
+    flow_state: str = "UNKNOWN"
+    notes: str = ""
 
 
 @dataclass(frozen=True)
-class IndicatorSet:
-    spot: float
-    vwap: float
-    vwap_slope: float
-    stddev: float
-    upper_1sd: float
-    lower_1sd: float
-    upper_2sd: float
-    lower_2sd: float
-    atr: float
-    adx: float
-    plus_di: float
-    minus_di: float
-    rsi: float
-    momentum_3m_pct: float
-    recent_range: float
-    prior_range: float
-    compressed: bool
-    swing_low: float
-    swing_high: float
-    previous_close: float
-    session_open: float
-    candles_count: int
-    indicators_seeded: bool
-    volume_source: str
-    momentum_1m_pct: float = float("nan")
-    swing_low_5m: float = float("nan")
-    swing_high_5m: float = float("nan")
-    atr_5m: float = float("nan")
-    session_high: float = float("nan")
-    session_low: float = float("nan")
-
-
-@dataclass
-class OIAnalysis:
-    rows: dict[float, dict[str, Any]]
-    call_total: float
-    put_total: float
-    pcr: float
-    pcr_previous: Optional[float]
-    pcr_spiking: bool
-    call_coi_pct: float
-    put_coi_pct: float
-    session_call_coi_pct: float
-    session_put_coi_pct: float
-    tactical_source: str
-    tactical_available: bool
-    tactical_age_minutes: Optional[float]
-    pin_market_veto: bool
-    pin_strikes: list[float]
-    both_sides_building: bool
-    call_unwind_dominates: bool
-    put_unwind_dominates: bool
-    walls_resistance: list[StructuralWall]
-    walls_support: list[StructuralWall]
-    baseline_quality: str
-    reasons: list[str]
-    session_baseline_source: str = "UNAVAILABLE"
-    call_coi_acceleration_pct: float = float("nan")
-    put_coi_acceleration_pct: float = float("nan")
-    acceleration_available: bool = False
-    wall_change_source: str = "OI_CONCENTRATION_ONLY"
-    change_oi_fallback_available: bool = False
-    change_oi_fallback_interval_days: Optional[int] = None
-    call_coi_1m_pct: float = float("nan")
-    put_coi_1m_pct: float = float("nan")
-    call_coi_3m_pct: float = float("nan")
-    put_coi_3m_pct: float = float("nan")
-    call_coi_5m_pct: float = float("nan")
-    put_coi_5m_pct: float = float("nan")
-
-
-@dataclass(frozen=True)
-class Scenario:
-    state: str
+class Signal:
     direction: str
-    confidence: float
-    trigger_reason: str
-    wall_level: Optional[float]
-    wall_state: str
-    executable_candidate: bool
-    hard_veto: Optional[str]
-    features: dict[str, Any]
+    setup: str
+    score: float
+    confidence_pct: float
+    trigger: str
+    level: Optional[float]
+    evidence: tuple[str, ...]
+    blockers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class RiskPlan:
     valid: bool
-    target_1: Optional[float]
-    target_2: Optional[float]
-    stop_loss: Optional[float]
+    t1: Optional[float]
+    t2: Optional[float]
+    sl: Optional[float]
     stop_source: str
-    target_1_source: str
-    target_2_source: str
-    skipped_weak_walls: tuple[float, ...]
+    target_source: str
+    reward_points: Optional[float]
+    risk_points: Optional[float]
+    reward_risk: Optional[float]
     reason: str
-    reward_points: Optional[float] = None
-    risk_points: Optional[float] = None
-    reward_risk_ratio: Optional[float] = None
-    max_t1_distance_points: Optional[float] = None
-    remaining_session_minutes: Optional[float] = None
-    stop_atr_points: Optional[float] = None
-    stop_atr_source: str = "UNAVAILABLE"
-    skipped_unreachable_walls: tuple[float, ...] = ()
 
 
-def _infer_state_session_date(state: Mapping[str, Any]) -> str:
-    """Infer the stored session date across V52–V58 state formats without guessing."""
-    for key in ("session_date", "state_session_date"):
-        parsed = parse_date(state.get(key))
-        if parsed:
-            return parsed.isoformat()
-    timestamp_fields = ("last_scan_timestamp", "last_signal_timestamp")
-    for key in timestamp_fields:
-        stamp = parse_timestamp(state.get(key))
-        if stamp:
-            return stamp.astimezone(IST).date().isoformat()
-    for key in ("market_snapshot", "option_oi_snapshot", "session_oi_baseline"):
-        raw = state.get(key)
-        stamp = parse_timestamp(raw.get("timestamp")) if isinstance(raw, dict) else None
-        if stamp:
-            return stamp.astimezone(IST).date().isoformat()
-    candidates: list[datetime] = []
-    for key in ("chain_snapshots", "option_oi_history", "option_oi_history_snapshots", "market_history"):
-        rows = state.get(key)
-        if not isinstance(rows, list):
-            continue
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            stamp = parse_timestamp(row.get("timestamp"))
-            if stamp:
-                candidates.append(stamp.astimezone(IST))
-    return max(candidates).date().isoformat() if candidates else ""
+@dataclass(frozen=True)
+class Indicators:
+    spot: float
+    vwap: float
+    vwap_slope: float
+    atr: float
+    rsi: float
+    adx: float
+    plus_di: float
+    minus_di: float
+    momentum_1m: float
+    momentum_3m: float
+    last_close: float
+    prev_close: float
+    session_high: float
+    session_low: float
+    swing_high: float
+    swing_low: float
+    candles: int
+    volume_source: str
 
 
-def _normalize_legacy_chain_snapshot(raw: Any) -> Optional[dict[str, Any]]:
-    """Normalize supported historical OI snapshot layouts to the V64 chain schema."""
-    if not isinstance(raw, dict):
-        return None
-    stamp = parse_timestamp(raw.get("timestamp"))
-    if stamp is None:
-        return None
-    by_strike: dict[float, dict[str, Any]] = {}
-
-    def add(strike_value: Any, side: str, oi_value: Any) -> None:
-        strike = safe_float(strike_value)
-        oi = safe_float(oi_value)
-        side_norm = str(side).strip().upper()
-        if not finite(strike) or strike <= 0 or not finite(oi) or oi < 0 or side_norm not in {"CE", "PE", "CALL", "PUT"}:
-            return
-        row = by_strike.setdefault(strike, {"strike": strike, "call_oi": 0.0, "put_oi": 0.0})
-        row["call_oi" if side_norm in {"CE", "CALL"} else "put_oi"] = oi
-
-    rows = raw.get("rows")
-    if isinstance(rows, list):
-        for item in rows:
-            if not isinstance(item, dict):
-                continue
-            strike = item.get("strike")
-            if finite(strike):
-                by_strike[float(strike)] = {
-                    "strike": float(strike),
-                    "call_oi": max(0.0, safe_float(item.get("call_oi"), 0.0)),
-                    "put_oi": max(0.0, safe_float(item.get("put_oi"), 0.0)),
-                }
-
-    # V52 stored OI by logical contract/instrument and in a strikes map.
-    for map_key in ("oi_by_contract", "oi_by_instrument"):
-        mapping = raw.get(map_key)
-        if not isinstance(mapping, dict):
-            continue
-        for key, item in mapping.items():
-            if not isinstance(item, dict):
-                continue
-            side = item.get("side", "")
-            key_upper = str(key).upper()
-            if not side:
-                if key_upper.endswith("|CE") or key_upper.endswith(":CE"):
-                    side = "CE"
-                elif key_upper.endswith("|PE") or key_upper.endswith(":PE"):
-                    side = "PE"
-            add(item.get("strike"), str(side), item.get("oi"))
-
-    legacy_strikes = raw.get("strikes")
-    if isinstance(legacy_strikes, dict):
-        for strike, item in legacy_strikes.items():
-            if not isinstance(item, dict):
-                continue
-            add(strike, "CE", item.get("call_oi"))
-            add(strike, "PE", item.get("put_oi"))
-
-    if not by_strike:
-        return None
-    normalized_rows = [by_strike[k] for k in sorted(by_strike)]
-    call_total = sum(safe_float(row.get("call_oi"), 0.0) for row in normalized_rows)
-    put_total = sum(safe_float(row.get("put_oi"), 0.0) for row in normalized_rows)
-    pcr = safe_float(raw.get("pcr"), put_total / call_total if call_total > 0 else float("nan"))
-    return {
-        "timestamp": ist_iso(stamp),
-        "expiry": str(raw.get("expiry", ""))[:10],
-        "pcr": pcr,
-        "rows": normalized_rows,
-    }
-
-
-def _migrate_intraday_state(state: dict[str, Any], today: date) -> None:
-    """Consolidate legacy same-session OI snapshots and tracker fields in-place."""
-    today_iso = today.isoformat()
-    active_expiry = str(state.get("option_expiry", ""))[:10]
-    collected: dict[str, dict[str, Any]] = {}
-    for key in ("chain_snapshots", "option_oi_history", "option_oi_history_snapshots", "option_oi_snapshot"):
-        raw_rows = state.get(key)
-        if not isinstance(raw_rows, list):
-            continue
-        for raw in raw_rows:
-            item = _normalize_legacy_chain_snapshot(raw)
-            if item is None or str(item.get("timestamp", ""))[:10] != today_iso:
-                continue
-            expiry = str(item.get("expiry", ""))[:10]
-            if active_expiry and expiry != active_expiry:
-                continue
-            # Multiple legacy stores sometimes contain the same minute; prefer the
-            # canonical V64 snapshot when it was present first, but keep valid rows.
-            minute_key = str(item["timestamp"])[:16]
-            collected.setdefault(minute_key, item)
-    snapshots = sorted(collected.values(), key=lambda item: str(item.get("timestamp", "")))
-    state["chain_snapshots"] = snapshots[-12:]
-
-    baseline = _normalize_legacy_chain_snapshot(state.get("session_oi_baseline"))
-    if baseline is not None and str(baseline.get("timestamp", ""))[:10] == today_iso:
-        if not active_expiry or str(baseline.get("expiry", ""))[:10] == active_expiry:
-            state["session_oi_baseline"] = baseline
-        else:
-            baseline = None
-            state["session_oi_baseline"] = None
-    else:
-        state["session_oi_baseline"] = None
-        baseline = None
-    if state.get("session_oi_baseline") is None and snapshots:
-        earliest = snapshots[0]
-        earliest_ts = parse_timestamp(earliest.get("timestamp"))
-        state["session_oi_baseline"] = earliest
-        state["session_oi_baseline_source"] = (
-            "MIGRATED_09_15_BASELINE" if earliest_ts and earliest_ts.astimezone(IST).time() == time(9, 15)
-            else "MIGRATED_FIRST_AVAILABLE_SNAPSHOT_NOT_CONFIRMED_OPEN"
-        )
-    if state.get("session_oi_baseline") is not None and str(state.get("session_oi_baseline_source", "UNAVAILABLE")).upper() in {"", "UNAVAILABLE", "NONE"}:
-        state["session_oi_baseline_source"] = "MIGRATED_EXISTING_SAME_SESSION_BASELINE"
-    else:
-        state.setdefault("session_oi_baseline_source", "UNAVAILABLE")
-    # Persist only enough history to warm indicators and explain recent decisions. The
-    # original 2,250-row seed and unbounded legacy histories need not remain in GitHub state:
-    # 900 1m bars still cover roughly two-to-three regular sessions and >60 5m equivalents.
-    seed = state.get("historical_seed")
-    if isinstance(seed, dict) and isinstance(seed.get("candles"), list):
-        seed["candles"] = seed["candles"][-900:]
-        state["historical_seed"] = seed
-    if isinstance(state.get("scan_history"), list):
-        state["scan_history"] = state["scan_history"][-60:]
-    if isinstance(state.get("market_history"), list):
-        state["market_history"] = state["market_history"][-120:]
-    if isinstance(state.get("futures_snapshots"), list):
-        state["futures_snapshots"] = state["futures_snapshots"][-32:]
-    state["schema_version"] = 81
-    state["scanner_version"] = SCANNER_VERSION
-    state["session_date"] = today_iso
-    # V81 protection fields migrate lazily; valid active V79 trackers remain monitorable.
-    tracker_rows = state.get("recommendation_trackers")
-    if isinstance(tracker_rows, list):
-        for tracker in tracker_rows:
-            if isinstance(tracker, dict):
-                tracker.setdefault("regime_history", [])
-                if not isinstance(tracker.get("regime_history"), list):
-                    tracker["regime_history"] = []
-                tracker["regime_history"] = tracker["regime_history"][-12:]
-                tracker.setdefault("monitoring_data_status", "NOT_YET_ASSESSED")
-                tracker.setdefault("target_event_integrity", "UNASSESSED")
-                if tracker.get("confidence_pct") is None:
-                    tracker["confidence_pct"] = tracker.get("latest_signal_confidence_pct", tracker.get("confidence"))
-    legacy_tracker = state.get("recommendation_tracker")
-    if isinstance(legacy_tracker, dict):
-        legacy_tracker.setdefault("regime_history", [])
-        if not isinstance(legacy_tracker.get("regime_history"), list):
-            legacy_tracker["regime_history"] = []
-        legacy_tracker["regime_history"] = legacy_tracker["regime_history"][-12:]
-        legacy_tracker.setdefault("monitoring_data_status", "NOT_YET_ASSESSED")
-        legacy_tracker.setdefault("target_event_integrity", "UNASSESSED")
-        if legacy_tracker.get("confidence_pct") is None:
-            legacy_tracker["confidence_pct"] = legacy_tracker.get("latest_signal_confidence_pct", legacy_tracker.get("confidence"))
-    # Remove legacy directional latches so V81 classifies live structure afresh.
-    for key in ("persistent_direction", "continuation_phase", "continuation_count", "continuation_last_bar"):
-        state.pop(key, None)
-
-
-@dataclass
-class StateStore:
-    path: Path
-    state: dict[str, Any] = field(default_factory=dict)
+class AtomicState:
+    """Small V83 state store; safe atomic replace and same-session snapshots."""
+    def __init__(self, path: Path):
+        self.path = path
+        self.data: dict[str, Any] = {}
 
     def load(self, today: date) -> dict[str, Any]:
-        """Load/upgrade scanner state, preserving alert outbox across session resets.
-
-        On corrupt JSON the unreadable file is copied to a timestamped diagnostic backup;
-        the scanner fails closed for signals if required baselines cannot be recovered.
-        """
         try:
-            if self.path.exists():
-                with self.path.open("r", encoding="utf-8") as handle:
-                    data = json.load(handle)
-                self.state = data if isinstance(data, dict) else {}
-        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            LOGGER.error("STATE LOAD FAILURE; preserving corrupt file and starting safely: %s", exc)
-            try:
-                if self.path.exists():
-                    backup = self.path.with_name(f"{self.path.name}.corrupt-{now_ist().strftime('%Y%m%dT%H%M%S')}")
-                    backup.write_bytes(self.path.read_bytes())
-                    LOGGER.error("CORRUPT STATE BACKUP: %s", backup)
-            except OSError as backup_exc:
-                LOGGER.error("Unable to back up corrupt state file: %s", backup_exc)
-            self.state = {}
-
-        # Preserve queued legacy structural-reversal alerts under the V74 milestone/failure policy.
-        raw_outbox = self.state.get("alert_outbox")
-        if isinstance(raw_outbox, list):
-            for alert in raw_outbox:
-                if (isinstance(alert, dict)
-                        and str(alert.get("status", "PENDING")).upper() == "PENDING"
-                        and str(alert.get("event_type", "")).upper() == "VIRTUAL_RECOMMENDATION_INVALIDATED_BY_STRUCTURE"):
-                    alert["event_type"] = "MARKET_REVERSAL_CONFIRMED"
-                    alert["subject"] = "NIFTY V81 MARKET REVERSAL CONFIRMED — VIRTUAL RECOMMENDATION INVALIDATED"
-                    payload = alert.get("payload") if isinstance(alert.get("payload"), dict) else {}
-                    payload.setdefault("invalidated_direction", payload.get("direction"))
-                    payload.setdefault("replacement_direction", "Not available in legacy alert")
-                    payload.setdefault("message", "An opposite structure was confirmed; the prior virtual recommendation was invalidated. No order was placed.")
-                    alert["payload"] = payload
-        raw_outbox = self.state.get("alert_outbox")
-        if isinstance(raw_outbox, list):
-            for alert in raw_outbox:
-                if isinstance(alert, dict) and isinstance(alert.get("payload"), Mapping):
-                    alert["payload"] = _compact_email_payload(alert["payload"])
-        stored_date = _infer_state_session_date(self.state)
-        today_iso = today.isoformat()
-        if stored_date != today_iso:
-            if stored_date:
-                LOGGER.info("SESSION RESET: state_date=%s current_date=%s; clearing intraday OI/direction state.", stored_date, today_iso)
-            # Unsent notifications must survive a date boundary; market/virtual trackers must not.
-            # A failed selection/failure email may survive a date boundary for operator
-            # visibility, but old T1/T2 milestones must never be delivered as if current.
-            old_audit_compaction_done = bool(self.state.get("audit_v77_legacy_compaction_done", False))
-            old_outbox = [dict(x) for x in self.state.get("alert_outbox", [])
-                          if isinstance(x, dict)
-                          and str(x.get("status", "PENDING")).upper() == "PENDING"
-                          and str(x.get("event_type", "")).upper() in EMAIL_ALLOWED_EVENT_TYPES
-                          and str(x.get("event_type", "")).upper() not in {"T1_REACHED", "T2_REACHED"}] if isinstance(self.state.get("alert_outbox"), list) else []
-            old_dedupe = self.state.get("alert_dedupe", {}) if isinstance(self.state.get("alert_dedupe"), dict) else {}
-            self.state = {
-                "schema_version": 81,
-                "scanner_version": SCANNER_VERSION,
-                "session_date": today_iso,
-                "audit_v77_legacy_compaction_done": old_audit_compaction_done,
-                "chain_snapshots": [],
-                "session_oi_baseline": None,
-                "session_oi_baseline_source": "UNAVAILABLE",
-                "futures_snapshots": [],
-                "market_history": [],
-                "historical_seed": {},
-                "option_expiry": "",
-                "nifty_future": {},
-                "recommendation_tracker": None,
-                "recommendation_trackers": [],
-                "last_email_fingerprint": "",
-                "last_signal_fingerprint": "",
-                "last_signal_timestamp": "",
-                "alert_outbox": old_outbox[-200:],
-                "alert_dedupe": old_dedupe,
-            }
-        else:
-            # Preserve current-session history across version upgrades; normalize older
-            # snapshot formats rather than throwing away valid tactical COI baselines.
-            _migrate_intraday_state(self.state, today)
-            self.state.setdefault("audit_v77_legacy_compaction_done", False)
-            self.state.setdefault("futures_snapshots", [])
-            self.state.setdefault("market_history", [])
-            self.state.setdefault("historical_seed", {})
-            self.state.setdefault("recommendation_tracker", None)
-            self.state.setdefault("recommendation_trackers", [])
-            self.state.setdefault("alert_outbox", [])
-            self.state.setdefault("alert_dedupe", {})
-
-        # Migrate the pre-V64 singular tracker into the canonical tracker list.
-        trackers_raw = self.state.get("recommendation_trackers")
-        trackers = [dict(item) for item in trackers_raw if isinstance(item, dict)] if isinstance(trackers_raw, list) else []
-        primary = self.state.get("recommendation_tracker")
-        if not trackers and isinstance(primary, dict):
-            trackers = [dict(primary)]
-        elif isinstance(primary, dict):
-            primary_fp = str(primary.get("signal_fingerprint", ""))
-            if primary_fp:
-                found = next((item for item in trackers if str(item.get("signal_fingerprint", "")) == primary_fp), None)
-                if found is not None:
-                    # Keep the singular legacy view canonical for backward compatibility.
-                    found.update(primary)
-                    primary = found
-                else:
-                    trackers.append(dict(primary))
-                    primary = trackers[-1]
-        trackers = _compact_persisted_tracker_history(trackers)
-        self.state["recommendation_trackers"] = trackers
-        if trackers:
-            latest = next((item for item in reversed(trackers)
-                           if str(item.get("signal_fingerprint", "")) == str(self.state.get("last_signal_fingerprint", ""))), trackers[-1])
-            self.state["recommendation_tracker"] = latest
-        else:
-            self.state["recommendation_tracker"] = None
-
-        if not isinstance(self.state.get("alert_outbox"), list):
-            self.state["alert_outbox"] = []
-        if not isinstance(self.state.get("alert_dedupe"), dict):
-            self.state["alert_dedupe"] = {}
-        # Directional watches track price/OI structure only, never candidate contracts.
-        active_watch = self.state.get("active_directional_watch")
-        if isinstance(active_watch, dict):
-            active_watch.pop("best_candidate", None)
-            active_watch.pop("candidate_preview", None)
-        # Remove legacy candidate previews from already-persisted watch notifications too;
-        # the renderer also enforces this, but sanitizing state prevents stale strikes being reused.
-        outbox = self.state.get("alert_outbox", [])
-        if isinstance(outbox, list):
-            for alert in outbox:
-                if not isinstance(alert, dict) or str(alert.get("event_type", "")).upper() not in {
-                    "PREDICTIVE_WATCH", "REVERSAL_WATCH", "PREDICTIVE_WATCH_INVALIDATED", "DIRECTIONAL_SHIFT_WATCH"
-                }:
-                    continue
-                payload = alert.get("payload")
-                if not isinstance(payload, dict):
-                    continue
-                for key in ("best_candidate", "candidate_preview", "trading_symbol", "strike", "option_type",
-                            "option_ltp", "ltp", "delta", "premium_vwap", "score", "risk_plan", "T1", "T2", "SL", "trailing_SL"):
-                    payload.pop(key, None)
-                previous_watch = payload.get("previous_watch")
-                if isinstance(previous_watch, dict):
-                    previous_watch.pop("best_candidate", None)
-                    previous_watch.pop("candidate_preview", None)
-        # V74 email policy migration: suppress queued watches, quote-health, stagnation,
-        # cap and diagnostic emails. SIGNAL_READY, T1/T2 milestones and confirmed failures
-        # are the only permitted customer-facing event types.
-        for alert in self.state.get("alert_outbox", []):
-            if not isinstance(alert, dict):
+            loaded = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+            if not isinstance(loaded, dict):
+                loaded = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            LOG.warning("State file could not be read; starting safe empty state: %s", exc)
+            loaded = {}
+        prior_date = parse_date(loaded.get("session_date"))
+        schema_ok = loaded.get("schema_version") == 83 and loaded.get("scanner_version") == VERSION
+        # Only import V83 snapshots with the expected schema. Legacy signal trackers and
+        # email dedupe state are deliberately not migrated across scanner versions.
+        old_snaps = loaded.get("chain_snapshots", []) if isinstance(loaded.get("chain_snapshots", []), list) else []
+        snaps = []
+        for snap in old_snaps:
+            if not isinstance(snap, dict):
                 continue
-            if (str(alert.get("status", "PENDING")).upper() == "PENDING"
-                    and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
-                alert["status"] = "SUPPRESSED_POLICY"
-                alert["suppressed_at"] = now_ist().isoformat()
-                alert["last_error"] = "Suppressed by V81: only selected-strike, milestone, and confirmed stop/failure emails are permitted."
-                alert.pop("next_attempt_at", None)
-        # V81 no longer performs holiday-calendar lookups; discard a legacy persisted cache.
-        self.state.pop("nse_holiday_calendar", None)
-        # Remove obsolete direction latches. Every decision is recomputed from current structure.
-        self.state.pop("persistent_direction", None)
-        self.state.pop("continuation_phase", None)
-        return self.state
+            stamp = parse_dt(snap.get("timestamp"))
+            rows = snap.get("rows")
+            if (stamp and stamp.date() == today and str(snap.get("expiry", ""))
+                    and isinstance(rows, list)
+                    and all(isinstance(r, dict) and all(k in r for k in ("strike", "call_oi", "put_oi", "call_ltp", "put_ltp")) for r in rows[:3])):
+                snaps.append(snap)
+        if prior_date != today:
+            loaded = {}
+            snaps = []
+            schema_ok = False
+        self.data = {
+            "schema_version": 83,
+            "scanner_version": VERSION,
+            "session_date": today.isoformat(),
+            "option_expiry": str(loaded.get("option_expiry", "")) if schema_ok else "",
+            "chain_snapshots": snaps[-40:] if schema_ok else [],
+            "active_signal": loaded.get("active_signal") if schema_ok and isinstance(loaded.get("active_signal"), dict) else None,
+            "signal_history": loaded.get("signal_history", []) if schema_ok and isinstance(loaded.get("signal_history", []), list) else [],
+            "last_email_key": str(loaded.get("last_email_key", "")) if schema_ok else "",
+            "emailed_event_keys": loaded.get("emailed_event_keys", []) if schema_ok and isinstance(loaded.get("emailed_event_keys", []), list) else [],
+            "emailed_notification_keys": loaded.get("emailed_notification_keys", []) if schema_ok and isinstance(loaded.get("emailed_notification_keys", []), list) else [],
+            "pending_email_notifications": loaded.get("pending_email_notifications", []) if schema_ok and isinstance(loaded.get("pending_email_notifications", []), list) else [],
+            "last_scan_timestamp": loaded.get("last_scan_timestamp") if schema_ok else None,
+        }
+        return self.data
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(json_safe(self.state), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         fd, temp_path = tempfile.mkstemp(prefix=self.path.name + ".", suffix=".tmp", dir=str(self.path.parent))
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(payload)
+                json.dump(safe_json(self.data), handle, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_path, self.path)
@@ -983,76 +366,28 @@ class StateStore:
                 pass
             raise
 
-    def recent_chain_snapshots(self, now: datetime, keep_minutes: int = 20) -> list[dict[str, Any]]:
-        raw = self.state.get("chain_snapshots", [])
-        if not isinstance(raw, list):
-            raw = []
-        cutoff = now - timedelta(minutes=keep_minutes)
-        valid: list[dict[str, Any]] = []
-        for row in raw:
-            if not isinstance(row, dict):
-                continue
-            ts = parse_timestamp(row.get("timestamp"))
-            if ts and ts.date() == now.date() and cutoff <= ts <= now + timedelta(seconds=5):
-                valid.append(row)
-        valid.sort(key=lambda r: str(r.get("timestamp", "")))
-        self.state["chain_snapshots"] = valid[-12:]
-        return valid
-
-    def append_chain_snapshot(self, snapshot: dict[str, Any], now: datetime) -> None:
-        samples = self.recent_chain_snapshots(now)
-        key = str(snapshot.get("timestamp", ""))[:16]
-        samples = [x for x in samples if str(x.get("timestamp", ""))[:16] != key]
-        samples.append(snapshot)
-        samples.sort(key=lambda r: str(r.get("timestamp", "")))
-        cutoff = now - timedelta(minutes=20)
-        samples = [x for x in samples if (parse_timestamp(x.get("timestamp")) or datetime.min.replace(tzinfo=IST)) >= cutoff]
-        self.state["chain_snapshots"] = samples[-12:]
-
-
-# =============================================================================
-# Upstox API and normalization
-# =============================================================================
-
-def _is_exact_nifty_future_row(row: Mapping[str, Any]) -> bool:
-    """Reject BANKNIFTY/FINNIFTY/MIDCPNIFTY when search query is simply NIFTY."""
-    instrument_type = str(row.get("instrument_type", "")).strip().upper()
-    if instrument_type != "FUT":
-        return False
-    underlying = str(row.get("underlying_symbol", "")).strip().upper()
-    symbol_tokens = str(row.get("trading_symbol", "")).strip().upper().split()
-    if underlying:
-        return underlying in {"NIFTY", "NIFTY 50"}
-    return len(symbol_tokens) >= 2 and symbol_tokens[0] == "NIFTY" and symbol_tokens[1] == "FUT"
-
-
-def _is_exact_nifty_future_symbol(symbol: str) -> bool:
-    """Validate a cached NIFTY future using its canonical trading-symbol prefix."""
-    tokens = str(symbol or "").strip().upper().split()
-    return len(tokens) >= 2 and tokens[0] == "NIFTY" and tokens[1] == "FUT"
-
 
 class UpstoxClient:
-    def __init__(self, config: Config, session: Optional[requests.Session] = None) -> None:
+    def __init__(self, config: Config, session: Optional[requests.Session] = None):
         self.config = config
         self.session = session or requests.Session()
         self.session.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
 
     def get(self, path: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        self.config.validate(require_token=True)
+        self.config.validate()
         url = path if path.startswith("http") else BASE_URL + path
-        last_error = "Unknown API error"
-        for attempt in range(1, self.config.retries + 1):
+        last_error = "unknown error"
+        for attempt in range(self.config.retries):
             try:
                 response = self.session.get(
                     url, params=params,
                     headers={"Authorization": f"Bearer {self.config.token}", "Accept": "application/json"},
-                    timeout=(min(5.0, self.config.timeout_seconds), self.config.timeout_seconds),
+                    timeout=(min(5.0, self.config.timeout), self.config.timeout),
                 )
             except requests.RequestException as exc:
-                last_error = f"network/timeout error: {exc}"
-                if attempt < self.config.retries:
-                    time_module.sleep(min(0.5 * (2 ** (attempt - 1)), 3.0))
+                last_error = f"network error: {exc}"
+                if attempt + 1 < self.config.retries:
+                    time_module.sleep(min(0.4 * (2 ** attempt), 2.5))
                     continue
                 raise ScannerError(f"Upstox request failed for {url}: {last_error}") from exc
             if response.status_code == 200:
@@ -1060,7856 +395,1188 @@ class UpstoxClient:
                     payload = response.json()
                 except ValueError as exc:
                     raise ScannerError(f"Upstox returned invalid JSON for {url}") from exc
-                if not isinstance(payload, dict):
-                    raise ScannerError(f"Unexpected Upstox response shape for {url}")
-                if str(payload.get("status", "success")).lower() == "error":
-                    raise ScannerError(f"Upstox API error at {url}: {json.dumps(payload)[:1000]}")
+                if not isinstance(payload, dict) or str(payload.get("status", "success")).lower() == "error":
+                    raise ScannerError(f"Unexpected Upstox response from {url}: {str(payload)[:500]}")
                 return payload
-            last_error = f"HTTP {response.status_code}: {str(response.text)[:1000]}"
-            retryable = response.status_code in {429, 500, 502, 503, 504}
-            if retryable and attempt < self.config.retries:
-                retry_after = safe_float(response.headers.get("Retry-After"), float("nan"))
-                delay = retry_after if math.isfinite(retry_after) else min(0.75 * (2 ** (attempt - 1)), 4.0)
-                time_module.sleep(max(0.1, min(delay, 8.0)))
+            last_error = f"HTTP {response.status_code}: {response.text[:500]}"
+            if response.status_code in {429, 500, 502, 503, 504} and attempt + 1 < self.config.retries:
+                retry_after = number(response.headers.get("Retry-After"), min(0.5 * (2 ** attempt), 3.0))
+                time_module.sleep(clamp(retry_after, 0.2, 5.0))
                 continue
             raise ScannerError(f"Upstox request failed for {url}: {last_error}")
         raise ScannerError(f"Upstox request failed for {url}: {last_error}")
 
     def market_status(self) -> str:
         payload = self.get("/v2/market/status/NSE")
-        data = payload.get("data", {})
-        value = str(data.get("status", "UNKNOWN")).upper() if isinstance(data, dict) else "UNKNOWN"
-        return "OPEN" if value in {"NORMAL_OPEN", "OPEN"} else "CLOSED" if value in {"NORMAL_CLOSE", "CLOSED"} else value
+        data = payload.get("data") or {}
+        status = str(data.get("status", "UNKNOWN")).upper() if isinstance(data, dict) else "UNKNOWN"
+        return "OPEN" if status in {"OPEN", "NORMAL_OPEN"} else "CLOSED" if status in {"CLOSED", "NORMAL_CLOSE"} else status
 
-    def quotes(self, keys: Sequence[str]) -> dict[str, LiveQuote]:
-        unique = list(dict.fromkeys(k for k in keys if str(k).strip()))
-        if not unique:
-            return {}
-        if len(unique) > 500:
-            raise ScannerError("Upstox V3 Full Market Quotes accepts at most 500 instrument keys per request.")
-        payload = self.get("/v3/market-quote/quotes", {"instrument_key": ",".join(unique)})
-        raw = payload.get("data", {})
-        if not isinstance(raw, dict):
-            raise ScannerError("Upstox full-market-quote data is not an object.")
-        result: dict[str, LiveQuote] = {}
-        for key in unique:
-            row = _lookup_quote(raw, key)
-            if not isinstance(row, dict):
-                continue
-            result[key] = _normalise_quote(key, row, self.config.max_quote_age_seconds)
-        return result
-
-    def candles(self, instrument_key: str, interval: int = 1, historical: bool = False,
-                from_date: Optional[date] = None, to_date: Optional[date] = None) -> pd.DataFrame:
-        encoded = urllib.parse.quote(instrument_key, safe="")
-        if historical:
-            if from_date is None or to_date is None:
-                raise ValueError("from_date and to_date are required for historical candles")
-            path = f"/v3/historical-candle/{encoded}/minutes/{int(interval)}/{to_date.isoformat()}/{from_date.isoformat()}"
-        else:
-            path = f"/v3/historical-candle/intraday/{encoded}/minutes/{int(interval)}"
-        payload = self.get(path)
-        data = payload.get("data", {})
-        candle_rows = data.get("candles", []) if isinstance(data, dict) else []
-        frame = parse_candles(candle_rows)
-        if frame.empty:
-            return frame
-        current = now_ist()
-        local_time = frame["timestamp"].dt.tz_convert(IST)
-        if not historical:
-            frame = frame.loc[local_time.dt.date == current.date()].copy()
-        else:
-            frame = frame.loc[local_time.dt.date <= (to_date or current.date())].copy()
-        return (frame.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True))
-
-    def option_expiry(self, state: dict[str, Any], today: date) -> str:
-        cached = parse_date(state.get("option_expiry", ""))
+    def expiry(self, state: dict[str, Any], today: date) -> str:
+        cached = parse_date(state.get("option_expiry"))
         if cached and cached >= today:
             return cached.isoformat()
         payload = self.get("/v2/option/contract", {"instrument_key": self.config.nifty_key})
-        rows = payload.get("data", [])
+        rows = payload.get("data")
         if not isinstance(rows, list):
-            raise ScannerError("Option-contract endpoint returned an invalid data array.")
-        expiries = sorted({d for row in rows if isinstance(row, dict)
-                           and (d := parse_date(row.get("expiry"))) is not None and d >= today})
+            raise ScannerError("Option contracts response has no data array.")
+        expiries = sorted({d for r in rows if isinstance(r, dict) and (d := parse_date(r.get("expiry"))) and d >= today})
         if not expiries:
-            raise ScannerError("No active NIFTY option expiry found.")
+            raise ScannerError("No non-expired NIFTY option expiry was returned.")
         state["option_expiry"] = expiries[0].isoformat()
         return expiries[0].isoformat()
 
-    def option_chain(self, expiry: str) -> list[dict[str, Any]]:
-        requested_expiry = parse_date(expiry)
-        if requested_expiry is None:
-            raise ScannerError(f"Invalid requested NIFTY option expiry: {expiry!r}.")
-        payload = self.get("/v2/option/chain", {
-            "instrument_key": self.config.nifty_key,
-            "expiry_date": requested_expiry.isoformat(),
-        })
-        rows = payload.get("data", [])
+    def chain(self, expiry: str) -> list[dict[str, Any]]:
+        exp = parse_date(expiry)
+        if not exp:
+            raise ScannerError(f"Invalid option expiry: {expiry!r}")
+        payload = self.get("/v2/option/chain", {"instrument_key": self.config.nifty_key, "expiry_date": exp.isoformat()})
+        rows = payload.get("data")
         if not isinstance(rows, list) or not rows:
-            raise ScannerError(f"NIFTY option chain is empty for expiry {requested_expiry.isoformat()}.")
+            raise ScannerError(f"Option chain is empty for expiry {exp.isoformat()}.")
+        with_expiry = [r for r in rows if isinstance(r, dict) and r.get("expiry")]
+        if with_expiry:
+            matched = [r for r in with_expiry if parse_date(r.get("expiry")) == exp]
+            if not matched:
+                raise ScannerError("Option-chain expiry does not match requested expiry; refusing mixed-expiry rows.")
+            return matched
+        return [r for r in rows if isinstance(r, dict)]
 
-        valid_rows = [row for row in rows if isinstance(row, dict)]
-        filtered: list[dict[str, Any]] = []
-        has_explicit_expiry = False
-        has_unparseable_expiry = False
-        for row in valid_rows:
-            raw_expiry = row.get("expiry")
-            if raw_expiry is None or not str(raw_expiry).strip():
-                # The endpoint was explicitly queried for this expiry; if the API
-                # omits expiry in every row, retain compatibility with that response.
+    def quotes(self, keys: Sequence[str]) -> dict[str, Quote]:
+        unique = list(dict.fromkeys(str(k) for k in keys if str(k).strip()))
+        result: dict[str, Quote] = {}
+        for start in range(0, len(unique), 450):
+            group = unique[start:start + 450]
+            if not group:
                 continue
-            has_explicit_expiry = True
-            row_expiry = parse_date(raw_expiry)
-            if row_expiry is None:
-                has_unparseable_expiry = True
-            elif row_expiry == requested_expiry:
-                filtered.append(row)
+            payload = self.get("/v3/market-quote/quotes", {"instrument_key": ",".join(group)})
+            rows = payload.get("data")
+            if not isinstance(rows, dict):
+                raise ScannerError("V3 quotes response data is not an object.")
+            for key in group:
+                raw = rows.get(key) or rows.get(key.replace("|", ":", 1))
+                if not isinstance(raw, dict):
+                    # Some quote responses key rows by their exchange-formatted token.
+                    raw = next((v for v in rows.values() if isinstance(v, dict) and str(v.get("instrument_token", "")).replace(":", "|") == key), None)
+                if not isinstance(raw, dict):
+                    continue
+                result[key] = normalise_quote(key, raw, self.config.max_quote_age)
+        return result
 
-        if filtered:
-            return filtered
-        if has_explicit_expiry:
-            detail = "unparseable expiry values" if has_unparseable_expiry else "no rows matching the requested date"
-            raise ScannerError(
-                f"NIFTY option-chain expiry validation failed for {requested_expiry.isoformat()}: {detail}."
-            )
-        if valid_rows:
-            return valid_rows
-        raise ScannerError(f"NIFTY option chain contains no valid rows for expiry {requested_expiry.isoformat()}.")
-
-    def change_oi_by_strike(self, expiry: str, session_date: date) -> dict[str, Any]:
-        """Fetch Upstox's documented interval-in-days COI for structural/session context.
-
-        This endpoint does not provide 1-minute velocity. Its result is only a fallback
-        for wall classification and session context when locally timestamped snapshots
-        are unavailable; it is never substituted for tactical COI in entry scoring.
-        """
-        payload = self.get("/v2/market/change-oi", {
-            "instrument_key": self.config.nifty_key,
-            "expiry": expiry,
-            "date": session_date.isoformat(),
-            "interval": 1,
-        })
-        data = payload.get("data", {})
-        if not isinstance(data, dict):
-            raise ScannerError("Upstox Change-OI endpoint returned an invalid data object.")
-        requested_expiry_date = parse_date(expiry)
-        if requested_expiry_date is None:
-            raise ScannerError(f"Invalid requested Change-OI expiry: {expiry!r}.")
-        response_expiry_raw = data.get("expiry", expiry)
-        if response_expiry_raw is None or not str(response_expiry_raw).strip():
-            response_expiry_date = requested_expiry_date
-        else:
-            response_expiry_date = parse_date(response_expiry_raw)
-            if response_expiry_date is None or response_expiry_date != requested_expiry_date:
-                raise ScannerError(
-                    "Upstox Change-OI expiry mismatch: "
-                    f"requested={requested_expiry_date.isoformat()} response={str(response_expiry_raw)[:32]!r}."
-                )
-        items = data.get("call_put_oi_data_list", [])
-        if not isinstance(items, list):
-            raise ScannerError("Upstox Change-OI endpoint returned an invalid per-strike list.")
-        by_strike: dict[float, dict[str, float]] = {}
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            strike = safe_float(item.get("strike_price"), float("nan"))
-            call_change = safe_float(item.get("call_change_oi"), float("nan"))
-            put_change = safe_float(item.get("put_change_oi"), float("nan"))
-            if not finite(strike) or strike <= 0:
-                continue
-            by_strike[float(strike)] = {
-                "call_change_oi": call_change,
-                "put_change_oi": put_change,
-            }
-        if not by_strike:
-            raise ScannerError("Upstox Change-OI endpoint contained no valid strike rows.")
-        return {
-            "by_strike": by_strike,
-            "total_call_change_oi": safe_float(data.get("total_call_change_oi"), float("nan")),
-            "total_put_change_oi": safe_float(data.get("total_put_change_oi"), float("nan")),
-            "interval_days": 1,
-            "date": session_date.isoformat(),
-            "expiry": response_expiry_date.isoformat(),
-            "source": "UPSTOX_CHANGE_OI_INTERVAL_1_DAY",
-        }
-
-    def nearest_future(self, state: dict[str, Any], today: date) -> Optional[dict[str, str]]:
-        cached = state.get("nifty_future")
-        if isinstance(cached, dict):
-            expiry = parse_date(cached.get("expiry"))
-            key = str(cached.get("instrument_key", ""))
-            symbol = str(cached.get("trading_symbol", ""))
-            if key and symbol and expiry and expiry >= today and _is_exact_nifty_future_symbol(symbol):
-                return {"instrument_key": key, "trading_symbol": symbol, "expiry": expiry.isoformat()}
-        rows: list[dict[str, Any]] = []
-        for expiry_filter in ("current_month", "next_month"):
-            payload = self.get("/v2/instruments/search", {
-                "query": "NIFTY", "exchanges": "NSE", "segments": "FO",
-                "instrument_types": "FUT", "expiry": expiry_filter,
-                "page_number": 1, "records": 30,
-            })
-            data = payload.get("data", [])
-            if isinstance(data, list):
-                rows.extend(x for x in data if isinstance(x, dict))
-        valid = []
-        for row in rows:
-            expiry = parse_date(row.get("expiry"))
-            key = str(row.get("instrument_key", "")).strip()
-            symbol = str(row.get("trading_symbol", "")).strip()
-            if key and symbol and expiry and expiry >= today and _is_exact_nifty_future_row(row):
-                valid.append((expiry, row))
-        if not valid:
-            LOGGER.warning("NIFTY futures instrument not found; continuing without futures confirmation.")
-            return None
-        valid.sort(key=lambda pair: pair[0])
-        expiry, selected = valid[0]
-        future = {"instrument_key": str(selected["instrument_key"]),
-                  "trading_symbol": str(selected["trading_symbol"]), "expiry": expiry.isoformat()}
-        state["nifty_future"] = future
-        return future
+    def candles(self, key: str, interval: int = 1) -> pd.DataFrame:
+        encoded = urllib.parse.quote(key, safe="")
+        payload = self.get(f"/v3/historical-candle/intraday/{encoded}/minutes/{interval}")
+        data = payload.get("data") or {}
+        rows = data.get("candles", []) if isinstance(data, dict) else []
+        frame = parse_candles(rows)
+        if frame.empty:
+            return frame
+        today = now_ist().date()
+        dates = frame["timestamp"].dt.tz_convert(IST).dt.date
+        return frame.loc[dates == today].reset_index(drop=True)
 
 
-def _lookup_quote(raw: Mapping[str, Any], key: str) -> Optional[dict[str, Any]]:
-    for candidate in (key, key.replace("|", ":", 1)):
-        value = raw.get(candidate)
-        if isinstance(value, dict):
-            return value
-    for value in raw.values():
-        if isinstance(value, dict) and str(value.get("instrument_token", "")).replace(":", "|") == key:
-            return value
-    # Never map a lone response row to an unrelated requested key. In a batched
-    # quote request, Upstox may omit instruments with no current quote; a singleton
-    # fallback would silently copy one option's LTP/depth into other contracts.
-    return None
-
-
-def _normalise_quote(key: str, raw: dict[str, Any], max_age: float) -> LiveQuote:
+def normalise_quote(key: str, raw: Mapping[str, Any], max_age_seconds: float = 30.0) -> Quote:
     depth = raw.get("depth") if isinstance(raw.get("depth"), dict) else {}
     ohlc = raw.get("ohlc") if isinstance(raw.get("ohlc"), dict) else {}
     buys = depth.get("buy", []) if isinstance(depth.get("buy", []), list) else []
     sells = depth.get("sell", []) if isinstance(depth.get("sell", []), list) else []
-    first_buy = buys[0] if buys and isinstance(buys[0], dict) else {}
-    first_sell = sells[0] if sells and isinstance(sells[0], dict) else {}
-    bid = safe_float(first_buy.get("price"), float("nan"))
-    ask = safe_float(first_sell.get("price"), float("nan"))
-    # Exchange quote timestamp denotes snapshot generation; last_trade_time is kept
-    # separately because a quiet contract may have old last trade but fresh depth.
-    ts_raw = raw.get("timestamp")
-    trade_raw = raw.get("last_trade_time")
-    now = now_ist()
-    ts = parse_timestamp(ts_raw)
-    trade_ts = parse_timestamp(trade_raw)
-    if ts:
-        age = (now - ts).total_seconds()
-        freshness = "FRESH" if -5.0 <= age <= max_age else "STALE" if age > max_age else "FUTURE_TIMESTAMP"
-    elif trade_ts:
-        age = (now - trade_ts).total_seconds()
-        freshness = "FRESH" if -5.0 <= age <= max_age else "STALE" if age > max_age else "FUTURE_TIMESTAMP"
-    else:
-        age, freshness = None, "UNVERIFIED"
-    trade_age = (now - trade_ts).total_seconds() if trade_ts else None
-    # `dict.get(key, default)` does not use the default when the key exists but is
-    # explicitly null. Fall back to the documented V3 OHLC volume in that case.
-    quote_volume = safe_float(raw.get("volume"), float("nan"))
-    if not finite(quote_volume):
-        quote_volume = safe_float(ohlc.get("volume"), 0.0)
-    return LiveQuote(
+    buy_rows = [x for x in buys if isinstance(x, dict)]
+    sell_rows = [x for x in sells if isinstance(x, dict)]
+    bid = number(buy_rows[0].get("price")) if buy_rows else float("nan")
+    ask = number(sell_rows[0].get("price")) if sell_rows else float("nan")
+    stamp = parse_dt(raw.get("timestamp")) or parse_dt(raw.get("last_trade_time"))
+    age = (now_ist() - stamp).total_seconds() if stamp else None
+    freshness = "UNVERIFIED" if age is None else "FRESH" if -5 <= age <= max_age_seconds else "STALE" if age > max_age_seconds else "FUTURE_TIMESTAMP"
+    volume = number(raw.get("volume"), number(ohlc.get("volume"), 0.0))
+    return Quote(
         instrument_key=key,
         symbol=str(raw.get("symbol", raw.get("trading_symbol", key))),
-        ltp=safe_float(raw.get("last_price", raw.get("ltp"))),
-        bid=bid, ask=ask,
-        bid_qty=sum(max(0.0, safe_float(x.get("quantity"), 0.0)) for x in buys if isinstance(x, dict)),
-        ask_qty=sum(max(0.0, safe_float(x.get("quantity"), 0.0)) for x in sells if isinstance(x, dict)),
-        volume=max(0.0, quote_volume),
-        oi=max(0.0, safe_float(raw.get("oi"), 0.0)),
-        previous_oi=safe_float(raw.get("previous_oi", raw.get("prev_oi")), float("nan")),
-        previous_close=safe_float(raw.get("prev_close_price"), safe_float(ohlc.get("close"), float("nan"))),
-        timestamp=ts.isoformat() if ts else (str(ts_raw) if ts_raw else None),
-        last_trade_time=trade_ts.isoformat() if trade_ts else (str(trade_raw) if trade_raw else None),
-        freshness=freshness, age_seconds=age, last_trade_age_seconds=trade_age, raw=raw,
+        ltp=number(raw.get("last_price", raw.get("ltp"))),
+        bid=bid, ask=ask, volume=max(0.0, volume),
+        oi=max(0.0, number(raw.get("oi"), 0.0)),
+        prev_oi=number(raw.get("previous_oi", raw.get("prev_oi"))),
+        timestamp=stamp.isoformat() if stamp else None,
+        age_seconds=age, freshness=freshness,
+        bid_qty=sum(max(0.0, number(x.get("quantity"), 0.0)) for x in buy_rows),
+        ask_qty=sum(max(0.0, number(x.get("quantity"), 0.0)) for x in sell_rows),
     )
 
 
 def parse_candles(rows: Any) -> pd.DataFrame:
-    """Normalize Upstox [timestamp, open, high, low, close, volume, oi?] rows."""
+    columns = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
     parsed: list[dict[str, Any]] = []
     if not isinstance(rows, list):
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+        return pd.DataFrame(columns=columns)
     for row in rows:
         if not isinstance(row, (list, tuple)) or len(row) < 6:
             continue
-        try:
-            ts = pd.to_datetime(row[0], utc=True, errors="coerce")
-            vals = [safe_float(row[i], float("nan")) for i in range(1, 6)]
-            if pd.isna(ts) or not all(math.isfinite(v) for v in vals[:4]):
-                continue
-            parsed.append({"timestamp": ts, "open": vals[0], "high": vals[1], "low": vals[2],
-                           "close": vals[3], "volume": max(0.0, vals[4]),
-                           "oi": safe_float(row[6], float("nan")) if len(row) > 6 else float("nan")})
-        except (TypeError, ValueError, OverflowError):
+        stamp = pd.to_datetime(row[0], utc=True, errors="coerce")
+        values = [number(row[i]) for i in range(1, 6)]
+        if pd.isna(stamp) or not all(finite(x) for x in values[:4]):
             continue
-    frame = pd.DataFrame(parsed)
-    if frame.empty:
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
-    return frame.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+        if values[1] < values[2] or values[0] <= 0 or values[3] <= 0:
+            continue
+        parsed.append({"timestamp": stamp, "open": values[0], "high": values[1], "low": values[2], "close": values[3],
+                       "volume": max(0.0, values[4]), "oi": number(row[6]) if len(row) > 6 else float("nan")})
+    if not parsed:
+        return pd.DataFrame(columns=columns)
+    frame = pd.DataFrame(parsed).sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+    return frame
 
 
-# =============================================================================
-# Mathematical indicators (Wilder ATR/ADX/RSI, VWAP and delta)
-# =============================================================================
-
-def calculate_atr(frame: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Wilder ATR. Overnight gap is excluded at session boundaries."""
-    if frame is None or frame.empty:
-        return pd.Series(dtype=float)
-    work = frame.copy()
-    high = pd.to_numeric(work["high"], errors="coerce")
-    low = pd.to_numeric(work["low"], errors="coerce")
-    close = pd.to_numeric(work["close"], errors="coerce")
-    prev_close = close.shift(1)
-    if "timestamp" in work:
-        dates = pd.to_datetime(work["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST).dt.date
-        prev_close = prev_close.mask(dates.ne(dates.shift(1)), pd.to_numeric(work["open"], errors="coerce"))
-    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    n = max(2, int(period))
-    return tr.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
-
-
-def calculate_vwap(frame: pd.DataFrame) -> pd.Series:
-    """Session VWAP, weighted by supplied volume; input must use index prices."""
-    if frame is None or frame.empty:
-        return pd.Series(dtype=float)
-    work = frame.copy()
-    typical = (pd.to_numeric(work["high"], errors="coerce") + pd.to_numeric(work["low"], errors="coerce") + pd.to_numeric(work["close"], errors="coerce")) / 3.0
-    volume = pd.to_numeric(work["volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
-    dates = pd.to_datetime(work["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST).dt.date
-    cumulative_volume = volume.groupby(dates).cumsum()
-    cumulative_pv = (typical * volume).groupby(dates).cumsum()
-    vwap = cumulative_pv / cumulative_volume.replace(0.0, np.nan)
-    # A no-volume index feed cannot define a true volume VWAP. Keep it NaN rather
-    # than quietly substituting a price mean and presenting that as VWAP.
-    return vwap
-
-
-def calculate_vwap_bands(frame: pd.DataFrame) -> tuple[float, float, float, float, float]:
-    """Return session VWAP, weighted sigma, +/-1 sigma and +/-2 sigma levels."""
-    if frame is None or frame.empty:
-        return (float("nan"),) * 5
-    work = frame.copy()
-    typical = (pd.to_numeric(work["high"], errors="coerce") + pd.to_numeric(work["low"], errors="coerce") + pd.to_numeric(work["close"], errors="coerce")) / 3.0
-    volume = pd.to_numeric(work["volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
-    dates = pd.to_datetime(work["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST).dt.date
-    cv = volume.groupby(dates).cumsum()
-    cpv = (typical * volume).groupby(dates).cumsum()
-    cp2v = (typical.pow(2) * volume).groupby(dates).cumsum()
-    vwap_series = cpv / cv.replace(0.0, np.nan)
-    var = (cp2v / cv.replace(0.0, np.nan)) - vwap_series.pow(2)
-    std = np.sqrt(var.clip(lower=0.0))
-    if not vwap_series.notna().any():
-        return (float("nan"),) * 5
-    vwap = safe_float(vwap_series.iloc[-1])
-    sigma = safe_float(std.iloc[-1])
-    if not finite(vwap) or not finite(sigma):
-        return (float("nan"),) * 5
-    return vwap, sigma, vwap + sigma, vwap - sigma, vwap + 2 * sigma
-
-
-def calculate_adx(frame: pd.DataFrame, period: int = 14) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Standard Wilder +DI, -DI, ADX with full warm-up windows."""
-    if frame is None or frame.empty:
-        empty = pd.Series(dtype=float)
-        return empty, empty, empty
-    high = pd.to_numeric(frame["high"], errors="coerce")
-    low = pd.to_numeric(frame["low"], errors="coerce")
-    close = pd.to_numeric(frame["close"], errors="coerce")
-    prev_high, prev_low, prev_close = high.shift(1), low.shift(1), close.shift(1)
-    if "timestamp" in frame:
-        dates = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST).dt.date
-        new_session = dates.ne(dates.shift(1))
-        prev_high = prev_high.mask(new_session, high)
-        prev_low = prev_low.mask(new_session, low)
-        prev_close = prev_close.mask(new_session, close)
-    up = high - prev_high
-    down = prev_low - low
-    valid = up.notna() & down.notna()
-    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=frame.index, dtype=float).where(valid)
-    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=frame.index, dtype=float).where(valid)
-    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    n = max(2, int(period))
-    atr = tr.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
-    plus_s = plus_dm.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
-    minus_s = minus_dm.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
-    plus_di = 100.0 * plus_s / atr.replace(0.0, np.nan)
-    minus_di = 100.0 * minus_s / atr.replace(0.0, np.nan)
-    denom = (plus_di + minus_di).replace(0.0, np.nan)
-    dx = (100.0 * (plus_di - minus_di).abs() / denom).clip(0.0, 100.0)
-    adx = dx.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean().clip(0.0, 100.0)
-    return adx, plus_di, minus_di
-
-
-def calculate_rsi(close: pd.Series, period: int = 14, session_dates: Optional[pd.Series] = None) -> pd.Series:
-    values = pd.to_numeric(close, errors="coerce")
-    delta = values.diff()
-    if session_dates is not None:
-        dates = pd.Series(session_dates, index=values.index)
-        delta = delta.mask(dates.ne(dates.shift(1)))
-    gain, loss = delta.clip(lower=0.0), -delta.clip(upper=0.0)
-    n = max(2, int(period))
-    avg_gain = gain.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
-    avg_loss = loss.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
-    rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    rsi = 100.0 - 100.0 / (1.0 + rs)
-    rsi = rsi.where(avg_loss > 0.0, 100.0)
-    both_flat = (avg_gain == 0.0) & (avg_loss == 0.0)
-    return rsi.where(~both_flat, 50.0).clip(0.0, 100.0)
-
-
-def normal_cdf(value: float) -> float:
-    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
-
-
-def black_scholes_delta(spot: float, strike: float, years: float, iv: float,
-                        rate: float, option_type: str) -> float:
-    """European Black-Scholes delta approximation; returns signed put delta."""
-    if not all(finite(v) for v in (spot, strike, years, iv, rate)) or spot <= 0 or strike <= 0 or years <= 0 or iv <= 0:
-        return float("nan")
-    root_t = math.sqrt(years)
-    d1 = (math.log(spot / strike) + (rate + 0.5 * iv * iv) * years) / (iv * root_t)
-    call_delta = normal_cdf(d1)
-    return call_delta if str(option_type).upper() in {"CE", "CALL"} else call_delta - 1.0
-
-
-def option_years_to_expiry(expiry: str, now: datetime) -> float:
-    exp_date = parse_date(expiry)
-    if exp_date is None:
-        return 1.0 / (365.0 * 24.0 * 60.0)
-    expiry_dt = datetime.combine(exp_date, time(15, 30), tzinfo=IST)
-    seconds = max(60.0, (expiry_dt - (now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST))).total_seconds())
-    return seconds / (365.0 * 24.0 * 3600.0)
-
-
-def parse_option_side(row: dict[str, Any], option_type: str) -> dict[str, Any]:
-    block_key = "call_options" if option_type == "CE" else "put_options"
-    block = row.get(block_key) if isinstance(row.get(block_key), dict) else {}
+def parse_contract_side(row: Mapping[str, Any], side: str, strike: float, expiry: str) -> Contract:
+    key = "call_options" if side == "CE" else "put_options"
+    block = row.get(key) if isinstance(row.get(key), dict) else {}
     market = block.get("market_data") if isinstance(block.get("market_data"), dict) else {}
     greeks = block.get("option_greeks") if isinstance(block.get("option_greeks"), dict) else {}
-    return {
-        "instrument_key": str(block.get("instrument_key", "")),
-        "ltp": safe_float(market.get("ltp")),
-        "close_price": safe_float(market.get("close_price")),
-        "oi": max(0.0, safe_float(market.get("oi"), 0.0)),
-        "prev_oi": max(0.0, safe_float(market.get("prev_oi"), float("nan"))),
-        "volume": max(0.0, safe_float(market.get("volume"), 0.0)),
-        "bid": safe_float(market.get("bid_price")),
-        "ask": safe_float(market.get("ask_price")),
-        "bid_qty": max(0.0, safe_float(market.get("bid_qty"), 0.0)),
-        "ask_qty": max(0.0, safe_float(market.get("ask_qty"), 0.0)),
-        "delta": safe_float(greeks.get("delta")),
-        "theta": safe_float(greeks.get("theta")),
-        "gamma": safe_float(greeks.get("gamma")),
-        "vega": safe_float(greeks.get("vega")),
-        "iv": safe_float(greeks.get("iv")),
-    }
+    return Contract(
+        instrument_key=str(block.get("instrument_key", "")),
+        symbol=str(block.get("trading_symbol", f"NIFTY {strike:g} {side}")),
+        strike=float(strike), side=side, expiry=expiry,
+        ltp=number(market.get("ltp")), oi=max(0.0, number(market.get("oi"), 0.0)),
+        prev_oi=number(market.get("prev_oi")), volume=max(0.0, number(market.get("volume"), 0.0)),
+        bid=number(market.get("bid_price")), ask=number(market.get("ask_price")),
+        bid_qty=max(0.0, number(market.get("bid_qty"), 0.0)), ask_qty=max(0.0, number(market.get("ask_qty"), 0.0)),
+        delta=number(greeks.get("delta")), iv=number(greeks.get("iv")), theta=number(greeks.get("theta")),
+        gamma=number(greeks.get("gamma")), vega=number(greeks.get("vega")),
+    )
 
 
-def audit_option_chain_rows(chain: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return a stable, normalized audit view of every CE/PE row in the fetched chain."""
-    rows: list[dict[str, Any]] = []
+def chain_to_contracts(chain: Sequence[dict[str, Any]], expiry: str) -> tuple[dict[float, dict[str, Any]], dict[tuple[float, str], Contract]]:
+    rows_by_strike: dict[float, dict[str, Any]] = {}
+    contracts: dict[tuple[float, str], Contract] = {}
     for row in chain:
-        if not isinstance(row, dict):
-            continue
-        strike = safe_float(row.get("strike_price"))
+        strike = number(row.get("strike_price"))
         if not finite(strike) or strike <= 0:
             continue
-        rows.append({
-            "strike": float(strike),
-            "expiry": str(row.get("expiry", "")),
-            "underlying_spot_price": safe_float(row.get("underlying_spot_price")),
-            "CE": parse_option_side(row, "CE"),
-            "PE": parse_option_side(row, "PE"),
-        })
-    return rows
+        strike = float(strike)
+        rows_by_strike[strike] = row
+        for side in ("CE", "PE"):
+            contract = parse_contract_side(row, side, strike, expiry)
+            if contract.instrument_key:
+                contracts[(strike, side)] = contract
+    if not rows_by_strike:
+        raise ScannerError("Option chain contains no valid strike prices.")
+    return rows_by_strike, contracts
 
 
-def audit_candle_tail(frame: pd.DataFrame, limit: int = 45) -> list[dict[str, Any]]:
-    """Serialize a bounded tail of OHLCV candles; successive scans preserve older bars."""
-    if not isinstance(frame, pd.DataFrame) or frame.empty:
-        return []
-    output: list[dict[str, Any]] = []
-    for row in frame.tail(max(1, limit)).to_dict(orient="records"):
-        item = dict(row)
-        stamp = parse_timestamp(item.get("timestamp"))
-        item["timestamp"] = ist_iso(stamp) if stamp else str(item.get("timestamp", ""))
-        output.append(json_safe(item))
-    return output
+def completed_candles(frame: pd.DataFrame, now: datetime) -> pd.DataFrame:
+    """Exclude the currently forming minute candle; decisions use closed candles only."""
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+    stamps = frame["timestamp"].dt.tz_convert(IST)
+    minute_start = now.astimezone(IST).replace(second=0, microsecond=0)
+    return frame.loc[stamps < minute_start].copy().reset_index(drop=True)
 
 
-# =============================================================================
-# Historical/candle preparation and indicators
-# =============================================================================
-
-def merge_index_with_futures_volume(index_frame: pd.DataFrame, futures_frame: pd.DataFrame) -> tuple[pd.DataFrame, str]:
-    """Keep NIFTY index OHLC; use futures volume only if index volume is unavailable/zero."""
-    if index_frame.empty:
-        return index_frame, "UNAVAILABLE"
-    out = index_frame.copy()
-    out["volume"] = pd.to_numeric(out["volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
-    if out["volume"].sum() > 0:
-        return out, "NIFTY_INDEX_CANDLE_VOLUME"
-    if not futures_frame.empty and "volume" in futures_frame:
-        fut = futures_frame[["timestamp", "volume"]].copy()
-        fut["volume"] = pd.to_numeric(fut["volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
-        out = out.drop(columns=["volume"]).merge(fut, on="timestamp", how="left")
-        out["volume"] = pd.to_numeric(out["volume"], errors="coerce").fillna(0.0)
-        if out["volume"].sum() > 0:
-            return out, "NIFTY_FUTURES_VOLUME_PROXY_INDEX_PRICE"
-    return out, "NO_VALID_VOLUME"
+def true_range(frame: pd.DataFrame) -> pd.Series:
+    prev = frame["close"].shift(1)
+    tr = pd.concat([frame["high"] - frame["low"], (frame["high"] - prev).abs(), (frame["low"] - prev).abs()], axis=1).max(axis=1)
+    if "timestamp" in frame and len(frame):
+        sessions = frame["timestamp"].dt.tz_convert(IST).dt.date
+        tr = tr.mask(sessions.ne(sessions.shift(1)), frame["high"] - frame["low"])
+    return tr
 
 
-def _combine_history_and_session(history: pd.DataFrame, session: pd.DataFrame) -> pd.DataFrame:
-    columns = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
-    parts = []
-    for frame in (history, session):
-        if frame is not None and not frame.empty:
-            part = frame.copy()
-            for col in columns:
-                if col not in part:
-                    part[col] = np.nan
-            parts.append(part[columns])
-    if not parts:
-        return pd.DataFrame(columns=columns)
-    merged = pd.concat(parts, ignore_index=True, sort=False)
-    merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True, errors="coerce")
-    for col in columns[1:]:
-        merged[col] = pd.to_numeric(merged[col], errors="coerce")
-    return merged.dropna(subset=["timestamp", "open", "high", "low", "close"]).sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
-
-
-def build_indicators(
-    now: datetime,
-    spot: float,
-    index_session: pd.DataFrame,
-    futures_session: pd.DataFrame,
-    historical_seed: pd.DataFrame,
-    config: Config,
-    previous_close: float = float("nan"),
-) -> IndicatorSet:
-    if index_session.empty:
-        raise ScannerError("NIFTY index 1-minute candle feed is empty; no structure can be calculated.")
-    index_session = completed_one_minute_candles(index_session, now)
-    if index_session.empty:
-        raise ScannerError("No completed current-session NIFTY 1-minute candles are available yet.")
-    if futures_session is not None and not futures_session.empty:
-        futures_session = completed_one_minute_candles(futures_session, now)
-    session, volume_source = merge_index_with_futures_volume(index_session, futures_session)
-    combined = _combine_history_and_session(historical_seed, session)
-    if combined.empty:
-        raise ScannerError("Insufficient valid index candles to calculate indicators.")
-    atr_series = calculate_atr(combined, config.atr_period)
-    adx_series, plus_series, minus_series = calculate_adx(combined, config.adx_period)
-    rsi_series = calculate_rsi(combined["close"], config.rsi_period,
-                              session_dates=pd.to_datetime(combined["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST).dt.date)
-    current_day = now.astimezone(IST).date() if now.tzinfo else now.replace(tzinfo=IST).date()
-    combined_dates = pd.to_datetime(combined["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST).dt.date
-    today_mask = combined_dates.eq(current_day)
-    session_indicators = combined.loc[today_mask].copy().reset_index(drop=True)
-    if session_indicators.empty:
-        raise ScannerError("Historical seed has no current-session bars and live index candles were not usable.")
-    vwap, sigma, upper1, lower1, upper2 = calculate_vwap_bands(session_indicators)
-    lower2 = vwap - 2 * sigma if finite(vwap) and finite(sigma) else float("nan")
-    # vwap slope measured across the last ~3 current-session points.
-    vwap_series = calculate_vwap(session_indicators)
-    vwap_slope = float("nan")
-    if vwap_series.notna().sum() >= 2:
-        valid_v = vwap_series.dropna()
-        vwap_slope = float(valid_v.iloc[-1] - valid_v.iloc[max(0, len(valid_v) - 4)])
-    last_idx = len(combined) - 1
-    atr = safe_float(atr_series.iloc[last_idx]) if len(atr_series) else float("nan")
-    five_minute_all = completed_resampled_candles_all_sessions(combined, 5, now)
-    atr_5m_series = calculate_atr(five_minute_all, config.atr_period) if not five_minute_all.empty else pd.Series(dtype=float)
-    atr_5m = safe_float(atr_5m_series.iloc[-1]) if len(atr_5m_series) else float("nan")
-    adx = safe_float(adx_series.iloc[last_idx]) if len(adx_series) else float("nan")
-    plus_di = safe_float(plus_series.iloc[last_idx]) if len(plus_series) else float("nan")
-    minus_di = safe_float(minus_series.iloc[last_idx]) if len(minus_series) else float("nan")
-    rsi = safe_float(rsi_series.iloc[last_idx]) if len(rsi_series) else float("nan")
-    recent = session_indicators.tail(3)
-    prior = session_indicators.iloc[max(0, len(session_indicators) - 6):max(0, len(session_indicators) - 3)]
-    recent_range = safe_float(recent["high"].max() - recent["low"].min()) if not recent.empty else float("nan")
-    prior_range = safe_float(prior["high"].max() - prior["low"].min()) if not prior.empty else float("nan")
-    range_limit = max(config.compression_atr_multiple * atr * math.sqrt(max(1, len(recent))), 0.20 * _estimate_strike_step_from_price(spot)) if finite(atr) else float("nan")
-    compressed = bool(finite(recent_range) and finite(range_limit) and recent_range <= range_limit and
-                      (not finite(prior_range) or prior_range <= 0 or recent_range <= prior_range * 0.80 or recent_range <= range_limit * 0.70))
-    close_series = pd.to_numeric(session_indicators["close"], errors="coerce")
-    momentum = float("nan")
-    if len(close_series) >= 2:
-        back = close_series.iloc[max(0, len(close_series) - 4)]
-        if finite(back) and back != 0:
-            momentum = (safe_float(close_series.iloc[-1]) / float(back)) - 1.0
-    momentum_1m = float("nan")
-    if len(close_series) >= 2:
-        previous_completed = safe_float(close_series.iloc[-2])
-        latest_completed = safe_float(close_series.iloc[-1])
-        if finite(previous_completed) and previous_completed > 0 and finite(latest_completed):
-            momentum_1m = latest_completed / previous_completed - 1.0
-    five_minute = completed_resampled_candles(session, 5, now)
-    # Only use a five-minute swing pivot after a completed candle on its right confirms it.
-    # The latest candle cannot confirm itself, so early/session-short data can legitimately
-    # leave the pivot unavailable; risk routing then requires an intact OI wall instead.
-    confirmed_lows: list[tuple[int, float]] = []
-    confirmed_highs: list[tuple[int, float]] = []
-    if len(five_minute) >= 3:
-        pivot_start = max(1, len(five_minute) - 20)
-        for pivot_idx in range(pivot_start, len(five_minute) - 1):
-            prev_bar = five_minute.iloc[pivot_idx - 1]
-            pivot_bar = five_minute.iloc[pivot_idx]
-            next_bar = five_minute.iloc[pivot_idx + 1]
-            pivot_low = safe_float(pivot_bar.get("low"), float("nan"))
-            pivot_high = safe_float(pivot_bar.get("high"), float("nan"))
-            prev_low = safe_float(prev_bar.get("low"), float("nan"))
-            next_low = safe_float(next_bar.get("low"), float("nan"))
-            prev_high = safe_float(prev_bar.get("high"), float("nan"))
-            next_high = safe_float(next_bar.get("high"), float("nan"))
-            if all(finite(value) for value in (pivot_low, prev_low, next_low)) and pivot_low <= prev_low and pivot_low <= next_low:
-                confirmed_lows.append((pivot_idx, pivot_low))
-            if all(finite(value) for value in (pivot_high, prev_high, next_high)) and pivot_high >= prev_high and pivot_high >= next_high:
-                confirmed_highs.append((pivot_idx, pivot_high))
-    swing_low_5m = confirmed_lows[-1][1] if confirmed_lows else float("nan")
-    swing_high_5m = confirmed_highs[-1][1] if confirmed_highs else float("nan")
-    session_high = safe_float(session_indicators["high"].max())
-    session_low = safe_float(session_indicators["low"].min())
-    swing_look = session_indicators.tail(5)
-    swing_low = safe_float(swing_look["low"].min()) if not swing_look.empty else float("nan")
-    swing_high = safe_float(swing_look["high"].max()) if not swing_look.empty else float("nan")
-    session_open = safe_float(session_indicators["open"].iloc[0]) if not session_indicators.empty else float("nan")
-    return IndicatorSet(
-        spot=spot, vwap=vwap, vwap_slope=vwap_slope, stddev=sigma,
-        upper_1sd=upper1, lower_1sd=lower1, upper_2sd=upper2, lower_2sd=lower2,
-        atr=atr, adx=adx, plus_di=plus_di, minus_di=minus_di, rsi=rsi,
-        momentum_3m_pct=momentum, recent_range=recent_range, prior_range=prior_range,
-        compressed=compressed, swing_low=swing_low, swing_high=swing_high,
-        previous_close=previous_close, session_open=session_open,
-        # This is the number of usable, completed current-session 1m bars,
-        # not the historical seed length used to warm up ATR/ADX.
-        candles_count=len(session_indicators),
-        indicators_seeded=(finite(adx) and finite(atr)),
-        volume_source=volume_source, momentum_1m_pct=momentum_1m,
-        swing_low_5m=swing_low_5m, swing_high_5m=swing_high_5m, atr_5m=atr_5m,
-        session_high=session_high, session_low=session_low,
-    )
-
-
-def unavailable_current_session_indicators(spot: float, previous_close: float) -> IndicatorSet:
-    """Represent missing current-session candles explicitly while allowing quote-based monitoring.
-
-    Indicator-derived entries and trailing-stop changes are disabled when the current
-    session's 1m price series is unavailable; live NIFTY/option quotes can still check
-    already-persisted virtual T1/T2/SL levels.
-    """
-    missing = float("nan")
-    return IndicatorSet(
-        spot=spot, vwap=missing, vwap_slope=missing, stddev=missing,
-        upper_1sd=missing, lower_1sd=missing, upper_2sd=missing, lower_2sd=missing,
-        atr=missing, adx=missing, plus_di=missing, minus_di=missing, rsi=missing,
-        momentum_3m_pct=missing, recent_range=missing, prior_range=missing,
-        compressed=False, swing_low=missing, swing_high=missing,
-        previous_close=previous_close, session_open=missing, candles_count=0,
-        indicators_seeded=False, volume_source="CURRENT_SESSION_1M_UNAVAILABLE", atr_5m=missing,
-    )
-
-
-def _estimate_strike_step_from_price(spot: float) -> float:
-    # Only a compression-normalization fallback; actual option strike step is inferred from chain.
-    if spot >= 30000:
-        return 100.0
-    return 50.0
-
-
-def load_historical_seed(client: UpstoxClient, state: dict[str, Any], key: str, now: datetime) -> pd.DataFrame:
-    today = now.astimezone(IST).date()
-    cache = state.get("historical_seed")
-    if isinstance(cache, dict) and cache.get("date") == today.isoformat() and cache.get("instrument_key") == key:
-        try:
-            rows = cache.get("candles", [])
-            if isinstance(rows, list) and len(rows) > 900:
-                rows = rows[-900:]
-                cache["candles"] = rows
-                state["historical_seed"] = cache
-            return parse_candles(rows)
-        except Exception as exc:
-            LOGGER.warning("HISTORICAL SEED CACHE INVALID; refetching: %s", exc)
-    to_date = today - timedelta(days=1)
-    from_date = today - timedelta(days=10)
-    try:
-        frame = client.candles(key, interval=1, historical=True, from_date=from_date, to_date=to_date)
-        rows_out = []
-        for row in frame.to_dict(orient="records"):
-            ts = parse_timestamp(row.get("timestamp"))
-            if ts:
-                rows_out.append([ts.isoformat(), row.get("open"), row.get("high"), row.get("low"), row.get("close"), row.get("volume", 0), row.get("oi")])
-        state["historical_seed"] = {"date": today.isoformat(), "instrument_key": key, "candles": rows_out[-900:]}
-        LOGGER.info("HISTORICAL INDICATOR SEED: loaded %d prior-session 1m bars.", len(frame))
-        return frame
-    except Exception as exc:
-        LOGGER.warning("HISTORICAL INDICATOR SEED unavailable; early ATR/ADX may remain UNKNOWN: %s", exc)
-        state["historical_seed"] = {"date": today.isoformat(), "instrument_key": key, "candles": []}
-        return pd.DataFrame()
-
-
-# =============================================================================
-# Multi-horizon option OI, structural walls, and predictive scenarios
-# =============================================================================
-
-def chain_rows_by_strike(chain: Sequence[dict[str, Any]]) -> dict[float, dict[str, Any]]:
-    output: dict[float, dict[str, Any]] = {}
-    for row in chain:
-        if not isinstance(row, dict):
-            continue
-        strike = safe_float(row.get("strike_price"))
-        if not finite(strike) or strike <= 0:
-            continue
-        output[float(strike)] = row
-    return output
-
-
-def infer_strike_step(strikes: Sequence[float], fallback: float = 50.0) -> float:
-    clean = sorted({float(s) for s in strikes if finite(s) and float(s) > 0})
-    diffs = [b - a for a, b in zip(clean, clean[1:]) if b > a]
-    diffs = [d for d in diffs if d >= 1.0]
-    return float(np.median(diffs)) if diffs else fallback
-
-
-def nearest_strike(spot: float, strikes: Sequence[float]) -> float:
-    clean = [float(s) for s in strikes if finite(s)]
-    if not clean:
-        raise ScannerError("Cannot find ATM: option chain has no strike prices.")
-    return min(clean, key=lambda s: (abs(s - spot), s))
-
-
-def _snapshot_map(snapshot: dict[str, Any]) -> dict[float, dict[str, Any]]:
-    output: dict[float, dict[str, Any]] = {}
-    rows = snapshot.get("rows", [])
-    if isinstance(rows, list):
-        for row in rows:
-            if isinstance(row, dict) and finite(row.get("strike")):
-                output[float(row["strike"])] = row
-    return output
-
-
-def _find_snapshot_baseline(snapshots: Sequence[dict[str, Any]], now: datetime,
-                            target_minutes: float) -> Optional[tuple[dict[str, Any], float]]:
-    # Accept windows broad enough for one missed scheduled scan but never use prior dates.
-    # The source label reflects a realistic baseline age. A delayed 2-minute poll
-    # must not be described as a one-minute COI measurement.
-    ranges = {1.0: (0.45, 1.60), 2.0: (1.40, 3.20), 3.0: (2.20, 4.80),
-              5.0: (3.80, 7.50), 15.0: (10.0, 18.5)}
-    low, high = ranges[target_minutes]
-    matches = []
-    for snap in snapshots:
-        ts = parse_timestamp(snap.get("timestamp"))
-        if not ts or ts.date() != now.astimezone(IST).date():
-            continue
-        age = (now - ts).total_seconds() / 60.0
-        if low <= age <= high:
-            matches.append((abs(age - target_minutes), snap, age))
-    if not matches:
-        return None
-    matches.sort(key=lambda v: v[0])
-    _, snap, age = matches[0]
-    return snap, age
-
-
-def _snapshot_baseline_has_coverage(
-    current_rows: Mapping[float, Mapping[str, Any]],
-    snapshot: Optional[Mapping[str, Any]],
-    minimum_fraction: float = 0.60,
-) -> bool:
-    """Verify a snapshot represents enough of the current chain before computing COI.
-
-    Coverage is checked independently for calls and puts. A stale/different-expiry or
-    partial-chain snapshot must not produce a deceptively precise aggregate velocity.
-    """
-    if not isinstance(snapshot, Mapping) or not current_rows:
-        return False
-    prior_rows = _snapshot_map(dict(snapshot))
-    if not prior_rows:
-        return False
-    fraction = min(1.0, max(0.10, float(minimum_fraction)))
-    for side_key in ("call_oi", "put_oi"):
-        eligible = 0
-        matched = 0
-        for strike, current in current_rows.items():
-            current_oi = safe_float(current.get(side_key), float("nan"))
-            if not finite(current_oi) or current_oi <= 0:
-                continue
-            eligible += 1
-            previous = prior_rows.get(float(strike))
-            if previous is None:
-                continue
-            previous_oi = safe_float(previous.get(side_key), float("nan"))
-            if finite(previous_oi) and previous_oi > 0:
-                matched += 1
-        if eligible == 0 or matched / eligible < fraction:
-            return False
-    return True
-
-
-def has_usable_tactical_snapshot_baseline(
-    chain: Sequence[dict[str, Any]], snapshots: Sequence[dict[str, Any]], now: datetime,
-) -> bool:
-    """Return true only if a recent same-session snapshot has valid chain coverage."""
-    chain_map = chain_rows_by_strike(chain)
-    current_rows: dict[float, dict[str, Any]] = {}
-    for strike, row in chain_map.items():
-        call = parse_option_side(row, "CE")
-        put = parse_option_side(row, "PE")
-        current_rows[float(strike)] = {"call_oi": call["oi"], "put_oi": put["oi"]}
-    for horizon in (1.0, 3.0, 5.0):
-        baseline = _find_snapshot_baseline(snapshots, now, horizon)
-        if baseline and _snapshot_baseline_has_coverage(current_rows, baseline[0]):
-            return True
-    return False
-
-
-def _pct_change(current: float, baseline: float) -> float:
-    if not finite(current) or not finite(baseline) or baseline <= 0:
+def rsi_value(close: pd.Series, period: int = 14) -> float:
+    if len(close) < period + 1:
         return float("nan")
-    return (current - baseline) / baseline
-
-
-def _oi_change_for_side(current_rows: dict[float, dict[str, Any]], baseline: Optional[dict[str, Any]], side_key: str,
-                        prev_key: str = "") -> tuple[float, dict[float, float]]:
-    if baseline is None:
-        return float("nan"), {}
-    base_rows = _snapshot_map(baseline)
-    changes: dict[float, float] = {}
-    numerator = 0.0
-    denominator = 0.0
-    for strike, row in current_rows.items():
-        current = safe_float(row.get(side_key), float("nan"))
-        oldrow = base_rows.get(strike, {})
-        old = safe_float(oldrow.get(side_key), float("nan"))
-        if finite(current) and finite(old) and old > 0:
-            changes[strike] = (current - old) / old
-            numerator += current - old
-            denominator += old
-    return (numerator / denominator if denominator > 0 else float("nan")), changes
-
-
-def classify_wall_state(change_pct: float, threshold: float, available: bool = True) -> str:
-    if not available or not finite(change_pct):
-        return "UNKNOWN"
-    if change_pct <= -threshold:
-        return "WEAKENING"
-    if change_pct >= threshold:
-        return "BUILDING"
-    return "STABLE"
-
-
-def _wall_candidates(rows: dict[float, dict[str, Any]], changes: dict[float, float], spot: float,
-                     side: str, step: float, threshold: float,
-                     change_source: str = "TACTICAL_OI_SNAPSHOT") -> list[StructuralWall]:
-    side = side.upper()
-    oi_key = "call_oi" if side == "CALL" else "put_oi"
-    valid = [(k, safe_float(r.get(oi_key), 0.0)) for k, r in rows.items()
-             if (k > spot + 0.01 if side == "CALL" else k < spot - 0.01)]
-    if not valid:
-        return []
-    # Inspect the full chain for predictive wall routing: a weak nearby wall must
-    # not hide the next intact wall merely because it sits >200 index points away.
-    # Materiality/local-peak filtering, rather than a rigid price-distance cut, removes noise.
-    focus = valid
-    max_oi = max((oi for _, oi in focus), default=0.0)
-    if max_oi <= 0:
-        return []
-    sorted_strikes = sorted(rows)
-    walls: list[StructuralWall] = []
-    for strike, oi in focus:
-        if oi < 0.20 * max_oi:
-            continue
-        idx = sorted_strikes.index(strike) if strike in rows else -1
-        before = safe_float(rows.get(sorted_strikes[idx - 1], {}).get(oi_key), -1.0) if idx > 0 else -1.0
-        after = safe_float(rows.get(sorted_strikes[idx + 1], {}).get(oi_key), -1.0) if 0 <= idx < len(sorted_strikes) - 1 else -1.0
-        local_peak = oi >= before and oi >= after
-        if not local_peak and oi < 0.55 * max_oi:
-            continue
-        change = changes.get(strike, float("nan"))
-        state = classify_wall_state(change, threshold, finite(change))
-        walls.append(StructuralWall(strike=strike, side=side, oi=oi,
-                                    change_pct=change if finite(change) else None,
-                                    state=state, source=change_source if finite(change) else "OI_CONCENTRATION_ONLY",
-                                    distance=abs(strike - spot)))
-    # Ensure a wall is available if the local-peak filter eliminated all levels.
-    if not walls:
-        k, oi = max(focus, key=lambda pair: pair[1])
-        change = changes.get(k, float("nan"))
-        walls.append(StructuralWall(k, side, oi, change if finite(change) else None,
-                                    classify_wall_state(change, threshold, finite(change)),
-                                    change_source if finite(change) else "OI_CONCENTRATION_ONLY", abs(k - spot)))
-    return sorted(walls, key=lambda wall: wall.strike if side == "CALL" else -wall.strike)
-
-
-def analyze_option_oi(chain: Sequence[dict[str, Any]], prior_snapshots: Sequence[dict[str, Any]],
-                      now: datetime, spot: float, config: Config,
-                      session_baseline: Optional[dict[str, Any]] = None,
-                      session_baseline_source: str = "UNAVAILABLE",
-                      api_change_oi: Optional[Mapping[str, Any]] = None) -> OIAnalysis:
-    chain_map = chain_rows_by_strike(chain)
-    if not chain_map:
-        raise ScannerError("Option chain has no valid strikes.")
-    current: dict[float, dict[str, Any]] = {}
-    call_total = put_total = 0.0
-    for strike, row in chain_map.items():
-        call = parse_option_side(row, "CE")
-        put = parse_option_side(row, "PE")
-        current[strike] = {"strike": strike, "call_oi": call["oi"], "put_oi": put["oi"],
-                           "call_prev_oi": call["prev_oi"], "put_prev_oi": put["prev_oi"]}
-        call_total += call["oi"]
-        put_total += put["oi"]
-    pcr = put_total / call_total if call_total > 0 else float("nan")
-    snapshots = sorted([s for s in prior_snapshots if isinstance(s, dict)], key=lambda x: str(x.get("timestamp", "")))
-    def checked_baseline(horizon: float) -> Optional[tuple[dict[str, Any], float]]:
-        candidate = _find_snapshot_baseline(snapshots, now, horizon)
-        if candidate and _snapshot_baseline_has_coverage(current, candidate[0]):
-            return candidate
-        return None
-
-    b1 = checked_baseline(1.0)
-    b2 = checked_baseline(2.0)
-    b3 = checked_baseline(3.0)
-    b5 = checked_baseline(5.0)
-    b15 = checked_baseline(15.0)
-    selected_baseline = None
-    selected_age = None
-    selected_source = "UNAVAILABLE"
-    # Prefer the observed interval closest to its intended 1m/3m/5m horizon.
-    # On a 4-5 minute cron gap this selects the valid 5m baseline rather than treating
-    # the same snapshot as a low-quality 3m velocity and shrinking it unnecessarily.
-    usable_windows = [(label, minutes, baseline) for label, minutes, baseline in
-                      (("1M", 1.0, b1), ("3M", 3.0, b3), ("5M", 5.0, b5)) if baseline]
-    if usable_windows:
-        selected_source, selected_window, selected_window_result = min(
-            usable_windows, key=lambda item: (abs(float(item[2][1]) - item[1]), item[1])
-        )
-        selected_baseline, selected_age = selected_window_result
-    call_pct, call_changes = _oi_change_for_side(current, selected_baseline, "call_oi")
-    put_pct, put_changes = _oi_change_for_side(current, selected_baseline, "put_oi")
-    if selected_baseline and finite(selected_age) and selected_age > 0 and finite(selected_window):
-        velocity_scale = min(2.0, max(0.5, selected_window / selected_age))
-        call_pct = call_pct * velocity_scale if finite(call_pct) else call_pct
-        put_pct = put_pct * velocity_scale if finite(put_pct) else put_pct
-        call_changes = {k: v * velocity_scale for k, v in call_changes.items()}
-        put_changes = {k: v * velocity_scale for k, v in put_changes.items()}
-    # V70: retain normalized per-strike tactical COI as well as the market-wide aggregate.
-    # This lets the candidate router distinguish strikes instead of applying an identical
-    # aggregate COI component to every CE/PE contract on the same side.
-    for strike, row in current.items():
-        row["call_coi_pct"] = call_changes.get(strike, float("nan"))
-        row["put_coi_pct"] = put_changes.get(strike, float("nan"))
-    def normalized_window(baseline: Optional[tuple[dict[str, Any], float]], minutes: float) -> tuple[float, float]:
-        if not baseline or not finite(baseline[1]) or baseline[1] <= 0:
-            return float("nan"), float("nan")
-        c, _ = _oi_change_for_side(current, baseline[0], "call_oi")
-        p, _ = _oi_change_for_side(current, baseline[0], "put_oi")
-        scale = min(2.0, max(0.5, minutes / baseline[1]))
-        return (c * scale if finite(c) else float("nan"), p * scale if finite(p) else float("nan"))
-    call_1m, put_1m = normalized_window(b1, 1.0)
-    call_3m, put_3m = normalized_window(b3, 3.0)
-    call_5m, put_5m = normalized_window(b5, 5.0)
-    call_acceleration = put_acceleration = float("nan")
-    acceleration_available = False
-    # Acceleration is the change in the one-minute OI percentage velocity versus
-    # the preceding one-minute interval. It becomes measurable after 09:16 when
-    # there are 09:15, 09:16 and current snapshots; before that the velocity score
-    # is used without a cold-start penalty.
-    one_minute_spacing = bool(b1 is not None and b2 is not None and abs((b2[1] - b1[1]) - 1.0) <= 0.45)
-    if selected_source == "1M" and b2 is not None and b1 is not None and one_minute_spacing:
-        previous_call_velocity, _ = _oi_change_for_side(_snapshot_map(b1[0]), b2[0], "call_oi")
-        previous_put_velocity, _ = _oi_change_for_side(_snapshot_map(b1[0]), b2[0], "put_oi")
-        if finite(previous_call_velocity) and finite(previous_put_velocity) and finite(call_pct) and finite(put_pct):
-            call_acceleration = call_pct - previous_call_velocity
-            put_acceleration = put_pct - previous_put_velocity
-            acceleration_available = True
-    session_call = session_put = float("nan")
-    baseline_quality = "TACTICAL" if selected_baseline else "NO_SAME_SESSION_BASELINE"
-    # Session COI must use a separately persisted session-opening/first-observation
-    # snapshot. The tactical ring is intentionally pruned after 20 minutes and must
-    # never be mislabeled as a session baseline.
-    session_base = session_baseline if isinstance(session_baseline, dict) else None
-    session_base_ts = parse_timestamp(session_base.get("timestamp")) if session_base else None
-    if (session_base_ts is None or session_base_ts.date() != now.astimezone(IST).date()
-            or session_base_ts > now + timedelta(seconds=5)
-            or not _snapshot_baseline_has_coverage(current, session_base)):
-        session_base = None
-    actual_session_source = session_baseline_source if session_base else "UNAVAILABLE"
-    if session_base is not None:
-        session_call, _ = _oi_change_for_side(current, session_base, "call_oi")
-        session_put, _ = _oi_change_for_side(current, session_base, "put_oi")
-    prev_oi_context_used = False
-    if not finite(call_pct) or not finite(put_pct):
-        # Upstox prev_oi is useful context but not equivalent to a same-session velocity window.
-        # Keep this explicitly labelled so the predictor cannot confuse it with 1m/3m COI.
-        call_num = call_den = put_num = put_den = 0.0
-        for r in current.values():
-            c, cp = safe_float(r.get("call_oi")), safe_float(r.get("call_prev_oi"))
-            p, pp = safe_float(r.get("put_oi")), safe_float(r.get("put_prev_oi"))
-            if finite(c) and finite(cp) and cp > 0:
-                call_num += c - cp; call_den += cp
-            if finite(p) and finite(pp) and pp > 0:
-                put_num += p - pp; put_den += pp
-        if not finite(session_call) and call_den > 0:
-            session_call = call_num / call_den
-            prev_oi_context_used = True
-        if not finite(session_put) and put_den > 0:
-            session_put = put_num / put_den
-            prev_oi_context_used = True
-        if actual_session_source == "UNAVAILABLE" and prev_oi_context_used:
-            actual_session_source = "UPSTOX_PREVIOUS_OI_CONTEXT_NOT_TACTICAL"
-    change_fallback_available = False
-    wall_change_source = "TACTICAL_OI_SNAPSHOT" if selected_baseline else "OI_CONCENTRATION_ONLY"
-    wall_call_changes = dict(call_changes)
-    wall_put_changes = dict(put_changes)
-    change_data = api_change_oi if isinstance(api_change_oi, Mapping) else {}
-    fallback_rows = change_data.get("by_strike", {}) if isinstance(change_data, Mapping) else {}
-    if not selected_baseline and isinstance(fallback_rows, Mapping) and fallback_rows:
-        # Convert raw interval change into a percentage against the implied baseline.
-        # This is session/wall context only; call_pct/put_pct remain NaN for tactical scoring.
-        for strike, row in current.items():
-            api_row = fallback_rows.get(strike, fallback_rows.get(str(round(strike, 2)), {}))
-            if not isinstance(api_row, Mapping):
-                continue
-            call_change = safe_float(api_row.get("call_change_oi"), float("nan"))
-            put_change = safe_float(api_row.get("put_change_oi"), float("nan"))
-            current_call = safe_float(row.get("call_oi"), float("nan"))
-            current_put = safe_float(row.get("put_oi"), float("nan"))
-            implied_call_base = current_call - call_change if finite(call_change) and finite(current_call) else float("nan")
-            implied_put_base = current_put - put_change if finite(put_change) and finite(current_put) else float("nan")
-            if finite(implied_call_base) and implied_call_base > 0:
-                wall_call_changes[strike] = call_change / implied_call_base
-            if finite(implied_put_base) and implied_put_base > 0:
-                wall_put_changes[strike] = put_change / implied_put_base
-        change_fallback_available = bool(wall_call_changes or wall_put_changes)
-        if change_fallback_available:
-            wall_change_source = "UPSTOX_CHANGE_OI_SESSION_FALLBACK"
-            # Where no local session baseline survived a restart, the documented API's
-            # interval-in-days totals may provide session context, never tactical velocity.
-            total_call_delta = safe_float(change_data.get("total_call_change_oi"), float("nan"))
-            total_put_delta = safe_float(change_data.get("total_put_change_oi"), float("nan"))
-            call_base = call_total - total_call_delta if finite(total_call_delta) else float("nan")
-            put_base = put_total - total_put_delta if finite(total_put_delta) else float("nan")
-            if not finite(session_call) and finite(call_base) and call_base > 0:
-                session_call = total_call_delta / call_base
-            if not finite(session_put) and finite(put_base) and put_base > 0:
-                session_put = total_put_delta / put_base
-            if actual_session_source == "UNAVAILABLE":
-                actual_session_source = str(change_data.get("source", "UPSTOX_CHANGE_OI_INTERVAL_1_DAY"))
-
-    tactical_available = bool(selected_baseline and finite(call_pct) and finite(put_pct))
-    if not tactical_available:
-        selected_source = "UNAVAILABLE"
-        if snapshots:
-            baseline_quality = "NO_VALID_TACTICAL_WINDOW"
-    elif len(snapshots) == 1:
-        baseline_quality = "FIRST_SESSION_SNAPSHOT_WITH_VALID_TACTICAL_BASELINE"
-    else:
-        baseline_quality = "VALID_SAME_SESSION_TACTICAL_BASELINE"
-    # Pin guard is exact per strike: both legs must independently increase >10% over the 5m baseline.
-    pin_strikes: list[float] = []
-    if b5:
-        _, c5_changes = _oi_change_for_side(current, b5[0], "call_oi")
-        _, p5_changes = _oi_change_for_side(current, b5[0], "put_oi")
-        for strike in current:
-            if finite(c5_changes.get(strike)) and finite(p5_changes.get(strike)) and c5_changes[strike] > 0.10 and p5_changes[strike] > 0.10:
-                pin_strikes.append(strike)
-    # ADX is added by the scenario engine; this is the structural dual-side build diagnostic.
-    both_sides_building = bool(finite(call_pct) and finite(put_pct) and
-                               call_pct >= config.oi_velocity_trigger and put_pct >= config.oi_velocity_trigger)
-    prev_pcr = safe_float(snapshots[-1].get("pcr")) if snapshots else float("nan")
-    pcr_spiking = bool(finite(pcr) and finite(prev_pcr) and prev_pcr > 0 and pcr >= prev_pcr * (1.0 + config.pcr_spike_pct))
-    call_dominates = bool(finite(call_pct) and call_pct < 0 and
-                          (not finite(put_pct) or abs(call_pct) > abs(min(put_pct, 0.0))))
-    put_dominates = bool(finite(put_pct) and put_pct < 0 and
-                         (not finite(call_pct) or abs(put_pct) > abs(min(call_pct, 0.0))))
-    resistance = _wall_candidates(current, wall_call_changes, spot, "CALL", infer_strike_step(list(current)),
-                                  config.oi_velocity_trigger, wall_change_source)
-    support = _wall_candidates(current, wall_put_changes, spot, "PUT", infer_strike_step(list(current)),
-                               config.oi_velocity_trigger, wall_change_source)
-    reasons = []
-    reasons.append(f"PCR={pcr:.3f}" if finite(pcr) else "PCR=UNAVAILABLE")
-    reasons.append(f"tactical_COI={selected_source}" if tactical_available else "tactical_COI=UNAVAILABLE; session proxy not relabelled as velocity")
-    if change_fallback_available:
-        reasons.append("Upstox interval-in-days Change-OI used for structural wall/session context only; not used as tactical velocity or entry score")
-    if acceleration_available:
-        reasons.append(f"COI_acceleration_call={call_acceleration*100:+.3f}% put={put_acceleration*100:+.3f}%")
-    else:
-        reasons.append("COI acceleration unavailable; tactical velocity retained without a cold-start score penalty")
-    if pin_strikes:
-        reasons.append("5m pin disqualification at " + ",".join(f"{x:.0f}" for x in sorted(pin_strikes)))
-    if both_sides_building:
-        reasons.append("aggregate Call and Put OI both building tactically")
-    return OIAnalysis(
-        rows=current, call_total=call_total, put_total=put_total, pcr=pcr,
-        pcr_previous=prev_pcr if finite(prev_pcr) else None, pcr_spiking=pcr_spiking,
-        call_coi_pct=call_pct, put_coi_pct=put_pct,
-        session_call_coi_pct=session_call, session_put_coi_pct=session_put,
-        tactical_source=selected_source, tactical_available=tactical_available,
-        tactical_age_minutes=selected_age, pin_market_veto=bool(pin_strikes), pin_strikes=sorted(pin_strikes),
-        both_sides_building=both_sides_building, call_unwind_dominates=call_dominates,
-        put_unwind_dominates=put_dominates, walls_resistance=resistance, walls_support=support,
-        baseline_quality=baseline_quality, reasons=reasons,
-        session_baseline_source=actual_session_source,
-        call_coi_acceleration_pct=call_acceleration,
-        put_coi_acceleration_pct=put_acceleration,
-        acceleration_available=acceleration_available,
-        wall_change_source=wall_change_source,
-        change_oi_fallback_available=change_fallback_available,
-        change_oi_fallback_interval_days=1 if change_fallback_available else None,
-        call_coi_1m_pct=call_1m, put_coi_1m_pct=put_1m,
-        call_coi_3m_pct=call_3m, put_coi_3m_pct=put_3m,
-        call_coi_5m_pct=call_5m, put_coi_5m_pct=put_5m,
-    )
-
-
-def make_chain_snapshot(chain: Sequence[dict[str, Any]], oi: OIAnalysis, now: datetime, expiry: str) -> dict[str, Any]:
-    rows = []
-    chain_map = chain_rows_by_strike(chain)
-    for strike in sorted(chain_map):
-        row = oi.rows.get(strike, {})
-        raw = chain_map[strike]
-        call = parse_option_side(raw, "CE")
-        put = parse_option_side(raw, "PE")
-        rows.append({"strike": strike, "call_oi": row.get("call_oi", call["oi"]), "put_oi": row.get("put_oi", put["oi"])})
-    return {"timestamp": ist_iso(now), "expiry": expiry, "pcr": oi.pcr, "rows": rows}
-
-
-def _nearest_wall(walls: Sequence[StructuralWall], spot: float, direction: str,
-                  intact_only: bool = False) -> Optional[StructuralWall]:
-    direction = direction.upper()
-    candidates = []
-    for wall in walls:
-        if direction == "BULLISH" and wall.strike <= spot:
-            continue
-        if direction == "BEARISH" and wall.strike >= spot:
-            continue
-        if intact_only and wall.state not in {"BUILDING", "STABLE"}:
-            continue
-        candidates.append(wall)
-    if not candidates:
-        return None
-    return min(candidates, key=lambda w: abs(w.strike - spot))
-
-
-def _build_oi_wall_context(oi: OIAnalysis, indicators: IndicatorSet) -> tuple[Optional[StructuralWall], Optional[StructuralWall]]:
-    return (_nearest_wall(oi.walls_resistance, indicators.spot, "BULLISH"),
-            _nearest_wall(oi.walls_support, indicators.spot, "BEARISH"))
-
-
-def futures_regime_conflicts(direction: str, future_regime: str) -> bool:
-    """Return true for a fresh futures regime whose price direction conflicts with the setup."""
-    regime = str(future_regime or "UNKNOWN").upper()
-    conflicts = {
-        "BULLISH": {"STRONG_SHORT_BUILDUP", "SHORT_BUILDUP", "LONG_UNWINDING"},
-        "BEARISH": {"STRONG_LONG_BUILDUP", "LONG_BUILDUP", "SHORT_COVERING"},
-    }
-    return regime in conflicts.get(str(direction or "").upper(), set())
-
-
-def detect_scenario(now: datetime, indicators: IndicatorSet, oi: OIAnalysis,
-                    future_regime: str, config: Config) -> Scenario:
-    """Single authoritative scenario hierarchy. No prior direction latch is consulted."""
-    t = now.astimezone(IST).time() if now.tzinfo else now.replace(tzinfo=IST).time()
-    spot, vwap, atr = indicators.spot, indicators.vwap, indicators.atr
-    call_pct, put_pct = oi.call_coi_pct, oi.put_coi_pct
-    c_session, p_session = oi.session_call_coi_pct, oi.session_put_coi_pct
-    trigger = config.oi_velocity_trigger
-    above_vwap = finite(vwap) and spot > vwap
-    below_vwap = finite(vwap) and spot < vwap
-    support_wall = _nearest_wall(oi.walls_support, spot, "BEARISH")
-    resistance_wall = _nearest_wall(oi.walls_resistance, spot, "BULLISH")
-    proximity = max(config.wall_proximity_atr * atr, 0.75 * infer_strike_step(list(oi.rows))) if finite(atr) else 0.75 * infer_strike_step(list(oi.rows))
-    near_res = bool(resistance_wall and resistance_wall.distance <= proximity)
-    near_sup = bool(support_wall and support_wall.distance <= proximity)
-    tactical_valid = oi.tactical_available and finite(call_pct) and finite(put_pct)
-    bullish_coi = tactical_valid and call_pct <= -trigger and put_pct >= 0.0
-    bearish_coi = tactical_valid and put_pct <= -trigger and call_pct >= 0.0
-    bullish_gap_coi = tactical_valid and call_pct <= -trigger and put_pct >= 0.25 * trigger
-    bearish_gap_coi = tactical_valid and put_pct <= -trigger and call_pct >= 0.25 * trigger
-    # If session and tactical flows conflict, only tactical determines direction. Session is diagnostic.
-    if tactical_valid and finite(c_session) and finite(p_session):
-        session_bullish = c_session <= -trigger and p_session >= 0
-        session_bearish = p_session <= -trigger and c_session >= 0
-        if (session_bearish and bullish_coi) or (session_bullish and bearish_coi):
-            flow_note = f"tactical {oi.tactical_source} COI overrides contradictory session baseline"
-        else:
-            flow_note = f"tactical COI source={oi.tactical_source}"
-    else:
-        flow_note = "tactical COI unavailable"
-    # The low-ADX dual-side-building veto is applied after exhaustion-reversal and
-    # structural wall-reaction classification so those explicit mean-reversion
-    # exceptions cannot be hidden by an early global return.
-    # Pinning is a contract-level disqualification, not a market-wide veto.
-    # A broad chain can contain many far-OTM strikes with simultaneous OI changes;
-    # those must not suppress a valid local reversal by count alone. The strict
-    # market-wide veto remains ADX<20 plus aggregate two-sided COI building above.
-
-    # Stage 1 must be able to publish an early *watch* independently of Stage 3 readiness.
-    # Missing tactical COI is never fabricated: the scenario is directional but explicitly
-    # non-executable until real timestamped OI observations exist.
-    if not tactical_valid:
-        positive_momentum = finite(indicators.momentum_1m_pct) and indicators.momentum_1m_pct > 0
-        negative_momentum = finite(indicators.momentum_1m_pct) and indicators.momentum_1m_pct < 0
-        if indicators.compressed and near_res and above_vwap and positive_momentum and resistance_wall:
-            confidence = min(62.0, 42.0 + (8.0 if finite(indicators.vwap_slope) and indicators.vwap_slope > 0 else 0.0)
-                             + (6.0 if resistance_wall.state == "WEAKENING" else 0.0))
-            return Scenario("PREDICTIVE_BULLISH_WATCH_COI_UNAVAILABLE", "BULLISH", confidence,
-                            f"Early bullish watch: NIFTY compressed {resistance_wall.distance:.1f} points below Call-OI wall {resistance_wall.strike:.0f}; spot above VWAP. Tactical COI is unavailable, so wall weakening is unconfirmed; watch only, not trade-ready.",
-                            resistance_wall.strike, resistance_wall.state, False, None,
-                            {"compressed": True, "tactical_coi_available": False, "wall_weakening_confirmed": resistance_wall.state == "WEAKENING"})
-        if indicators.compressed and near_sup and below_vwap and negative_momentum and support_wall:
-            confidence = min(62.0, 42.0 + (8.0 if finite(indicators.vwap_slope) and indicators.vwap_slope < 0 else 0.0)
-                             + (6.0 if support_wall.state == "WEAKENING" else 0.0))
-            return Scenario("PREDICTIVE_BEARISH_WATCH_COI_UNAVAILABLE", "BEARISH", confidence,
-                            f"Early bearish watch: NIFTY compressed {support_wall.distance:.1f} points above Put-OI wall {support_wall.strike:.0f}; spot below VWAP. Tactical COI is unavailable, so support weakening is unconfirmed; watch only, not trade-ready.",
-                            support_wall.strike, support_wall.state, False, None,
-                            {"compressed": True, "tactical_coi_available": False, "wall_weakening_confirmed": support_wall.state == "WEAKENING"})
-
-    # Exhaustion reversal is counter-trend and needs directional loss-of-support/resistance evidence.
-    overextended_up = finite(indicators.upper_2sd) and spot > indicators.upper_2sd
-    overextended_down = finite(indicators.lower_2sd) and spot < indicators.lower_2sd
-    if overextended_up and tactical_valid:
-        support_unwind = put_pct <= -trigger
-        bearish_price_turn = finite(indicators.momentum_1m_pct) and indicators.momentum_1m_pct < 0
-        if support_unwind and bearish_price_turn:
-            confidence = min(95.0, 56.0 + (min(12.0, max(0.0, indicators.adx - 20.0)) if finite(indicators.adx) else 0.0) + min(12.0, abs(put_pct) / trigger * 4.0))
-            return Scenario("EXHAUSTION_REVERSAL", "BEARISH", confidence,
-                            f"Exhaustion reversal: NIFTY {spot:.2f} above +2σ VWAP band; ADX={indicators.adx:.1f}; Put/support OI unwinding {put_pct*100:+.2f}% tactically with downside momentum. {flow_note}.",
-                            support_wall.strike if support_wall else None, support_wall.state if support_wall else "UNKNOWN", True, None,
-                            {"adx": indicators.adx, "rsi": indicators.rsi, "sigma_side": "+2", "put_coi_pct": put_pct})
-    if overextended_down and tactical_valid:
-        resistance_unwind = call_pct <= -trigger
-        bullish_price_turn = finite(indicators.momentum_1m_pct) and indicators.momentum_1m_pct > 0
-        if resistance_unwind and bullish_price_turn:
-            confidence = min(95.0, 56.0 + (min(12.0, max(0.0, indicators.adx - 20.0)) if finite(indicators.adx) else 0.0) + min(12.0, abs(call_pct) / trigger * 4.0))
-            return Scenario("EXHAUSTION_REVERSAL", "BULLISH", confidence,
-                            f"Exhaustion reversal: NIFTY {spot:.2f} below -2σ VWAP band; ADX={indicators.adx:.1f}; Call/resistance OI unwinding {call_pct*100:+.2f}% tactically with upside momentum. {flow_note}.",
-                            resistance_wall.strike if resistance_wall else None, resistance_wall.state if resistance_wall else "UNKNOWN", True, None,
-                            {"adx": indicators.adx, "rsi": indicators.rsi, "sigma_side": "-2", "call_coi_pct": call_pct})
-
-    # Morning gap-and-go: one-minute index data, VWAP alignment, call/put OI flow.
-    gap_pct = ((indicators.session_open / indicators.previous_close) - 1.0) if finite(indicators.session_open) and finite(indicators.previous_close) and indicators.previous_close > 0 else float("nan")
-    if t < MORNING_END and finite(gap_pct) and gap_pct >= config.gap_threshold_pct and above_vwap and bullish_gap_coi:
-        confidence = min(96.0, 65.0 + min(12.0, abs(gap_pct) * 1000) + min(12.0, abs(call_pct) / trigger * 3.0))
-        wall = resistance_wall
-        return Scenario("MORNING_GAP_GO", "BULLISH", confidence,
-                        f"Morning Gap & Go: gap +{gap_pct*100:.2f}%, spot above VWAP, Call OI unwinding {call_pct*100:+.2f}% and Put OI {put_pct*100:+.2f}% ({flow_note}).",
-                        wall.strike if wall else None, wall.state if wall else "UNKNOWN", True, None,
-                        {"gap_pct": gap_pct, "call_coi_pct": call_pct, "put_coi_pct": put_pct})
-    if t < MORNING_END and finite(gap_pct) and gap_pct <= -config.gap_threshold_pct and below_vwap and bearish_gap_coi:
-        confidence = min(96.0, 65.0 + min(12.0, abs(gap_pct) * 1000) + min(12.0, abs(put_pct) / trigger * 3.0))
-        wall = support_wall
-        return Scenario("MORNING_GAP_GO", "BEARISH", confidence,
-                        f"Morning Gap & Go down: gap {gap_pct*100:.2f}%, spot below VWAP, Put OI unwinding {put_pct*100:+.2f}% and Call OI {call_pct*100:+.2f}% ({flow_note}).",
-                        wall.strike if wall else None, wall.state if wall else "UNKNOWN", True, None,
-                        {"gap_pct": gap_pct, "call_coi_pct": call_pct, "put_coi_pct": put_pct})
-
-    # Gamma squeeze gets priority over a generic compression watch when PCR expansion
-    # and dominant Call-OI unwinding are simultaneously present.
-    if t >= MORNING_END and t < ENTRY_CUTOFF and indicators.compressed and near_res and oi.pcr_spiking and oi.call_unwind_dominates and bullish_coi and above_vwap:
-        confidence = min(97.0, 68.0 + min(10.0, abs(call_pct) / trigger * 2.5) + min(8.0, max(0.0, oi.pcr - 1.0) * 10.0))
-        return Scenario("GAMMA_SQUEEZE", "BULLISH", confidence,
-                        f"Gamma squeeze setup: compression near {resistance_wall.strike:.0f} Call wall, PCR rose {config.pcr_spike_pct*100:.1f}%+ from its last sampled value and Call OI unwinding ({call_pct*100:+.2f}%) dominates Put unwinding ({put_pct*100:+.2f}%). {flow_note}.",
-                        resistance_wall.strike, resistance_wall.state, False, None,
-                        {"pcr": oi.pcr, "pcr_previous": oi.pcr_previous, "call_coi_pct": call_pct,
-                         "put_coi_pct": put_pct, "awaiting_completed_1m_breakout_close": True})
-    if t >= MORNING_END and t < ENTRY_CUTOFF and indicators.compressed and near_sup and oi.pcr_spiking and oi.put_unwind_dominates and bearish_coi and below_vwap:
-        confidence = min(97.0, 68.0 + min(10.0, abs(put_pct) / trigger * 2.5) + min(8.0, max(0.0, oi.pcr - 1.0) * 10.0))
-        return Scenario("GAMMA_SQUEEZE", "BEARISH", confidence,
-                        f"Bearish gamma squeeze setup: compression near {support_wall.strike:.0f} Put wall, PCR rose {config.pcr_spike_pct*100:.1f}%+ from its last sampled value and Put OI unwinding ({put_pct*100:+.2f}%) dominates Call unwinding ({call_pct*100:+.2f}%). {flow_note}.",
-                        support_wall.strike, support_wall.state, False, None,
-                        {"pcr": oi.pcr, "pcr_previous": oi.pcr_previous, "call_coi_pct": call_pct,
-                         "put_coi_pct": put_pct, "awaiting_completed_1m_breakout_close": True})
-
-
-    # Predictive pre-breakout: price compresses just below a weakening resistance/support; no candle close beyond wall required.
-    if indicators.compressed and near_res and resistance_wall and resistance_wall.state == "WEAKENING" and bullish_coi and above_vwap:
-        confidence = min(97.0, 66.0 + min(12.0, abs(call_pct) / trigger * 3.0) + (8.0 if oi.pcr_spiking else 0.0))
-        return Scenario("PREDICTIVE_BULLISH_BREAKOUT", "BULLISH", confidence,
-                        f"NIFTY compressing {resistance_wall.distance:.1f} points below {resistance_wall.strike:.0f} Call-OI resistance; defending Call OI unwinding {call_pct*100:+.2f}% over {oi.tactical_source}; spot is still below wall. {flow_note}.",
-                        resistance_wall.strike, resistance_wall.state, False, None,
-                        {"compressed": True, "call_coi_pct": call_pct, "put_coi_pct": put_pct,
-                         "pcr_spiking": oi.pcr_spiking, "awaiting_completed_1m_breakout_close": True})
-    if indicators.compressed and near_sup and support_wall and support_wall.state == "WEAKENING" and bearish_coi and below_vwap:
-        confidence = min(97.0, 66.0 + min(12.0, abs(put_pct) / trigger * 3.0))
-        return Scenario("PREDICTIVE_BEARISH_BREAKDOWN", "BEARISH", confidence,
-                        f"NIFTY compressing {support_wall.distance:.1f} points above {support_wall.strike:.0f} Put-OI support; defending Put OI unwinding {put_pct*100:+.2f}% over {oi.tactical_source}; spot is still above wall. {flow_note}.",
-                        support_wall.strike, support_wall.state, False, None,
-                        {"compressed": True, "call_coi_pct": call_pct, "put_coi_pct": put_pct,
-                         "awaiting_completed_1m_breakout_close": True})
-
-    # Low-PCR / rising-Call-OI imbalance from the prior scanner requirements. OI alone
-    # cannot identify whether the new Call OI is buying or writing, so the Strike Router
-    # additionally requires strong call-premium/order-book flow before allowing entry.
-    if (tactical_valid and finite(oi.pcr) and oi.pcr <= 1.0 and call_pct >= trigger
-            and above_vwap and finite(indicators.momentum_1m_pct) and indicators.momentum_1m_pct > 0
-            and not futures_regime_conflicts("BULLISH", future_regime)):
-        confidence = min(86.0, 59.0 + min(12.0, oi.call_total / max(oi.put_total, 1.0))
-                         + min(10.0, call_pct / trigger * 2.0))
-        return Scenario("PCR_LOW_CALL_OI_IMBALANCE", "BULLISH", confidence,
-                        f"Low-PCR Call OI expansion: PCR={oi.pcr:.3f} (<=1.0), Call OI building {call_pct*100:+.2f}% while spot is above VWAP and 1m momentum is positive. Because OI alone cannot distinguish call buying from writing, execution additionally requires strong Call premium/order-book flow. {flow_note}.",
-                        resistance_wall.strike if resistance_wall else None, resistance_wall.state if resistance_wall else "UNKNOWN", True, None,
-                        {"pcr": oi.pcr, "call_coi_pct": call_pct, "put_coi_pct": put_pct,
-                         "requires_option_flow_confirmation": True, "futures_regime": future_regime})
-
-    # A directional continuation is allowed before a completed 3m candle, but must align with VWAP and tactical OI.
-    future = future_regime.upper()
-    if above_vwap and bullish_coi and finite(indicators.momentum_1m_pct) and indicators.momentum_1m_pct > 0 and not futures_regime_conflicts("BULLISH", future):
-        confidence = min(91.0, 55.0 + min(15.0, abs(call_pct) / trigger * 2.5) + min(10.0, indicators.momentum_1m_pct * 25000))
-        return Scenario("BULLISH_CONTINUATION", "BULLISH", confidence,
-                        f"Bullish continuation: spot above NIFTY VWAP, positive 1m momentum, Call OI {call_pct*100:+.2f}% and Put OI {put_pct*100:+.2f}% over {oi.tactical_source}; futures={future}. {flow_note}.",
-                        resistance_wall.strike if resistance_wall else None, resistance_wall.state if resistance_wall else "UNKNOWN", True, None,
-                        {"call_coi_pct": call_pct, "put_coi_pct": put_pct, "futures_regime": future})
-    if below_vwap and bearish_coi and finite(indicators.momentum_1m_pct) and indicators.momentum_1m_pct < 0 and not futures_regime_conflicts("BEARISH", future):
-        confidence = min(91.0, 55.0 + min(15.0, abs(put_pct) / trigger * 2.5) + min(10.0, abs(indicators.momentum_1m_pct) * 25000))
-        return Scenario("BEARISH_CONTINUATION", "BEARISH", confidence,
-                        f"Bearish continuation: spot below NIFTY VWAP, negative 1m momentum, Put OI {put_pct*100:+.2f}% and Call OI {call_pct*100:+.2f}% over {oi.tactical_source}; futures={future}. {flow_note}.",
-                        support_wall.strike if support_wall else None, support_wall.state if support_wall else "UNKNOWN", True, None,
-                        {"call_coi_pct": call_pct, "put_coi_pct": put_pct, "futures_regime": future})
-
-    return Scenario("WATCH_NO_CONFIRMED_SETUP", "NEUTRAL", 0.0,
-                    f"No qualifying predictive scenario. VWAP alignment, compression/wall condition, tactical COI, PCR, or futures context is insufficient. {flow_note}.",
-                    None, "", False, None,
-                    {"above_vwap": above_vwap, "below_vwap": below_vwap, "compressed": indicators.compressed,
-                     "call_coi_pct": call_pct, "put_coi_pct": put_pct, "pcr_spiking": oi.pcr_spiking})
-
-
-def completed_one_minute_candles(frame: Optional[pd.DataFrame], now: datetime) -> pd.DataFrame:
-    """Return current-session 1m bars whose full minute has elapsed, oldest first."""
-    if frame is None or frame.empty or "timestamp" not in frame.columns:
-        return pd.DataFrame()
-    work = frame.copy()
-    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
-    work = work.dropna(subset=["timestamp"]).sort_values("timestamp").drop_duplicates("timestamp", keep="last")
-    for column in ("open", "high", "low", "close", "volume"):
-        if column in work.columns:
-            work[column] = pd.to_numeric(work[column], errors="coerce")
-    current = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
-    local_ts = work["timestamp"].dt.tz_convert(IST)
-    complete_mask = (local_ts + pd.to_timedelta(1, unit="m") <= current) & (local_ts.dt.date == current.date())
-    work = work.loc[complete_mask].dropna(subset=["open", "high", "low", "close"])
-    return work.reset_index(drop=True)
-
-
-def detect_price_structure_candidate(frame: pd.DataFrame, indicators: IndicatorSet, oi: OIAnalysis,
-                                    now: datetime, future_regime: str, config: Config) -> Optional[Scenario]:
-    """Price-led continuation based on completed 1m candles, not an OI-only pattern."""
-    bars = completed_one_minute_candles(frame, now).tail(10).copy()
-    if len(bars) < 6 or not finite(indicators.atr) or indicators.atr <= 0:
-        return None
-    if finite(indicators.adx) and indicators.adx < 20.0 and oi.both_sides_building:
-        return None
-    for col in ("open", "high", "low", "close"):
-        bars[col] = pd.to_numeric(bars[col], errors="coerce")
-    bars = bars.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
-    if len(bars) < 6:
-        return None
-    last, prev = bars.iloc[-1], bars.iloc[-2]
-    close, open_ = safe_float(last["close"]), safe_float(last["open"])
-    prior_close = safe_float(prev["close"])
-    prior3 = bars.iloc[-4:-1]
-    prior_low, prior_high = safe_float(prior3["low"].min()), safe_float(prior3["high"].max())
-    if not all(finite(x) for x in (close, open_, prior_close, prior_low, prior_high)):
-        return None
-
-    buffer = max(0.08 * indicators.atr, 1.0)
-    m1, m3 = indicators.momentum_1m_pct, indicators.momentum_3m_pct
-    di_bull = finite(indicators.plus_di) and finite(indicators.minus_di) and indicators.plus_di > indicators.minus_di + 1.0
-    di_bear = finite(indicators.plus_di) and finite(indicators.minus_di) and indicators.minus_di > indicators.plus_di + 1.0
-    vwap_bull = finite(indicators.vwap) and indicators.spot > indicators.vwap
-    vwap_bear = finite(indicators.vwap) and indicators.spot < indicators.vwap
-    rsi_bull = finite(indicators.rsi) and indicators.rsi >= 52.0
-    rsi_bear = finite(indicators.rsi) and indicators.rsi <= 48.0
-
-    bull_break = close >= prior_high + buffer and close > prior_close
-    bear_break = close <= prior_low - buffer and close < prior_close
-    bull_momentum = finite(m1) and m1 > 0 and finite(m3) and m3 >= -0.00010 and (di_bull or rsi_bull)
-    bear_momentum = finite(m1) and m1 < 0 and finite(m3) and m3 <= 0.00010 and (di_bear or rsi_bear)
-    bull_follow = close > open_ and close >= prior_close + 0.25 * indicators.atr
-    bear_follow = close < open_ and close <= prior_close - 0.25 * indicators.atr
-
-    trig = max(config.oi_velocity_trigger, 0.0001)
-    tactical = bool(oi.tactical_available and finite(oi.call_coi_pct) and finite(oi.put_coi_pct))
-    bull_conflict = tactical and oi.put_coi_pct <= -2.0 * trig and oi.call_coi_pct > 0.0
-    bear_conflict = tactical and oi.call_coi_pct <= -2.0 * trig and oi.put_coi_pct > 0.0
-    bull_conflict = bull_conflict or futures_regime_conflicts("BULLISH", future_regime)
-    bear_conflict = bear_conflict or futures_regime_conflicts("BEARISH", future_regime)
-    last_ts = parse_timestamp(last.get("timestamp"))
-    oi_label = ("TACTICAL_OI_MIXED_OR_BOTH_UNWINDING" if tactical and oi.call_coi_pct < 0 and oi.put_coi_pct < 0
-                else "TACTICAL_OI_OBSERVED" if tactical else "TACTICAL_OI_UNAVAILABLE")
-    features = {
-        "setup_route": "PRICE_STRUCTURE_CONTINUATION",
-        "completed_bar_timestamp": ist_iso(last_ts or now),
-        "structure_confirmed": True,
-        "oi_evidence": {"available": tactical, "source": oi.tactical_source,
-            "call_coi_pct": oi.call_coi_pct if finite(oi.call_coi_pct) else None,
-            "put_coi_pct": oi.put_coi_pct if finite(oi.put_coi_pct) else None,
-            "interpretation": oi_label},
-    }
-
-    if bull_break and bull_momentum and bull_follow and vwap_bull and not bull_conflict:
-        confidence = min(88.0, 69.0 + (5.0 if di_bull else 0.0)
-                         + (4.0 if tactical and oi.call_coi_pct < 0 <= oi.put_coi_pct else 0.0))
-        features["price_structure_confirmation"] = {
-            "break_confirmed": True, "momentum_confirmed": True, "follow_through_confirmed": True,
-            "boundary": prior_high, "buffer_points": buffer, "close": close,
-            "vwap_alignment": True, "directional_indicator_alignment": di_bull,
-            "oi_conflict": False, "futures_conflict": False}
-        return Scenario("CONFIRMED_BULLISH_CONTINUATION", "BULLISH", confidence,
-            f"Price-led bullish continuation: completed 1m close {close:.2f} cleared prior 3-bar high {prior_high:.2f}; momentum and VWAP align. {oi_label}; OI does not identify buyer/writer side.",
-            None, "UNKNOWN", True, None, features)
-
-    if bear_break and bear_momentum and bear_follow and vwap_bear and not bear_conflict:
-        confidence = min(88.0, 69.0 + (5.0 if di_bear else 0.0)
-                         + (4.0 if tactical and oi.put_coi_pct < 0 <= oi.call_coi_pct else 0.0))
-        features["price_structure_confirmation"] = {
-            "break_confirmed": True, "momentum_confirmed": True, "follow_through_confirmed": True,
-            "boundary": prior_low, "buffer_points": buffer, "close": close,
-            "vwap_alignment": True, "directional_indicator_alignment": di_bear,
-            "oi_conflict": False, "futures_conflict": False}
-        return Scenario("CONFIRMED_BEARISH_CONTINUATION", "BEARISH", confidence,
-            f"Price-led bearish continuation: completed 1m close {close:.2f} broke prior 3-bar low {prior_low:.2f}; momentum and VWAP align. {oi_label}; OI does not identify buyer/writer side.",
-            None, "UNKNOWN", True, None, features)
-    return None
-
-
-def resolve_v68_direction(primary: Scenario, price_candidate: Optional[Scenario],
-                          reversal_watch: Optional[Scenario], indicators: IndicatorSet,
-                          oi: OIAnalysis, future_regime: str) -> Scenario:
-    """Resolve scenario conflicts with confirmed tested boundaries ahead of generic continuation."""
-    protected_states = {
-        "STRUCTURAL_SUPPORT_BOUNCE", "STRUCTURAL_RESISTANCE_REJECTION",
-        "STRUCTURAL_BOUNDARY_COMPRESSION", "CONFIRMED_BULLISH_BREAKOUT",
-        "CONFIRMED_BEARISH_BREAKDOWN",
-    }
-    if primary.state in protected_states:
-        # Tested reactions, boundary waits, and two-close boundary breaks are authoritative.
-        # A generic local 3-bar continuation cannot replace the structural classification.
-        return primary
-    if primary.features.get("setup_route") in {
-        "STRUCTURAL_LEVEL_INTERACTION", "STRUCTURAL_BOUNDARY_WAIT", "TESTED_STRUCTURAL_BOUNDARY_BREAK"
-    }:
-        return primary
-    if finite(indicators.adx) and indicators.adx < 20.0 and oi.both_sides_building and price_candidate is None:
-        return Scenario("SIDEWAYS_CHOP", "NEUTRAL", 0.0,
-            "Low ADX and two-sided OI build indicate pinning; directional entries remain vetoed.",
-            None, "", False, "SIDEWAYS_ADX_DUAL_SIDE_OI_BUILD", {"price_candidate_blocked": None})
-    if price_candidate is not None:
-        return price_candidate
-    if primary.direction in {"BULLISH", "BEARISH"} and reversal_watch is not None and reversal_watch.direction != primary.direction:
-        opposite = reversal_watch.direction
-        momentum_ok = finite(indicators.momentum_3m_pct) and (
-            indicators.momentum_3m_pct < -0.00035 if opposite == "BEARISH" else indicators.momentum_3m_pct > 0.00035)
-        di_ok = (
-            finite(indicators.minus_di) and finite(indicators.plus_di) and indicators.minus_di > indicators.plus_di + 1.0
-            if opposite == "BEARISH" else
-            finite(indicators.plus_di) and finite(indicators.minus_di) and indicators.plus_di > indicators.minus_di + 1.0)
-        if momentum_ok and di_ok:
-            return Scenario("DIRECTIONAL_CONFLICT_WATCH", "NEUTRAL", 0.0,
-                f"Primary {primary.direction} setup conflicts with {opposite} reversal watch; wait for completed structure confirmation.",
-                None, "", False, None, {"primary_scenario": primary.state, "primary_direction": primary.direction,
-                    "opposing_watch": reversal_watch.state, "opposing_direction": opposite,
-                    "opposing_momentum_confirmed": True, "opposing_di_confirmed": True})
-        return primary
-    if reversal_watch is not None and reversal_watch.direction in {"BULLISH", "BEARISH"}:
-        return Scenario("DIRECTIONAL_REVERSAL_WATCH", "NEUTRAL", 0.0,
-            f"{reversal_watch.direction} reversal watch detected without completed price-structure confirmation; no strike forced.",
-            None, "", False, None, {"watch_scenario": reversal_watch.state, "watch_direction": reversal_watch.direction,
-                "watch_confidence_pct": reversal_watch.confidence, "price_structure_confirmed": False,
-                "oi_tactical_available": oi.tactical_available})
-    return primary
-
-def confirm_wall_breakout_scenario(
-    scenario: Scenario, frame: pd.DataFrame, indicators: IndicatorSet, oi: OIAnalysis,
-    future_regime: str, now: datetime, config: Config,
-) -> Scenario:
-    """Promote a breakout watch only after a completed 1m close clears its wall.
-
-    A live spot tick or compression alone is insufficient. The latest completed 1m
-    close must clear the structural wall by a small ATR/strike-step buffer, spot must
-    remain on the breakout side, VWAP and 1m momentum must align, tactical OI flow
-    must confirm, and futures must not conflict.
-    """
-    eligible_states = {
-        "PREDICTIVE_BULLISH_BREAKOUT", "PREDICTIVE_BEARISH_BREAKDOWN", "GAMMA_SQUEEZE"
-    }
-    if scenario.state not in eligible_states:
-        return scenario
-    direction = scenario.direction.upper()
-    wall = safe_float(scenario.wall_level, float("nan"))
-    if direction not in {"BULLISH", "BEARISH"} or not finite(wall) or wall <= 0:
-        return replace(
-            scenario, executable_candidate=False,
-            trigger_reason=scenario.trigger_reason + " Breakout confirmation unavailable; no strike is selected.",
-            features={**scenario.features, "awaiting_completed_1m_breakout_close": True,
-                      "breakout_confirmation_failure": "STRUCTURAL_WALL_UNAVAILABLE"},
-        )
-
-    bars = completed_one_minute_candles(frame, now)
-    latest_close = safe_float(bars.iloc[-1].get("close"), float("nan")) if not bars.empty else float("nan")
-    step = infer_strike_step(list(oi.rows))
-    buffer = max(0.05 * indicators.atr if finite(indicators.atr) else 0.0,
-                 0.05 * step if finite(step) else 0.0, 1.0)
-    tactical_valid = oi.tactical_available and finite(oi.call_coi_pct) and finite(oi.put_coi_pct)
-    trigger = config.oi_velocity_trigger
-    if direction == "BULLISH":
-        flow_ok = tactical_valid and oi.call_coi_pct <= -trigger and oi.put_coi_pct >= 0.0
-        crossed = finite(latest_close) and latest_close >= wall + buffer and indicators.spot > wall
-        vwap_ok = finite(indicators.vwap) and indicators.spot > indicators.vwap
-        momentum_ok = finite(indicators.momentum_1m_pct) and indicators.momentum_1m_pct > 0.0
-    else:
-        flow_ok = tactical_valid and oi.put_coi_pct <= -trigger and oi.call_coi_pct >= 0.0
-        crossed = finite(latest_close) and latest_close <= wall - buffer and indicators.spot < wall
-        vwap_ok = finite(indicators.vwap) and indicators.spot < indicators.vwap
-        momentum_ok = finite(indicators.momentum_1m_pct) and indicators.momentum_1m_pct < 0.0
-    futures_ok = not futures_regime_conflicts(direction, future_regime)
-    confirmed = bool(crossed and flow_ok and vwap_ok and momentum_ok and futures_ok)
-
-    features = {
-        **(scenario.features if isinstance(scenario.features, dict) else {}),
-        "awaiting_completed_1m_breakout_close": not confirmed,
-        "breakout_confirmation": {
-            "latest_completed_1m_close": latest_close if finite(latest_close) else None,
-            "wall_level": wall, "required_buffer_points": buffer,
-            "close_crossed_wall": crossed, "tactical_flow_confirmed": bool(flow_ok),
-            "vwap_alignment": bool(vwap_ok), "one_minute_momentum_alignment": bool(momentum_ok),
-            "futures_non_conflicting": bool(futures_ok),
-        },
-    }
-    if not confirmed:
-        missing = []
-        if not crossed:
-            missing.append("completed 1m close beyond wall plus buffer")
-        if not flow_ok:
-            missing.append("aligned tactical OI flow")
-        if not vwap_ok:
-            missing.append("VWAP alignment")
-        if not momentum_ok:
-            missing.append("1m momentum alignment")
-        if not futures_ok:
-            missing.append("non-conflicting futures regime")
-        reason = "Breakout not confirmed; waiting for " + ", ".join(missing) + ". No option contract is selected."
-        return Scenario(scenario.state, direction, scenario.confidence,
-                        scenario.trigger_reason + " " + reason,
-                        scenario.wall_level, scenario.wall_state, False, scenario.hard_veto, features)
-
-    confirmed_state = "CONFIRMED_BULLISH_BREAKOUT" if direction == "BULLISH" else "CONFIRMED_BEARISH_BREAKDOWN"
-    reason = (
-        f"Confirmed {direction.lower()} structural breakout: latest completed 1m close {latest_close:.2f} "
-        f"cleared wall {wall:.2f} by at least {buffer:.2f} points; live spot remains beyond the wall, "
-        f"1m momentum/VWAP align, tactical COI is confirmed, and futures regime is non-conflicting."
-    )
-    return Scenario(confirmed_state, direction, min(98.0, scenario.confidence + 2.0), reason,
-                    scenario.wall_level, scenario.wall_state, True, None, features)
-
-
-def _structure_test_count(bars: pd.DataFrame, level: float, side: str, tolerance: float,
-                          breakout_buffer: float = 0.0) -> int:
-    """Count separate test-and-retreat episodes, not candles within one continuous touch cluster.
-
-    A second test is counted only after price has moved materially away from the boundary.
-    This prevents a flat grind touching the same level for several candles from being treated
-    as several independent rejections. A close accepted beyond the boundary is not a rejection.
-    """
-    if bars is None or bars.empty or not finite(level):
-        return 0
-    side = str(side or "").upper()
-    if side not in {"RESISTANCE", "SUPPORT"}:
-        return 0
-    tested = 0
-    in_touch_cluster = False
-    separation = max(1.5 * max(0.0, tolerance), max(0.5 * max(0.0, breakout_buffer), 1.0))
-    for _, bar in bars.iterrows():
-        high = safe_float(bar.get("high"), float("nan"))
-        low = safe_float(bar.get("low"), float("nan"))
-        close = safe_float(bar.get("close"), float("nan"))
-        if not all(finite(v) for v in (high, low, close)):
-            continue
-        if side == "RESISTANCE":
-            hit = high >= level - tolerance and high <= level + max(2.0 * tolerance, breakout_buffer)
-            accepted = close > level + breakout_buffer
-            moved_away = close <= level - separation and high < level - tolerance
-        else:
-            hit = low <= level + tolerance and low >= level - max(2.0 * tolerance, breakout_buffer)
-            accepted = close < level - breakout_buffer
-            moved_away = close >= level + separation and low > level + tolerance
-        if accepted:
-            in_touch_cluster = False
-            continue
-        if hit and not in_touch_cluster:
-            tested += 1
-            in_touch_cluster = True
-        elif in_touch_cluster and moved_away:
-            in_touch_cluster = False
-    return tested
-
-
-def _merge_structure_levels(raw: Sequence[tuple[float, str, str]], tolerance: float) -> list[tuple[float, str, str]]:
-    """Deduplicate clustered price/OI levels; prefer an observed OI wall when levels overlap."""
-    candidates = [(float(level), str(source), str(state)) for level, source, state in raw if finite(level) and level > 0]
-    candidates.sort(key=lambda item: (0 if "OI_WALL" in item[1] else 1, item[0]))
-    merged: list[tuple[float, str, str]] = []
-    for level, source, state in candidates:
-        existing = next((idx for idx, (known, _, _) in enumerate(merged) if abs(known - level) <= tolerance), None)
-        if existing is None:
-            merged.append((level, source, state))
-            continue
-        known, known_source, known_state = merged[existing]
-        if "OI_WALL" in source and "OI_WALL" not in known_source:
-            merged[existing] = (level, source, state)
-        elif "OI_WALL" not in known_source and "5M_PIVOT" in source:
-            merged[existing] = (level, source, state)
-        else:
-            merged[existing] = (known, known_source, known_state)
-    return merged
-
-
-def detect_structural_wall_reaction(
-    frame: pd.DataFrame, indicators: IndicatorSet, oi: OIAnalysis,
-    now: datetime, config: Config, future_regime: str = "UNKNOWN",
-) -> Optional[Scenario]:
-    """Classify a tested support/resistance as reaction, confirmed breach, or wait-only compression.
-
-    Levels come from intact OI walls, completed 5m pivots, confirmed recent 1m pivots, and
-    session extremes. Rejection/bounce requires at least two separate completed-bar tests,
-    a completed price turn, independent directional evidence, and no strong flow/futures veto.
-    Breakout/breakdown requires two completed closes beyond a previously tested boundary.
-    """
-    bars = completed_one_minute_candles(frame, now)
-    # Three complete 1m bars are sufficient for a tested-boundary reclaim when two
-    # distinct lows/highs plus two closes are already present. Do not impose a fixed
-    # seven-bar delay after a valid early support/resistance reaction.
-    if len(bars) < 3 or not finite(indicators.atr) or indicators.atr <= 0:
-        return None
-    if not finite(indicators.spot) or indicators.spot <= 0:
-        return None
-
-    step = infer_strike_step(list(oi.rows))
-    tolerance = min(max(0.10 * indicators.atr, 0.12 * step, 2.0), 0.22 * step)
-    displacement = max(0.10 * indicators.atr, 2.0)
-    buffer = max(0.08 * indicators.atr, 0.08 * step, 2.0)
-    recent = bars.tail(24).copy().reset_index(drop=True)
-    if len(recent) < 3:
-        return None
-    for col in ("open", "high", "low", "close"):
-        recent[col] = pd.to_numeric(recent[col], errors="coerce")
-    recent = recent.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
-    if len(recent) < 3:
-        return None
-
-    resistance_raw: list[tuple[float, str, str]] = []
-    support_raw: list[tuple[float, str, str]] = []
-    for wall in oi.walls_resistance:
-        if wall.state in {"BUILDING", "STABLE", "WEAKENING"}:
-            resistance_raw.append((wall.strike, "CALL_OI_WALL", wall.state))
-    for wall in oi.walls_support:
-        if wall.state in {"BUILDING", "STABLE", "WEAKENING"}:
-            support_raw.append((wall.strike, "PUT_OI_WALL", wall.state))
-
-    if finite(indicators.swing_high_5m):
-        resistance_raw.append((indicators.swing_high_5m, "CONFIRMED_5M_PIVOT", "PRICE_ACTION"))
-    if finite(indicators.swing_low_5m):
-        support_raw.append((indicators.swing_low_5m, "CONFIRMED_5M_PIVOT", "PRICE_ACTION"))
-    if finite(indicators.swing_high):
-        resistance_raw.append((indicators.swing_high, "RECENT_1M_SWING_HIGH", "PRICE_ACTION"))
-    if finite(indicators.swing_low):
-        support_raw.append((indicators.swing_low, "RECENT_1M_SWING_LOW", "PRICE_ACTION"))
-    if finite(indicators.session_high):
-        resistance_raw.append((indicators.session_high, "SESSION_HIGH", "PRICE_ACTION"))
-    if finite(indicators.session_low):
-        support_raw.append((indicators.session_low, "SESSION_LOW", "PRICE_ACTION"))
-
-    # Add confirmed local extrema: two bars on each side confirm the pivot, preventing look-ahead.
-    highs = recent["high"].astype(float).tolist()
-    lows = recent["low"].astype(float).tolist()
-    for idx in range(2, len(recent) - 2):
-        if highs[idx] >= max(highs[idx - 2:idx]) and highs[idx] >= max(highs[idx + 1:idx + 3]):
-            resistance_raw.append((highs[idx], "CONFIRMED_1M_PIVOT", "PRICE_ACTION"))
-        if lows[idx] <= min(lows[idx - 2:idx]) and lows[idx] <= min(lows[idx + 1:idx + 3]):
-            support_raw.append((lows[idx], "CONFIRMED_1M_PIVOT", "PRICE_ACTION"))
-
-    resistance_levels = _merge_structure_levels(resistance_raw, tolerance)
-    support_levels = _merge_structure_levels(support_raw, tolerance)
-    # Keep reaction zones local: wide strike-step proximity was repeatedly tagging stale pivots.
-    proximity = max(0.75 * step, 1.5 * indicators.atr)
-    tactical = bool(oi.tactical_available and finite(oi.call_coi_pct) and finite(oi.put_coi_pct))
-    trigger = max(config.oi_velocity_trigger, 0.0001)
-
-    # Independent market-context confirmations; OI is corroboration, not a standalone direction call.
-    vwap_bull = finite(indicators.vwap) and indicators.spot >= indicators.vwap
-    vwap_bear = finite(indicators.vwap) and indicators.spot <= indicators.vwap
-    # Indicators are preferred; if their 1m momentum field is unavailable, derive the
-    # very-short-term direction from the last two completed 1m closes. This is not a
-    # substitute for the independent OI/VWAP/DI checks below, but avoids a needless late
-    # entry solely because an optional precomputed field is missing.
-    close_series = pd.to_numeric(recent["close"], errors="coerce").dropna()
-    derived_momentum_1m = ((float(close_series.iloc[-1]) / float(close_series.iloc[-2]) - 1.0)
-                           if len(close_series) >= 2 and float(close_series.iloc[-2]) > 0 else float("nan"))
-    momentum_1m = safe_float(indicators.momentum_1m_pct, float("nan"))
-    if not finite(momentum_1m):
-        momentum_1m = derived_momentum_1m
-    momentum_bull = ((finite(momentum_1m) and momentum_1m > 0.0)
-                     and (not finite(indicators.momentum_3m_pct) or indicators.momentum_3m_pct >= -0.00010))
-    momentum_bear = ((finite(momentum_1m) and momentum_1m < 0.0)
-                     and (not finite(indicators.momentum_3m_pct) or indicators.momentum_3m_pct <= 0.00010))
-    di_bull = (finite(indicators.adx) and indicators.adx >= 18.0 and finite(indicators.plus_di)
-               and finite(indicators.minus_di) and indicators.plus_di > indicators.minus_di + 1.0)
-    di_bear = (finite(indicators.adx) and indicators.adx >= 18.0 and finite(indicators.plus_di)
-               and finite(indicators.minus_di) and indicators.minus_di > indicators.plus_di + 1.0)
-    flow_bull = tactical and ((oi.put_coi_pct >= trigger) or (oi.call_coi_pct <= -trigger))
-    flow_bear = tactical and ((oi.call_coi_pct >= trigger) or (oi.put_coi_pct <= -trigger))
-    flow_bull_conflict = tactical and oi.put_coi_pct <= -2.0 * trigger and oi.call_coi_pct >= trigger
-    flow_bear_conflict = tactical and oi.call_coi_pct <= -2.0 * trigger and oi.put_coi_pct >= trigger
-
-    latest = recent.iloc[-1]
-    previous = recent.iloc[-2]
-    latest_close = safe_float(latest["close"])
-    latest_open = safe_float(latest["open"])
-    previous_close = safe_float(previous["close"])
-    last_two = recent.tail(2)
-    last_two_closes = pd.to_numeric(last_two["close"], errors="coerce").tolist()
-    recent_touch_window = recent.tail(14)
-    pre_break_window = recent.iloc[:-2].tail(14)
-
-    # 1) Confirm structural breach first; a breakout after repeated tests outranks a fading-wall watch.
-    for side, levels in (("RESISTANCE", resistance_levels), ("SUPPORT", support_levels)):
-        for level, source, wall_state in levels:
-            distance = abs(indicators.spot - level)
-            if distance > max(4.0 * indicators.atr, 3.0 * step):
-                continue
-            prior_tests = _structure_test_count(pre_break_window, level, side, tolerance, buffer)
-            if prior_tests < 2 or len(last_two_closes) != 2 or not all(finite(v) for v in last_two_closes):
-                continue
-            if side == "RESISTANCE":
-                crossed = all(v >= level + buffer for v in last_two_closes) and indicators.spot >= level + buffer
-                flow_ok, flow_conflict = flow_bull, flow_bear_conflict
-                aligned = vwap_bull and momentum_bull and (di_bull or (finite(indicators.rsi) and indicators.rsi >= 52.0))
-                direction, state = "BULLISH", "CONFIRMED_BULLISH_BREAKOUT"
-            else:
-                crossed = all(v <= level - buffer for v in last_two_closes) and indicators.spot <= level - buffer
-                flow_ok, flow_conflict = flow_bear, flow_bull_conflict
-                aligned = vwap_bear and momentum_bear and (di_bear or (finite(indicators.rsi) and indicators.rsi <= 48.0))
-                direction, state = "BEARISH", "CONFIRMED_BEARISH_BREAKDOWN"
-            if not crossed or not aligned or not flow_ok or flow_conflict or futures_regime_conflicts(direction, future_regime):
-                continue
-            # The final readiness gate rechecks futures, option quote/score, and structural risk.
-            close_stamp = parse_timestamp(last_two.iloc[-1].get("timestamp"))
-            return Scenario(
-                state, direction, 82.0,
-                f"Confirmed {direction.lower()} breach of tested {side.lower()} boundary {level:.2f}: two completed 1m closes and live spot cleared the level; VWAP, momentum, directional DI/RSI, and tactical OI agree.",
-                float(level), wall_state, True, None,
-                {"setup_route": "TESTED_STRUCTURAL_BOUNDARY_BREAK", "structure_confirmed": True,
-                 "awaiting_completed_1m_breakout_close": False,
-                 "structure_source": source, "wall_level": float(level), "wall_state": wall_state,
-                 "repeated_test_count": prior_tests, "completed_1m_close": latest_close,
-                 "completed_bar_timestamp": ist_iso(close_stamp or now),
-                 "breakout_confirmation": {"close_crossed_wall": True, "tactical_flow_confirmed": bool(flow_ok),
-                     "vwap_alignment": True, "one_minute_momentum_alignment": True,
-                     "futures_non_conflicting": True, "two_distinct_closes_confirmed": True,
-                     "structure_source": source},
-                 "flow_conflict": False, "price_action_confirmations": 3 + int(bool(flow_ok))},
-            )
-
-    # 2) Repeated rejection/bounce at a boundary; never infer it from a single touch or OI wall alone.
-    reactions: list[Scenario] = []
-    for level, source, wall_state in resistance_levels:
-        if level < indicators.spot - tolerance or level - indicators.spot > proximity:
-            continue
-        tests = _structure_test_count(recent_touch_window, level, "RESISTANCE", tolerance, buffer)
-        # A continuous cluster of tests must not be mistaken for separate rejection episodes.
-        # However, two distinct highs inside the boundary zone followed by two completed closes
-        # back below an OI resistance is a valid reclaim/rejection pattern and should not wait
-        # for price to retest the wall a third time.
-        cluster_depth = max(2.0 * tolerance, 0.30 * step, 2.0 * buffer)
-        cluster_touches = int(((pd.to_numeric(recent_touch_window["high"], errors="coerce") >= level - tolerance)
-                               & (pd.to_numeric(recent_touch_window["high"], errors="coerce") <= level + cluster_depth)).sum())
-        reclaim_closes = bool(len(last_two_closes) == 2 and all(finite(v) and v <= level - max(displacement, buffer) for v in last_two_closes))
-        clustered_reclaim = bool("CALL_OI_WALL" in source and cluster_touches >= 2 and reclaim_closes
-                                 and latest_close < previous_close and indicators.spot <= level - 0.25 * displacement)
-        effective_tests = max(tests, cluster_touches if clustered_reclaim else tests)
-        if effective_tests < 2:
-            continue
-        closes_below = latest_close <= level - displacement and indicators.spot <= level - 0.25 * displacement
-        price_turn = latest_close < latest_open or latest_close < previous_close
-        confirmations = int(vwap_bear) + int(momentum_bear) + int(di_bear) + int(flow_bear)
-        directional_context = vwap_bear and momentum_bear and (di_bear or flow_bear)
-        if not (closes_below and price_turn) or not directional_context or flow_bear_conflict or futures_regime_conflicts("BEARISH", future_regime):
-            continue
-        confidence = min(91.0, 66.0 + min(8.0, 2.0 * (effective_tests - 2))
-                         + 4.0 * int(vwap_bear) + 4.0 * int(momentum_bear)
-                         + 4.0 * int(di_bear) + 4.0 * int(flow_bear))
-        reactions.append(Scenario(
-            "STRUCTURAL_RESISTANCE_REJECTION", "BEARISH", confidence,
-            f"Repeated resistance rejection at {level:.2f} ({source}): {effective_tests} observed boundary tests, latest close {latest_close:.2f} moved away from the level; {confirmations} independent directional confirmations.",
-            float(level), wall_state, True, None,
-            {"setup_route": "STRUCTURAL_LEVEL_INTERACTION", "reaction": "RESISTANCE_REJECTION",
-             "structure_source": source, "wall_level": float(level), "wall_strike": float(level),
-             "wall_state": wall_state, "wall_tested": True, "repeated_test_count": effective_tests,
-             "wall_rejection_confirmed": True, "price_turn_confirmed": True,
-             "clustered_reclaim_confirmed": bool(clustered_reclaim),
-             "completed_1m_close": latest_close, "completed_bar_timestamp": ist_iso(parse_timestamp(latest.get("timestamp")) or now),
-             "tactical_flow_confirmed": bool(flow_bear), "vwap_alignment": bool(vwap_bear),
-             "momentum_alignment": bool(momentum_bear), "directional_di_alignment": bool(di_bear),
-             "structure_confirmation_count": confirmations, "flow_conflict": False,
-             "price_action_confirmations": int(vwap_bear) + int(momentum_bear) + int(di_bear)},
-        ))
-        break
-
-    for level, source, wall_state in support_levels:
-        if level > indicators.spot + tolerance or indicators.spot - level > proximity:
-            continue
-        tests = _structure_test_count(recent_touch_window, level, "SUPPORT", tolerance, buffer)
-        # Early entries after an OI-wall reclaim should not require a fully separated second
-        # retest. Require multiple distinct 1m lows in a tightly bounded zone, then two completed
-        # closes and live spot back above the boundary. Directional OI/VWAP/momentum/DI and
-        # futures confirmation remain mandatory below, so this does not authorize a wick-only buy.
-        cluster_depth = max(2.0 * tolerance, 0.30 * step, 2.0 * buffer)
-        cluster_touches = int(((pd.to_numeric(recent_touch_window["low"], errors="coerce") <= level + tolerance)
-                               & (pd.to_numeric(recent_touch_window["low"], errors="coerce") >= level - cluster_depth)).sum())
-        reclaim_closes = bool(len(last_two_closes) == 2 and all(finite(v) and v >= level + max(displacement, buffer) for v in last_two_closes))
-        clustered_reclaim = bool("PUT_OI_WALL" in source and cluster_touches >= 2 and reclaim_closes
-                                 and latest_close > previous_close and indicators.spot >= level + 0.25 * displacement)
-        effective_tests = max(tests, cluster_touches if clustered_reclaim else tests)
-        if effective_tests < 2:
-            continue
-        closes_above = latest_close >= level + displacement and indicators.spot >= level + 0.25 * displacement
-        price_turn = latest_close > latest_open or latest_close > previous_close
-        confirmations = int(vwap_bull) + int(momentum_bull) + int(di_bull) + int(flow_bull)
-        directional_context = vwap_bull and momentum_bull and (di_bull or flow_bull)
-        if not (closes_above and price_turn) or not directional_context or flow_bull_conflict or futures_regime_conflicts("BULLISH", future_regime):
-            continue
-        confidence = min(91.0, 66.0 + min(8.0, 2.0 * (effective_tests - 2))
-                         + 4.0 * int(vwap_bull) + 4.0 * int(momentum_bull)
-                         + 4.0 * int(di_bull) + 4.0 * int(flow_bull))
-        reactions.append(Scenario(
-            "STRUCTURAL_SUPPORT_BOUNCE", "BULLISH", confidence,
-            f"Repeated support bounce/reclaim at {level:.2f} ({source}): {effective_tests} observed boundary tests, latest close {latest_close:.2f} moved away from the level; {confirmations} independent directional confirmations.",
-            float(level), wall_state, True, None,
-            {"setup_route": "STRUCTURAL_LEVEL_INTERACTION", "reaction": "SUPPORT_BOUNCE",
-             "structure_source": source, "wall_level": float(level), "wall_strike": float(level),
-             "wall_state": wall_state, "wall_tested": True, "repeated_test_count": effective_tests,
-             "wall_hold_confirmed": True, "price_turn_confirmed": True,
-             "clustered_reclaim_confirmed": bool(clustered_reclaim),
-             "completed_1m_close": latest_close, "completed_bar_timestamp": ist_iso(parse_timestamp(latest.get("timestamp")) or now),
-             "tactical_flow_confirmed": bool(flow_bull), "vwap_alignment": bool(vwap_bull),
-             "momentum_alignment": bool(momentum_bull), "directional_di_alignment": bool(di_bull),
-             "structure_confirmation_count": confirmations, "flow_conflict": False,
-             "price_action_confirmations": int(vwap_bull) + int(momentum_bull) + int(di_bull)},
-        ))
-        break
-
-    if reactions:
-        return max(reactions, key=lambda item: (item.confidence, item.executable_candidate))
-
-    # 3) A repeatedly tested boundary with no confirmed directional response is wait-only.
-    # The detector applies this even when the whole-session compression flag is false.
-    last_five = recent_touch_window.tail(5)
-    compressed_range = safe_float(last_five["high"].max() - last_five["low"].min())
-    compression_limit = max(1.5 * indicators.atr, 0.35 * step)
-    range_compressing = finite(compressed_range) and compressed_range <= compression_limit
-    closes = pd.to_numeric(last_five["close"], errors="coerce").dropna().tolist()
-    net_progress_limit = max(0.65 * indicators.atr, 0.25 * step)
-    local_stall = bool(len(closes) >= 4 and abs(closes[-1] - closes[0]) <= net_progress_limit)
-    is_compressing = bool(indicators.compressed or range_compressing)
-    is_waiting = bool(is_compressing or local_stall)
-    for side, levels in (("RESISTANCE", resistance_levels), ("SUPPORT", support_levels)):
-        for level, source, wall_state in levels:
-            distance = abs(indicators.spot - level)
-            if distance > proximity:
-                continue
-            # A broken level behind spot is no longer an untouched boundary. Let the
-            # confirmed-break logic above own that case; do not call it compression.
-            if side == "RESISTANCE" and level < indicators.spot - tolerance:
-                continue
-            if side == "SUPPORT" and level > indicators.spot + tolerance:
-                continue
-            tests = _structure_test_count(recent_touch_window, level, side, tolerance, buffer)
-            if tests < 2 or not is_waiting:
-                continue
-            side_text = "resistance" if side == "RESISTANCE" else "support"
-            state_label = "compressing" if is_compressing else "stalling near"
-            return Scenario(
-                "STRUCTURAL_BOUNDARY_COMPRESSION", "NEUTRAL", 0.0,
-                f"NIFTY is {state_label} {side_text} {level:.2f} after {tests} separate completed-candle test episodes, but no confirmed rejection/bounce or two-close breach exists. Wait for a confirmed break with VWAP, momentum, directional/OI flow, and non-conflicting futures.",
-                float(level), wall_state, False, "STRUCTURAL_BOUNDARY_COMPRESSION",
-                {"setup_route": "STRUCTURAL_BOUNDARY_WAIT", "structure_source": source,
-                 "boundary_side": side, "wall_level": float(level), "wall_state": wall_state,
-                 "repeated_test_count": tests, "waiting_for_confirmed_breach": True,
-                 "completed_1m_close": latest_close, "compression_range": compressed_range,
-                 "compression_limit": compression_limit, "compression_detected": is_compressing},
-            )
-    return None
-
-def predictive_prebreakout_selection_gate(
-    scenario: Scenario, indicators: IndicatorSet, oi: OIAnalysis, risk: RiskPlan,
-    now: datetime, future_regime: str, config: Config,
-) -> tuple[bool, str, dict[str, Any]]:
-    """Keep pre-breakout watches diagnostic-only until a tested boundary is confirmed."""
-    state = str(scenario.state or "").upper()
-    eligible = state in {"PREDICTIVE_BULLISH_BREAKOUT", "PREDICTIVE_BEARISH_BREAKDOWN", "GAMMA_SQUEEZE"}
-    reason = ("PREBREAKOUT_SELECTION_DISABLED_WAIT_FOR_CONFIRMED_BOUNDARY_BREAK"
-              if eligible else "NOT_APPLICABLE_NO_PREDICTIVE_PREBREAKOUT_SELECTION")
-    return False, reason, {
-        "eligible_scenario": eligible, "passed": False,
-        "selection_policy": "WAIT_FOR_CONFIRMED_BOUNDARY_REJECTION_BOUNCE_OR_TWO_CLOSE_BREAK",
-        "rejection_reason": reason, "scenario": state, "checks": {},
-    }
-
-def directional_oi_structure_confirmation(
-    scenario: Scenario, indicators: IndicatorSet, oi: OIAnalysis, config: Config,
-) -> tuple[bool, str, dict[str, Any]]:
-    """Require the local OI structure at the actual setup boundary to support the entry.
-
-    Aggregate COI is context, not a substitute for the strike-level wall being traded.
-    For a bounce/rejection the corresponding PUT support/CALL resistance must exist and
-    not be weakening. For a confirmed break, the OI change at the crossed strike (or an
-    equivalent local wall transition) must support the direction. A nearby intact wall
-    directly ahead blocks entry until price clears it or the wall begins weakening.
-    """
-    state = str(scenario.state or "").upper()
-    direction = str(scenario.direction or "").upper()
-    applicable_states = {
-        "STRUCTURAL_SUPPORT_BOUNCE", "STRUCTURAL_RESISTANCE_REJECTION",
-        "CONFIRMED_BULLISH_BREAKOUT", "CONFIRMED_BEARISH_BREAKDOWN",
-        "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BULLISH", "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BEARISH",
-    }
-    evidence: dict[str, Any] = {
-        "applicable": state in applicable_states,
-        "scenario": state,
-        "direction": direction,
-        "passed": False,
-        "boundary_level": safe_float(scenario.wall_level, float("nan")),
-        "tactical_available": bool(oi.tactical_available),
-    }
-    if state not in applicable_states:
-        return False, "OI_STRUCTURE_NOT_APPLICABLE_TO_THIS_SCENARIO", evidence
-    if direction not in {"BULLISH", "BEARISH"}:
-        evidence["reason"] = "NO_DIRECTIONAL_SETUP"
-        return False, "OI_STRUCTURE_NO_DIRECTIONAL_SETUP", evidence
-    if (not oi.tactical_available or not isinstance(oi.rows, dict) or not oi.rows
-            or not finite(oi.call_coi_pct) or not finite(oi.put_coi_pct)):
-        evidence["reason"] = "TACTICAL_OI_BASELINE_UNAVAILABLE"
-        return False, "OI_STRUCTURE_TACTICAL_BASELINE_UNAVAILABLE", evidence
-
-    step = infer_strike_step(list(oi.rows))
-    atr5, atr_source = structural_stop_atr(indicators)
-    if not finite(step) or step <= 0:
-        evidence["reason"] = "STRIKE_STEP_UNAVAILABLE"
-        return False, "OI_STRUCTURE_STRIKE_STEP_UNAVAILABLE", evidence
-    if not finite(atr5) or atr5 <= 0:
-        atr5 = max(1.0, safe_float(indicators.atr, step / math.sqrt(5.0)) * math.sqrt(5.0))
-        atr_source = "ATR_1M_SQRT5_FALLBACK"
-
-    trigger = max(config.oi_velocity_trigger, 0.0002)
-    noise = 0.50 * trigger
-    anchor_radius = max(1.00 * step, 1.00 * atr5)
-    wall_clearance = max(1.00 * step, 0.75 * atr5)
-    breakout_chase_limit = max(1.00 * step, 1.25 * atr5)
-    boundary = safe_float(scenario.wall_level, float("nan"))
-
-    def closest_wall(walls: Sequence[StructuralWall], level: float, radius: float) -> Optional[StructuralWall]:
-        if not finite(level):
-            return None
-        candidates = [w for w in walls if finite(w.strike) and abs(float(w.strike) - level) <= radius]
-        return min(candidates, key=lambda w: abs(float(w.strike) - level)) if candidates else None
-
-    def row_at(level: float) -> tuple[Optional[float], Optional[Mapping[str, Any]]]:
-        if not finite(level) or not oi.rows:
-            return None, None
-        try:
-            key = min(oi.rows, key=lambda k: abs(float(k) - level))
-            if abs(float(key) - level) > max(0.70 * step, 3.0):
-                return None, None
-            row = oi.rows.get(key)
-            return (float(key), row if isinstance(row, Mapping) else None)
-        except (TypeError, ValueError):
-            return None, None
-
-    def local_flow(row: Optional[Mapping[str, Any]]) -> tuple[bool, bool, Optional[float], Optional[float]]:
-        if not isinstance(row, Mapping):
-            return False, False, None, None
-        call_change = safe_float(row.get("call_coi_pct"), float("nan"))
-        put_change = safe_float(row.get("put_coi_pct"), float("nan"))
-        call_value = call_change if finite(call_change) else None
-        put_value = put_change if finite(put_change) else None
-        if not (finite(call_change) and finite(put_change)):
-            return False, False, call_value, put_value
-        bullish_flow = ((call_change <= -trigger and put_change >= -noise)
-                        or (put_change >= trigger and call_change <= noise))
-        bearish_flow = ((put_change <= -trigger and call_change >= -noise)
-                        or (call_change >= trigger and put_change <= noise))
-        return bullish_flow, bearish_flow, call_value, put_value
-
-    call_agg, put_agg = oi.call_coi_pct, oi.put_coi_pct
-    global_bull = ((call_agg <= -trigger and put_agg >= -noise)
-                   or (put_agg >= trigger and call_agg >= -noise))
-    global_bear = ((put_agg <= -trigger and call_agg >= -noise)
-                   or (call_agg >= trigger and put_agg >= -noise))
-
-    boundary_strike, boundary_row = row_at(boundary)
-    boundary_bull, boundary_bear, boundary_call_change, boundary_put_change = local_flow(boundary_row)
-    evidence.update({
-        "oi_trigger_fraction": trigger,
-        "aggregate_call_change_fraction": call_agg,
-        "aggregate_put_change_fraction": put_agg,
-        "aggregate_bullish_flow": bool(global_bull),
-        "aggregate_bearish_flow": bool(global_bear),
-        "boundary_oi_strike": boundary_strike,
-        "boundary_call_change_fraction": boundary_call_change,
-        "boundary_put_change_fraction": boundary_put_change,
-        "boundary_local_bullish_flow": bool(boundary_bull),
-        "boundary_local_bearish_flow": bool(boundary_bear),
-        "anchor_radius_points": round(anchor_radius, 2),
-        "wall_clearance_points": round(wall_clearance, 2),
-        "breakout_chase_limit_points": round(breakout_chase_limit, 2),
-        "atr5_source": atr_source,
-    })
-
-    def wall_dict(wall: Optional[StructuralWall]) -> Optional[dict[str, Any]]:
-        if wall is None:
-            return None
-        return {"strike": float(wall.strike), "side": wall.side, "oi": float(wall.oi),
-                "change_fraction": wall.change_pct, "state": wall.state,
-                "distance_from_spot": round(abs(float(wall.strike) - indicators.spot), 2)}
-
-    # A structurally failed active signal can seed an opposite setup in the same scan.
-    # Its previous tracker already required a completed 3m pivot break and two independent
-    # adverse factors. The replacement must still be on the broken side of that pivot and
-    # the *current* tactical OI must support the new direction. Here the nearest OI wall
-    # in the new direction is a possible target, not an automatic entry veto; route_targets_and_stop
-    # enforces target ordering and minimum reward/risk against that exact wall.
-    if state in {"ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BULLISH", "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BEARISH"}:
-        expected_direction = "BULLISH" if state.endswith("BULLISH") else "BEARISH"
-        distance = abs(indicators.spot - boundary) if finite(boundary) else float("inf")
-        aligned_global = bool(global_bull if direction == "BULLISH" else global_bear)
-        aligned_local = bool(boundary_bull if direction == "BULLISH" else boundary_bear)
-        opposite_local = bool(boundary_bear if direction == "BULLISH" else boundary_bull)
-        global_strength = max(abs(call_agg), abs(put_agg)) if finite(call_agg) and finite(put_agg) else 0.0
-        strong_global_alignment = aligned_global and global_strength >= 2.0 * trigger
-        current_price_beyond_pivot = (
-            finite(boundary) and
-            (indicators.spot > boundary + max(1.0, 0.05 * atr5) if direction == "BULLISH"
-             else indicators.spot < boundary - max(1.0, 0.05 * atr5))
-        )
-        evidence.update({
-            "active_signal_reversal": True,
-            "expected_direction": expected_direction,
-            "active_failure_pivot": boundary,
-            "active_failure_close": safe_float((scenario.features or {}).get("structural_break_close"), float("nan")),
-            "breakout_distance_points": round(distance, 2) if finite(distance) else None,
-            "current_global_flow_aligned": aligned_global,
-            "current_local_flow_aligned": aligned_local,
-            "current_local_flow_conflicts": opposite_local,
-            "strong_global_alignment_overrides_local_noise": bool(strong_global_alignment),
-        })
-        if direction != expected_direction:
-            reason = "ACTIVE_REVERSAL_DIRECTION_MISMATCH"
-        elif not bool((scenario.features or {}).get("active_signal_reversal_confirmed")) or not bool((scenario.features or {}).get("structural_break_confirmed")):
-            reason = "ACTIVE_REVERSAL_LACKS_CONFIRMED_STRUCTURAL_FAILURE"
-        elif not current_price_beyond_pivot:
-            reason = "PRICE_RECLAIMED_FAILED_PIVOT_ACTIVE_REVERSAL_CANCELLED"
-        elif distance > breakout_chase_limit:
-            reason = f"ACTIVE_REVERSAL_ALREADY_EXTENDED_{distance:.1f}_POINTS_OVER_LIMIT_{breakout_chase_limit:.1f}"
-        elif opposite_local and not strong_global_alignment:
-            reason = "LOCAL_OI_FLOW_CONFLICTS_WITH_ACTIVE_REVERSAL"
-        elif not (aligned_global or aligned_local):
-            reason = "CURRENT_TACTICAL_OI_DOES_NOT_CONFIRM_ACTIVE_REVERSAL"
-        else:
-            reason = "CONFIRMED_STRUCTURAL_FAILURE_AND_CURRENT_DIRECTIONAL_OI_ALIGNED"
-        passed = reason == "CONFIRMED_STRUCTURAL_FAILURE_AND_CURRENT_DIRECTIONAL_OI_ALIGNED"
-
-    # A valid directional entry may not run directly into an intact opposing wall.
-    elif state == "STRUCTURAL_SUPPORT_BOUNCE" and direction == "BULLISH":
-        support = closest_wall(oi.walls_support, boundary, anchor_radius)
-        support_strike = float(support.strike) if support else float("nan")
-        _, support_row = row_at(support_strike)
-        support_bull, support_bear, support_call_change, support_put_change = local_flow(support_row)
-        overhead = [w for w in oi.walls_resistance
-                    if w.strike > indicators.spot and w.state in {"BUILDING", "STABLE", "UNKNOWN"}
-                    and (float(w.strike) - indicators.spot) <= wall_clearance]
-        blocking = min(overhead, key=lambda w: w.strike) if overhead else None
-        evidence.update({"tested_put_support": wall_dict(support), "support_local_bullish_flow": support_bull,
-                         "support_local_bearish_flow": support_bear, "support_call_change_fraction": support_call_change,
-                         "support_put_change_fraction": support_put_change, "nearby_overhead_call_wall": wall_dict(blocking)})
-        if support is None:
-            reason = "NO_MATERIAL_PUT_OI_SUPPORT_AT_TESTED_BOUNDARY"
-        elif support.state not in {"BUILDING", "STABLE"}:
-            reason = f"PUT_OI_SUPPORT_{support.state}_AT_{support.strike:.0f}"
-        elif support_bear:
-            reason = "LOCAL_PUT_SUPPORT_OI_CONFLICTS_WITH_BULLISH_BOUNCE"
-        elif blocking is not None:
-            reason = f"INTACT_CALL_OI_WALL_{blocking.state}_{blocking.strike:.0f}_ONLY_{blocking.strike-indicators.spot:.1f}_POINTS_AHEAD"
-        elif not (support_bull or global_bull):
-            reason = "PUT_SUPPORT_NOT_CONFIRMED_BY_LOCAL_OR_AGGREGATE_TACTICAL_OI_FLOW"
-        else:
-            reason = "LOCAL_PUT_SUPPORT_AND_DIRECTIONAL_OI_FLOW_CONFIRMED"
-        passed = reason == "LOCAL_PUT_SUPPORT_AND_DIRECTIONAL_OI_FLOW_CONFIRMED"
-
-    elif state == "STRUCTURAL_RESISTANCE_REJECTION" and direction == "BEARISH":
-        resistance = closest_wall(oi.walls_resistance, boundary, anchor_radius)
-        resistance_strike = float(resistance.strike) if resistance else float("nan")
-        _, resistance_row = row_at(resistance_strike)
-        resistance_bull, resistance_bear, resistance_call_change, resistance_put_change = local_flow(resistance_row)
-        evidence.update({"tested_call_resistance": wall_dict(resistance),
-                         "resistance_local_bullish_flow": resistance_bull,
-                         "resistance_local_bearish_flow": resistance_bear,
-                         "resistance_call_change_fraction": resistance_call_change,
-                         "resistance_put_change_fraction": resistance_put_change})
-        if resistance is None:
-            reason = "NO_MATERIAL_CALL_OI_RESISTANCE_AT_TESTED_BOUNDARY"
-        elif resistance.state not in {"BUILDING", "STABLE"}:
-            reason = f"CALL_OI_RESISTANCE_{resistance.state}_AT_{resistance.strike:.0f}"
-        elif resistance_bull:
-            reason = "LOCAL_CALL_RESISTANCE_OI_CONFLICTS_WITH_BEARISH_REJECTION"
-        elif not (resistance_bear or global_bear):
-            reason = "CALL_RESISTANCE_NOT_CONFIRMED_BY_DIRECTIONAL_TACTICAL_OI_FLOW"
-        else:
-            reason = "LOCAL_CALL_RESISTANCE_AND_DIRECTIONAL_OI_FLOW_CONFIRMED"
-        passed = reason == "LOCAL_CALL_RESISTANCE_AND_DIRECTIONAL_OI_FLOW_CONFIRMED"
-
-    elif state == "CONFIRMED_BULLISH_BREAKOUT" and direction == "BULLISH":
-        overhead = [w for w in oi.walls_resistance
-                    if w.strike > indicators.spot and w.state in {"BUILDING", "STABLE", "UNKNOWN"}
-                    and (float(w.strike) - indicators.spot) <= wall_clearance]
-        blocking = min(overhead, key=lambda w: w.strike) if overhead else None
-        support = closest_wall(oi.walls_support, boundary, anchor_radius)
-        support_bull = False
-        if support is not None:
-            _, support_row = row_at(float(support.strike))
-            support_bull, _, _, _ = local_flow(support_row)
-        distance = abs(indicators.spot - boundary) if finite(boundary) else float("inf")
-        evidence.update({"nearby_overhead_call_wall": wall_dict(blocking), "boundary_put_support": wall_dict(support),
-                         "support_local_bullish_flow": support_bull, "breakout_distance_points": round(distance, 2) if finite(distance) else None})
-        if not finite(boundary):
-            reason = "BREAKOUT_BOUNDARY_UNAVAILABLE"
-        elif distance > breakout_chase_limit:
-            reason = f"BREAKOUT_ALREADY_EXTENDED_{distance:.1f}_POINTS_OVER_LIMIT_{breakout_chase_limit:.1f}"
-        elif blocking is not None:
-            reason = f"INTACT_CALL_OI_WALL_{blocking.state}_{blocking.strike:.0f}_TOO_CLOSE_AHEAD"
-        elif boundary_bear:
-            reason = "BROKEN_BOUNDARY_LOCAL_OI_CONFLICTS_WITH_BULLISH_BREAKOUT"
-        elif not (boundary_bull or global_bull or (support is not None and support.state == "BUILDING" and support_bull)):
-            reason = "BROKEN_BOUNDARY_LACKS_LOCAL_BULLISH_OI_TRANSITION"
-        else:
-            reason = "LOCAL_BULLISH_OI_TRANSITION_AND_BREAKOUT_CLEARANCE_CONFIRMED"
-        passed = reason == "LOCAL_BULLISH_OI_TRANSITION_AND_BREAKOUT_CLEARANCE_CONFIRMED"
-
-    elif state == "CONFIRMED_BEARISH_BREAKDOWN" and direction == "BEARISH":
-        below = [w for w in oi.walls_support
-                 if w.strike < indicators.spot and w.state in {"BUILDING", "STABLE", "UNKNOWN"}
-                 and (indicators.spot - float(w.strike)) <= wall_clearance]
-        blocking = max(below, key=lambda w: w.strike) if below else None
-        resistance = closest_wall(oi.walls_resistance, boundary, anchor_radius)
-        _, resistance_row = row_at(float(resistance.strike)) if resistance is not None else (None, None)
-        resistance_bull, resistance_bear, _, _ = local_flow(resistance_row)
-        distance = abs(indicators.spot - boundary) if finite(boundary) else float("inf")
-        evidence.update({"nearby_below_put_wall": wall_dict(blocking), "boundary_call_resistance": wall_dict(resistance),
-                         "resistance_local_bearish_flow": resistance_bear, "breakout_distance_points": round(distance, 2) if finite(distance) else None})
-        if not finite(boundary):
-            reason = "BREAKDOWN_BOUNDARY_UNAVAILABLE"
-        elif distance > breakout_chase_limit:
-            reason = f"BREAKDOWN_ALREADY_EXTENDED_{distance:.1f}_POINTS_OVER_LIMIT_{breakout_chase_limit:.1f}"
-        elif blocking is not None:
-            reason = f"INTACT_PUT_OI_WALL_{blocking.state}_{blocking.strike:.0f}_TOO_CLOSE_BELOW"
-        elif boundary_bull or resistance_bull:
-            reason = "BROKEN_BOUNDARY_LOCAL_OI_CONFLICTS_WITH_BEARISH_BREAKDOWN"
-        elif not (boundary_bear or global_bear or (resistance is not None and resistance.state == "BUILDING" and resistance_bear)):
-            reason = "BROKEN_BOUNDARY_LACKS_LOCAL_BEARISH_OI_TRANSITION"
-        else:
-            reason = "LOCAL_BEARISH_OI_TRANSITION_AND_BREAKDOWN_CLEARANCE_CONFIRMED"
-        passed = reason == "LOCAL_BEARISH_OI_TRANSITION_AND_BREAKDOWN_CLEARANCE_CONFIRMED"
-    else:
-        reason, passed = "SCENARIO_DIRECTION_MISMATCH", False
-
-    evidence["reason"] = reason
-    evidence["passed"] = bool(passed)
-    return bool(passed), reason, evidence
-
-
-def selection_trigger_confirmation(
-    scenario: Scenario, indicators: IndicatorSet, oi: OIAnalysis, config: Config,
-    future_regime: str = "UNKNOWN",
-) -> tuple[bool, str]:
-    """Require price/market confirmation and directional OI at the traded boundary.
-
-    The OI structure gate is local to the tested boundary, not merely aggregate PCR/COI.
-    This prevents a price-action pivot from being mistaken for defended OI support and
-    avoids entry directly beneath an intact opposing wall. It deliberately accepts a
-    confirmed local OI transition even when aggregate call and put OI both decrease.
-    """
-    direction = str(scenario.direction or "").upper()
-    if direction not in {"BULLISH", "BEARISH"}:
-        return False, "NO_DIRECTIONAL_SETUP"
-    if scenario.hard_veto:
-        return False, f"MARKET_HARD_VETO:{scenario.hard_veto}"
-    if not scenario.executable_candidate:
-        return False, "SCENARIO_NOT_EXECUTABLE_OR_CONFIRMATION_INCOMPLETE"
-    if futures_regime_conflicts(direction, future_regime):
-        return False, f"FUTURES_REGIME_CONFLICT:{str(future_regime).upper()}"
-
-    features = scenario.features if isinstance(scenario.features, Mapping) else {}
-    state = str(scenario.state or "").upper()
-    if state in {"CONFIRMED_BULLISH_CONTINUATION", "CONFIRMED_BEARISH_CONTINUATION", "BULLISH_CONTINUATION", "BEARISH_CONTINUATION"}:
-        return False, "GENERIC_CONTINUATION_NOT_TESTED_STRUCTURAL_BOUNDARY"
-
-    structural_ok = False
-    structural_reason = "NO_CONFIRMED_SUPPORT_RESISTANCE_INTERACTION"
-    if state == "STRUCTURAL_SUPPORT_BOUNCE" and direction == "BULLISH":
-        wall_state = str(features.get("wall_state", scenario.wall_state)).upper()
-        structural_ok = bool(
-            features.get("reaction") == "SUPPORT_BOUNCE"
-            and features.get("wall_tested") and int(safe_float(features.get("repeated_test_count"), 0)) >= 2
-            and features.get("wall_hold_confirmed") and features.get("price_turn_confirmed")
-            and int(safe_float(features.get("structure_confirmation_count"), 0)) >= 2
-            and not features.get("flow_conflict")
-            and wall_state in {"BUILDING", "STABLE", "WEAKENING", "PRICE_ACTION"}
-            and finite(features.get("wall_strike", scenario.wall_level))
-        )
-        structural_reason = "CONFIRMED_SUPPORT_BOUNCE" if structural_ok else "SUPPORT_BOUNCE_CONFIRMATION_INCOMPLETE"
-
-    elif state == "STRUCTURAL_RESISTANCE_REJECTION" and direction == "BEARISH":
-        wall_state = str(features.get("wall_state", scenario.wall_state)).upper()
-        structural_ok = bool(
-            features.get("reaction") == "RESISTANCE_REJECTION"
-            and features.get("wall_tested") and int(safe_float(features.get("repeated_test_count"), 0)) >= 2
-            and features.get("wall_rejection_confirmed") and features.get("price_turn_confirmed")
-            and int(safe_float(features.get("structure_confirmation_count"), 0)) >= 2
-            and not features.get("flow_conflict")
-            and wall_state in {"BUILDING", "STABLE", "WEAKENING", "PRICE_ACTION"}
-            and finite(features.get("wall_strike", scenario.wall_level))
-        )
-        structural_reason = "CONFIRMED_RESISTANCE_REJECTION" if structural_ok else "RESISTANCE_REJECTION_CONFIRMATION_INCOMPLETE"
-
-    elif state in {"CONFIRMED_BULLISH_BREAKOUT", "CONFIRMED_BEARISH_BREAKDOWN"}:
-        conf = features.get("breakout_confirmation") if isinstance(features.get("breakout_confirmation"), Mapping) else {}
-        expected_direction = "BULLISH" if state == "CONFIRMED_BULLISH_BREAKOUT" else "BEARISH"
-        structural_ok = bool(
-            direction == expected_direction
-            and not features.get("awaiting_completed_1m_breakout_close", True)
-            and conf.get("close_crossed_wall")
-            and conf.get("tactical_flow_confirmed")
-            and conf.get("vwap_alignment")
-            and conf.get("one_minute_momentum_alignment")
-            and conf.get("futures_non_conflicting")
-        )
-        structural_reason = (("CONFIRMED_STRUCTURAL_BREAKOUT" if direction == "BULLISH" else "CONFIRMED_STRUCTURAL_BREAKDOWN")
-                             if structural_ok else "BREAKOUT_CONFIRMATION_INCOMPLETE")
-
-    elif state in {"ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BULLISH", "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BEARISH"}:
-        expected_direction = "BULLISH" if state.endswith("BULLISH") else "BEARISH"
-        pivot = safe_float(scenario.wall_level, float("nan"))
-        atr5, _atr_source = structural_stop_atr(indicators)
-        if not finite(atr5) or atr5 <= 0:
-            atr5 = indicators.atr * math.sqrt(5.0) if finite(indicators.atr) and indicators.atr > 0 else 0.0
-        pivot_buffer = max(1.0, min(0.05 * atr5, 2.0)) if atr5 > 0 else 1.0
-        current_beyond_pivot = finite(pivot) and (
-            indicators.spot > pivot + pivot_buffer if direction == "BULLISH"
-            else indicators.spot < pivot - pivot_buffer
-        )
-        momentum3 = safe_float(indicators.momentum_3m_pct, float("nan"))
-        momentum1 = safe_float(indicators.momentum_1m_pct, float("nan"))
-        momentum_aligned = (
-            (finite(momentum3) and (momentum3 >= 0.00010 if direction == "BULLISH" else momentum3 <= -0.00010))
-            or (finite(momentum1) and (momentum1 >= 0.00010 if direction == "BULLISH" else momentum1 <= -0.00010))
-        )
-        failure_evidence = features.get("structural_failure_evidence") if isinstance(features.get("structural_failure_evidence"), Mapping) else {}
-        prior_confirmation = bool(
-            sum(bool(value) for value in failure_evidence.values()) >= 2
-            and (failure_evidence.get("MOMENTUM_3M") or failure_evidence.get("TACTICAL_OI"))
-        )
-        structural_ok = bool(
-            direction == expected_direction
-            and features.get("active_signal_reversal_confirmed")
-            and features.get("structural_break_confirmed")
-            and features.get("current_directional_oi_confirmed")
-            and prior_confirmation
-            and current_beyond_pivot
-            and momentum_aligned
-        )
-        structural_reason = "CONFIRMED_ACTIVE_SIGNAL_REVERSAL" if structural_ok else "ACTIVE_SIGNAL_REVERSAL_CONFIRMATION_INCOMPLETE"
-
-    elif state == "EXHAUSTION_REVERSAL":
-        return False, "EXHAUSTION_SETUP_REQUIRES_CONFIRMED_STRUCTURAL_BOUNDARY_INTERACTION"
-
-    if not structural_ok:
-        return False, structural_reason
-    oi_ok, oi_reason, _evidence = directional_oi_structure_confirmation(scenario, indicators, oi, config)
-    if not oi_ok:
-        return False, f"OI_STRUCTURE_GATE:{oi_reason}"
-    return True, f"{structural_reason};OI_STRUCTURE:{oi_reason}"
-
-def detect_reversal_watch(
-    frame: pd.DataFrame, indicators: IndicatorSet, oi: OIAnalysis,
-    now: datetime, config: Config,
-) -> Optional[Scenario]:
-    """Detect early 1m reversal watches independently of trade-entry vetoes.
-
-    This function never authorizes an entry. It allows the scanner to notify about
-    a plausible turn while the global sideways gate still blocks directional buying.
-    A watch requires multiple price/indicator cues; a single RSI value or candle is
-    insufficient. OI conflict is reported, never silently ignored.
-    """
-    bars = completed_one_minute_candles(frame, now).tail(8).copy()
-    if len(bars) < 4 or not finite(indicators.atr) or indicators.atr <= 0:
-        return None
-    spot, atr = indicators.spot, indicators.atr
-    if not finite(spot) or spot <= 0:
-        return None
-    for column in ("open", "high", "low", "close"):
-        bars[column] = pd.to_numeric(bars[column], errors="coerce")
-    bars = bars.dropna(subset=["open", "high", "low", "close"])
-    if len(bars) < 4:
-        return None
-
-    last, prior = bars.iloc[-1], bars.iloc[-2]
-    recent3 = bars.tail(3)
-    earlier3 = bars.iloc[-6:-3] if len(bars) >= 6 else bars.iloc[:-3]
-    recent_low = safe_float(recent3["low"].min(), float("nan"))
-    recent_high = safe_float(recent3["high"].max(), float("nan"))
-    previous_low = safe_float(earlier3["low"].min(), float("nan")) if not earlier3.empty else float("nan")
-    previous_high = safe_float(earlier3["high"].max(), float("nan")) if not earlier3.empty else float("nan")
-    last_close = safe_float(last["close"], float("nan"))
-    last_open = safe_float(last["open"], float("nan"))
-    prior_close = safe_float(prior["close"], float("nan"))
-    if not all(finite(v) for v in (recent_low, recent_high, last_close, last_open, prior_close)):
-        return None
-
-    momentum, rsi, vwap = indicators.momentum_3m_pct, indicators.rsi, indicators.vwap
-    di_bull = finite(indicators.plus_di) and finite(indicators.minus_di) and indicators.plus_di > indicators.minus_di + 1.0
-    di_bear = finite(indicators.plus_di) and finite(indicators.minus_di) and indicators.minus_di > indicators.plus_di + 1.0
-    near_above_vwap = finite(vwap) and spot >= vwap - 0.25 * atr
-    near_below_vwap = finite(vwap) and spot <= vwap + 0.25 * atr
-    bounce = spot - safe_float(bars.tail(5)["low"].min(), spot)
-    drop = safe_float(bars.tail(5)["high"].max(), spot) - spot
-    higher_low = finite(previous_low) and recent_low >= previous_low - 0.10 * atr
-    lower_high = finite(previous_high) and recent_high <= previous_high + 0.10 * atr
-    bullish_bar = last_close > prior_close and last_close >= last_open
-    bearish_bar = last_close < prior_close and last_close <= last_open
-
-    threshold = config.oi_velocity_trigger
-    bull_oi = bool(oi.tactical_available and (
-        (finite(oi.call_coi_pct) and oi.call_coi_pct <= -0.5 * threshold)
-        or (finite(oi.put_coi_pct) and oi.put_coi_pct >= 0.5 * threshold)
-    ))
-    bear_oi = bool(oi.tactical_available and (
-        (finite(oi.put_coi_pct) and oi.put_coi_pct <= -0.5 * threshold)
-        or (finite(oi.call_coi_pct) and oi.call_coi_pct >= 0.5 * threshold)
-    ))
-    bull = {
-        "positive_momentum": finite(momentum) and momentum >= 0.00035,
-        "bullish_DI_alignment": di_bull,
-        "RSI_recovery": finite(rsi) and rsi >= 48.0,
-        "near_VWAP_reclaim": near_above_vwap,
-        "bounce_from_local_low": bounce >= max(0.45 * atr, 5.0),
-        "higher_low_structure": higher_low,
-        "bullish_last_1m_bar": bullish_bar,
-        "tactical_OI_support": bull_oi,
-        "VWAP_slope_stabilizing": finite(indicators.vwap_slope) and indicators.vwap_slope >= -0.10 * atr,
-    }
-    bear = {
-        "negative_momentum": finite(momentum) and momentum <= -0.00035,
-        "bearish_DI_alignment": di_bear,
-        "RSI_weakness": finite(rsi) and rsi <= 52.0,
-        "near_VWAP_rejection": near_below_vwap,
-        "drop_from_local_high": drop >= max(0.45 * atr, 5.0),
-        "lower_high_structure": lower_high,
-        "bearish_last_1m_bar": bearish_bar,
-        "tactical_OI_resistance": bear_oi,
-        "VWAP_slope_weakening": finite(indicators.vwap_slope) and indicators.vwap_slope <= 0.10 * atr,
-    }
-    bull_score, bear_score = sum(bool(v) for v in bull.values()), sum(bool(v) for v in bear.values())
-    bull_valid = bull["positive_momentum"] and bull_score >= 5 and bull_score >= bear_score + 2
-    bear_valid = bear["negative_momentum"] and bear_score >= 5 and bear_score >= bull_score + 2
-    if not bull_valid and not bear_valid:
-        return None
-
-    direction = "BULLISH" if bull_valid else "BEARISH"
-    factors, score = (bull, bull_score) if bull_valid else (bear, bear_score)
-    confidence = min(78.0, 54.0 + 3.0 * max(0, score - 4))
-    aligned = [name.replace("_", " ") for name, passed in factors.items() if passed]
-    flow_text = (
-        f"tactical COI {oi.tactical_source}: Call {oi.call_coi_pct * 100:+.2f}%, Put {oi.put_coi_pct * 100:+.2f}%"
-        if oi.tactical_available and finite(oi.call_coi_pct) and finite(oi.put_coi_pct)
-        else "tactical COI unavailable"
-    )
-    veto_context = []
-    if finite(indicators.adx) and indicators.adx < 20.0 and oi.both_sides_building:
-        veto_context.append("strict SIDEWAYS veto remains active; no directional entry is allowed")
-    elif oi.pin_strikes and oi.rows:
-        atm = nearest_strike(spot, list(oi.rows))
-        step = infer_strike_step(list(oi.rows))
-        local_pins = [x for x in oi.pin_strikes if abs(float(x) - atm) <= 2.0 * step]
-        if local_pins:
-            veto_context.append(f"{len(local_pins)} local strike(s) remain pin-disqualified")
-    suffix = ("; " + "; ".join(veto_context)) if veto_context else ""
-    if finite(vwap):
-        reason = (f"{direction} reversal watch from 1m price structure: {', '.join(aligned)}; "
-                  f"NIFTY={spot:.2f}, VWAP={vwap:.2f} ({spot-vwap:+.2f} points); {flow_text}{suffix}. "
-                  "WATCH ONLY: this does not bypass entry vetoes.")
-    else:
-        reason = (f"{direction} reversal watch from 1m price structure: {', '.join(aligned)}; "
-                  f"NIFTY={spot:.2f}; VWAP unavailable; {flow_text}{suffix}. WATCH ONLY: no entry authorized.")
-    features = {
-        "watch_only": True, "score": score, "bull_score": bull_score, "bear_score": bear_score,
-        "factors": factors, "adx": indicators.adx, "rsi": rsi, "momentum_3m_pct": momentum,
-        "vwap": vwap, "spot": spot, "tactical_oi_available": oi.tactical_available,
-        "tactical_oi_source": oi.tactical_source, "pin_strikes": list(oi.pin_strikes),
-        "sideways_veto_active": bool(finite(indicators.adx) and indicators.adx < 20 and oi.both_sides_building),
-    }
-    return Scenario(f"{direction}_REVERSAL_WATCH", direction, confidence, reason, None, "UNKNOWN",
-                    False, "WATCH_ONLY_NOT_TRADE_READY", features)
-
-
-def provisional_reversal_ranking_scenario(
-    resolved_scenario: Scenario, reversal_watch: Optional[Scenario], config: Config,
-) -> Optional[Scenario]:
-    """Expose a qualified neutralized reversal watch to the provisional strike ranker only.
-
-    This does not promote the watch to an executable scenario. The caller must pass
-    this object only to provisional=True strike ranking; the original resolved scenario
-    remains authoritative for trade readiness, tracker creation, and all emails.
-    """
-    if resolved_scenario.state != "DIRECTIONAL_REVERSAL_WATCH":
-        return None
-    if reversal_watch is None or reversal_watch.direction not in {"BULLISH", "BEARISH"}:
-        return None
-    if reversal_watch.confidence < config.watch_alert_min_confidence:
-        return None
-    features = reversal_watch.features if isinstance(reversal_watch.features, Mapping) else {}
-    if bool(features.get("sideways_veto_active", False)):
-        return None
-    # Only remove the watch-only marker on this separate ranking clone. It is never
-    # passed to final readiness or tracker/email code.
-    return replace(
-        reversal_watch,
-        executable_candidate=False,
-        hard_veto=None,
-        features={**dict(features), "provisional_reversal_ranking_only": True,
-                  "final_selection_authorized": False,
-                  "watch_confidence_pct": reversal_watch.confidence},
-    )
-
-
-def _watch_strong_opposite_tactical_flow(
-    direction: str, oi: OIAnalysis, indicators: IndicatorSet, config: Config,
-) -> bool:
-    """True only for a strong fresh tactical COI impulse aligned with 3m momentum."""
-    side = str(direction or "").upper()
-    if side not in {"BULLISH", "BEARISH"} or not oi.tactical_available:
-        return False
-    if not (finite(oi.call_coi_pct) and finite(oi.put_coi_pct) and finite(indicators.momentum_3m_pct)):
-        return False
-    threshold = max(config.oi_velocity_trigger, 0.0001)
-    if side == "BULLISH":
-        return bool(oi.call_coi_pct <= -1.5 * threshold
-                    and oi.put_coi_pct >= -0.25 * threshold
-                    and indicators.momentum_3m_pct >= 0.0002)
-    return bool(oi.put_coi_pct <= -1.5 * threshold
-                and oi.call_coi_pct >= -0.25 * threshold
-                and indicators.momentum_3m_pct <= -0.0002)
-
-
-def _completed_bar_stamp(frame: pd.DataFrame, now: datetime) -> str:
-    """Return the latest completed 1m bar timestamp, or empty if no bar is trustworthy."""
-    bars = completed_one_minute_candles(frame, now)
+    diff = close.diff().dropna()
+    gain = diff.clip(lower=0).ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    loss = (-diff.clip(upper=0)).ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    if len(gain) == 0:
+        return float("nan")
+    g, l = number(gain.iloc[-1]), number(loss.iloc[-1])
+    if l == 0 and g == 0: return 50.0
+    if l == 0: return 100.0
+    return 100 - 100/(1 + g/l)
+
+
+def indicator_set(frame: pd.DataFrame, live_spot: float, now: Optional[datetime] = None) -> Indicators:
+    effective_now = (now or now_ist()).astimezone(IST)
+    bars = completed_candles(frame, effective_now)
     if bars.empty:
-        return ""
-    ts = parse_timestamp(bars.iloc[-1].get("timestamp"))
-    return ist_iso(ts) if ts is not None else ""
-
-
-def reconcile_directional_watch(
-    state: dict[str, Any], scenario: Scenario, reversal_watch: Optional[Scenario],
-    indicators: IndicatorSet, oi: OIAnalysis, index_candles: pd.DataFrame,
-    now: datetime, config: Config,
-) -> Optional[dict[str, Any]]:
-    """Maintain a directional *watch* across scans without sticky trade bias.
-
-    A single neutral/soft-veto scan pauses the watch; it does not invalidate it.
-    Neutral invalidation requires distinct completed 1m bars. Two distinct opposite
-    observations are required unless fresh tactical COI plus momentum is decisive.
-    An explicit wall-reaction invalidation or max-age expiry may end the watch at once.
-    This state machine never changes a trade-ready tracker or authorizes entry.
-    """
-    now_ist_value = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
-    today = now_ist_value.date().isoformat()
-    bar_stamp = _completed_bar_stamp(index_candles, now_ist_value)
-    watch_raw = state.get("active_directional_watch")
-    watch = dict(watch_raw) if isinstance(watch_raw, dict) else None
-    threshold = config.watch_alert_min_confidence
-
-    scenario_dir = str(scenario.direction or "").upper()
-    scenario_dir = scenario_dir if scenario_dir in {"BULLISH", "BEARISH"} and scenario.confidence >= threshold else "NEUTRAL"
-    reversal_dir = "NEUTRAL"
-    if reversal_watch is not None:
-        raw_dir = str(reversal_watch.direction or "").upper()
-        if raw_dir in {"BULLISH", "BEARISH"} and reversal_watch.confidence >= threshold:
-            reversal_dir = raw_dir
-    observed_direction = scenario_dir if scenario_dir in {"BULLISH", "BEARISH"} else reversal_dir
-    observed_scenario = scenario if scenario_dir in {"BULLISH", "BEARISH"} else (reversal_watch or scenario)
-
-    # A watch from another session is never carried into today's decision state.
-    if watch is not None and str(watch.get("timestamp", ""))[:10] != today:
-        state.pop("active_directional_watch", None)
-        watch = None
-
-    def start_watch(direction: str, source: Scenario) -> dict[str, Any]:
-        identity_seed = f"{today}|{direction}|{source.state}|{source.wall_level}"
-        identity = hashlib.sha256(identity_seed.encode("utf-8")).hexdigest()[:20]
-        features = source.features if isinstance(source.features, dict) else {}
-        watch_state: dict[str, Any] = {
-            "identity": identity, "timestamp": ist_iso(now_ist_value),
-            "last_supported_at": ist_iso(now_ist_value), "last_observation_at": ist_iso(now_ist_value),
-            "direction": direction, "scenario": source.state,
-            "confidence_pct": round(source.confidence, 1),
-            "wall_level": source.wall_level, "wall_state": source.wall_state,
-            "reaction": features.get("reaction", ""),
-            "neutral_scan_count": 0, "opposite_scan_count": 0,
-            "last_neutral_bar_timestamp": bar_stamp,
-            "last_opposite_bar_timestamp": bar_stamp,
-            "status": "ACTIVE", "last_current_scenario": source.state,
-            "last_current_hard_veto": source.hard_veto, "email_notified": False,
-            "watch_notice": "Directional market watch only. This is not a selected option or trade-ready recommendation.",
-        }
-        explicit_level = safe_float(features.get("invalidation_level"), float("nan"))
-        if finite(explicit_level):
-            watch_state["invalidation_level"] = explicit_level
-            watch_state["invalidation_side"] = str(features.get("invalidation_side", ""))
-        state["active_directional_watch"] = watch_state
-        return watch_state
-
-    if watch is None:
-        if observed_direction in {"BULLISH", "BEARISH"}:
-            start_watch(observed_direction, observed_scenario)
-        return None
-
-    previous_direction = str(watch.get("direction", "")).upper()
-    previous_identity = str(watch.get("identity", ""))
-    watch["last_observation_at"] = ist_iso(now_ist_value)
-    watch["last_current_scenario"] = scenario.state
-    watch["last_current_hard_veto"] = scenario.hard_veto
-
-    # Strong current opposite flow bypasses the ordinary persistence wait.
-    strong_opposite = observed_direction in {"BULLISH", "BEARISH"} and observed_direction != previous_direction and _watch_strong_opposite_tactical_flow(observed_direction, oi, indicators, config)
-
-    # Explicit local wall reactions carry a defined invalidation side; only these
-    # or an explicit invalidation_level may invalidate on a single price observation.
-    wall = safe_float(watch.get("wall_level"), float("nan"))
-    buffer = max(3.0, config.watch_invalidation_atr_buffer * indicators.atr) if finite(indicators.atr) and indicators.atr > 0 else 5.0
-    reaction = str(watch.get("reaction", "")).upper()
-    structural_reason = ""
-    if finite(wall) and finite(indicators.spot):
-        if previous_direction == "BULLISH" and reaction == "SUPPORT_BOUNCE" and indicators.spot < wall - buffer:
-            structural_reason = f"SUPPORT_BOUNCE_INVALIDATED: spot {indicators.spot:.2f} fell below support wall {wall:.2f} minus buffer {buffer:.2f}"
-        elif previous_direction == "BEARISH" and reaction == "RESISTANCE_REJECTION" and indicators.spot > wall + buffer:
-            structural_reason = f"RESISTANCE_REJECTION_INVALIDATED: spot {indicators.spot:.2f} reclaimed resistance wall {wall:.2f} plus buffer {buffer:.2f}"
-    explicit_level = safe_float(watch.get("invalidation_level"), float("nan"))
-    invalidation_side = str(watch.get("invalidation_side", "")).upper()
-    if not structural_reason and finite(explicit_level) and finite(indicators.spot):
-        if invalidation_side == "BELOW" and indicators.spot < explicit_level - buffer:
-            structural_reason = f"EXPLICIT_INVALIDATION_LEVEL_BROKEN_BELOW: {explicit_level:.2f}"
-        elif invalidation_side == "ABOVE" and indicators.spot > explicit_level + buffer:
-            structural_reason = f"EXPLICIT_INVALIDATION_LEVEL_BROKEN_ABOVE: {explicit_level:.2f}"
-
-    supported_at = parse_timestamp(watch.get("last_supported_at") or watch.get("timestamp"))
-    age_minutes = (now_ist_value - supported_at.astimezone(IST)).total_seconds() / 60.0 if supported_at else 0.0
-    invalidation_reason = ""
-    invalidation_type = ""
-    if structural_reason:
-        invalidation_reason, invalidation_type = structural_reason, "STRUCTURAL_PRICE_INVALIDATION"
-    elif age_minutes >= config.watch_max_age_minutes and observed_direction != previous_direction:
-        invalidation_reason = f"WATCH_EXPIRED: no renewed aligned directional evidence for {age_minutes:.1f} minutes"
-        invalidation_type = "WATCH_MAX_AGE_EXPIRED"
-    elif observed_direction in {"BULLISH", "BEARISH"} and observed_direction != previous_direction:
-        if strong_opposite:
-            invalidation_reason = f"STRONG_OPPOSITE_TACTICAL_FLOW: {observed_direction} COI and 3m momentum aligned"
-            invalidation_type = "STRONG_OPPOSITE_TACTICAL_OVERRIDE"
-            watch["opposite_scan_count"] = config.watch_opposite_invalidation_scans
-        else:
-            # A directional observation breaks a prior neutral sequence; neutral
-            # counts must describe consecutive distinct completed-bar observations.
-            watch["neutral_scan_count"] = 0
-            watch["last_neutral_bar_timestamp"] = bar_stamp
-            same_opposite = str(watch.get("pending_opposite_direction", "")).upper() == observed_direction
-            last_bar = str(watch.get("last_opposite_bar_timestamp", "")) if same_opposite else ""
-            count = int(watch.get("opposite_scan_count", 0) or 0) if same_opposite else 0
-            if bar_stamp and bar_stamp != last_bar:
-                count += 1
-                watch["last_opposite_bar_timestamp"] = bar_stamp
-            watch["pending_opposite_direction"] = observed_direction
-            watch["opposite_scan_count"] = count
-            watch["status"] = "OPPOSITE_EVIDENCE_PENDING"
-            watch["pending_opposite_scenario"] = observed_scenario.state
-            watch["pending_opposite_confidence_pct"] = round(observed_scenario.confidence, 1)
-            if count >= config.watch_opposite_invalidation_scans:
-                invalidation_reason = f"OPPOSITE_DIRECTION_CONFIRMED: {observed_direction} on {count} distinct completed 1m observations"
-                invalidation_type = "CONFIRMED_OPPOSITE_DIRECTION"
+        raise ScannerError("No completed NIFTY one-minute candles are available.")
+    closes = bars["close"].astype(float)
+    trs = true_range(bars)
+    atr = number(trs.tail(14).mean(), number((bars["high"] - bars["low"]).tail(14).mean(), 25.0))
+    atr = max(8.0, atr) if finite(atr) else 25.0
+    momentum_1m = (closes.iloc[-1] / closes.iloc[-2] - 1) if len(closes) >= 2 and closes.iloc[-2] else 0.0
+    momentum_3m = (closes.iloc[-1] / closes.iloc[-4] - 1) if len(closes) >= 4 and closes.iloc[-4] else 0.0
+    # Session VWAP is only produced when actual price-bar volume is meaningful.
+    volume = bars["volume"].clip(lower=0)
+    if volume.tail(10).sum() > 0:
+        typical = (bars["high"] + bars["low"] + bars["close"]) / 3
+        vwap = number((typical * volume).sum() / volume.sum())
+        prior_n = max(1, len(bars) - 5)
+        vwap_prior = number((typical.iloc[:prior_n] * volume.iloc[:prior_n]).sum() / volume.iloc[:prior_n].sum()) if volume.iloc[:prior_n].sum() > 0 else float("nan")
+        vwap_slope = (vwap - vwap_prior) if finite(vwap) and finite(vwap_prior) else 0.0
+        volume_source = "INDEX_CANDLE_VOLUME"
     else:
-        watch["pending_opposite_direction"] = ""
-        watch["opposite_scan_count"] = 0
-        watch["pending_opposite_scenario"] = ""
-
-    if not invalidation_reason and observed_direction == previous_direction and observed_direction in {"BULLISH", "BEARISH"}:
-        watch["last_supported_at"] = ist_iso(now_ist_value)
-        watch["last_supporting_scenario"] = observed_scenario.state
-        watch["scenario"] = observed_scenario.state
-        watch["confidence_pct"] = round(observed_scenario.confidence, 1)
-        if observed_scenario.wall_level is not None:
-            watch["wall_level"] = observed_scenario.wall_level
-            watch["wall_state"] = observed_scenario.wall_state
-        features = observed_scenario.features if isinstance(observed_scenario.features, dict) else {}
-        if features.get("reaction"):
-            watch["reaction"] = features["reaction"]
-        watch["neutral_scan_count"] = 0
-        watch["last_neutral_bar_timestamp"] = bar_stamp
-        watch["status"] = "ACTIVE" if observed_scenario.hard_veto is None else "ACTIVE_WATCH_ENTRY_VETOED"
-    elif not invalidation_reason and observed_direction not in {"BULLISH", "BEARISH"}:
-        if bar_stamp and bar_stamp != str(watch.get("last_neutral_bar_timestamp", "")):
-            watch["neutral_scan_count"] = int(watch.get("neutral_scan_count", 0) or 0) + 1
-            watch["last_neutral_bar_timestamp"] = bar_stamp
-        watch["status"] = "NEUTRAL_CONFIRMATION_PENDING"
-        watch["last_neutral_reason"] = scenario.hard_veto or scenario.state
-        if int(watch.get("neutral_scan_count", 0) or 0) >= config.watch_neutral_invalidation_scans:
-            invalidation_reason = f"NEUTRAL_CONFIRMATION_LIMIT_REACHED: {watch['neutral_scan_count']} distinct completed 1m observations lacked aligned direction"
-            invalidation_type = "CONFIRMED_NEUTRAL_EXPIRY"
-
-    if invalidation_reason:
-        payload = {
-            "timestamp": ist_iso(now_ist_value), "previous_watch": dict(watch),
-            "previous_direction": previous_direction, "current_direction": observed_direction,
-            "current_scenario": scenario.state, "current_hard_veto": scenario.hard_veto,
-            "nifty_spot": indicators.spot, "vwap": indicators.vwap, "atr": indicators.atr,
-            "invalidation_type": invalidation_type, "invalidation_reason": invalidation_reason,
-            "neutral_scan_count": watch.get("neutral_scan_count", 0),
-            "opposite_scan_count": watch.get("opposite_scan_count", 0),
-            "required_neutral_scans": config.watch_neutral_invalidation_scans,
-            "required_opposite_scans": config.watch_opposite_invalidation_scans,
-            "age_minutes": round(age_minutes, 1),
-            "note": "The prior predictive watch ended; this is not an actual position exit and no order was placed.",
-        }
-        state["last_invalidated_directional_watch"] = {
-            "identity": previous_identity, "direction": previous_direction,
-            "scenario": watch.get("scenario"), "timestamp": ist_iso(now_ist_value),
-            "reason": invalidation_reason, "invalidation_type": invalidation_type,
-        }
-        state.pop("active_directional_watch", None)
-        # A genuinely opposite directional signal starts its own new watch generation.
-        if observed_direction in {"BULLISH", "BEARISH"} and observed_direction != previous_direction:
-            start_watch(observed_direction, observed_scenario)
-        return payload
-
-    state["active_directional_watch"] = watch
-    return None
-
-
-def apply_direction_flip_guard(
-    state: dict[str, Any], scenario: Scenario, oi: OIAnalysis,
-    indicators: IndicatorSet, index_candles: pd.DataFrame, now: datetime,
-    config: Config, future_regime: str = "UNKNOWN",
-) -> tuple[Scenario, list[dict[str, Any]]]:
-    """Require distinct 1m evidence before ordinary opposite-direction churn; tactical flips can override.
-
-    This is not a sticky bias: it never changes the direction label to the old direction.
-    It converts an unconfirmed reversal into a watch-only setup and allows strong fresh
-    tactical COI + price momentum to override the confirmation delay.
-    """
-    if scenario.direction not in {"BULLISH", "BEARISH"} or scenario.hard_veto:
-        state.pop("direction_flip_pending", None)
-        return scenario, []
-    trigger_confirmed, trigger_reason = selection_trigger_confirmation(
-        scenario, indicators, oi, config, future_regime=future_regime
-    )
-    if not trigger_confirmed:
-        # A generic opposite continuation/watch is not enough to invalidate an active
-        # virtual recommendation. Require the same structural trigger as a new entry.
-        state.pop("direction_flip_pending", None)
-        return scenario, []
-    today = now.astimezone(IST).date().isoformat()
-    trackers = state.get("recommendation_trackers", [])
-    active = [x for x in trackers if isinstance(x, dict)
-              and str(x.get("status", "")).upper() == "TRACKING"
-              and str(x.get("session_date", x.get("created_at", "")))[:10] == today]
-    opposing = [x for x in active if str(x.get("direction", "")).upper() != scenario.direction]
-    if not opposing:
-        state.pop("direction_flip_pending", None)
-        return scenario, []
-
-    bars = completed_one_minute_candles(index_candles, now)
-    bar_stamp = ist_iso(parse_timestamp(bars.iloc[-1]["timestamp"])) if not bars.empty and parse_timestamp(bars.iloc[-1]["timestamp"]) else ""
-    if not bar_stamp:
-        guarded = replace(scenario, executable_candidate=False,
-                          trigger_reason=scenario.trigger_reason + " Direction flip remains watch-only because no completed 1m bar timestamp is available.",
-                          features={**scenario.features, "direction_flip_guard": "NO_COMPLETED_1M_BAR"})
-        return guarded, []
-
-    trigger = config.oi_velocity_trigger
-    momentum = indicators.momentum_3m_pct
-    strong_flow = False
-    if oi.tactical_available and finite(momentum):
-        if scenario.direction == "BULLISH":
-            strong_flow = finite(oi.call_coi_pct) and finite(oi.put_coi_pct) and oi.call_coi_pct <= -1.5 * trigger and oi.put_coi_pct >= -0.25 * trigger and momentum > 0.0002
-        else:
-            strong_flow = finite(oi.put_coi_pct) and finite(oi.call_coi_pct) and oi.put_coi_pct <= -1.5 * trigger and oi.call_coi_pct >= -0.25 * trigger and momentum < -0.0002
-    active_reversal_override = bool(
-        scenario.state in {"ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BULLISH", "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BEARISH"}
-        and isinstance(scenario.features, Mapping)
-        and scenario.features.get("active_signal_reversal_confirmed")
-        and scenario.features.get("structural_break_confirmed")
-        and scenario.features.get("current_directional_oi_confirmed")
-    )
-    # The entry-trigger gate itself already enforces repeated support/resistance tests,
-    # completed closes for breakouts, local/aggregate tactical OI, and non-conflicting
-    # futures. Requiring two *additional* 1m observations after that confirmation delays
-    # the reversal and can leave the old tracker active while the move accelerates.
-    confirmed_structural_states = {
-        "STRUCTURAL_SUPPORT_BOUNCE", "STRUCTURAL_RESISTANCE_REJECTION",
-        "CONFIRMED_BULLISH_BREAKOUT", "CONFIRMED_BEARISH_BREAKDOWN",
-        "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BULLISH", "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BEARISH",
-    }
-    confirmed_structural_setup = bool(trigger_confirmed and scenario.state in confirmed_structural_states)
-    structural_override = active_reversal_override or confirmed_structural_setup or (
-        scenario.state in {"PREDICTIVE_BULLISH_BREAKOUT", "PREDICTIVE_BEARISH_BREAKDOWN", "GAMMA_SQUEEZE", "MORNING_GAP_GO", "EXHAUSTION_REVERSAL"}
-        and strong_flow
-    )
-    pending = state.get("direction_flip_pending") if isinstance(state.get("direction_flip_pending"), dict) else {}
-    if structural_override:
-        confirmed = True
-        confirm_reason = (
-            "CONFIRMED_ACTIVE_STRUCTURAL_REVERSAL_AND_CURRENT_OI" if active_reversal_override else
-            "CONFIRMED_STRUCTURAL_SETUP_IMMEDIATE_OVERRIDE" if confirmed_structural_setup else
-            "STRONG_TACTICAL_COI_PRICE_ALIGNMENT_OVERRIDE"
-        )
-        count = config.direction_flip_confirmations
+        vwap, vwap_slope, volume_source = float("nan"), float("nan"), "UNAVAILABLE_INDEX_VOLUME_ZERO"
+    # Wilder-style directional movement with a smoothed DX series for ADX.
+    if len(bars) >= 15:
+        up_move = bars["high"].diff()
+        down_move = -bars["low"].diff()
+        plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=bars.index).where(up_move.notna())
+        minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=bars.index).where(down_move.notna())
+        tr_mean = trs.ewm(alpha=1/14, adjust=False, min_periods=8).mean().replace(0, np.nan)
+        plus_series = 100 * plus_dm.ewm(alpha=1/14, adjust=False, min_periods=8).mean() / tr_mean
+        minus_series = 100 * minus_dm.ewm(alpha=1/14, adjust=False, min_periods=8).mean() / tr_mean
+        denominator = (plus_series + minus_series).replace(0, np.nan)
+        dx_series = (100 * (plus_series - minus_series).abs() / denominator).clip(0, 100)
+        adx_series = dx_series.ewm(alpha=1/14, adjust=False, min_periods=8).mean().clip(0, 100)
+        plus_di = number(plus_series.iloc[-1])
+        minus_di = number(minus_series.iloc[-1])
+        adx = number(adx_series.iloc[-1])
     else:
-        same_pending = str(pending.get("direction", "")).upper() == scenario.direction
-        count = int(pending.get("count", 0) or 0) if same_pending else 0
-        last_counted = str(pending.get("last_bar_timestamp", "")) if same_pending else ""
-        if bar_stamp != last_counted:
-            count += 1
-        confirm_reason = "DISTINCT_COMPLETED_1M_BAR_CONFIRMATION"
-        confirmed = count >= config.direction_flip_confirmations and oi.tactical_available and scenario.executable_candidate
-        state["direction_flip_pending"] = {
-            "direction": scenario.direction, "count": count,
-            "last_bar_timestamp": bar_stamp,
-            "started_at": pending.get("started_at", ist_iso(now)) if same_pending else ist_iso(now),
-            "source": confirm_reason,
-        }
-    if not confirmed:
-        guarded = replace(
-            scenario, executable_candidate=False,
-            trigger_reason=(scenario.trigger_reason +
-                           f" Direction-flip guard: {scenario.direction} is opposite to an active virtual recommendation; "
-                           f"{count}/{config.direction_flip_confirmations} distinct completed 1m confirmations, or stronger tactical COI, required. Live direction is reported unchanged; entry is watch-only."),
-            features={**scenario.features, "direction_flip_guard": "PENDING", "flip_confirmation_count": count,
-                      "flip_confirmations_required": config.direction_flip_confirmations,
-                      "strong_tactical_override": strong_flow},
-        )
-        return guarded, []
-
-    state.pop("direction_flip_pending", None)
-    events: list[dict[str, Any]] = []
-    for tracker in opposing:
-        tracker["status"] = "INVALIDATED_STATE"
-        tracker["completed_at"] = ist_iso(now)
-        tracker["completion_reason"] = f"Opposite {scenario.direction} structure confirmed by {confirm_reason}; virtual recommendation is no longer active."
-        prior_assessment = tracker.get("regime_assessment") if isinstance(tracker.get("regime_assessment"), dict) else {}
-        tracker["regime_assessment"] = {**prior_assessment,
-            "assessed_at": ist_iso(now), "context_state": "OPPOSITE_STRUCTURE_CONFIRMED_BY_GUARD",
-            "scenario_relation": "OPPOSITE_DIRECTION_CONFIRMED",
-            "replacement_direction": scenario.direction, "confirmation_source": confirm_reason,
-            "confirmation_trigger_reason": trigger_reason,
-            "policy": "Confirmed only by the existing structural direction-flip guard; diagnostics did not cause invalidation."}
-        events.append({
-            "event_type": "MARKET_REVERSAL_CONFIRMED",
-            "event_at": ist_iso(now), "tracker_fingerprint": tracker.get("signal_fingerprint", ""),
-            "direction": tracker.get("direction"), "invalidated_direction": tracker.get("direction"),
-            "replacement_direction": scenario.direction, "scenario": tracker.get("scenario", ""),
-            "instrument_key": tracker.get("instrument_key", ""), "trading_symbol": tracker.get("trading_symbol", ""),
-            "option_type": tracker.get("option_type", ""), "strike": tracker.get("strike"),
-            "spot": indicators.spot, "option_ltp": tracker.get("last_option_ltp_observed"),
-            "T1": tracker.get("target_1"), "T2": tracker.get("target_2"),
-            "SL": tracker.get("stop_loss"), "trailing_SL": tracker.get("trailing_stop", tracker.get("stop_loss")),
-            "active_regime_assessment": tracker.get("regime_assessment", {}),
-            "monitoring_data_status": tracker.get("monitoring_data_status", "UNAVAILABLE"),
-            "target_event_integrity": tracker.get("target_event_integrity", "UNASSESSED"),
-            "target_event_integrity_since": tracker.get("target_event_integrity_since"),
-            "monitoring_gap_minutes": tracker.get("monitoring_gap_minutes"),
-            "monitoring_data_note": tracker.get("monitoring_data_note", ""),
-            "message": f"Confirmed market reversal: opposite {scenario.direction} structure passed the structural-entry confirmation gate ({trigger_reason}; {confirm_reason}). The previous {tracker.get('direction')} virtual recommendation is invalidated; no broker order was placed.",
-        })
-    state["recommendation_trackers"] = trackers
-    primary_fp = str(state.get("recommendation_tracker", {}).get("signal_fingerprint", "")) if isinstance(state.get("recommendation_tracker"), dict) else ""
-    state["recommendation_tracker"] = next((x for x in reversed(trackers) if x.get("signal_fingerprint") == primary_fp), None)
-    return scenario, events
-
-
-def opposing_wall_clearance_reason(scenario: Scenario, spot: float,
-                                   indicators: IndicatorSet, oi: OIAnalysis,
-                                   config: Config) -> str:
-    """Avoid entries into an intact opposing wall while allowing a weakening wall to be bypassed."""
-    if scenario.direction not in {"BULLISH", "BEARISH"}:
-        return ""
-    step = infer_strike_step(list(oi.rows))
-    atr_distance = 0.20 * indicators.atr if finite(indicators.atr) and indicators.atr > 0 else 0.0
-    required = max(config.opposing_wall_clearance_steps * step, atr_distance)
-    walls = oi.walls_resistance if scenario.direction == "BULLISH" else oi.walls_support
-    if scenario.direction == "BULLISH":
-        intact = [w for w in walls if w.state in {"BUILDING", "STABLE"} and w.strike > spot]
-        nearest = min(intact, key=lambda w: w.strike - spot) if intact else None
-        gap = nearest.strike - spot if nearest else float("inf")
-    else:
-        intact = [w for w in walls if w.state in {"BUILDING", "STABLE"} and w.strike < spot]
-        nearest = max(intact, key=lambda w: w.strike) if intact else None
-        gap = spot - nearest.strike if nearest else float("inf")
-    if nearest is not None and gap < required:
-        return (f"INSUFFICIENT_RUNWAY_TO_INTACT_OPPOSING_WALL level={nearest.strike:.2f} "
-                f"clearance={gap:.2f} required={required:.2f}; weakening walls were excluded from this check")
-    return ""
-
-
-def futures_regime_from_snapshots(quote: Optional[LiveQuote], state: dict[str, Any], now: datetime) -> tuple[str, dict[str, Any]]:
-    if quote is None or not finite(quote.ltp) or quote.ltp <= 0 or quote.freshness != "FRESH":
-        return "UNKNOWN", {"reason": "fresh futures quote unavailable"}
-    rows = state.get("futures_snapshots", []) if isinstance(state.get("futures_snapshots"), list) else []
-    selected = None
-    age_m = None
-    for row in reversed(rows):
-        ts = parse_timestamp(row.get("timestamp")) if isinstance(row, dict) else None
-        if ts and ts.date() == now.astimezone(IST).date():
-            age = (now - ts).total_seconds() / 60.0
-            if 1.0 <= age <= 5.5:
-                selected, age_m = row, age
-                break
-    if selected is None:
-        # previous_oi/prev_close is a session-context proxy only and is not labelled a tactical regime.
-        return "UNKNOWN", {"reason": "no same-session 1-5m futures baseline", "session_proxy_available": finite(quote.previous_oi) and quote.previous_oi > 0}
-    old_price = safe_float(selected.get("ltp"))
-    old_oi = safe_float(selected.get("oi"))
-    price_pct = (quote.ltp - old_price) / old_price if finite(old_price) and old_price > 0 else float("nan")
-    oi_pct = _pct_change(quote.oi, old_oi)
-    if not finite(price_pct) or not finite(oi_pct):
-        return "UNKNOWN", {"reason": "invalid futures price/OI baseline", "baseline_age_minutes": age_m}
-    min_price_move = 0.00025
-    min_oi_move = 0.0010
-    if price_pct >= min_price_move and oi_pct >= min_oi_move:
-        regime = "STRONG_LONG_BUILDUP" if price_pct >= 0.0005 and oi_pct >= 0.002 else "LONG_BUILDUP"
-    elif price_pct <= -min_price_move and oi_pct >= min_oi_move:
-        regime = "STRONG_SHORT_BUILDUP" if price_pct <= -0.0005 and oi_pct >= 0.002 else "SHORT_BUILDUP"
-    elif price_pct >= min_price_move and oi_pct <= -min_oi_move:
-        regime = "SHORT_COVERING"
-    elif price_pct <= -min_price_move and oi_pct <= -min_oi_move:
-        regime = "LONG_UNWINDING"
-    else:
-        regime = "NEUTRAL"
-    return regime, {"price_change_pct": price_pct, "oi_change_pct": oi_pct, "baseline_age_minutes": age_m, "source": "SAME_SESSION_QUOTE_SNAPSHOTS"}
-
-
-def append_futures_snapshot(state: dict[str, Any], quote: Optional[LiveQuote], now: datetime) -> None:
-    if quote is None or quote.freshness != "FRESH" or not finite(quote.ltp):
-        return
-    samples = state.get("futures_snapshots", []) if isinstance(state.get("futures_snapshots"), list) else []
-    minute_key = ist_iso(now)[:16]
-    samples = [s for s in samples if isinstance(s, dict) and str(s.get("timestamp", ""))[:16] != minute_key]
-    samples.append({"timestamp": ist_iso(now), "instrument_key": quote.instrument_key, "ltp": quote.ltp, "oi": quote.oi})
-    cutoff = now - timedelta(minutes=20)
-    samples = [s for s in samples if (parse_timestamp(s.get("timestamp")) or datetime.min.replace(tzinfo=IST)) >= cutoff]
-    state["futures_snapshots"] = samples[-32:]
-
-
-# =============================================================================
-# Strike quality, premium VWAP, targets and stops
-# =============================================================================
-
-def expected_underlying_move_for_ranking(
-    scenario: Scenario, spot: float, indicators: IndicatorSet,
-    oi: OIAnalysis, risk: RiskPlan,
-) -> tuple[float, str]:
-    """Estimate the NIFTY move to a structural target for option ranking only.
-
-    A validated T1 is preferred. For a watch without a complete risk plan, use the
-    nearest intact opposing OI wall. ATR is an explicitly labelled last-resort proxy;
-    this estimate never authorizes a signal and is not reported as a guaranteed target.
-    """
-    if risk.valid and finite(risk.target_1) and abs(float(risk.target_1) - spot) >= 1.0:
-        return abs(float(risk.target_1) - spot), str(risk.target_1_source or "STRUCTURAL_T1")
-    if scenario.direction == "BULLISH":
-        walls = [w for w in oi.walls_resistance if w.strike > spot and w.state in {"BUILDING", "STABLE"}]
-        walls.sort(key=lambda w: w.strike)
-        if walls:
-            return abs(walls[0].strike - spot), f"NEXT_INTACT_CALL_WALL_{walls[0].state}"
-    elif scenario.direction == "BEARISH":
-        walls = [w for w in oi.walls_support if w.strike < spot and w.state in {"BUILDING", "STABLE"}]
-        walls.sort(key=lambda w: w.strike, reverse=True)
-        if walls:
-            return abs(spot - walls[0].strike), f"NEXT_INTACT_PUT_WALL_{walls[0].state}"
-    if finite(indicators.atr) and indicators.atr > 0:
-        return float(indicators.atr), "ATR_ONLY_RANKING_PROXY_NOT_STRUCTURAL_TARGET"
-    return float("nan"), "UNAVAILABLE"
-
-
-def allowed_strikes(spot: float, strikes: Sequence[float], direction: str, now: datetime,
-                    scenario: Scenario, indicators: IndicatorSet) -> tuple[float, list[tuple[float, str]]]:
-    atm = nearest_strike(spot, strikes)
-    step = infer_strike_step(strikes)
-    direction = direction.upper()
-    if direction == "BULLISH":
-        permitted = [(atm, "ATM"), (atm - step, "ITM1"), (atm - 2 * step, "ITM2")]
-        otm = atm + step
-    else:
-        permitted = [(atm, "ATM"), (atm + step, "ITM1"), (atm + 2 * step, "ITM2")]
-        otm = atm - step
-    available = {round(float(s), 2) for s in strikes}
-    permitted = [(float(s), label) for s, label in permitted if round(float(s), 2) in available]
-    t = now.astimezone(IST).time() if now.tzinfo else now.replace(tzinfo=IST).time()
-    confirmed_afternoon_squeeze = (
-        t >= MIDDAY_END and t < ENTRY_CUTOFF and scenario.state == "GAMMA_SQUEEZE"
-        and scenario.confidence >= 80.0 and finite(indicators.adx) and indicators.adx >= 25.0
-        and finite(indicators.momentum_3m_pct) and abs(indicators.momentum_3m_pct) >= 0.00075
-    )
-    if confirmed_afternoon_squeeze and round(otm, 2) in available:
-        permitted.append((float(otm), "OTM1_CONFIRMED_AFTERNOON_SQUEEZE"))
-    return atm, permitted
-
-
-def _session_premium_vwap(frame: pd.DataFrame, now: datetime) -> float:
-    if frame is None or frame.empty or "volume" not in frame:
-        return float("nan")
-    local_dates = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST).dt.date
-    today = now.astimezone(IST).date() if now.tzinfo else now.replace(tzinfo=IST).date()
-    work = frame.loc[local_dates == today].copy()
-    if work.empty:
-        return float("nan")
-    volume = pd.to_numeric(work["volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
-    price = (pd.to_numeric(work["high"], errors="coerce") + pd.to_numeric(work["low"], errors="coerce") + pd.to_numeric(work["close"], errors="coerce")) / 3.0
-    total = float(volume.sum())
-    if total <= 0:
-        return float("nan")
-    return float((price * volume).sum() / total)
-
-
-def _option_candle_flow(frame: pd.DataFrame, ltp: float, direction: str, depth_imbalance: float) -> tuple[float, float, float]:
-    """Return [0,1] flow-quality, latest premium return, recent/median volume ratio."""
-    if frame is None or frame.empty or "close" not in frame.columns or "volume" not in frame.columns:
-        return float("nan"), float("nan"), float("nan")
-    close = pd.to_numeric(frame["close"], errors="coerce").dropna()
-    volumes = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
-    ret = float("nan")
-    if len(close) >= 2 and close.iloc[-2] > 0:
-        ret = (ltp / float(close.iloc[-2])) - 1.0
-    if len(close) < 2 or not finite(ret):
-        return float("nan"), ret, float("nan")
-    # This is a long-option quality score; positive premium movement is favorable for CE and PE alike.
-    aligned_ret = ret
-    momentum_score = clamp(0.5 + (aligned_ret / 0.004) * 0.5) if finite(aligned_ret) else 0.5
-    depth_score = clamp(0.5 + 0.5 * depth_imbalance)
-    if len(volumes) >= 3:
-        current_vol = float(volumes.iloc[-1])
-        baseline = float(volumes.iloc[-min(8, len(volumes) - 1):-1].median()) if len(volumes) > 1 else 0.0
-        vol_ratio = current_vol / baseline if baseline > 0 else (1.0 if current_vol > 0 else 0.0)
-    else:
-        vol_ratio = 1.0 if float(volumes.sum()) > 0 else 0.0
-    volume_score = clamp(vol_ratio / 2.0)
-    return clamp(0.50 * momentum_score + 0.30 * depth_score + 0.20 * volume_score), ret, vol_ratio
-
-
-def _coi_score(direction: str, oi: OIAnalysis, config: Config, scenario_state: str = "") -> float:
-    """Normalize tactical COI velocity; blend measured acceleration when available.
-
-    If acceleration is unavailable during the first tactical interval, its component
-    is not treated as zero and does not penalize the entry score. The 30% component
-    uses velocity until an actual second velocity observation makes acceleration measurable.
-    """
-    if not oi.tactical_available or not finite(oi.call_coi_pct) or not finite(oi.put_coi_pct):
-        return float("nan")
-    trig = max(config.oi_velocity_trigger, 0.0001)
-    if scenario_state in {"CONFIRMED_BULLISH_CONTINUATION", "CONFIRMED_BEARISH_CONTINUATION"}:
-        if direction == "BULLISH":
-            if oi.put_coi_pct <= -2.0 * trig and oi.call_coi_pct > 0.0:
-                return 0.0
-            if oi.call_coi_pct < 0.0 and oi.put_coi_pct < 0.0:
-                return 0.50
-        else:
-            if oi.call_coi_pct <= -2.0 * trig and oi.put_coi_pct > 0.0:
-                return 0.0
-            if oi.call_coi_pct < 0.0 and oi.put_coi_pct < 0.0:
-                return 0.50
-    if direction == "BULLISH" and scenario_state == "PCR_LOW_CALL_OI_IMBALANCE" and finite(oi.pcr) and oi.pcr <= 1.0:
-        velocity_score = clamp(0.70 * clamp(oi.call_coi_pct / (2.0 * trig))
-                               + 0.30 * clamp(oi.put_coi_pct / (2.0 * trig)))
-        if not oi.acceleration_available:
-            return velocity_score
-        accel_score = clamp(0.70 * clamp(0.5 + oi.call_coi_acceleration_pct / (2.0 * trig))
-                            + 0.30 * clamp(0.5 + oi.put_coi_acceleration_pct / (2.0 * trig)))
-    elif direction == "BULLISH":
-        velocity_score = clamp(0.65 * clamp((-oi.call_coi_pct) / (2.0 * trig))
-                               + 0.35 * clamp(oi.put_coi_pct / (2.0 * trig)))
-        if not oi.acceleration_available:
-            return velocity_score
-        accel_score = clamp(0.65 * clamp(0.5 - oi.call_coi_acceleration_pct / (2.0 * trig))
-                            + 0.35 * clamp(0.5 + oi.put_coi_acceleration_pct / (2.0 * trig)))
-    else:
-        velocity_score = clamp(0.65 * clamp((-oi.put_coi_pct) / (2.0 * trig))
-                               + 0.35 * clamp(oi.call_coi_pct / (2.0 * trig)))
-        if not oi.acceleration_available:
-            return velocity_score
-        accel_score = clamp(0.65 * clamp(0.5 - oi.put_coi_acceleration_pct / (2.0 * trig))
-                            + 0.35 * clamp(0.5 + oi.call_coi_acceleration_pct / (2.0 * trig)))
-    return clamp(0.70 * velocity_score + 0.30 * accel_score)
-
-
-def _strike_local_coi_score(direction: str, strike: float, oi: OIAnalysis,
-                            config: Config) -> float:
-    """Score whether the candidate strike's own OI changes support the setup.
-
-    For CE selection, call-OI unwinding at the candidate strike and put-OI building
-    are supportive clues. For PE selection the inverse is used. This is a weak
-    location-level signal, not proof of buyer/seller identity; missing baselines stay
-    unavailable rather than being fabricated.
-    """
-    row = oi.rows.get(float(strike))
-    if not isinstance(row, Mapping):
-        row = oi.rows.get(round(float(strike), 2))
-    if not isinstance(row, Mapping):
-        return float("nan")
-    call_change = safe_float(row.get("call_coi_pct"), float("nan"))
-    put_change = safe_float(row.get("put_coi_pct"), float("nan"))
-    if not finite(call_change) or not finite(put_change):
-        return float("nan")
-    trigger = max(config.oi_velocity_trigger, 0.0001)
-    # Smooth scaling preserves differences between neighbouring strikes and avoids
-    # saturating the local score on a single strong snapshot change.
-    if str(direction).upper() == "BULLISH":
-        call_unwind = clamp(0.5 - call_change / (8.0 * trigger))
-        put_build = clamp(0.5 + put_change / (8.0 * trigger))
-        return clamp(0.60 * call_unwind + 0.40 * put_build)
-    if str(direction).upper() == "BEARISH":
-        put_unwind = clamp(0.5 - put_change / (8.0 * trigger))
-        call_build = clamp(0.5 + call_change / (8.0 * trigger))
-        return clamp(0.60 * put_unwind + 0.40 * call_build)
-    return float("nan")
-
-
-def liquidity_adjusted_spread_limit(quote: LiveQuote, config: Config) -> tuple[float, str]:
-    """Return a conservative spread ceiling based on live depth and traded volume.
-
-    The configured MAX_SPREAD_RATIO is only a ceiling. Thin/low-activity contracts
-    receive tighter limits; wider quotes are tolerated only when the live book has
-    meaningful depth on both sides and the contract has traded actively. Freshness,
-    valid bid/ask, delta and all other final-selection gates remain independent.
-    """
-    configured_cap = clamp(config.max_spread_ratio, 0.0005, 0.0030)
-    bid_depth = max(0.0, safe_float(quote.bid_qty, 0.0))
-    ask_depth = max(0.0, safe_float(quote.ask_qty, 0.0))
-    balanced_depth = min(bid_depth, ask_depth)
-    volume = max(0.0, safe_float(quote.volume, 0.0))
-
-    if quote.freshness != "FRESH" or not finite(quote.bid) or not finite(quote.ask) \
-            or quote.bid <= 0 or quote.ask < quote.bid:
-        return min(configured_cap, 0.0010), "INVALID_OR_NOT_FRESH"
-    if volume >= 100_000 and balanced_depth >= 1_000:
-        liquidity_cap, tier = 0.0025, "HIGH_VOLUME_DEEP_BOOK"
-    elif volume >= 25_000 and balanced_depth >= 250:
-        liquidity_cap, tier = 0.0020, "ACTIVE_BOOK"
-    elif volume >= 5_000 and balanced_depth >= 100:
-        liquidity_cap, tier = 0.0015, "MODERATE_LIQUIDITY"
-    else:
-        liquidity_cap, tier = 0.0010, "THIN_OR_LOW_ACTIVITY"
-    return min(configured_cap, liquidity_cap), tier
-
-
-def _candidate_from_data(
-    *, row: dict[str, Any], strike: float, option_type: str, expiry: str,
-    quote: LiveQuote, candle_frame: pd.DataFrame,
-    oi: OIAnalysis, direction: str, now: datetime, indicators: IndicatorSet,
-    config: Config, moneyness: str, pin_disqualified: bool, exhaustion: bool = False,
-    scenario_state: str = "", expected_underlying_move: float = float("nan"),
-) -> OptionContract:
-    side = parse_option_side(row, option_type)
-    # Never silently fall back to the untimestamped chain LTP when the dedicated
-    # live quote is missing: a fresh depth snapshot without a valid LTP is not executable.
-    ltp = quote.ltp
-    iv_raw = side["iv"]
-    iv = iv_raw / 100.0 if finite(iv_raw) and iv_raw > 2.0 else iv_raw
-    delta_api = side["delta"]
-    if finite(delta_api) and abs(delta_api) <= 1.0:
-        delta, delta_source = delta_api, "UPSTOX_GREEKS"
-    else:
-        iv_model = iv if finite(iv) and iv > 0 else config.fallback_iv
-        delta = black_scholes_delta(indicators.spot, strike, option_years_to_expiry(expiry, now), iv_model,
-                                    config.risk_free_rate, option_type)
-        delta_source = "BLACK_SCHOLES_APPROX_IV" if finite(iv) and iv > 0 else "BLACK_SCHOLES_APPROX_FALLBACK_IV"
-    premium_vwap = _session_premium_vwap(candle_frame, now)
-    flow_score, premium_return, volume_ratio = _option_candle_flow(candle_frame, ltp, direction, quote.depth_imbalance)
-    lift_ratio = (ltp / premium_vwap - 1.0) if finite(ltp) and finite(premium_vwap) and premium_vwap > 0 else float("nan")
-    vwap_score = clamp(lift_ratio / 0.003) if finite(lift_ratio) else float("nan")
-    aggregate_coi_score = _coi_score(direction, oi, config, scenario_state=scenario_state)
-    local_oi_score = _strike_local_coi_score(direction, strike, oi, config)
-    # Keep aggregate positioning as the anchor. Strike-local COI is blended in only
-    # when a valid same-session baseline exists, preventing one noisy strike from
-    # overriding the broader flow reading.
-    if finite(aggregate_coi_score) and finite(local_oi_score):
-        coi_score = clamp(0.60 * aggregate_coi_score + 0.40 * local_oi_score)
-    else:
-        coi_score = aggregate_coi_score
-    price_led_neutral_coi = (
-        scenario_state in {"CONFIRMED_BULLISH_CONTINUATION", "CONFIRMED_BEARISH_CONTINUATION"}
-        and finite(coi_score) and abs(coi_score - 0.5) < 1e-9
-    )
-    delta_fit_score = (clamp(1.0 - abs(abs(delta_api) - 0.65) / 0.40)
-                       if finite(delta_api) and abs(delta_api) <= 1.0
-                       else clamp(1.0 - abs(abs(delta) - 0.65) / 0.40) if finite(delta) else float("nan"))
-    theta_burden = abs(safe_float(side.get("theta"), float("nan"))) / ltp if finite(side.get("theta")) and finite(ltp) and ltp > 0 else float("nan")
-    theta_efficiency_score = clamp(1.0 - theta_burden / 0.25) if finite(theta_burden) else 0.50
-    weighted_components = [(0.40, flow_score, "FLOW"), (0.30, vwap_score, "PREMIUM_VWAP"), (0.30, coi_score, "TACTICAL_COI")]
-    available_components = [(weight, value, label) for weight, value, label in weighted_components
-                            if finite(value) and 0.0 <= float(value) <= 1.0]
-    # The requested weights are fixed, not re-normalized when a component is absent.
-    # An incomplete score remains unavailable and cannot accidentally inflate readiness.
-    total = (sum(weight * value for weight, value, _ in available_components)
-             if len(available_components) == 3 else float("nan"))
-    # This separate rank score is not a probability and does not replace the hard
-    # 0.650 quality gate. It combines the legacy quality score with delta suitability,
-    # theta burden, and a target-distance option-move estimate for candidate ranking.
-    move_points = abs(safe_float(expected_underlying_move, float("nan")))
-    if finite(move_points) and move_points > 0 and finite(delta) and finite(ltp) and ltp > 0:
-        # First-order delta plus second-order gamma approximation. It intentionally
-        # excludes IV movement and time decay; those are not forecast with certainty.
-        projected_rupees = abs(delta) * move_points
-        if finite(side.get("gamma")):
-            projected_rupees += 0.5 * abs(safe_float(side.get("gamma"))) * move_points * move_points
-        projected_return_pct = 100.0 * projected_rupees / ltp
-    else:
-        projected_rupees = projected_return_pct = float("nan")
-    # A provisional neutral projection rank is replaced with a within-scan relative
-    # projection rank after all permitted strikes have been evaluated.
-    projection_rank_score = 0.50
-    ranking_score = (clamp(0.65 * total + 0.10 * delta_fit_score
-                            + 0.05 * theta_efficiency_score + 0.20 * projection_rank_score)
-                     if finite(total) and finite(delta_fit_score) else float("nan"))
-    score_basis = "FULL_40_30_30" if len(available_components) == 3 else "INCOMPLETE_" + "_".join(label for _, _, label in available_components)
-    vetoes: list[str] = []
-    if quote.freshness != "FRESH":
-        vetoes.append(f"QUOTE_{quote.freshness}")
-    if not finite(ltp) or ltp <= 0:
-        vetoes.append("LIVE_OPTION_LTP_UNAVAILABLE_OR_NONPOSITIVE")
-    if not finite(quote.bid) or not finite(quote.ask) or quote.bid <= 0 or quote.ask < quote.bid:
-        vetoes.append("INVALID_BID_ASK")
-    spread_limit, spread_tier = liquidity_adjusted_spread_limit(quote, config)
-    if not finite(quote.spread_ratio) or quote.spread_ratio > spread_limit:
-        vetoes.append(f"SPREAD>{spread_limit*100:.3f}%_LIQUIDITY_TIER={spread_tier}")
-    if not finite(premium_vwap) or premium_vwap <= 0:
-        vetoes.append("OPTION_PREMIUM_VWAP_UNAVAILABLE")
-    elif not finite(ltp) or ltp <= premium_vwap:
-        vetoes.append("OPTION_LTP_NOT_ABOVE_OWN_1M_VWAP")
-    delta_floor = config.min_exhaustion_delta if exhaustion else config.min_directional_delta
-    if not finite(delta) or abs(delta) < delta_floor:
-        vetoes.append(f"DELTA<{delta_floor:.2f}")
-    if pin_disqualified:
-        vetoes.append("PIN_DISQUALIFICATION_CALL_AND_PUT_OI_BOTH_UP_GT10PCT_5M")
-    if not finite(flow_score) or not 0.0 <= float(flow_score) <= 1.0:
-        vetoes.append("OPTION_FLOW_SCORE_MISSING_OR_INVALID_REQUIRES_MORE_1M_CANDLES")
-    if not finite(vwap_score):
-        vetoes.append("PREMIUM_VWAP_LIFT_SCORE_UNAVAILABLE")
-    if scenario_state == "PCR_LOW_CALL_OI_IMBALANCE" and direction == "BULLISH" and (not finite(flow_score) or flow_score < 0.65):
-        vetoes.append("LOW_PCR_SETUP_REQUIRES_STRONG_OPTION_FLOW_SCORE>=0.650")
-    if not oi.tactical_available or not finite(coi_score):
-        vetoes.append("TACTICAL_COI_BASELINE_UNAVAILABLE")
-    else:
-        if finite(indicators.adx) and indicators.adx < 20.0:
-            coi_floor = config.min_coi_score_low_adx
-        elif finite(indicators.adx) and indicators.adx > 25.0:
-            coi_floor = config.min_coi_score_high_adx
-        else:
-            coi_floor = config.min_coi_score_normal_adx
-        if not price_led_neutral_coi and coi_score <= coi_floor:
-            vetoes.append(f"TACTICAL_COI_COMPONENT<={coi_floor:.2f}_ADX={indicators.adx:.1f}")
-    if finite(total) and total < config.min_score:
-        vetoes.append(f"SCORE<{config.min_score:.3f}")
-    return OptionContract(
-        instrument_key=quote.instrument_key,
-        trading_symbol=quote.symbol,
-        option_type=option_type,
-        strike=strike,
-        expiry=expiry,
-        ltp=ltp,
-        oi=side["oi"], prev_oi=side["prev_oi"], volume=quote.volume if finite(quote.volume) else side["volume"],
-        bid=quote.bid, ask=quote.ask, bid_qty=quote.bid_qty, ask_qty=quote.ask_qty,
-        delta=delta, theta=side["theta"], iv=iv, delta_source=delta_source,
-        spread_ratio=quote.spread_ratio, premium_vwap=premium_vwap,
-        flow_score=flow_score, vwap_lift_score=vwap_score, coi_score=coi_score, total_score=total,
-        call_coi_pct=oi.call_coi_pct, put_coi_pct=oi.put_coi_pct, tactical_source=oi.tactical_source,
-        quote_freshness=quote.freshness, quote_age_seconds=quote.age_seconds,
-        premium_return_pct=premium_return * 100.0 if finite(premium_return) else float("nan"),
-        volume_ratio=volume_ratio, pin_disqualified=pin_disqualified, vetoes=tuple(vetoes),
-        score_basis=score_basis, score_components_available=tuple(label for _, _, label in available_components),
-        gamma=side.get("gamma", float("nan")), vega=side.get("vega", float("nan")),
-        local_oi_score=local_oi_score, delta_fit_score=delta_fit_score,
-        theta_efficiency_score=theta_efficiency_score, ranking_score=ranking_score,
-        expected_underlying_move_points=move_points,
-        expected_option_move_rupees=projected_rupees,
-        expected_option_move_pct=projected_return_pct,
-        projection_rank_score=projection_rank_score,
+        plus_di = minus_di = adx = float("nan")
+    recent = bars.tail(80)
+    recent_pivot_highs = _pivot_prices(recent, "high", "high")
+    recent_pivot_lows = _pivot_prices(recent, "low", "low")
+    session_bars = bars.loc[bars["timestamp"].dt.tz_convert(IST).dt.date == effective_now.date()]
+    return Indicators(
+        spot=float(live_spot), vwap=vwap, vwap_slope=vwap_slope, atr=atr, rsi=rsi_value(closes),
+        adx=adx, plus_di=plus_di, minus_di=minus_di, momentum_1m=momentum_1m, momentum_3m=momentum_3m,
+        last_close=float(closes.iloc[-1]), prev_close=float(closes.iloc[-2]) if len(closes) > 1 else float(closes.iloc[-1]),
+        session_high=float(session_bars["high"].max()) if not session_bars.empty else float(bars["high"].max()),
+        session_low=float(session_bars["low"].min()) if not session_bars.empty else float(bars["low"].min()),
+        swing_high=max(recent_pivot_highs) if recent_pivot_highs else float(recent["high"].max()),
+        swing_low=min(recent_pivot_lows) if recent_pivot_lows else float(recent["low"].min()),
+        candles=len(bars), volume_source=volume_source,
     )
 
 
-def select_option_contract(
-    chain: Sequence[dict[str, Any]], spot: float, scenario: Scenario, now: datetime,
-    indicators: IndicatorSet, oi: OIAnalysis, quotes: Mapping[str, LiveQuote],
-    option_candles: Mapping[str, pd.DataFrame], expiry: str, config: Config,
-    preferred_instrument_key: Optional[str] = None,
-    provisional: bool = False,
-    expected_underlying_move: float = float("nan"),
-) -> tuple[Optional[OptionContract], list[dict[str, Any]]]:
-    """Rank eligible-side contracts; final selection remains strictly gated.
-
-    In provisional mode, a directional, non-hard-veto watch may rank contracts for
-    internal JSON diagnostics before the underlying break/interaction is confirmed.
-    That result is never fed into trade readiness, tracker registration, or email.
-    The normal mode retains the original market and option hard gates.
-    """
-    if scenario.direction not in {"BULLISH", "BEARISH"}:
-        return None, []
-    if scenario.hard_veto or (not scenario.executable_candidate and not provisional):
-        return None, [{
-            "route_status": "SKIPPED_MARKET_NOT_CONFIRMED",
-            "execution_eligible": False,
-            "selected_for_execution": False,
-            "provisional_only": bool(provisional),
-            "vetoes": ["MARKET_SCENARIO_NOT_CONFIRMED_STRIKE_ROUTING_SKIPPED"],
-        }]
-    chain_map = chain_rows_by_strike(chain)
-    strikes = sorted(chain_map)
-    atm, permitted = allowed_strikes(spot, strikes, scenario.direction, now, scenario, indicators)
-    option_type = "CE" if scenario.direction == "BULLISH" else "PE"
-    pin_set = set(oi.pin_strikes)
-    candidates: list[OptionContract] = []
-    diagnostics: list[dict[str, Any]] = []
-    for strike, moneyness in permitted:
-        raw_row = chain_map.get(round(strike, 2)) or chain_map.get(strike)
-        if not isinstance(raw_row, dict):
-            diagnostics.append({"strike": strike, "moneyness": moneyness, "option_type": option_type,
-                                "vetoes": ["STRIKE_NOT_IN_LIVE_CHAIN"], "execution_eligible": False})
-            continue
-        side = parse_option_side(raw_row, option_type)
-        key = side["instrument_key"]
-        quote = quotes.get(key)
-        if not key or quote is None:
-            diagnostics.append({"strike": strike, "moneyness": moneyness, "option_type": option_type,
-                                "vetoes": ["LIVE_QUOTE_UNAVAILABLE"], "execution_eligible": False})
-            continue
-        candidate = _candidate_from_data(
-            row=raw_row, strike=strike, option_type=option_type, expiry=expiry, quote=quote,
-            candle_frame=option_candles.get(key, pd.DataFrame()), oi=oi, direction=scenario.direction,
-            now=now, indicators=indicators, config=config, moneyness=moneyness,
-            pin_disqualified=(strike in pin_set), exhaustion="EXHAUSTION" in scenario.state,
-            scenario_state=scenario.state, expected_underlying_move=expected_underlying_move,
-        )
-        candidates.append(candidate)
-        diagnostics.append({
-            "strike": strike, "moneyness": moneyness, "option_type": option_type,
-            "instrument_key": key, "score": candidate.total_score, "score_basis": candidate.score_basis,
-            "score_components_available": list(candidate.score_components_available),
-            "flow_score": candidate.flow_score, "vwap_lift_score": candidate.vwap_lift_score,
-            "coi_score": candidate.coi_score, "local_oi_score": candidate.local_oi_score,
-            "delta_fit_score": candidate.delta_fit_score,
-            "theta_efficiency_score": candidate.theta_efficiency_score,
-            "ranking_score": candidate.ranking_score,
-            "expected_underlying_move_points": candidate.expected_underlying_move_points,
-            "expected_option_move_rupees": candidate.expected_option_move_rupees,
-            "expected_option_move_pct": candidate.expected_option_move_pct,
-            "projection_rank_score": candidate.projection_rank_score,
-            "call_coi_at_strike_pct": oi.rows.get(float(strike), {}).get("call_coi_pct"),
-            "put_coi_at_strike_pct": oi.rows.get(float(strike), {}).get("put_coi_pct"),
-            "vetoes": list(candidate.vetoes),
-            "execution_eligible": not candidate.vetoes,
-            "provisional_only": bool(provisional),
-            "premium_vwap": candidate.premium_vwap, "ltp": candidate.ltp,
-            "delta": candidate.delta, "gamma": candidate.gamma, "vega": candidate.vega,
-            "theta": candidate.theta, "spread_ratio": candidate.spread_ratio,
-            "effective_max_spread_ratio": liquidity_adjusted_spread_limit(quote, config)[0],
-            "spread_liquidity_tier": liquidity_adjusted_spread_limit(quote, config)[1],
-            "quote_bid_depth_qty": quote.bid_qty, "quote_ask_depth_qty": quote.ask_qty,
-            "quote_volume": quote.volume,
-            "quote_freshness": candidate.quote_freshness,
-        })
-
-    if not candidates:
-        return None, diagnostics
-
-    projection_values = [candidate.expected_option_move_pct for candidate in candidates
-                         if finite(candidate.expected_option_move_pct) and candidate.expected_option_move_pct >= 0]
-    max_projection = max(projection_values) if projection_values else float("nan")
-    candidate_by_key: dict[str, OptionContract] = {}
-    for candidate in candidates:
-        if finite(candidate.expected_option_move_pct) and finite(max_projection) and max_projection > 0:
-            projection_rank = clamp(candidate.expected_option_move_pct / max_projection)
-        else:
-            projection_rank = 0.50
-        total = candidate.total_score
-        if finite(total) and finite(candidate.delta_fit_score):
-            rank_score = clamp(0.65 * total + 0.10 * candidate.delta_fit_score
-                               + 0.05 * (candidate.theta_efficiency_score if finite(candidate.theta_efficiency_score) else 0.50)
-                               + 0.20 * projection_rank)
-        else:
-            rank_score = float("nan")
-        updated = replace(candidate, ranking_score=rank_score, projection_rank_score=projection_rank)
-        candidate_by_key[updated.instrument_key] = updated
-        for diagnostic in diagnostics:
-            if diagnostic.get("instrument_key") == updated.instrument_key:
-                diagnostic["ranking_score"] = rank_score
-                diagnostic["projection_rank_score"] = projection_rank
-                break
-    candidates = [candidate_by_key.get(candidate.instrument_key, candidate) for candidate in candidates]
-
-    def rank_key(candidate: OptionContract) -> tuple[Any, ...]:
-        return (0 if finite(candidate.total_score) else 1,
-                -(candidate.ranking_score if finite(candidate.ranking_score) else
-                  candidate.total_score if finite(candidate.total_score) else -1.0),
-                0 if candidate.strike == atm else 1, candidate.strike)
-
-    ranked = sorted(candidates, key=rank_key)
-    passing = sorted((candidate for candidate in candidates if not candidate.vetoes), key=rank_key)
-    if provisional:
-        # Provisional output is a shortlist only: even a zero-veto candidate is not
-        # authorized to become the selected recommendation until final market gates pass.
-        best_review = ranked[0]
-        for diagnostic in diagnostics:
-            match = (diagnostic.get("instrument_key") == best_review.instrument_key
-                     and diagnostic.get("strike") == best_review.strike)
-            diagnostic["best_candidate_for_review"] = bool(match)
-            diagnostic["option_gate_pass"] = bool(diagnostic.get("execution_eligible"))
-            diagnostic["selected_for_execution"] = False
-            diagnostic["provisional_only"] = True
-        return best_review, diagnostics
-    if not passing:
-        # Mark the best blocked contract for internal diagnostics only. Never return it as a candidate.
-        best_review = ranked[0]
-        for diagnostic in diagnostics:
-            match = (diagnostic.get("instrument_key") == best_review.instrument_key
-                     and diagnostic.get("strike") == best_review.strike)
-            diagnostic["best_candidate_for_review"] = bool(match)
-            diagnostic["option_gate_pass"] = False
-            diagnostic["selected_for_execution"] = False
-        return None, diagnostics
-
-    selected = passing[0]
-    # Strike stickiness can apply only among contracts that pass every option-level gate.
-    if preferred_instrument_key:
-        preferred = next((item for item in passing if item.instrument_key == preferred_instrument_key), None)
-        if preferred and finite(preferred.total_score) and finite(selected.total_score) and \
-                preferred.total_score >= selected.total_score - config.strike_stickiness_tolerance:
-            selected = preferred
-    for diagnostic in diagnostics:
-        match = (diagnostic.get("instrument_key") == selected.instrument_key
-                 and diagnostic.get("strike") == selected.strike)
-        diagnostic["best_candidate_for_review"] = bool(match)
-        diagnostic["option_gate_pass"] = bool(diagnostic.get("execution_eligible"))
-        # Final execution selection is assigned only after the full readiness gate passes.
-        diagnostic["selected_for_execution"] = False
-    return selected, diagnostics
-
-
-def dynamic_atr_buffer_multiple(indicators: IndicatorSet) -> float:
-    """Use a wider structural stop buffer during recent 1m range expansion.
-
-    The multiplier is applied to the 5-minute ATR when available, matching the
-    5-minute pivot timeframe; the 1-minute ATR is used only as a documented fallback.
-    """
-    atr = indicators.atr
-    recent = indicators.recent_range
-    prior = indicators.prior_range
-    if finite(recent) and finite(prior) and prior > 0 and recent >= 1.5 * prior:
-        return 0.8
-    if finite(recent) and finite(atr) and atr > 0 and recent >= 1.5 * atr * math.sqrt(3.0):
-        return 0.8
-    return 0.5
-
-
-def structural_stop_atr(indicators: IndicatorSet) -> tuple[float, str]:
-    """Return ATR consistent with structural stops, with a conservative fallback.
-
-    The stop anchor is a 5-minute pivot/OI level, so prefer true 5-minute ATR. If it is
-    unavailable, scale 1-minute ATR by sqrt(5) as an explicitly labelled approximation.
-    """
-    if finite(indicators.atr_5m) and indicators.atr_5m > 0:
-        return float(indicators.atr_5m), "ATR_5M_COMPLETED_CANDLES"
-    if finite(indicators.atr) and indicators.atr > 0:
-        return float(indicators.atr) * math.sqrt(5.0), "ATR_1M_SQRT5_FALLBACK"
-    return float("nan"), "UNAVAILABLE"
-
-
-def remaining_regular_session_minutes(now: datetime) -> float:
-    """Minutes remaining until the regular NSE close, using the timestamp's IST date."""
-    local = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
-    close_at = datetime.combine(local.date(), MARKET_END, tzinfo=IST)
-    return max(0.0, (close_at - local).total_seconds() / 60.0)
-
-
-def route_targets_and_stop(
-    scenario: Scenario, spot: float, indicators: IndicatorSet, oi: OIAnalysis, config: Config,
-    *, now: Optional[datetime] = None,
-) -> RiskPlan:
-    """Route the nearest usable observed support/resistance level with structural stop and R:R gates."""
-    if scenario.direction not in {"BULLISH", "BEARISH"}:
-        return RiskPlan(False, None, None, None, "", "", "", (), "No directional scenario.")
-    atr_stop, atr_source = structural_stop_atr(indicators)
-    if not finite(atr_stop) or atr_stop <= 0:
-        return RiskPlan(False, None, None, None, "", "", "", (), "ATR unavailable; cannot place a volatility-buffered structural stop.")
-
-    local_now = now or now_ist()
-    remaining_minutes = remaining_regular_session_minutes(local_now)
-    time_bars = max(1.0, remaining_minutes / 5.0)
-    max_target_distance = max(1.5 * atr_stop, config.max_t1_expected_move_multiple * atr_stop * math.sqrt(time_bars))
-    bullish = scenario.direction == "BULLISH"
-    target_walls = oi.walls_resistance if bullish else oi.walls_support
-    stop_walls = oi.walls_support if bullish else oi.walls_resistance
-    short_atr = indicators.atr if finite(indicators.atr) and indicators.atr > 0 else atr_stop / math.sqrt(5.0)
-    step = infer_strike_step(list(oi.rows))
-    min_distance = max(0.20 * short_atr, 0.25 * step, 1.0)
-
-    skipped_weak: list[float] = []
-    skipped_unreachable: list[float] = []
-    target_candidates: list[tuple[float, str, int]] = []
-    for wall in target_walls:
-        level = float(wall.strike)
-        ahead = level > spot + min_distance if bullish else level < spot - min_distance
-        if not ahead:
-            continue
-        if wall.state == "WEAKENING":
-            skipped_weak.append(level)
-            continue
-        if wall.state not in {"BUILDING", "STABLE"}:
-            continue
-        if abs(level - spot) > max_target_distance:
-            skipped_unreachable.append(level)
-            continue
-        target_candidates.append((level, f"INTACT_{wall.side}_OI_WALL_{wall.state}", 0))
-
-    # Price-derived levels are real completed-session observations, not synthetic offsets.
-    # The 5m pivot is confirmed; the 1m swing is a recent completed-candle extreme.
-    price_levels = (
-        [(indicators.swing_high_5m, "CONFIRMED_5M_RESISTANCE_PIVOT", 1),
-         (indicators.swing_high, "RECENT_1M_RESISTANCE_EXTREME", 2),
-         (indicators.session_high, "CURRENT_SESSION_RESISTANCE_EXTREME", 3)] if bullish else
-        [(indicators.swing_low_5m, "CONFIRMED_5M_SUPPORT_PIVOT", 1),
-         (indicators.swing_low, "RECENT_1M_SUPPORT_EXTREME", 2),
-         (indicators.session_low, "CURRENT_SESSION_SUPPORT_EXTREME", 3)]
-    )
-    for value, source, priority in price_levels:
-        if not finite(value):
-            continue
-        level = float(value)
-        ahead = level > spot + min_distance if bullish else level < spot - min_distance
-        if not ahead:
-            continue
-        distance = abs(level - spot)
-        if distance > max_target_distance:
-            skipped_unreachable.append(level)
-            continue
-        target_candidates.append((level, source, priority))
-
-    # Stop is anchored to the nearest protective structural level. For a confirmed rejection
-    # or bounce, its tested boundary is a valid anchor even if the level originated in price action.
-    stop_anchors: list[tuple[float, str]] = []
-    local_pivot = indicators.swing_low_5m if bullish else indicators.swing_high_5m
-    if finite(local_pivot) and (local_pivot < spot if bullish else local_pivot > spot):
-        stop_anchors.append((float(local_pivot), "CONFIRMED_5M_PIVOT"))
-    for wall in stop_walls:
-        if wall.state not in {"BUILDING", "STABLE"}:
-            continue
-        if wall.strike < spot if bullish else wall.strike > spot:
-            stop_anchors.append((float(wall.strike), f"INTACT_{wall.side}_OI_WALL_{wall.state}"))
-    reaction = str((scenario.features or {}).get("reaction", "")).upper()
-    reaction_level = safe_float(scenario.wall_level, float("nan"))
-    if finite(reaction_level) and (
-        (bullish and reaction == "SUPPORT_BOUNCE" and reaction_level < spot)
-        or (not bullish and reaction == "RESISTANCE_REJECTION" and reaction_level > spot)
-        or (bullish and reaction == "STRUCTURAL_BREAK_RETEST" and reaction_level < spot)
-        or (not bullish and reaction == "STRUCTURAL_BREAK_RETEST" and reaction_level > spot)
-    ):
-        anchor_label = ("FAILED_STRUCTURAL_PIVOT" if reaction == "STRUCTURAL_BREAK_RETEST"
-                        else f"TESTED_{'SUPPORT' if bullish else 'RESISTANCE'}_BOUNDARY")
-        stop_anchors.append((float(reaction_level), anchor_label))
-    if not stop_anchors:
-        return RiskPlan(False, None, None, None, "", "", "", tuple(sorted(set(skipped_weak))),
-                        "No confirmed 5-minute pivot, intact structural wall, or tested reaction boundary for stop placement.",
-                        max_t1_distance_points=max_target_distance, remaining_session_minutes=remaining_minutes,
-                        stop_atr_points=atr_stop, stop_atr_source=atr_source,
-                        skipped_unreachable_walls=tuple(sorted(set(skipped_unreachable))))
-    base, base_source = (max(stop_anchors, key=lambda row: row[0]) if bullish
-                         else min(stop_anchors, key=lambda row: row[0]))
-    atr_buffer = dynamic_atr_buffer_multiple(indicators)
-    # A confirmed, tested support bounce/resistance rejection has a concrete invalidation
-    # level. Do not apply the generic 0.80 ATR expansion widening on top of that level:
-    # it can make the first valid opposing OI wall fail the 1:1 floor by a few points and
-    # force the scanner to wait for a much later breakout. Keep the buffer at least 0.50 ATR
-    # and cap only the expansion multiplier at 0.65 for these confirmed reaction setups.
-    confirmed_reaction = (
-        (bullish and scenario.state == "STRUCTURAL_SUPPORT_BOUNCE" and reaction == "SUPPORT_BOUNCE")
-        or (not bullish and scenario.state == "STRUCTURAL_RESISTANCE_REJECTION" and reaction == "RESISTANCE_REJECTION")
-    )
-    if confirmed_reaction:
-        atr_buffer = min(atr_buffer, 0.65)
-    active_reversal_reaction = (
-        scenario.state in {"ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BULLISH", "ACTIVE_SIGNAL_REVERSAL_CONFIRMED_BEARISH"}
-        and reaction == "STRUCTURAL_BREAK_RETEST"
-    )
-    if active_reversal_reaction:
-        # The failed pivot is an explicit invalidation boundary for the new direction.
-        # Cap, rather than widen, the generic ATR buffer; the R:R planner still decides
-        # whether this protective stop makes the nearest observed target viable.
-        atr_buffer = min(atr_buffer, 0.30)
-    stop = base - atr_buffer * atr_stop if bullish else base + atr_buffer * atr_stop
-    stop_source = f"{base_source}_PLUS_MINUS_{atr_buffer:.2f}_{atr_source}"
-    stop_ok = finite(stop) and (stop < spot if bullish else stop > spot)
-    if not stop_ok:
-        return RiskPlan(False, None, None, float(stop) if finite(stop) else None, stop_source, "", "",
-                        tuple(sorted(set(skipped_weak))), "Structural stop is not on the protective side of spot.",
-                        max_target_distance_points=max_target_distance, remaining_session_minutes=remaining_minutes,
-                        stop_atr_points=atr_stop, stop_atr_source=atr_source,
-                        skipped_unreachable_walls=tuple(sorted(set(skipped_unreachable))))
-
-    risk_points = abs(spot - stop)
-    if not finite(risk_points) or risk_points <= 0:
-        return RiskPlan(False, None, None, float(stop), stop_source, "", "", tuple(sorted(set(skipped_weak))),
-                        "Structural stop risk is zero or invalid.", max_t1_distance_points=max_target_distance,
-                        remaining_session_minutes=remaining_minutes, stop_atr_points=atr_stop,
-                        stop_atr_source=atr_source, skipped_unreachable_walls=tuple(sorted(set(skipped_unreachable))))
-
-    # An intact opposing OI wall is a real barrier, not an inconvenient target candidate.
-    # Never skip a too-close BUILDING/STABLE wall to manufacture an attractive R:R at a
-    # much farther level; wait for the barrier to weaken/break or for a better entry/stop.
-    intact_barriers = []
-    for wall in target_walls:
-        level = float(wall.strike)
-        ahead = level > spot + min_distance if bullish else level < spot - min_distance
-        if not ahead or wall.state not in {"BUILDING", "STABLE"}:
-            continue
-        if abs(level - spot) <= max_target_distance:
-            intact_barriers.append(wall)
-    if intact_barriers:
-        first_barrier = min(intact_barriers, key=lambda wall: abs(float(wall.strike) - spot))
-        barrier_reward = abs(float(first_barrier.strike) - spot)
-        barrier_rr = barrier_reward / risk_points
-        if barrier_rr + 1e-9 < config.min_t1_reward_risk_ratio:
-            return RiskPlan(
-                False, None, None, float(stop), stop_source, "", "",
-                tuple(sorted(set(skipped_weak))),
-                (f"Nearest intact opposing {first_barrier.side} OI wall {first_barrier.strike:.2f} "
-                 f"is only {barrier_rr:.2f}:1 reward/risk and lies before farther targets; "
-                 "refusing to skip this structural barrier. Wait for it to weaken/break or obtain a safer entry/stop."),
-                reward_points=barrier_reward, risk_points=risk_points,
-                reward_risk_ratio=barrier_rr, max_t1_distance_points=max_target_distance,
-                remaining_session_minutes=remaining_minutes, stop_atr_points=atr_stop,
-                stop_atr_source=atr_source,
-                skipped_unreachable_walls=tuple(sorted(set(skipped_unreachable))),
-            )
-
-    # Apply the R:R floor before deduplicating nearby observations. Otherwise a session
-    # high/low a few points closer than an adjacent OI wall can suppress that wall during
-    # deduplication, then fail the R:R test itself, leaving no T1 even though the actual
-    # OI wall is a valid target. Among viable levels, preserve nearest-first ordering and
-    # coalesce duplicate price/OI observations only after each level is independently tested.
-    target_candidates.sort(key=lambda row: (abs(row[0] - spot), row[2]))
-    rr_eligible_candidates: list[tuple[float, str, int]] = []
-    for item in target_candidates:
-        reward = abs(item[0] - spot)
-        if reward / risk_points >= config.min_t1_reward_risk_ratio:
-            rr_eligible_candidates.append(item)
-    eligible_targets: list[tuple[float, str, int]] = []
-    for item in rr_eligible_candidates:
-        if not any(abs(item[0] - prior[0]) <= min_distance for prior in eligible_targets):
-            eligible_targets.append(item)
-    if not eligible_targets:
-        return RiskPlan(False, None, None, float(stop), stop_source, "", "",
-                        tuple(sorted(set(skipped_weak))),
-                        f"No observed structural target within {max_target_distance:.2f} points meets the required {config.min_t1_reward_risk_ratio:.2f}:1 T1 reward/risk floor.",
-                        risk_points=risk_points, max_t1_distance_points=max_target_distance,
-                        remaining_session_minutes=remaining_minutes, stop_atr_points=atr_stop,
-                        stop_atr_source=atr_source, skipped_unreachable_walls=tuple(sorted(set(skipped_unreachable))))
-
-    t1, t1_source, _ = eligible_targets[0]
-    t2 = None
-    t2_source = "UNAVAILABLE_NO_SECOND_STRUCTURAL_LEVEL"
-    for candidate_level, candidate_source, _priority in eligible_targets[1:]:
-        beyond = candidate_level > t1 + min_distance if bullish else candidate_level < t1 - min_distance
-        if beyond:
-            t2 = float(candidate_level)
-            t2_source = f"NEXT_{candidate_source}"
-            break
-    # If T2 is unavailable among targets with a valid T1 R:R, retain one farther in-range observed level
-    # only when it is structurally ordered beyond T1; otherwise leave T2 explicitly blank.
-    if t2 is None and skipped_unreachable:
-        t2_source = "UNAVAILABLE_EXPECTED_MOVE_LIMIT"
-
-    reward_points = abs(float(t1) - spot)
-    rr = reward_points / risk_points
-    t2_ok = t2 is None or (t2 > t1 if bullish else t2 < t1)
-    if not t2_ok:
-        t2, t2_source = None, "UNAVAILABLE_INVALID_LEVEL_ORDER"
-    target_detail = ("T1 and structural stop passed the minimum reward/risk gate; T2 available."
-                     if t2 is not None else
-                     "T1 and structural stop passed the minimum reward/risk gate; T2 unavailable and intentionally left unset.")
-    return RiskPlan(True, float(t1), float(t2) if t2 is not None else None, float(stop), stop_source,
-                    t1_source, t2_source, tuple(sorted(set(skipped_weak))),
-                    f"Valid structural plan. T1 reward/risk={rr:.2f}:1; target ceiling={max_target_distance:.2f} points; {target_detail}",
-                    reward_points=reward_points, risk_points=risk_points, reward_risk_ratio=rr,
-                    max_t1_distance_points=max_target_distance, remaining_session_minutes=remaining_minutes,
-                    stop_atr_points=atr_stop, stop_atr_source=atr_source,
-                    skipped_unreachable_walls=tuple(sorted(set(skipped_unreachable))))
-
-def _scan_intrabar_level_crossings(
-    tracker: dict[str, Any], frame: Optional[pd.DataFrame], now: datetime,
-    direction: str, target_1: float, target_2: float, stop_loss: float,
-    *, lookback: int = 60, prior_monitor_at: Optional[datetime] = None,
-) -> dict[str, Any]:
-    """Inspect newly completed 1m NIFTY OHLC ranges for virtual target/stop crossings.
-
-    If a single candle spans a stop and a target, the stop is processed first because
-    OHLC data cannot establish the exact intraminute order; this is deliberately
-    conservative and is reported as a virtual event, never an actual position exit.
-    """
-    result = {"stop_hit": False, "t1_hit": False, "t2_hit": False,
-              "stop_timestamp": None, "t1_timestamp": None, "t2_timestamp": None,
-              "ambiguous_bar": False, "bars_processed": 0,
-              "monitoring_data_status": "UNAVAILABLE", "monitoring_gap_minutes": None,
-              "monitoring_data_note": "No candle integrity assessment completed."}
-    bars = completed_one_minute_candles(frame, now)
-    now_ist_value = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
-    created = parse_timestamp(tracker.get("created_at"))
-    last_processed = parse_timestamp(tracker.get("last_intrabar_bar_timestamp"))
-    if created:
-        created = created.astimezone(IST)
-    if last_processed:
-        last_processed = last_processed.astimezone(IST)
-    prior_monitor = prior_monitor_at.astimezone(IST) if prior_monitor_at and prior_monitor_at.tzinfo else (prior_monitor_at.replace(tzinfo=IST) if prior_monitor_at else None)
-    elapsed_monitor_minutes = ((now_ist_value - prior_monitor).total_seconds() / 60.0) if prior_monitor else None
-    result["monitoring_gap_minutes"] = round(max(0.0, elapsed_monitor_minutes), 2) if elapsed_monitor_minutes is not None else None
-    if bars.empty:
-        if prior_monitor is not None:
-            result["monitoring_data_status"] = "GAP_UNRESOLVED"
-            result["monitoring_data_note"] = (
-                "Completed 1m candles disappeared after a prior monitoring scan. The interval's OHLC path "
-                "cannot be reconstructed; keep the virtual tracker active, continue current-spot stop checks, "
-                "and suppress new T1/T2 milestones for this signal generation."
-            )
-        else:
-            # Preserve the original cold-start regression: if candles have never been available for this
-            # tracker, live NIFTY spot can still surface a level, explicitly marked as spot-only evidence.
-            result["monitoring_data_status"] = "CANDLES_UNAVAILABLE_LIVE_SPOT_ONLY"
-            result["monitoring_data_note"] = (
-                "No completed 1m candles are available. Current live NIFTY spot may still trigger a level, "
-                "but any unobserved path between scans cannot be reconstructed from OHLC history."
-            )
-        return result
-    bars = bars.tail(min(15, max(1, int(lookback))))
-    gap_cutoff = now_ist_value - timedelta(minutes=15)
-    bars_local = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST)
-    bars = bars.loc[bars_local >= gap_cutoff].copy().sort_values("timestamp").reset_index(drop=True)
-    # Assess whether the available recent OHLC window covers the tracker timeline. A gap
-    # is not filled with synthetic bars; targets are withheld when chronology is uncertain.
-    candidate_stamps = [parse_timestamp(v) for v in bars["timestamp"].tolist()]
-    candidate_stamps = [v.astimezone(IST) for v in candidate_stamps if v is not None]
-    relevant_stamps = [v for v in candidate_stamps if (last_processed is None or v > last_processed)
-                       and (created is None or v >= created)]
-    unresolved_gap = False
-    gap_note = "Completed 1m candles are contiguous within the supported monitoring window."
-    gap_minutes = None
-    if elapsed_monitor_minutes is not None and elapsed_monitor_minutes > 15.0:
-        unresolved_gap = True
-        gap_note = ("Monitoring gap exceeded the 15-minute completed-candle replay window; "
-                    "hidden level-crossing order cannot be reconstructed.")
-    if last_processed is not None and candidate_stamps:
-        first_window = candidate_stamps[0]
-        if last_processed < gap_cutoff and (first_window - last_processed).total_seconds() > 120.0:
-            unresolved_gap = True
-            gap_minutes = round((first_window - last_processed).total_seconds() / 60.0 - 1.0, 2)
-            gap_note = "The bounded 15-minute candle window starts after the last processed candle; older crossings may be missing."
-    if last_processed is not None and relevant_stamps:
-        if (relevant_stamps[0] - last_processed).total_seconds() > 120.0:
-            unresolved_gap = True
-            gap_minutes = round((relevant_stamps[0] - last_processed).total_seconds() / 60.0 - 1.0, 2)
-            gap_note = "One or more completed 1m candles are missing since the prior processed bar; target chronology is uncertain."
-    for previous_stamp, next_stamp in zip(relevant_stamps, relevant_stamps[1:]):
-        delta_minutes = (next_stamp - previous_stamp).total_seconds() / 60.0
-        if delta_minutes > 1.5:
-            unresolved_gap = True
-            gap_minutes = max(gap_minutes or 0.0, round(delta_minutes - 1.0, 2))
-            gap_note = "A timestamp gap was found in completed 1m candles; target chronology is uncertain."
-            break
-    if created is not None and last_processed is None and relevant_stamps:
-        expected_first = created.replace(second=0, microsecond=0)
-        if created.second or created.microsecond:
-            expected_first += timedelta(minutes=1)
-        if (relevant_stamps[0] - expected_first).total_seconds() > 30.0:
-            unresolved_gap = True
-            gap_minutes = round(max(0.0, (relevant_stamps[0] - expected_first).total_seconds() / 60.0 - 1.0), 2)
-            gap_note = "The first available candle is later than expected after signal creation; earlier crossings may be missing."
-    latest_stamp = candidate_stamps[-1] if candidate_stamps else None
-    if latest_stamp is not None and (now_ist_value - (latest_stamp + timedelta(minutes=1))).total_seconds() > 150.0:
-        if not unresolved_gap:
-            gap_note = "The completed-candle feed is lagging; the current signal is monitored but OHLC chronology may be incomplete."
-        unresolved_gap = True
-    if unresolved_gap:
-        result["monitoring_data_status"] = "GAP_UNRESOLVED" if gap_note.find("lagging") == -1 else "CANDLE_FEED_STALE"
-        result["monitoring_data_note"] = gap_note
-    elif elapsed_monitor_minutes is not None and elapsed_monitor_minutes > 7.0:
-        result["monitoring_data_status"] = "GAP_REPLAYED_WITHIN_WINDOW"
-        result["monitoring_data_note"] = "Scans were farther apart than usual, but the completed 1m candle sequence is contiguous within the supported replay window."
-    else:
-        result["monitoring_data_status"] = "CONTIGUOUS"
-        result["monitoring_data_note"] = gap_note
-    result["monitoring_gap_minutes"] = gap_minutes if gap_minutes is not None else result["monitoring_gap_minutes"]
-    if created:
-        created = created.astimezone(IST)
-    if last_processed:
-        last_processed = last_processed.astimezone(IST)
-    existing_t1 = bool(tracker.get("target_1_hit", False))
-    dir_up = str(direction).upper() == "BULLISH"
-    last_seen: Optional[datetime] = None
-    for _, bar in bars.iterrows():
-        stamp = parse_timestamp(bar.get("timestamp"))
-        if stamp is None:
-            continue
-        stamp = stamp.astimezone(IST)
-        if stamp.date() != now_ist_value.date() or stamp + timedelta(minutes=1) > now_ist_value:
-            continue
-        # Exclude the entire minute candle if it started before the recommendation was created.
-        # An OHLC candle cannot separate its pre-entry and post-entry ranges.
-        if created and stamp < created:
-            continue
-        if last_processed and stamp <= last_processed:
-            continue
-        high = safe_float(bar.get("high"), float("nan"))
-        low = safe_float(bar.get("low"), float("nan"))
-        if not finite(high) or not finite(low):
-            last_seen = stamp
-            continue
-        result["bars_processed"] += 1
-        last_seen = stamp
-        stop_cross = low <= stop_loss if dir_up else high >= stop_loss
-        t1_cross = high >= target_1 if dir_up else low <= target_1
-        t2_cross = finite(target_2) and (high >= target_2 if dir_up else low <= target_2)
-        if stop_cross:
-            result["stop_hit"] = True
-            result["stop_timestamp"] = ist_iso(stamp)
-            # Any target crossed inside the same OHLC candle is ambiguous with the stop,
-            # even if T1 had already been reached on an earlier candle (for T2/T1 re-crosses).
-            # The stop-first rule is per-candle; distinct completed candles retain chronology.
-            result["ambiguous_bar"] = bool(t1_cross or t2_cross)
-            break
-        if not existing_t1 and t1_cross:
-            result["t1_hit"] = True
-            result["t1_timestamp"] = ist_iso(stamp)
-            existing_t1 = True
-        if t2_cross and existing_t1:
-            result["t2_hit"] = True
-            result["t2_timestamp"] = ist_iso(stamp)
-            break
-    if last_seen:
-        tracker["last_intrabar_bar_timestamp"] = ist_iso(last_seen)
+def _pivot_prices(frame: pd.DataFrame, column: str, which: str) -> list[float]:
+    if frame is None or len(frame) < 5:
+        return []
+    values = frame[column].to_numpy(dtype=float)
+    result: list[float] = []
+    for i in range(2, len(values) - 2):
+        window = values[i-2:i+3]
+        if which == "high" and values[i] >= max(window) and sum(values[i] == x for x in window) == 1:
+            result.append(float(values[i]))
+        elif which == "low" and values[i] <= min(window) and sum(values[i] == x for x in window) == 1:
+            result.append(float(values[i]))
     return result
 
 
-def completed_resampled_candles_all_sessions(
-    frame: Optional[pd.DataFrame], interval_minutes: int, now: datetime,
-) -> pd.DataFrame:
-    """Resample complete intraday bars across prior sessions and the current session.
-
-    Unlike completed_resampled_candles(), this helper preserves prior trading dates so
-    Wilder ATR can be seeded on completed 5-minute candles without relying on a short
-    current-session-only history. Off-session bars and incomplete intervals are excluded.
-    """
-    columns = ["timestamp", "open", "high", "low", "close", "volume"]
-    if frame is None or frame.empty or "timestamp" not in frame.columns or interval_minutes < 2:
-        return pd.DataFrame(columns=columns)
-    work = frame.copy()
-    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
-    work = work.dropna(subset=["timestamp"]).sort_values("timestamp").drop_duplicates("timestamp", keep="last")
-    if work.empty:
-        return pd.DataFrame(columns=columns)
-    for column in ("open", "high", "low", "close", "volume"):
-        if column not in work.columns:
-            work[column] = 0.0 if column == "volume" else np.nan
-        work[column] = pd.to_numeric(work[column], errors="coerce")
-    current = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
-    local_ts = work["timestamp"].dt.tz_convert(IST)
-    local_times = local_ts.dt.time
-    complete = local_ts + pd.to_timedelta(1, unit="m") <= current
-    in_session = (local_times >= MARKET_START) & (local_times < MARKET_END)
-    work = work.loc[complete & in_session].dropna(subset=["open", "high", "low", "close"]).copy()
-    if work.empty:
-        return pd.DataFrame(columns=columns)
-    work["timestamp"] = work["timestamp"].dt.tz_convert(IST).dt.tz_localize(None)
-    work = work.set_index("timestamp").sort_index()
-    minutes = int(interval_minutes)
-    resampled = work.resample(
-        f"{minutes}min", origin="start_day", offset="9h15min", label="left", closed="left"
-    ).agg(
-        open=("open", "first"), high=("high", "max"), low=("low", "min"),
-        close=("close", "last"), volume=("volume", "sum"), observed_minutes=("close", "count"),
-    )
-    current_naive = current.replace(tzinfo=None)
-    bar_end = resampled.index + pd.to_timedelta(minutes, unit="m")
-    valid = resampled["observed_minutes"].eq(minutes)
-    valid &= resampled.index.time >= MARKET_START
-    valid &= bar_end.time <= MARKET_END
-    # No current-day bar is used until its full interval has elapsed. Prior dates are complete.
-    current_day_mask = pd.Index(resampled.index.date) == current.date()
-    valid &= (~current_day_mask) | (bar_end <= current_naive)
-    result = resampled.loc[valid].dropna(subset=["open", "high", "low", "close"]).reset_index()
-    if result.empty:
-        return pd.DataFrame(columns=columns)
-    result["timestamp"] = pd.to_datetime(result["timestamp"]).dt.tz_localize(IST)
-    return result[columns].reset_index(drop=True)
+def _snapshot_rows(snapshot: Mapping[str, Any]) -> dict[float, Mapping[str, Any]]:
+    out: dict[float, Mapping[str, Any]] = {}
+    for row in snapshot.get("rows", []) if isinstance(snapshot.get("rows", []), list) else []:
+        if isinstance(row, dict) and finite(row.get("strike")):
+            out[float(row["strike"])] = row
+    return out
 
 
-def completed_resampled_candles(
-    frame: Optional[pd.DataFrame], interval_minutes: int, now: datetime,
-) -> pd.DataFrame:
-    """Build complete intraday OHLCV bars from completed 1m candles on IST boundaries."""
-    if frame is None or frame.empty or interval_minutes < 2:
-        return pd.DataFrame()
-    one_min = completed_one_minute_candles(frame, now)
-    if one_min.empty:
-        return pd.DataFrame()
-    work = one_min.copy()
-    local = pd.to_datetime(work["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST)
-    work["timestamp"] = local.dt.tz_localize(None)
-    work = work.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
-    expected = int(interval_minutes)
-    resampled = work.resample(
-        f"{expected}min", origin="start_day", offset="9h15min", label="left", closed="left"
-    ).agg(
-        open=("open", "first"), high=("high", "max"), low=("low", "min"),
-        close=("close", "last"), volume=("volume", "sum"), observed_minutes=("close", "count"),
-    )
-    current = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
-    valid = resampled["observed_minutes"].eq(expected)
-    valid &= (resampled.index + pd.to_timedelta(expected, unit="m") <= current.replace(tzinfo=None))
-    valid &= pd.Index(resampled.index.date) == current.date()
-    result = resampled.loc[valid].dropna(subset=["open", "high", "low", "close"]).reset_index()
-    result["timestamp"] = pd.to_datetime(result["timestamp"]).dt.tz_localize(IST)
-    return result.drop(columns=["observed_minutes"], errors="ignore").reset_index(drop=True)
+def _recent_snapshot(snapshots: Sequence[dict[str, Any]], now: datetime, expiry: str,
+                     low_minutes: float = 0.5, high_minutes: float = 7.0) -> tuple[Optional[dict[str, Any]], Optional[float]]:
+    matches: list[tuple[float, dict[str, Any]]] = []
+    for snap in snapshots:
+        stamp = parse_dt(snap.get("timestamp"))
+        if not stamp or stamp.date() != now.astimezone(IST).date() or str(snap.get("expiry", "")) != expiry:
+            continue
+        age = (now.astimezone(IST) - stamp).total_seconds() / 60
+        if low_minutes <= age <= high_minutes:
+            matches.append((age, snap))
+    if not matches:
+        return None, None
+    age, snap = min(matches, key=lambda x: abs(x[0] - 3.0))
+    return snap, age
 
 
-def evaluate_stagnation_watch(
-    tracker: dict[str, Any], index_candles: Optional[pd.DataFrame],
-    spot: float, indicators: IndicatorSet, oi: OIAnalysis, now: datetime,
-    *, range_limit_pct: float = 0.001, min_progress_pct: float = 0.0001,
-    oi_velocity_trigger: float = 0.0015, cooldown_minutes: int = 15,
-) -> dict[str, Any]:
-    """Warn about tight post-entry stagnation only when directional alignment has deteriorated.
-
-    This is diagnostic only: it never closes a recommendation or alters its stop. Three
-    complete, consecutive 5m bars after the recommendation timestamp are required.
-    """
-    neutral = {"status": "INSUFFICIENT_BARS", "warning": None, "range_pct": None,
-               "favorable_progress_pct": None, "flow_aligned": False, "vwap_aligned": False}
-    bars = completed_resampled_candles(index_candles, 5, now)
-    created = parse_timestamp(tracker.get("created_at"))
-    if created is None or bars.empty:
-        return neutral
-    bars = bars.loc[pd.to_datetime(bars["timestamp"], utc=True) >= pd.Timestamp(created.astimezone(IST).astimezone(ZoneInfo("UTC")))].copy()
-    if len(bars) < 3:
-        return neutral
-    recent = bars.tail(3).reset_index(drop=True)
-    stamps = pd.to_datetime(recent["timestamp"], utc=True, errors="coerce")
-    if stamps.isna().any() or any((stamps.iloc[i] - stamps.iloc[i - 1]).total_seconds() != 300 for i in range(1, len(stamps))):
-        return {**neutral, "status": "NONCONSECUTIVE_BARS"}
-    high = safe_float(recent["high"].max(), float("nan"))
-    low = safe_float(recent["low"].min(), float("nan"))
-    ref = safe_float(tracker.get("nifty_entry_reference"), float("nan"))
-    if not all(finite(v) for v in (high, low, ref, spot)) or ref <= 0 or spot <= 0:
-        return {**neutral, "status": "INVALID_REFERENCE"}
-    range_pct = (high - low) / max(float(spot), 1.0)
-    direction = str(tracker.get("direction", "")).upper()
-    last_close = safe_float(recent.iloc[-1]["close"], float("nan"))
-    progress = ((last_close / ref) - 1.0) if direction == "BULLISH" else ((ref / last_close) - 1.0 if last_close > 0 else float("nan"))
-    if direction == "BULLISH":
-        vwap_aligned = finite(indicators.vwap) and spot >= indicators.vwap
-        flow_aligned = bool(oi.tactical_available and finite(oi.call_coi_pct) and finite(oi.put_coi_pct)
-                            and oi.call_coi_pct <= -oi_velocity_trigger and oi.put_coi_pct >= -0.25 * oi_velocity_trigger)
-    elif direction == "BEARISH":
-        vwap_aligned = finite(indicators.vwap) and spot <= indicators.vwap
-        flow_aligned = bool(oi.tactical_available and finite(oi.put_coi_pct) and finite(oi.call_coi_pct)
-                            and oi.put_coi_pct <= -oi_velocity_trigger and oi.call_coi_pct >= -0.25 * oi_velocity_trigger)
-    else:
-        vwap_aligned = flow_aligned = False
-    details = {"range_pct": range_pct, "favorable_progress_pct": progress,
-               "flow_aligned": flow_aligned, "vwap_aligned": bool(vwap_aligned),
-               "bars": [str(stamp) for stamp in stamps]}
-    if range_pct > max(0.0, range_limit_pct):
-        return {**details, "status": "RANGE_NOT_STAGNANT", "warning": None}
-    if progress >= max(0.0, min_progress_pct) and flow_aligned and vwap_aligned:
-        return {**details, "status": "ALIGNED_CONTINUATION_NO_WARNING", "warning": None}
-    last_warning = parse_timestamp(tracker.get("last_stagnation_warning_at"))
-    if last_warning and (now - last_warning).total_seconds() < max(1, int(cooldown_minutes)) * 60:
-        return {**details, "status": "WARNING_COOLDOWN", "warning": None}
-    tracker["last_stagnation_warning_at"] = ist_iso(now)
-    warning = {
-        "event_type": "STAGNATION_RISK_WARNING", "event_at": ist_iso(now),
-        "tracker_fingerprint": tracker.get("signal_fingerprint", ""),
-        "direction": direction, "scenario": tracker.get("scenario", ""),
-        "instrument_key": tracker.get("instrument_key", ""),
-        "trading_symbol": tracker.get("trading_symbol", ""),
-        "option_type": tracker.get("option_type", ""), "strike": tracker.get("strike"),
-        "spot": spot, "option_ltp": tracker.get("last_option_ltp_observed"),
-        "option_quote_status": tracker.get("last_option_quote_status", "UNKNOWN"),
-        "T1": tracker.get("target_1"), "T2": tracker.get("target_2"),
-        "SL": tracker.get("stop_loss"), "trailing_SL": tracker.get("trailing_stop", tracker.get("stop_loss")),
-        "range_pct": range_pct * 100.0, "favorable_progress_pct": progress * 100.0,
-        "flow_aligned": flow_aligned, "vwap_aligned": bool(vwap_aligned),
-        "message": ("Three completed consecutive 5m bars have remained compressed after the recommendation. "
-                    "Directional progress/VWAP/tactical-COI alignment is incomplete; review theta/time-decay exposure. "
-                    "This is a warning only and does not close or invalidate the virtual recommendation."),
-    }
-    return {**details, "status": "STAGNATION_RISK_WARNING", "warning": warning}
-
-
-def _active_feature_status(direction: str, value: float, threshold: float) -> str:
-    """Map a directional numeric observation to ALIGNED/OPPOSING/NEUTRAL/UNAVAILABLE."""
-    if not finite(value):
-        return "UNAVAILABLE"
-    signed = float(value) if direction == "BULLISH" else -float(value)
-    if signed >= threshold:
-        return "ALIGNED"
-    if signed <= -threshold:
-        return "OPPOSING"
-    return "NEUTRAL"
-
-
-def _assess_active_signal_regime(
-    tracker: dict[str, Any], scenario: Optional[Scenario], indicators: IndicatorSet,
-    oi: OIAnalysis, future_regime: str, config: Optional[Config], now: datetime,
-    index_candles: Optional[pd.DataFrame],
-) -> dict[str, Any]:
-    """Persist compact context diagnostics without independently changing signal status.
-
-    This routine is intentionally non-voting. It never computes an aggregate score and
-    never exits or invalidates a tracker. Structural SL/T2 and apply_direction_flip_guard
-    remain the only signal-ending paths during ordinary market monitoring.
-    """
-    direction = str(tracker.get("direction", "")).upper()
-    if direction not in {"BULLISH", "BEARISH"}:
-        direction = "UNKNOWN"
-    trigger = config.oi_velocity_trigger if config is not None else 0.0015
-    scenario_state = "UNAVAILABLE"
-    scenario_direction = "UNKNOWN"
-    scenario_executable: Optional[bool] = None
-    scenario_hard_veto = False
-    if scenario is not None:
-        scenario_state = str(scenario.state or "UNKNOWN")
-        scenario_direction = str(scenario.direction or "NEUTRAL").upper()
-        scenario_executable = bool(scenario.executable_candidate)
-        scenario_hard_veto = bool(scenario.hard_veto)
-    if scenario is None:
-        scenario_relation = "SCENARIO_UNAVAILABLE"
-    elif scenario_hard_veto or scenario_direction not in {"BULLISH", "BEARISH"}:
-        scenario_relation = "NEUTRAL_OR_HARD_VETO"
-    elif scenario_direction == direction:
-        scenario_relation = "SAME_DIRECTION_SETUP"
-    else:
-        scenario_relation = "OPPOSITE_DIRECTION_SETUP_OR_WATCH"
-
-    atr = safe_float(indicators.atr)
-    spot = safe_float(indicators.spot)
-    vwap = safe_float(indicators.vwap)
-    vwap_tolerance = max(0.05 * atr if finite(atr) and atr > 0 else 0.0,
-                         0.00005 * spot if finite(spot) and spot > 0 else 0.0, 0.5)
-    vwap_gap = spot - vwap if finite(spot) and finite(vwap) else float("nan")
-    signed_vwap_gap = vwap_gap if direction == "BULLISH" else -vwap_gap
-    if direction not in {"BULLISH", "BEARISH"} or not finite(vwap_gap):
-        vwap_status = "UNAVAILABLE"
-    elif signed_vwap_gap > vwap_tolerance:
-        vwap_status = "ALIGNED"
-    elif signed_vwap_gap < -vwap_tolerance:
-        vwap_status = "OPPOSING"
-    else:
-        vwap_status = "NEAR_VWAP_NOISE_BAND"
-
-    momentum_status = _active_feature_status(direction, safe_float(indicators.momentum_3m_pct), 0.0001)
-    momentum_1m_status = _active_feature_status(direction, safe_float(indicators.momentum_1m_pct), 0.0001)
-    di_difference = (safe_float(indicators.plus_di) - safe_float(indicators.minus_di)
-                     if finite(indicators.plus_di) and finite(indicators.minus_di) else float("nan"))
-    if not finite(indicators.adx) or not finite(di_difference):
-        directional_status = "UNAVAILABLE"
-    elif indicators.adx < 18.0:
-        directional_status = "LOW_ADX_NON_DIRECTIONAL"
-    else:
-        directional_status = _active_feature_status(direction, di_difference, 2.0)
-
-    coi_status = "UNAVAILABLE"
-    call_coi = safe_float(oi.call_coi_pct)
-    put_coi = safe_float(oi.put_coi_pct)
-    if oi.tactical_available and finite(call_coi) and finite(put_coi) and direction in {"BULLISH", "BEARISH"}:
-        aligned = ((call_coi <= -1.5 * trigger and put_coi >= -0.25 * trigger)
-                   if direction == "BULLISH" else
-                   (put_coi <= -1.5 * trigger and call_coi >= -0.25 * trigger))
-        opposing = ((put_coi <= -1.5 * trigger and call_coi >= -0.25 * trigger)
-                    if direction == "BULLISH" else
-                    (call_coi <= -1.5 * trigger and put_coi >= -0.25 * trigger))
-        coi_status = "ALIGNED" if aligned else "OPPOSING" if opposing else "MIXED_OR_WEAK"
-
-    future = str(future_regime or "UNKNOWN").upper()
-    if future in {"UNKNOWN", "", "NONE", "UNAVAILABLE", "NEUTRAL"}:
-        futures_status = "UNAVAILABLE_OR_NEUTRAL"
-    elif futures_regime_conflicts(direction, future):
-        futures_status = "OPPOSING"
-    elif ((direction == "BULLISH" and future in {"STRONG_LONG_BUILDUP", "LONG_BUILDUP", "SHORT_COVERING"}) or
-          (direction == "BEARISH" and future in {"STRONG_SHORT_BUILDUP", "SHORT_BUILDUP", "LONG_UNWINDING"})):
-        futures_status = "ALIGNED"
-    else:
-        futures_status = "OTHER_REGIME"
-
-    contrary = [name for name, value in (
-        ("VWAP", vwap_status), ("MOMENTUM_3M", momentum_status),
-        ("DIRECTIONAL_DI_ADX", directional_status), ("TACTICAL_COI", coi_status),
-        ("FUTURES", futures_status),
-    ) if value == "OPPOSING"]
-    unavailable_or_neutral = any(value in {"UNAVAILABLE", "UNAVAILABLE_OR_NEUTRAL", "OTHER_REGIME",
-                                           "MIXED_OR_WEAK", "NEUTRAL", "NEAR_VWAP_NOISE_BAND",
-                                           "LOW_ADX_NON_DIRECTIONAL"}
-                                for value in (vwap_status, momentum_status, directional_status,
-                                              coi_status, futures_status))
-    critical_supportive = (vwap_status == "ALIGNED" and momentum_status == "ALIGNED"
-                           and scenario_relation == "SAME_DIRECTION_SETUP"
-                           and futures_status != "OPPOSING" and "OPPOSING" not in
-                           (directional_status, coi_status))
-    if scenario_relation == "OPPOSITE_DIRECTION_SETUP_OR_WATCH" and (
-            momentum_status == "OPPOSING" or directional_status == "OPPOSING" or
-            coi_status == "OPPOSING" or futures_status == "OPPOSING"):
-        context_state = "OPPOSITE_PRESSURE_PRESENT_PENDING_GUARD"
-    elif contrary:
-        context_state = "CONFLICT_PRESENT"
-    elif critical_supportive and not unavailable_or_neutral and coi_status == "ALIGNED":
-        context_state = "AVAILABLE_CONTEXT_ALIGNED"
-    else:
-        context_state = "MIXED_OR_INCOMPLETE"
-
-    bars = completed_one_minute_candles(index_candles, now)
-    bar_timestamp = ""
-    if not bars.empty:
-        latest_timestamp = parse_timestamp(bars.iloc[-1].get("timestamp"))
-        if latest_timestamp:
-            bar_timestamp = ist_iso(latest_timestamp)
-    previous_bar_timestamp = str(tracker.get("last_regime_bar_timestamp", ""))
-    history = tracker.get("regime_history")
-    history = [dict(x) for x in history if isinstance(x, dict)] if isinstance(history, list) else []
-    opposite_count = max(0, int(safe_float(tracker.get("opposite_scenario_consecutive_bars"), 0)))
-    if scenario_relation == "OPPOSITE_DIRECTION_SETUP_OR_WATCH":
-        # Count at most once per distinct completed candle. This is telemetry only; the
-        # authoritative reversal threshold remains apply_direction_flip_guard().
-        if bar_timestamp and bar_timestamp != previous_bar_timestamp:
-            opposite_count += 1
-    else:
-        opposite_count = 0
-    if bar_timestamp and bar_timestamp != previous_bar_timestamp:
-        history.append({
-            "timestamp": bar_timestamp,
-            "active_direction": direction,
-            "scenario_state": scenario_state,
-            "scenario_direction": scenario_direction,
-            "scenario_relation": scenario_relation,
-            "context_state": context_state,
-            "vwap": vwap_status,
-            "momentum_3m": momentum_status,
-            "momentum_1m": momentum_1m_status,
-            "directional_di_adx": directional_status,
-            "tactical_coi": coi_status,
-            "futures": futures_status,
+def oi_snapshot(chain: Sequence[dict[str, Any]], expiry: str, now: datetime) -> dict[str, Any]:
+    rows = []
+    for row in chain:
+        strike = number(row.get("strike_price"))
+        if not finite(strike):
+            continue
+        ce = row.get("call_options") if isinstance(row.get("call_options"), dict) else {}
+        pe = row.get("put_options") if isinstance(row.get("put_options"), dict) else {}
+        ce_md = ce.get("market_data") if isinstance(ce.get("market_data"), dict) else {}
+        pe_md = pe.get("market_data") if isinstance(pe.get("market_data"), dict) else {}
+        rows.append({
+            "strike": float(strike),
+            "call_oi": max(0.0, number(ce_md.get("oi"), 0.0)),
+            "put_oi": max(0.0, number(pe_md.get("oi"), 0.0)),
+            "call_ltp": number(ce_md.get("ltp")),
+            "put_ltp": number(pe_md.get("ltp")),
+            "call_volume": max(0.0, number(ce_md.get("volume"), 0.0)),
+            "put_volume": max(0.0, number(pe_md.get("volume"), 0.0)),
         })
-        tracker["last_regime_bar_timestamp"] = bar_timestamp
-    tracker["regime_history"] = history[-12:]
-    tracker["opposite_scenario_consecutive_bars"] = opposite_count
-    assessment = {
-        "assessed_at": ist_iso(now),
-        "active_direction": direction,
-        "scenario_state": scenario_state,
-        "scenario_direction": scenario_direction,
-        "scenario_relation": scenario_relation,
-        "scenario_executable_candidate": scenario_executable,
-        "scenario_hard_veto": scenario_hard_veto,
-        "context_state": context_state,
-        "evidence": {
-            "vwap": vwap_status,
-            "vwap_gap_points": round(vwap_gap, 2) if finite(vwap_gap) else None,
-            "vwap_noise_tolerance_points": round(vwap_tolerance, 2),
-            "momentum_3m": momentum_status,
-            "momentum_3m_pct": round(safe_float(indicators.momentum_3m_pct) * 100.0, 4) if finite(indicators.momentum_3m_pct) else None,
-            "momentum_1m": momentum_1m_status,
-            "directional_di_adx": directional_status,
-            "adx": round(float(indicators.adx), 2) if finite(indicators.adx) else None,
-            "di_difference_plus_minus": round(di_difference, 2) if finite(di_difference) else None,
-            "tactical_coi": coi_status,
-            "call_coi_pct": round(call_coi, 4) if finite(call_coi) else None,
-            "put_coi_pct": round(put_coi, 4) if finite(put_coi) else None,
-            "futures_regime": future,
-            "futures_alignment": futures_status,
-            "contrary_sources": contrary,
-        },
-        "opposite_scenario_consecutive_bars": opposite_count,
-        "distinct_completed_bar_timestamp": bar_timestamp or None,
-        "policy": "DIAGNOSTIC_ONLY_NO_WEIGHTED_EXIT_VOTE; structural stop and confirmed direction-flip guard remain authoritative.",
-    }
-    tracker["regime_assessment"] = assessment
-    return assessment
+    return {"timestamp": now.isoformat(), "expiry": expiry, "rows": rows}
 
 
-
-def _dynamic_level_context_ok(
-    tracker: Mapping[str, Any], indicators: IndicatorSet, oi: OIAnalysis,
-    scenario: Optional[Scenario], future_regime: str,
-) -> tuple[bool, str, dict[str, Any]]:
-    """Decide whether evolving levels are supported by multi-factor market context.
-
-    This does not demand every factor to agree. A completed 3-minute momentum reading
-    must support the active direction, with at least one independent confirmation from
-    VWAP, directional DI/ADX, tactical COI or futures; a clear contrary signal pauses
-    level extension/re-anchoring. Hard SL crossing remains unconditional.
-    """
-    direction = str(tracker.get("direction", "")).upper()
-    assessment = tracker.get("regime_assessment") if isinstance(tracker.get("regime_assessment"), Mapping) else {}
-    evidence = assessment.get("evidence") if isinstance(assessment.get("evidence"), Mapping) else {}
-    vwap_status = str(evidence.get("vwap", "UNAVAILABLE")).upper()
-    momentum_3m_status = str(evidence.get("momentum_3m", "UNAVAILABLE")).upper()
-    di_status = str(evidence.get("directional_di_adx", "UNAVAILABLE")).upper()
-    coi_status = str(evidence.get("tactical_coi", "UNAVAILABLE")).upper()
-    futures_status = str(evidence.get("futures", "UNAVAILABLE_OR_NEUTRAL")).upper()
-    statuses = {
-        "vwap": vwap_status, "momentum_3m": momentum_3m_status,
-        "directional_di_adx": di_status, "tactical_coi": coi_status,
-        "futures": futures_status,
-    }
-    if direction not in {"BULLISH", "BEARISH"}:
-        return False, "INVALID_ACTIVE_DIRECTION", statuses
-    if scenario is None:
-        return False, "CURRENT_SCENARIO_UNAVAILABLE", statuses
-    if bool(scenario.hard_veto):
-        return False, "CURRENT_SCENARIO_HARD_VETO", statuses
-    scenario_direction = str(scenario.direction or "NEUTRAL").upper()
-    if scenario_direction not in {direction, "NEUTRAL", "NONE", ""}:
-        return False, "CURRENT_SCENARIO_OPPOSES_ACTIVE_SIGNAL", statuses
-    # The 3m momentum and one independent market factor are minimum context. Missing
-    # inputs are tolerated and one secondary disagreement may be noise; a conflicting
-    # futures regime or multiple independent opposing inputs pauses level changes.
-    if momentum_3m_status != "ALIGNED":
-        return False, "COMPLETED_3M_MOMENTUM_NOT_ALIGNED", statuses
-    aligned = [key for key, value in statuses.items() if value == "ALIGNED"]
-    opposing = [key for key, value in statuses.items() if value == "OPPOSING"]
-    if futures_status == "OPPOSING":
-        return False, "FUTURES_CONTEXT_OPPOSES_ACTIVE_SIGNAL", statuses
-    if len(opposing) >= 2:
-        return False, "MULTIPLE_CONFLICTING_MARKET_FACTORS:" + ",".join(opposing), statuses
-    if len(aligned) < 2:
-        return False, "INSUFFICIENT_INDEPENDENT_CONFIRMATION", statuses
-    # Explicitly require multi-timeframe evidence and not merely the 1m candle path.
-    # A neutral/transition scenario is allowed if that independent evidence still aligns.
-    return True, "COMPLETED_3M_MOMENTUM_PLUS_INDEPENDENT_CONFIRMATION", statuses
+def classify_oi_flow(oi_change: Optional[float], premium_change: Optional[float]) -> str:
+    """Use OI and same-session option premium change together; OI alone is not writing/ buying."""
+    if oi_change is None or premium_change is None or not finite(oi_change) or not finite(premium_change):
+        return "UNKNOWN"
+    oi_up, premium_up = oi_change >= 0.001, premium_change >= 0.002
+    oi_down, premium_down = oi_change <= -0.001, premium_change <= -0.002
+    if oi_up and premium_down: return "SHORT_BUILDUP_WRITING"
+    if oi_up and premium_up: return "LONG_BUILDUP_BUYING"
+    if oi_down and premium_up: return "SHORT_COVERING"
+    if oi_down and premium_down: return "LONG_UNWINDING"
+    return "FLAT_OR_MIXED"
 
 
-def _target_source_is_intact(
-    level: float, source: str, direction: str, spot: float, oi: OIAnalysis,
-    max_distance: float, min_distance: float,
-) -> bool:
-    """Check whether a persisted target still references a valid level in front of spot."""
-    if not finite(level) or not finite(spot):
-        return False
-    # Existing levels remain valid right up to an actual crossing. min_distance applies
-    # when adding/reordering *new* levels; using it here could silently push an existing
-    # target farther away during a near-touch whipsaw (e.g. spot 22712 vs T1 22700).
-    ahead = level > spot + 0.01 if direction == "BULLISH" else level < spot - 0.01
-    if not ahead or abs(level - spot) > max_distance:
-        return False
-    source_upper = str(source or "").upper()
-    if "OI_WALL" in source_upper:
-        walls = oi.walls_resistance if direction == "BULLISH" else oi.walls_support
-        tolerance = max(1.0, infer_strike_step(list(oi.rows)) * 0.25)
-        return any(abs(float(wall.strike) - level) <= tolerance and wall.state in {"BUILDING", "STABLE"}
-                   for wall in walls)
-    # Completed price pivots/extremes remain usable if still ahead and within the refreshed
-    # volatility/time ceiling. They are not invalidated merely because a rolling pivot moved.
-    return True
-
-
-def _latest_confirmed_post_entry_pivot(
-    completed_3m: pd.DataFrame, direction: str, created_at: Optional[datetime],
-    *, max_bars: int = 15,
-) -> Optional[dict[str, Any]]:
-    """Return the newest confirmed post-entry 3m swing pivot with one full right bar.
-
-    A pivot is usable only after the bar to its right has fully completed. The current
-    partial/last bar is never used as its own confirmation. This function is shared by
-    proactive stop ratcheting and the independent structural-failure fallback.
-    """
-    if completed_3m is None or completed_3m.empty:
-        return None
-    direction = str(direction or "").upper()
-    if direction not in {"BULLISH", "BEARISH"}:
-        return None
-    frame = completed_3m.copy()
-    if "timestamp" not in frame.columns:
-        return None
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-    frame = frame.dropna(subset=["timestamp"]).sort_values("timestamp").drop_duplicates("timestamp", keep="last")
-    for col in ("high", "low", "close"):
-        frame[col] = pd.to_numeric(frame[col], errors="coerce")
-    frame = frame.dropna(subset=["high", "low", "close"]).tail(max(3, int(max_bars))).reset_index(drop=True)
-    if created_at is not None:
-        created_local = created_at.astimezone(IST) if created_at.tzinfo else created_at.replace(tzinfo=IST)
-        frame = frame.loc[frame["timestamp"].dt.tz_convert(IST) >= pd.Timestamp(created_local.astimezone(ZoneInfo("UTC")))].reset_index(drop=True)
-    if len(frame) < 3:
-        return None
-    # A resampled bar is safe only when the recent completed 3m bars are contiguous.
-    recent_stamps = frame["timestamp"].tail(min(8, len(frame))).tolist()
-    if any((b - a).total_seconds() > 180.5 for a, b in zip(recent_stamps, recent_stamps[1:])):
-        return None
-    # Iterate newest to oldest. i+1 is the fully completed bar that confirmed the pivot.
-    for i in range(len(frame) - 2, 0, -1):
-        row = frame.iloc[i]
-        left = frame.iloc[i - 1]
-        right = frame.iloc[i + 1]
-        if direction == "BULLISH":
-            value = safe_float(row["low"])
-            left_value, right_value = safe_float(left["low"]), safe_float(right["low"])
-            pivot_ok = finite(value) and finite(left_value) and finite(right_value) and (
-                (value < left_value and value <= right_value) or (value <= left_value and value < right_value)
-            )
-            reaction = safe_float(right["close"]) - value if pivot_ok else float("nan")
-        else:
-            value = safe_float(row["high"])
-            left_value, right_value = safe_float(left["high"]), safe_float(right["high"])
-            pivot_ok = finite(value) and finite(left_value) and finite(right_value) and (
-                (value > left_value and value >= right_value) or (value >= left_value and value > right_value)
-            )
-            reaction = value - safe_float(right["close"]) if pivot_ok else float("nan")
-        if not pivot_ok:
-            continue
-        try:
-            pivot_ts = frame.iloc[i]["timestamp"].to_pydatetime().astimezone(IST)
-            confirm_ts = frame.iloc[i + 1]["timestamp"].to_pydatetime().astimezone(IST)
-        except (AttributeError, ValueError, TypeError):
-            continue
-        return {
-            "timestamp": ist_iso(pivot_ts), "confirmation_timestamp": ist_iso(confirm_ts),
-            "level": float(value), "reaction_points": float(reaction),
-            "confirmation_close": safe_float(right["close"]),
-        }
-    return None
-
-
-def _update_protective_structural_trailing_stop(
-    tracker: dict[str, Any], spot: float, indicators: IndicatorSet, now: datetime,
-    index_candles: Optional[pd.DataFrame],
-) -> Optional[dict[str, Any]]:
-    """Ratchet the active virtual stop behind a confirmed 3m swing after progress + pullback.
-
-    Unlike target reassessment this protective function does not require bullish/bearish
-    context to remain aligned: a confirmed swing and a meaningful retracement are risk
-    information in their own right. It never loosens a stop, never uses an unfinished 3m
-    bar, and never derives a new stop from a history interval already marked uncertain.
-    """
-    if str(tracker.get("status", "TRACKING")).upper() != "TRACKING":
-        return None
-    direction = str(tracker.get("direction", "")).upper()
-    if direction not in {"BULLISH", "BEARISH"} or not finite(spot) or spot <= 0:
-        tracker["protective_trail_status"] = "HELD_INVALID_DIRECTION_OR_SPOT"
-        return None
-    integrity = str(tracker.get("target_event_integrity", "UNASSESSED")).upper()
-    monitor_status = str(tracker.get("monitoring_data_status", "UNAVAILABLE")).upper()
-    if integrity == "UNRESOLVED_AFTER_DATA_GAP" or monitor_status in {
-        "GAP_UNRESOLVED", "CANDLE_FEED_STALE", "CANDLES_UNAVAILABLE_LIVE_SPOT_ONLY", "UNAVAILABLE"
-    }:
-        tracker["protective_trail_status"] = "HELD_UNCERTAIN_CANDLE_HISTORY"
-        return None
-    created = parse_timestamp(tracker.get("created_at"))
-    if created is None or index_candles is None or index_candles.empty:
-        tracker["protective_trail_status"] = "HELD_CANDLES_UNAVAILABLE"
-        return None
-    created = created.astimezone(IST) if created.tzinfo else created.replace(tzinfo=IST)
-    atr = safe_float(indicators.atr_5m, float("nan"))
-    if not finite(atr) or atr <= 0:
-        # Explicitly convert the available 1m ATR to an approximate 5m scale; do not mix
-        # point distances from different timeframes without conversion.
-        atr_1m = safe_float(indicators.atr, float("nan"))
-        if not finite(atr_1m) or atr_1m <= 0:
-            tracker["protective_trail_status"] = "HELD_ATR_UNAVAILABLE"
-            return None
-        atr = atr_1m * math.sqrt(5.0)
-    one_min = completed_one_minute_candles(index_candles, now)
-    if one_min.empty:
-        tracker["protective_trail_status"] = "HELD_NO_COMPLETED_1M_CANDLES"
-        return None
-    stamps = pd.to_datetime(one_min["timestamp"], utc=True, errors="coerce")
-    created_utc = pd.Timestamp(created.astimezone(ZoneInfo("UTC")))
-    post_entry = one_min.loc[stamps >= created_utc].copy()
-    if post_entry.empty:
-        tracker["protective_trail_status"] = "WAITING_FOR_POST_ENTRY_CANDLES"
-        return None
-    for col in ("high", "low", "close"):
-        post_entry[col] = pd.to_numeric(post_entry[col], errors="coerce")
-    post_entry = post_entry.dropna(subset=["high", "low", "close"])
-    if post_entry.empty:
-        tracker["protective_trail_status"] = "HELD_INVALID_POST_ENTRY_CANDLES"
-        return None
-    entry = safe_float(tracker.get("nifty_entry_reference"), float("nan"))
-    if not finite(entry) or entry <= 0:
-        tracker["protective_trail_status"] = "HELD_INVALID_ENTRY_REFERENCE"
-        return None
-
-    prior_extreme = safe_float(tracker.get("max_favorable_spot"), entry)
-    if direction == "BULLISH":
-        observed_extreme = safe_float(post_entry["high"].max(), entry)
-        favorable_extreme = max(entry, prior_extreme, observed_extreme, spot)
-        favorable_points = favorable_extreme - entry
-        pullback_points = favorable_extreme - spot
-    else:
-        observed_extreme = safe_float(post_entry["low"].min(), entry)
-        # For a bearish signal, the most favorable extreme is the minimum price.
-        favorable_extreme = min(entry, prior_extreme if finite(prior_extreme) else entry,
-                                observed_extreme, spot)
-        favorable_points = entry - favorable_extreme
-        pullback_points = spot - favorable_extreme
-    previous_recorded = safe_float(tracker.get("max_favorable_spot"), float("nan"))
-    if not finite(previous_recorded) or abs(favorable_extreme - previous_recorded) > 0.001:
-        extreme_row = None
-        extreme_col = "high" if direction == "BULLISH" else "low"
-        extreme_idx = post_entry[extreme_col].idxmax() if direction == "BULLISH" else post_entry[extreme_col].idxmin()
-        if extreme_idx in post_entry.index:
-            extreme_row = post_entry.loc[extreme_idx]
-        extreme_ts = parse_timestamp(extreme_row.get("timestamp")) if isinstance(extreme_row, pd.Series) else None
-        tracker["max_favorable_spot_at"] = ist_iso(extreme_ts.astimezone(IST)) if extreme_ts is not None else ist_iso(now)
-    tracker["max_favorable_spot"] = float(favorable_extreme)
-    tracker["max_favorable_excursion_points"] = round(float(max(0.0, favorable_points)), 3)
-    tracker["last_protective_trail_assessed_at"] = ist_iso(now)
-
-    min_favorable_excursion = 1.25 * atr
-    min_retracement = 0.50 * atr
-    if favorable_points < min_favorable_excursion:
-        tracker["protective_trail_status"] = "WAITING_FOR_MEANINGFUL_FAVORABLE_EXCURSION"
-        return None
-    if pullback_points < min_retracement:
-        tracker["protective_trail_status"] = "WAITING_FOR_STRUCTURAL_PULLBACK"
-        return None
-
-    completed_3m = completed_resampled_candles(index_candles, 3, now)
-    if completed_3m.empty:
-        tracker["protective_trail_status"] = "HELD_NO_COMPLETED_3M_BARS"
-        return None
-    completed_3m = completed_3m.loc[
-        pd.to_datetime(completed_3m["timestamp"], utc=True, errors="coerce") >= created_utc
-    ].reset_index(drop=True)
-    pivot = _latest_confirmed_post_entry_pivot(completed_3m, direction, created, max_bars=15)
-    if pivot is None:
-        tracker["protective_trail_status"] = "WAITING_FOR_CONFIRMED_POST_ENTRY_SWING"
-        return None
-    if safe_float(pivot.get("reaction_points"), 0.0) < 0.25 * atr:
-        tracker["protective_trail_status"] = "HELD_WEAK_PIVOT_REACTION"
-        return None
-
-    # The small buffer protects against a one-tick/rounding touch of the swing itself.
-    pivot_level = safe_float(pivot.get("level"), float("nan"))
-    buffer_points = max(1.0, min(0.05 * atr, 2.0))
-    proposed = pivot_level - buffer_points if direction == "BULLISH" else pivot_level + buffer_points
-    min_spot_gap = max(0.10 * atr, 2.0)
-    active_stop = safe_float(tracker.get("trailing_stop", tracker.get("stop_loss")), float("nan"))
-    initial_stop = safe_float(tracker.get("initial_stop_loss", tracker.get("stop_loss")), float("nan"))
-    min_improvement = max(2.0, 0.05 * atr)
-    if not finite(active_stop) or not finite(proposed):
-        tracker["protective_trail_status"] = "HELD_INVALID_STOP_LEVEL"
-        return None
-    if direction == "BULLISH":
-        safe_side = proposed < spot - min_spot_gap
-        improves = proposed > active_stop + min_improvement
-        preserves_initial_risk = not finite(initial_stop) or proposed >= initial_stop
-    else:
-        safe_side = proposed > spot + min_spot_gap
-        improves = proposed < active_stop - min_improvement
-        preserves_initial_risk = not finite(initial_stop) or proposed <= initial_stop
-    if not safe_side:
-        tracker["protective_trail_status"] = "HELD_PIVOT_STOP_TOO_CLOSE_OR_BREACHED"
-        return None
-    if not improves or not preserves_initial_risk:
-        tracker["protective_trail_status"] = "NO_TIGHTER_PROTECTIVE_STOP_AVAILABLE"
-        return None
-
-    previous_stop = active_stop
-    tracker.setdefault("initial_stop_loss", initial_stop if finite(initial_stop) else tracker.get("stop_loss"))
-    tracker["trailing_stop"] = float(proposed)
-    tracker["trailing_stop_source"] = "PROTECTIVE_3M_SWING_TRAIL_AFTER_MFE_RETRACEMENT"
-    tracker["trailing_stop_updated_at"] = ist_iso(now)
-    tracker["trailing_stop_pivot_timestamp"] = pivot.get("timestamp")
-    tracker["trailing_stop_pivot_level"] = float(pivot_level)
-    tracker["trailing_stop_pivot_confirmation_timestamp"] = pivot.get("confirmation_timestamp")
-    tracker["trailing_stop_buffer_points"] = round(float(buffer_points), 3)
-    tracker["trailing_stop_retracement_points"] = round(float(pullback_points), 3)
-    tracker["protective_trail_status"] = "STOP_TIGHTENED_FROM_CONFIRMED_SWING"
-    tracker["sl_distance_points"] = round(abs(spot - proposed), 3)
-    history = tracker.get("protective_stop_history")
-    history = [dict(x) for x in history if isinstance(x, dict)] if isinstance(history, list) else []
-    history.append({
-        "timestamp": ist_iso(now), "direction": direction, "previous_stop": round(previous_stop, 3),
-        "new_stop": round(float(proposed), 3), "pivot_timestamp": pivot.get("timestamp"),
-        "pivot_level": round(float(pivot_level), 3), "mfe_points": round(float(favorable_points), 3),
-        "pullback_points": round(float(pullback_points), 3), "atr_5m": round(float(atr), 3),
-    })
-    tracker["protective_stop_history"] = history[-8:]
-    return {
-        "event_type": "ACTIVE_PROTECTIVE_STOP_TIGHTENED", "event_at": ist_iso(now),
-        "tracker_fingerprint": tracker.get("signal_fingerprint", ""), "direction": direction,
-        "trading_symbol": tracker.get("trading_symbol", ""), "option_type": tracker.get("option_type", ""),
-        "strike": tracker.get("strike"), "spot": float(spot),
-        "previous_trailing_SL": float(previous_stop), "new_trailing_SL": float(proposed),
-        "pivot_timestamp": pivot.get("timestamp"), "pivot_level": float(pivot_level),
-        "mfe_points": round(float(favorable_points), 3), "pullback_points": round(float(pullback_points), 3),
-        "message": "Protective NIFTY stop ratcheted after a confirmed post-entry 3m swing pivot, meaningful favorable excursion and volatility-sized retracement. The prior OHLC interval was already processed against its prior active levels.",
-    }
-
-
-def _detect_confirmed_structural_failure(
-    tracker: dict[str, Any], indicators: IndicatorSet, oi: OIAnalysis,
-    future_regime: str, scenario: Optional[Scenario], now: datetime,
-    index_candles: Optional[pd.DataFrame], config: Optional[Config],
-) -> Optional[dict[str, Any]]:
-    """Detect a completed 3m structural break only with two independent adverse factors.
-
-    This is a fallback to the proactive trail, not a one-red-candle exit. It requires a
-    closing break of a previously confirmed post-entry swing and at least two adverse
-    inputs among 3m momentum, tactical OI flow, decisive DI, VWAP, futures or a confirmed
-    opposite scenario. Uncertain candle chronology suppresses this path.
-    """
-    if str(tracker.get("status", "TRACKING")).upper() != "TRACKING":
-        return None
-    direction = str(tracker.get("direction", "")).upper()
-    if direction not in {"BULLISH", "BEARISH"} or index_candles is None or index_candles.empty:
-        return None
-    if (str(tracker.get("target_event_integrity", "")).upper() == "UNRESOLVED_AFTER_DATA_GAP"
-            or str(tracker.get("monitoring_data_status", "")).upper() in {
-                "GAP_UNRESOLVED", "CANDLE_FEED_STALE", "CANDLES_UNAVAILABLE_LIVE_SPOT_ONLY", "UNAVAILABLE"
-            }):
-        return None
-    created = parse_timestamp(tracker.get("created_at"))
-    if created is None:
-        return None
-    completed = completed_resampled_candles(index_candles, 3, now)
-    if completed.empty:
-        return None
-    completed = completed.loc[
-        pd.to_datetime(completed["timestamp"], utc=True, errors="coerce") >= pd.Timestamp(
-            (created.astimezone(IST) if created.tzinfo else created.replace(tzinfo=IST)).astimezone(ZoneInfo("UTC"))
-        )
-    ].reset_index(drop=True)
-    if len(completed) < 4:
-        return None
-    latest_stamp = parse_timestamp(completed.iloc[-1].get("timestamp"))
-    if latest_stamp is None:
-        return None
-    latest_stamp = latest_stamp.astimezone(IST)
-    current = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
-    if latest_stamp + timedelta(minutes=3) > current:
-        return None
-    previous_check = parse_timestamp(tracker.get("last_structural_failure_bar_timestamp"))
-    if previous_check is not None and latest_stamp <= previous_check.astimezone(IST):
-        return None
-    tracker["last_structural_failure_bar_timestamp"] = ist_iso(latest_stamp)
-
-    atr = safe_float(indicators.atr_5m, float("nan"))
-    if not finite(atr) or atr <= 0:
-        atr_1m = safe_float(indicators.atr, float("nan"))
-        if not finite(atr_1m) or atr_1m <= 0:
-            return None
-        atr = atr_1m * math.sqrt(5.0)
-    # The latest bar is the possible failure bar; search for a pivot before it, already
-    # confirmed by an earlier completed bar. That avoids using the failure candle itself
-    # to define the level it allegedly broke.
-    pivot = _latest_confirmed_post_entry_pivot(completed.iloc[:-1].copy(), direction, created, max_bars=15)
-    if pivot is None:
-        return None
-    pivot_level = safe_float(pivot.get("level"), float("nan"))
-    close = safe_float(completed.iloc[-1].get("close"), float("nan"))
-    if not finite(pivot_level) or not finite(close):
-        return None
-    buffer_points = max(1.0, min(0.05 * atr, 2.0))
-    invalidation_level = pivot_level - buffer_points if direction == "BULLISH" else pivot_level + buffer_points
-    structural_break = close <= invalidation_level if direction == "BULLISH" else close >= invalidation_level
-    if not structural_break:
-        return None
-
-    trigger = max(0.0001, config.oi_velocity_trigger if config is not None else 0.0015)
-    momentum = safe_float(indicators.momentum_3m_pct, float("nan"))
-    momentum_opposing = ((momentum <= -0.00015) if direction == "BULLISH" else (momentum >= 0.00015)) if finite(momentum) else False
-    oi_opposing = False
-    if oi.tactical_available and finite(oi.call_coi_pct) and finite(oi.put_coi_pct):
-        call_change, put_change = float(oi.call_coi_pct), float(oi.put_coi_pct)
-        if direction == "BULLISH":
-            oi_opposing = ((call_change >= trigger and put_change <= 0.25 * trigger)
-                           or (put_change <= -trigger and call_change <= 0.25 * trigger))
-        else:
-            oi_opposing = ((put_change >= trigger and call_change <= 0.25 * trigger)
-                           or (call_change <= -trigger and put_change <= 0.25 * trigger))
-    di_diff = (safe_float(indicators.plus_di) - safe_float(indicators.minus_di)
-               if finite(indicators.plus_di) and finite(indicators.minus_di) else float("nan"))
-    adx = safe_float(indicators.adx, float("nan"))
-    di_opposing = finite(di_diff) and finite(adx) and (
-        (direction == "BULLISH" and di_diff <= -6.0 and (adx >= 16.0 or di_diff <= -12.0))
-        or (direction == "BEARISH" and di_diff >= 6.0 and (adx >= 16.0 or di_diff >= 12.0))
-    )
-    vwap = safe_float(indicators.vwap, float("nan"))
-    spot = safe_float(indicators.spot, float("nan"))
-    vwap_opposing = finite(vwap) and finite(spot) and (
-        (direction == "BULLISH" and spot < vwap - 0.10 * atr)
-        or (direction == "BEARISH" and spot > vwap + 0.10 * atr)
-    )
-    future = str(future_regime or "UNKNOWN").upper()
-    futures_opposing = futures_regime_conflicts(direction, future)
-    scenario_opposing = bool(
-        scenario is not None and str(scenario.direction or "").upper() in {"BULLISH", "BEARISH"}
-        and str(scenario.direction or "").upper() != direction
-        and bool(scenario.executable_candidate) and not bool(scenario.hard_veto)
-    )
-    evidence = {
-        "MOMENTUM_3M": bool(momentum_opposing), "TACTICAL_OI": bool(oi_opposing),
-        "DIRECTIONAL_DI_ADX": bool(di_opposing), "VWAP": bool(vwap_opposing),
-        "FUTURES": bool(futures_opposing), "OPPOSITE_SCENARIO": bool(scenario_opposing),
-    }
-    adverse_count = sum(bool(value) for value in evidence.values())
-    # Momentum or local OI must contribute at least one independent directional signal;
-    # this avoids closing solely on an indicator combination that ignores price dynamics.
-    if adverse_count < 2 or not (momentum_opposing or oi_opposing):
-        return None
-    return {
-        "timestamp": ist_iso(latest_stamp + timedelta(minutes=3)),
-        "bar_timestamp": ist_iso(latest_stamp), "close": float(close),
-        "pivot_timestamp": pivot.get("timestamp"), "pivot_level": float(pivot_level),
-        "stop_level": float(invalidation_level), "buffer_points": float(buffer_points),
-        "evidence": evidence,
-    }
-
-
-def _derive_structural_reversal_event_from_stop(
-    state: Mapping[str, Any], events: Sequence[Mapping[str, Any]],
-    indicators: IndicatorSet, oi: OIAnalysis, future_regime: str,
-    scenario: Optional[Scenario], now: datetime,
-    index_candles: Optional[pd.DataFrame], config: Config,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Re-test a terminal SL event for a confirmed structural failure before rerouting.
-
-    A protective 1m stop can close the old tracker before the active-tracker structural
-    fallback runs. In that case the scan still must not miss a legitimate same-scan reversal.
-    We use a copy of that terminal tracker and independently require the completed-3m pivot
-    break plus two adverse factors. The original stop event is not changed or re-emailed.
-    """
-    normalized = [dict(item) for item in (events or []) if isinstance(item, Mapping)]
-    explicit = next((item for item in reversed(normalized)
-                     if str(item.get("event_type", "")).upper() == "STRUCTURAL_STOP_LOSS_REACHED"), None)
-    if explicit is not None:
-        return [explicit], {"source": "TRACKER_STRUCTURAL_FAILURE_EVENT", "source_stop_event_type": explicit.get("event_type")}
-
-    stop_types = {"INITIAL_STOP_LOSS_REACHED", "TRAILING_STOP_REACHED"}
-    stop_events = [item for item in normalized if str(item.get("event_type", "")).upper() in stop_types]
-    if not stop_events:
-        return [], {"source": "NONE", "reason": "NO_STRUCTURAL_FAILURE_OR_STOP_EVENT"}
-    tracker_rows = state.get("recommendation_trackers", []) if isinstance(state, Mapping) else []
-    tracker_by_fp = {str(item.get("signal_fingerprint", "")): item for item in tracker_rows
-                     if isinstance(item, Mapping) and item.get("signal_fingerprint")}
-    for stop_event in reversed(stop_events):
-        fingerprint = str(stop_event.get("tracker_fingerprint", ""))
-        saved = tracker_by_fp.get(fingerprint)
-        if not isinstance(saved, Mapping):
-            continue
-        replay_tracker = dict(saved)
-        replay_tracker["status"] = "TRACKING"
-        failure = _detect_confirmed_structural_failure(
-            replay_tracker, indicators, oi, future_regime, scenario, now, index_candles, config
-        )
-        if not isinstance(failure, Mapping):
-            continue
-        synthetic = dict(stop_event)
-        synthetic.update({
-            "event_type": "STRUCTURAL_STOP_LOSS_REACHED",
-            "reversal_source_stop_event_type": str(stop_event.get("event_type", "")),
-            "structural_failure_timestamp": failure.get("timestamp"),
-            "structural_failure_bar_timestamp": failure.get("bar_timestamp"),
-            "structural_failure_close": failure.get("close"),
-            "structural_pivot_timestamp": failure.get("pivot_timestamp"),
-            "structural_pivot_level": failure.get("pivot_level"),
-            "structural_failure_evidence": failure.get("evidence", {}),
-            "message": "Existing stop event independently corroborated by a completed 3m structural pivot break and at least two adverse context factors; eligible for same-scan opposite-side evaluation.",
-        })
-        return [synthetic], {
-            "source": "STOP_EVENT_PLUS_INDEPENDENT_STRUCTURAL_REPLAY",
-            "source_stop_event_type": stop_event.get("event_type"),
-            "structural_failure_confirmed": True,
-            "structural_failure_bar_timestamp": failure.get("bar_timestamp"),
-        }
-    return [], {
-        "source": "STOP_EVENT_WITHOUT_CONFIRMED_STRUCTURAL_REPLAY",
-        "reason": "STOP_CLOSED_PRIOR_SIGNAL_BUT_COMPLETED_3M_BREAK_AND_TWO_ADVERSE_FACTORS_NOT_CONFIRMED",
-    }
-
-
-def _build_confirmed_active_reversal_scenario(
-    events: Sequence[Mapping[str, Any]], spot: float, indicators: IndicatorSet,
-    oi: OIAnalysis, future_regime: str, now: datetime, config: Config,
-) -> tuple[Optional[Scenario], dict[str, Any]]:
-    """Turn a *confirmed* active-tracker structural failure into an opposite setup.
-
-    The old tracker has already passed a completed-3m pivot break and two independent
-    adverse factors. This coordinator does not treat a reversal watch as an entry: it
-    requires the current spot to remain beyond the broken pivot, current tactical OI to
-    align with the replacement direction, present 1m/3m momentum to agree, a non-conflicting
-    futures regime, and limited extension. The ordinary risk planner and option-quality
-    gates still run afterward. If any prerequisite is missing, the old signal stays closed
-    but no opposite strike is forced.
-    """
-    info: dict[str, Any] = {
-        "transition_detected": False, "reversal_candidate_created": False,
-        "action": "MAINTAIN_CURRENT_SCENARIO", "reason": "NO_CONFIRMED_STRUCTURAL_FAILURE_EVENT",
-    }
-    event = next((dict(item) for item in reversed(list(events or []))
-                  if isinstance(item, Mapping)
-                  and str(item.get("event_type", "")).upper() == "STRUCTURAL_STOP_LOSS_REACHED"), None)
-    if event is None:
-        return None, info
-
-    info["transition_detected"] = True
-    old_direction = str(event.get("direction", "")).upper()
-    new_direction = "BEARISH" if old_direction == "BULLISH" else "BULLISH" if old_direction == "BEARISH" else "NEUTRAL"
-    pivot = safe_float(event.get("structural_pivot_level"), float("nan"))
-    failure_close = safe_float(event.get("structural_failure_close"), float("nan"))
-    event_time = parse_timestamp(event.get("structural_failure_timestamp") or event.get("event_at"))
-    evidence = event.get("structural_failure_evidence") if isinstance(event.get("structural_failure_evidence"), Mapping) else {}
-    evidence_clean = {str(key): bool(value) for key, value in evidence.items()}
-    evidence_count = sum(evidence_clean.values())
-    info.update({
-        "action": "INVALIDATE_FAILED_SIGNAL_AND_EVALUATE_OPPOSITE",
-        "invalidated_direction": old_direction, "replacement_direction": new_direction,
-        "source_tracker_fingerprint": event.get("tracker_fingerprint", ""),
-        "source_option": event.get("trading_symbol", ""),
-        "structural_pivot_level": pivot if finite(pivot) else None,
-        "structural_failure_close": failure_close if finite(failure_close) else None,
-        "structural_failure_timestamp": event.get("structural_failure_timestamp"),
-        "failure_evidence": evidence_clean,
-    })
-
-    if new_direction not in {"BULLISH", "BEARISH"}:
-        info["reason"] = "SOURCE_TRACKER_DIRECTION_INVALID"
-        return None, info
-    if not finite(pivot) or not finite(failure_close):
-        info["reason"] = "STRUCTURAL_FAILURE_PIVOT_OR_CLOSE_MISSING"
-        return None, info
-    if evidence_count < 2 or not (evidence_clean.get("MOMENTUM_3M") or evidence_clean.get("TACTICAL_OI")):
-        info["reason"] = "STRUCTURAL_FAILURE_EVIDENCE_INCOMPLETE"
-        return None, info
-    if event_time is None:
-        info["reason"] = "STRUCTURAL_FAILURE_TIMESTAMP_MISSING"
-        return None, info
-    current = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
-    age_seconds = (current - event_time.astimezone(IST)).total_seconds()
-    info["failure_event_age_seconds"] = round(age_seconds, 2)
-    if age_seconds < -30.0 or age_seconds > 240.0:
-        info["reason"] = "STRUCTURAL_FAILURE_EVENT_STALE_OR_FUTURE_DATED"
-        return None, info
-
-    atr5, atr_source = structural_stop_atr(indicators)
-    if not finite(atr5) or atr5 <= 0:
-        info["reason"] = "ATR_UNAVAILABLE_FOR_REVERSAL_BUFFER"
-        return None, info
-    break_buffer = max(1.0, min(0.05 * atr5, 2.0))
-    pivot_broken_now = (spot < pivot - break_buffer if new_direction == "BEARISH"
-                        else spot > pivot + break_buffer)
-    distance = abs(float(spot) - pivot) if finite(spot) else float("inf")
-    strike_step = infer_strike_step(list(oi.rows)) if isinstance(oi.rows, dict) and oi.rows else float("nan")
-    chase_limit = max(float(strike_step) if finite(strike_step) else 0.0, 1.25 * atr5)
-    info.update({
-        "current_spot": float(spot) if finite(spot) else None,
-        "pivot_buffer_points": round(break_buffer, 2),
-        "spot_distance_from_failed_pivot": round(distance, 2) if finite(distance) else None,
-        "max_entry_extension_points": round(chase_limit, 2),
-        "atr5_source": atr_source,
-    })
-    if not finite(spot) or not pivot_broken_now:
-        info["reason"] = "PRICE_RECLAIMED_FAILED_PIVOT_NO_OPPOSITE_ENTRY"
-        return None, info
-    if distance > chase_limit:
-        info["reason"] = "REVERSAL_MOVE_ALREADY_EXTENDED_NO_CHASE"
-        return None, info
-    if not oi.tactical_available or not finite(oi.call_coi_pct) or not finite(oi.put_coi_pct):
-        info["reason"] = "CURRENT_TACTICAL_OI_UNAVAILABLE_NO_OPPOSITE_ENTRY"
-        return None, info
-
-    trigger = max(config.oi_velocity_trigger, 0.0002)
-    noise = 0.50 * trigger
-    call_change = float(oi.call_coi_pct)
-    put_change = float(oi.put_coi_pct)
-    global_bull = ((call_change <= -trigger and put_change >= -noise)
-                   or (put_change >= trigger and call_change >= -noise))
-    global_bear = ((put_change <= -trigger and call_change >= -noise)
-                   or (call_change >= trigger and put_change >= -noise))
-    global_aligned = global_bull if new_direction == "BULLISH" else global_bear
-
-    # Use the nearest actual option strike to the failed pivot for local COI. Missing local
-    # values are not silently converted to zero; aggregate tactical flow can confirm only
-    # if it is currently directional and the old structural-break evidence included OI.
-    local_strike: Optional[float] = None
-    local_row: Optional[Mapping[str, Any]] = None
-    local_bull = local_bear = False
-    local_call = local_put = float("nan")
-    if isinstance(oi.rows, dict) and oi.rows:
-        try:
-            closest = min(oi.rows, key=lambda key: abs(float(key) - pivot))
-            tolerance = max(0.70 * strike_step, 3.0) if finite(strike_step) else 3.0
-            if abs(float(closest) - pivot) <= tolerance:
-                local_strike = float(closest)
-                candidate_row = oi.rows.get(closest)
-                if isinstance(candidate_row, Mapping):
-                    local_row = candidate_row
-                    local_call = safe_float(local_row.get("call_coi_pct"), float("nan"))
-                    local_put = safe_float(local_row.get("put_coi_pct"), float("nan"))
-                    if finite(local_call) and finite(local_put):
-                        local_bull = ((local_call <= -trigger and local_put >= -noise)
-                                      or (local_put >= trigger and local_call <= noise))
-                        local_bear = ((local_put <= -trigger and local_call >= -noise)
-                                      or (local_call >= trigger and local_put <= noise))
-        except (TypeError, ValueError):
-            local_strike = None
-    local_aligned = local_bull if new_direction == "BULLISH" else local_bear
-    local_opposite = local_bear if new_direction == "BULLISH" else local_bull
-    oi_aligned = global_aligned or local_aligned
-    global_strength = max(abs(call_change), abs(put_change))
-    strong_global_alignment = global_aligned and global_strength >= 2.0 * trigger
-    info.update({
-        "oi_tactical_source": oi.tactical_source,
-        "aggregate_call_coi_pct": round(call_change * 100.0, 4),
-        "aggregate_put_coi_pct": round(put_change * 100.0, 4),
-        "aggregate_oi_aligned": bool(global_aligned),
-        "local_oi_strike": local_strike,
-        "local_call_coi_pct": round(local_call * 100.0, 4) if finite(local_call) else None,
-        "local_put_coi_pct": round(local_put * 100.0, 4) if finite(local_put) else None,
-        "local_oi_aligned": bool(local_aligned),
-        "local_oi_opposite": bool(local_opposite),
-        "oi_trigger_fraction": trigger,
-    })
-    if local_opposite and not strong_global_alignment:
-        info["reason"] = "LOCAL_OI_FLOW_CONFLICTS_WITH_OPPOSITE_ENTRY"
-        return None, info
-    if not oi_aligned:
-        info["reason"] = "CURRENT_LOCAL_OR_AGGREGATE_OI_DOES_NOT_CONFIRM_OPPOSITE_ENTRY"
-        return None, info
-
-    momentum3 = safe_float(indicators.momentum_3m_pct, float("nan"))
-    momentum1 = safe_float(indicators.momentum_1m_pct, float("nan"))
-    threshold = 0.00010
-    momentum3_aligned = finite(momentum3) and (momentum3 >= threshold if new_direction == "BULLISH" else momentum3 <= -threshold)
-    momentum1_aligned = finite(momentum1) and (momentum1 >= threshold if new_direction == "BULLISH" else momentum1 <= -threshold)
-    momentum_aligned = momentum3_aligned or momentum1_aligned
-    di_diff = (indicators.plus_di - indicators.minus_di) if finite(indicators.plus_di) and finite(indicators.minus_di) else float("nan")
-    di_aligned = finite(di_diff) and (di_diff >= 4.0 if new_direction == "BULLISH" else di_diff <= -4.0)
-    if not momentum_aligned and not (strong_global_alignment and di_aligned):
-        info["reason"] = "CURRENT_MOMENTUM_NOT_ALIGNED_WITH_OPPOSITE_FLOW"
-        info["momentum_3m_aligned"] = bool(momentum3_aligned)
-        info["momentum_1m_aligned"] = bool(momentum1_aligned)
-        info["directional_di_aligned"] = bool(di_aligned)
-        return None, info
-    if futures_regime_conflicts(new_direction, future_regime):
-        info["reason"] = f"FUTURES_REGIME_CONFLICT_{str(future_regime).upper()}"
-        return None, info
-
-    # Confidence is a rule-based confluence score, never a calibrated probability.
-    evidence_count = sum(evidence_clean.values())
-    confidence = min(88.0, 76.0 + 2.0 * max(0, evidence_count - 2)
-                     + (2.0 if strong_global_alignment else 0.0)
-                     + (2.0 if momentum3_aligned else 0.0)
-                     + (1.0 if di_aligned else 0.0))
-    features = {
-        "setup_route": "ACTIVE_SIGNAL_STRUCTURAL_REVERSAL",
-        "reaction": "STRUCTURAL_BREAK_RETEST",
-        "wall_tested": True,
-        "wall_level": float(pivot),
-        "wall_strike": local_strike if local_strike is not None else float(pivot),
-        "wall_state": "BROKEN_BOUNDARY",
-        "active_signal_reversal": True,
-        "active_signal_reversal_confirmed": True,
-        "structural_break_confirmed": True,
-        "current_directional_oi_confirmed": True,
-        "source_tracker_fingerprint": str(event.get("tracker_fingerprint", "")),
-        "source_direction": old_direction,
-        "source_option": str(event.get("trading_symbol", "")),
-        "structural_pivot_level": float(pivot),
-        "structural_break_close": float(failure_close),
-        "structural_break_bar_timestamp": event.get("structural_failure_bar_timestamp"),
-        "structural_failure_timestamp": event.get("structural_failure_timestamp"),
-        "structural_failure_evidence": evidence_clean,
-        "current_aggregate_oi_aligned": bool(global_aligned),
-        "current_local_oi_aligned": bool(local_aligned),
-        "current_local_oi_opposite": bool(local_opposite),
-        "current_global_oi_strong": bool(strong_global_alignment),
-        "current_momentum_3m_aligned": bool(momentum3_aligned),
-        "current_momentum_1m_aligned": bool(momentum1_aligned),
-        "current_directional_di_aligned": bool(di_aligned),
-        "pivot_buffer_points": float(break_buffer),
-        "max_entry_extension_points": float(chase_limit),
-        "evidence": [key for key, value in evidence_clean.items() if value],
-    }
-    scenario = Scenario(
-        state=f"ACTIVE_SIGNAL_REVERSAL_CONFIRMED_{new_direction}",
-        direction=new_direction,
-        confidence=confidence,
-        trigger_reason=(
-            f"Active {old_direction} virtual signal invalidated by a confirmed completed-3m pivot break at "
-            f"{pivot:.2f} (close {failure_close:.2f}); current price, tactical local/aggregate OI and "
-            f"momentum confirm {new_direction}. Opposite strike must still pass the normal structural-risk, "
-            "fresh-quote, liquidity, premium VWAP and score gates."
-        ),
-        wall_level=float(pivot), wall_state="BROKEN_BOUNDARY",
-        executable_candidate=True, hard_veto=None, features=features,
-    )
-    info.update({
-        "reversal_candidate_created": True,
-        "reason": "CONFIRMED_STRUCTURAL_REVERSAL_OI_AND_MOMENTUM_ALIGNED",
-        "scenario": scenario.state,
-        "confidence_pct": round(confidence, 1),
-        "current_momentum_3m_aligned": bool(momentum3_aligned),
-        "current_momentum_1m_aligned": bool(momentum1_aligned),
-        "current_directional_di_aligned": bool(di_aligned),
-    })
-    return scenario, info
-
-
-def _reassess_active_structural_levels(
-    tracker: dict[str, Any], spot: float, indicators: IndicatorSet, oi: OIAnalysis,
-    now: datetime, scenario: Optional[Scenario], future_regime: str,
-    config: Optional[Config], index_candles: Optional[pd.DataFrame],
-) -> Optional[dict[str, Any]]:
-    """Refresh virtual T1/T2 from confirmed evolving structure; stop management is separate.
-
-    Processing order is important: the caller must first test the *previously active* levels
-    against newly completed 1m OHLC bars, resolve stop/target events and then call this function.
-    Any level adjustment therefore applies prospectively to the next monitoring interval and
-    cannot rewrite the level that generated a just-recorded milestone.
-    """
-    if str(tracker.get("status", "TRACKING")).upper() != "TRACKING":
-        return None
-    if config is None:
-        tracker["target_reassessment_status"] = "HELD_NO_CONFIG"
-        return None
-    integrity = str(tracker.get("target_event_integrity", "UNASSESSED")).upper()
-    monitor_status = str(tracker.get("monitoring_data_status", "UNAVAILABLE")).upper()
-    if integrity == "UNRESOLVED_AFTER_DATA_GAP" or monitor_status in {"GAP_UNRESOLVED", "CANDLE_FEED_STALE"}:
-        tracker["target_reassessment_status"] = "HELD_UNRESOLVED_CANDLE_CHRONOLOGY"
-        tracker["target_reassessment_reason"] = "Level changes paused because an unseen stop/target crossing cannot be ruled out."
-        return None
-    if index_candles is None or index_candles.empty:
-        tracker["target_reassessment_status"] = "HELD_CANDLES_UNAVAILABLE"
-        tracker["target_reassessment_reason"] = "Targets/stops remain unchanged until completed multi-minute structure is available."
-        return None
-
-    completed_3m = completed_resampled_candles(index_candles, 3, now)
-    if completed_3m.empty:
-        tracker["target_reassessment_status"] = "WAITING_FOR_COMPLETED_3M_BAR"
-        return None
-    latest_stamp = parse_timestamp(completed_3m.iloc[-1].get("timestamp"))
-    created = parse_timestamp(tracker.get("created_at"))
-    if latest_stamp is None:
-        tracker["target_reassessment_status"] = "WAITING_FOR_VALID_3M_TIMESTAMP"
-        return None
-    latest_stamp = latest_stamp.astimezone(IST)
-    if created is not None and latest_stamp < created.astimezone(IST):
-        tracker["target_reassessment_status"] = "WAITING_FOR_POST_SELECTION_3M_BAR"
-        return None
-    bar_end = latest_stamp + timedelta(minutes=3)
-    current = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
-    if bar_end > current or (current - bar_end).total_seconds() > 300:
-        tracker["target_reassessment_status"] = "HELD_STALE_3M_BAR"
-        return None
-    previous_bar = parse_timestamp(tracker.get("last_dynamic_levels_3m_bar_timestamp"))
-    if previous_bar is not None and latest_stamp <= previous_bar.astimezone(IST):
-        tracker["target_reassessment_status"] = "NO_NEW_COMPLETED_3M_BAR"
-        return None
-
-    # Store the bar even if context is not supportive: the same completed candle must not
-    # be reconsidered repeatedly as if it were new evidence on every cron invocation.
-    tracker["last_dynamic_levels_3m_bar_timestamp"] = ist_iso(latest_stamp)
-    context_ok, context_reason, context_statuses = _dynamic_level_context_ok(
-        tracker, indicators, oi, scenario, future_regime
-    )
-    tracker["target_reassessment_context"] = context_statuses
-    if not context_ok:
-        tracker["target_reassessment_status"] = "HELD_MARKET_CONTEXT"
-        tracker["target_reassessment_reason"] = context_reason
-        return None
-
-    direction = str(tracker.get("direction", "")).upper()
-    synthetic_scenario = Scenario(
-        state=str(tracker.get("scenario", "ACTIVE_SIGNAL_REASSESSMENT")),
-        direction=direction,
-        confidence=safe_float(tracker.get("confidence_pct", tracker.get("latest_signal_confidence_pct")), 0.0),
-        trigger_reason="Active signal structural target/stop reassessment on a distinct completed 3-minute bar.",
-        wall_level=None, wall_state="", executable_candidate=True, hard_veto=None,
-        features={},
-    )
-    plan = route_targets_and_stop(synthetic_scenario, spot, indicators, oi, config, now=now)
-    if not plan.valid or not finite(plan.stop_loss):
-        tracker["target_reassessment_status"] = "HELD_NO_VALID_STRUCTURAL_PLAN"
-        tracker["target_reassessment_reason"] = str(plan.reason or "No valid current structural plan.")[:260]
-        return None
-
-    active_stop = safe_float(tracker.get("trailing_stop", tracker.get("stop_loss")), float("nan"))
-    active_t1 = safe_float(tracker.get("target_1"), float("nan"))
-    active_t2 = safe_float(tracker.get("target_2"), float("nan"))
-    if not finite(active_stop) or not finite(active_t1):
-        tracker["target_reassessment_status"] = "HELD_INVALID_PERSISTED_LEVELS"
-        return None
-    atr_for_distance = safe_float(indicators.atr_5m, float("nan"))
-    if not finite(atr_for_distance) or atr_for_distance <= 0:
-        atr_for_distance = safe_float(indicators.atr, 1.0) * math.sqrt(5.0)
-    min_distance = max(2.0, 0.10 * atr_for_distance if finite(atr_for_distance) else 2.0,
-                       0.25 * infer_strike_step(list(oi.rows)))
-    max_distance = max(min_distance, safe_float(plan.max_t1_distance_points, float("nan")))
-    if not finite(max_distance):
-        tracker["target_reassessment_status"] = "HELD_INVALID_TARGET_CEILING"
-        return None
-
-    old_t1_source = str(tracker.get("T1_source", tracker.get("target_1_source", "")))
-    old_t2_source = str(tracker.get("T2_source", tracker.get("target_2_source", "")))
-    old_t1_valid = _target_source_is_intact(active_t1, old_t1_source, direction, spot, oi, max_distance, min_distance)
-    old_t2_valid = _target_source_is_intact(active_t2, old_t2_source, direction, spot, oi, max_distance, min_distance) if finite(active_t2) else False
-    candidate_t1 = safe_float(plan.target_1, float("nan"))
-    candidate_t2 = safe_float(plan.target_2, float("nan"))
-    # The currently active protective stop is owned by
-    # _update_protective_structural_trailing_stop(). Keep target risk calculations tied to
-    # that stop, rather than deriving a second, competing stop inside the target routine.
-    current_risk = abs(active_stop - spot)
-
-    def valid_target_for_active_stop(level: float) -> bool:
-        ahead = level > spot + min_distance if direction == "BULLISH" else level < spot - min_distance
-        if not finite(level) or not ahead or abs(level - spot) > max_distance or current_risk <= 0:
-            return False
-        return abs(level - spot) / current_risk >= config.min_t1_reward_risk_ratio
-
-    candidate_t1_valid = valid_target_for_active_stop(candidate_t1)
-    target_changed = False
-    previous_t1 = active_t1
-    previous_t2 = active_t2 if finite(active_t2) else None
-    next_t1 = active_t1
-    next_t1_source = old_t1_source
-    t1_hit = bool(tracker.get("target_1_hit", False))
-
-    if not t1_hit and candidate_t1_valid:
-        old_distance = abs(active_t1 - spot)
-        candidate_distance = abs(candidate_t1 - spot)
-        delta_threshold = max(0.20 * atr_for_distance if finite(atr_for_distance) else 0.0,
-                              0.25 * infer_strike_step(list(oi.rows)), 2.0)
-        should_replace_t1 = (not old_t1_valid or candidate_distance < old_distance - delta_threshold)
-        # A target can move farther only when its prior OI wall has weakened/disappeared or
-        # the old price level is no longer valid. This prevents targets being chased away.
-        old_oi_target_invalid = ("OI_WALL" in old_t1_source.upper() and not old_t1_valid)
-        if should_replace_t1 or old_oi_target_invalid:
-            next_t1 = candidate_t1
-            next_t1_source = plan.target_1_source
-            if abs(next_t1 - active_t1) >= 0.01:
-                target_changed = True
-
-    # Build structurally ordered T2 choices from the refreshed plan and the previous target
-    # levels. This can move T2 closer to a newly formed wall, or further only if its prior
-    # anchor becomes invalid. It never moves a level behind spot or across T1.
-    candidate_pool: list[tuple[float, str, bool]] = []
-    for level, source, is_valid in (
-        (active_t1, old_t1_source, old_t1_valid),
-        (active_t2, old_t2_source, old_t2_valid),
-        (candidate_t1, plan.target_1_source, candidate_t1_valid),
-        (candidate_t2, plan.target_2_source, valid_target_for_active_stop(candidate_t2)),
-    ):
-        if finite(level):
-            candidate_pool.append((float(level), str(source or ""), bool(is_valid)))
-    if t1_hit:
-        # Once T1 has been hit, it is immutable historical evidence; the next valid structure
-        # in the active direction is the evolving T2. Do not reset the T1 milestone.
-        ordered = [row for row in candidate_pool
-                   if row[2] and (row[0] > spot + min_distance if direction == "BULLISH" else row[0] < spot - min_distance)]
-        ordered.sort(key=lambda row: abs(row[0] - spot))
-        if ordered:
-            nearest_level, nearest_source, _ = ordered[0]
-            current_t2_valid_ahead = old_t2_valid and finite(active_t2) and (
-                active_t2 > spot + 0.01 if direction == "BULLISH" else active_t2 < spot - 0.01
-            ) and (active_t2 > active_t1 if direction == "BULLISH" else active_t2 < active_t1)
-            new_t2 = active_t2 if current_t2_valid_ahead else nearest_level
-            new_t2_source = old_t2_source if current_t2_valid_ahead else nearest_source
-            # Prefer a newly confirmed closer opposing level to a farther old T2.
-            if current_t2_valid_ahead and abs(nearest_level - spot) < abs(active_t2 - spot) - min_distance:
-                new_t2, new_t2_source = nearest_level, nearest_source
-        else:
-            new_t2, new_t2_source = (active_t2, old_t2_source) if old_t2_valid else (float("nan"), "UNAVAILABLE_NO_VALID_FORWARD_STRUCTURE")
-    else:
-        ordered = [row for row in candidate_pool
-                   if row[2] and (row[0] > next_t1 + min_distance if direction == "BULLISH" else row[0] < next_t1 - min_distance)
-                   and (row[0] > spot + min_distance if direction == "BULLISH" else row[0] < spot - min_distance)]
-        ordered.sort(key=lambda row: abs(row[0] - spot))
-        current_t2_ordered = old_t2_valid and finite(active_t2) and (
-            active_t2 > next_t1 + min_distance if direction == "BULLISH" else active_t2 < next_t1 - min_distance
-        ) and (active_t2 > spot + min_distance if direction == "BULLISH" else active_t2 < spot - min_distance)
-        if ordered:
-            nearest_level, nearest_source, _ = ordered[0]
-            new_t2, new_t2_source = (active_t2, old_t2_source) if current_t2_ordered else (nearest_level, nearest_source)
-            if current_t2_ordered and abs(nearest_level - spot) < abs(active_t2 - spot) - min_distance:
-                new_t2, new_t2_source = nearest_level, nearest_source
-        else:
-            new_t2, new_t2_source = (active_t2, old_t2_source) if current_t2_ordered else (float("nan"), "UNAVAILABLE_NO_VALID_FORWARD_STRUCTURE")
-
-    # If T1 itself was unchanged and valid, do not permit a T2 level to collide with it.
-    if finite(new_t2):
-        good_order = new_t2 > next_t1 + min_distance if direction == "BULLISH" else new_t2 < next_t1 - min_distance
-        if not good_order:
-            new_t2 = float("nan")
-            new_t2_source = "UNAVAILABLE_INVALID_LEVEL_ORDER"
-    if not (finite(new_t2) and valid_target_for_active_stop(new_t2)):
-        # T2 is optional, but never retain a breached/out-of-range or structurally invalid level.
-        new_t2 = float("nan")
-        new_t2_source = "UNAVAILABLE_NO_VALID_FORWARD_STRUCTURE"
-
-    if not t1_hit and abs(next_t1 - active_t1) >= 0.01:
-        tracker.setdefault("initial_reward_risk_ratio", tracker.get("reward_risk_ratio"))
-        tracker["target_1"] = float(next_t1)
-        tracker["T1_source"] = next_t1_source
-        tracker["target_1_source"] = next_t1_source
-        tracker["t1_distance_points"] = abs(next_t1 - spot)
-        if current_risk > 0:
-            tracker["reward_risk_ratio"] = abs(next_t1 - spot) / current_risk
-        target_changed = True
-    if ((finite(active_t2) and (not finite(new_t2) or abs(new_t2 - active_t2) >= 0.01))
-            or (not finite(active_t2) and finite(new_t2))):
-        tracker["target_2"] = float(new_t2) if finite(new_t2) else None
-        tracker["T2_source"] = str(new_t2_source)
-        tracker["target_2_source"] = str(new_t2_source)
-        target_changed = True
-
-    if target_changed:
-        tracker["target_update_count"] = max(0, int(safe_float(tracker.get("target_update_count"), 0))) + 1
-        tracker["last_target_update_at"] = ist_iso(now)
-        tracker["target_reassessment_status"] = "LEVELS_UPDATED"
-        tracker["target_reassessment_reason"] = context_reason
-        changes = tracker.get("target_adjustment_history")
-        changes = [dict(row) for row in changes if isinstance(row, dict)] if isinstance(changes, list) else []
-        changes.append({
-            "timestamp": ist_iso(now), "3m_bar_timestamp": ist_iso(latest_stamp),
-            "spot": round(float(spot), 2) if finite(spot) else None,
-            "previous_T1": previous_t1, "new_T1": tracker.get("target_1"),
-            "previous_T2": previous_t2, "new_T2": tracker.get("target_2"),
-            "previous_SL": active_stop, "new_SL": tracker.get("trailing_stop", active_stop),
-            "context": {key: value for key, value in context_statuses.items()},
-        })
-        tracker["target_adjustment_history"] = changes[-8:]
-        return {
-            "event_type": "ACTIVE_LEVELS_REASSESSED", "event_at": ist_iso(now),
-            "tracker_fingerprint": tracker.get("signal_fingerprint", ""),
-            "direction": direction, "trading_symbol": tracker.get("trading_symbol", ""),
-            "strike": tracker.get("strike"), "spot": spot,
-            "previous_T1": previous_t1, "new_T1": tracker.get("target_1"),
-            "previous_T2": previous_t2, "new_T2": tracker.get("target_2"),
-            "previous_trailing_SL": active_stop, "new_trailing_SL": tracker.get("trailing_stop"),
-            "target_reassessment_reason": context_reason,
-            "message": "Active T1/T2 levels were updated prospectively after a distinct completed 3-minute bar and aligned market context. Protective stop management runs independently against confirmed swing structure.",
-        }
-    tracker["target_reassessment_status"] = "LEVELS_REASSESSED_NO_CHANGE"
-    tracker["target_reassessment_reason"] = context_reason
-    return None
-
-
-def update_recommendation_tracker(
-    state: dict[str, Any], spot: float, indicators: IndicatorSet,
-    oi: OIAnalysis, now: datetime,
-    option_quotes: Optional[Mapping[str, LiveQuote]] = None,
-    *, quote_alert_cooldown_minutes: int = 10,
-    index_candles: Optional[pd.DataFrame] = None,
-    intrabar_monitor_lookback: int = 60,
-    stagnation_warning_cooldown_minutes: int = 15,
-    stagnation_range_pct: float = 0.001,
-    stagnation_min_progress_pct: float = 0.0001,
-    oi_velocity_trigger: float = 0.0015,
-    scenario: Optional[Scenario] = None,
-    future_regime: str = "UNKNOWN",
-    config: Optional[Config] = None,
-) -> dict[str, Any]:
-    """Monitor every active virtual recommendation using NIFTY levels and its live option quote.
-
-    The tracker is explicitly hypothetical: it never represents an exchange position.
-    Level events are edge-triggered so each T1/T2/stop event can create one alert only.
-    Per-scan scenario/flow/futures reassessment is diagnostic only. Candle gaps are never
-    filled synthetically; unresolved chronology is surfaced and T1/T2 alerting stays disabled
-    for that signal generation after an unresolved history gap.
-    """
-    raw = state.get("recommendation_trackers")
-    trackers = [dict(x) for x in raw if isinstance(x, dict)] if isinstance(raw, list) else []
-    legacy = state.get("recommendation_tracker")
-    if not trackers and isinstance(legacy, dict):
-        trackers = [dict(legacy)]
-    # If the singular compatibility view has newer fields, merge it into the matching entry.
-    if isinstance(legacy, dict):
-        legacy_fp = str(legacy.get("signal_fingerprint", ""))
-        if legacy_fp:
-            for item in trackers:
-                if str(item.get("signal_fingerprint", "")) == legacy_fp:
-                    item.update(legacy)
-                    break
-    quotes = option_quotes or {}
-    events: list[dict[str, Any]] = []
-    monitor_rows: list[dict[str, Any]] = []
-    for tracker in trackers:
-        status = str(tracker.get("status", "")).upper()
-        if status != "TRACKING":
-            continue
-        direction = str(tracker.get("direction", "")).upper()
-        instrument_key = str(tracker.get("instrument_key", ""))
-        quote = quotes.get(instrument_key) if instrument_key else None
-        prior_quote_status = str(tracker.get("last_option_quote_status", "UNKNOWN")).upper()
-        prior_monitored_at = parse_timestamp(tracker.get("last_monitored_at"))
-        quote_status = quote.freshness if quote is not None else "UNAVAILABLE"
-        option_ltp: Optional[float] = None
-        if quote is not None and finite(quote.ltp) and quote.ltp > 0:
-            option_ltp = float(quote.ltp)
-            tracker["last_option_ltp_observed"] = option_ltp
-            tracker["last_option_quote_status"] = quote_status
-            tracker["last_option_quote_timestamp"] = quote.timestamp or quote.last_trade_time
-            entry_ltp = safe_float(tracker.get("entry_reference_ltp"))
-            if finite(entry_ltp) and entry_ltp > 0:
-                tracker["option_ltp_change_pct_from_signal"] = (option_ltp / entry_ltp - 1.0) * 100.0
-        else:
-            tracker["last_option_quote_status"] = quote_status
-        tracker["last_nifty_spot"] = float(spot) if finite(spot) else tracker.get("last_nifty_spot")
-
-        # Quote freshness is reported independently from index-level event monitoring.
-        # A missing/stale option quote cannot create a price exit, but it must be visible.
-        if quote is None or quote.freshness != "FRESH" or option_ltp is None:
-            prior_warning = parse_timestamp(tracker.get("last_quote_warning_at"))
-            cooldown_elapsed = prior_warning is None or (now - prior_warning).total_seconds() >= max(1, quote_alert_cooldown_minutes) * 60
-            if cooldown_elapsed:
-                events.append({
-                    "event_type": "SELECTED_OPTION_QUOTE_UNAVAILABLE",
-                    "event_at": ist_iso(now), "tracker_fingerprint": tracker.get("signal_fingerprint", ""),
-                    "direction": direction, "scenario": tracker.get("scenario", ""),
-                    "instrument_key": instrument_key, "trading_symbol": tracker.get("trading_symbol", ""),
-                    "option_type": tracker.get("option_type", ""), "strike": tracker.get("strike"),
-                    "spot": spot, "option_ltp": option_ltp, "option_quote_status": quote_status,
-                    "option_quote_age_seconds": quote.age_seconds if quote is not None else None,
-                    "T1": tracker.get("target_1"), "T2": tracker.get("target_2"),
-                    "SL": tracker.get("stop_loss"), "trailing_SL": tracker.get("trailing_stop", tracker.get("stop_loss")),
-                    "message": "The recommendation remains monitored against NIFTY index levels, but the selected option quote is not fresh/available.",
-                })
-                tracker["last_quote_warning_at"] = ist_iso(now)
-        else:
-            if prior_quote_status in {"STALE", "UNAVAILABLE", "ERROR", "MISSING"}:
-                tracker["quote_recovered_at"] = ist_iso(now)
-                events.append({
-                    "event_type": "SELECTED_OPTION_QUOTE_RECOVERED",
-                    "event_at": ist_iso(now), "tracker_fingerprint": tracker.get("signal_fingerprint", ""),
-                    "direction": direction, "scenario": tracker.get("scenario", ""),
-                    "instrument_key": instrument_key, "trading_symbol": tracker.get("trading_symbol", ""),
-                    "option_type": tracker.get("option_type", ""), "strike": tracker.get("strike"),
-                    "spot": spot, "option_ltp": option_ltp, "option_quote_status": quote_status,
-                    "option_quote_age_seconds": quote.age_seconds if quote is not None else None,
-                    "T1": tracker.get("target_1"), "T2": tracker.get("target_2"),
-                    "SL": tracker.get("stop_loss"), "trailing_SL": tracker.get("trailing_stop", tracker.get("stop_loss")),
-                    "message": "The selected option quote has become fresh again; virtual monitoring continues.",
-                })
-
-        t1 = safe_float(tracker.get("target_1"))
-        t2 = safe_float(tracker.get("target_2"))
-        stored_stop = safe_float(tracker.get("trailing_stop", tracker.get("stop_loss")))
-        if direction not in {"BULLISH", "BEARISH"} or not finite(t1) or not finite(stored_stop):
-            tracker["status"] = "INVALIDATED_STATE"
-            tracker["completed_at"] = ist_iso(now)
-            events.append({
-                "event_type": "TRACKER_STATE_INVALIDATED", "event_at": ist_iso(now),
-                "tracker_fingerprint": tracker.get("signal_fingerprint", ""),
-                "direction": direction, "instrument_key": instrument_key, "trading_symbol": tracker.get("trading_symbol", ""),
-                "option_type": tracker.get("option_type", ""), "strike": tracker.get("strike"), "spot": spot,
-                "option_ltp": option_ltp, "option_quote_status": quote_status,
-                "T1": tracker.get("target_1"), "T2": tracker.get("target_2"), "SL": tracker.get("stop_loss"),
-                "trailing_SL": tracker.get("trailing_stop"),
-                "message": "Persisted target/stop/direction data failed validation; this recommendation will no longer be monitored.",
+def analyze_oi(chain: Sequence[dict[str, Any]], snapshots: Sequence[dict[str, Any]], spot: float,
+               expiry: str, now: datetime, strike_step: float) -> dict[str, Any]:
+    current = oi_snapshot(chain, expiry, now)
+    prior, age = _recent_snapshot(snapshots, now, expiry)
+    prior_rows = _snapshot_rows(prior) if prior else {}
+    rows = _snapshot_rows(current)
+    all_calls = sum(number(r.get("call_oi"), 0.0) for r in rows.values())
+    all_puts = sum(number(r.get("put_oi"), 0.0) for r in rows.values())
+    pcr = all_puts / all_calls if all_calls > 0 else float("nan")
+    calls_delta = puts_delta = 0.0
+    calls_base = puts_base = 0.0
+    wall_items: list[dict[str, Any]] = []
+    for strike, row in rows.items():
+        old = prior_rows.get(strike, {})
+        call_oi, put_oi = number(row.get("call_oi"), 0), number(row.get("put_oi"), 0)
+        call_old, put_old = number(old.get("call_oi")), number(old.get("put_oi"))
+        call_prem, put_prem = number(row.get("call_ltp")), number(row.get("put_ltp"))
+        call_prem_old, put_prem_old = number(old.get("call_ltp")), number(old.get("put_ltp"))
+        c_change = (call_oi - call_old) / call_old if finite(call_old) and call_old > 0 else None
+        p_change = (put_oi - put_old) / put_old if finite(put_old) and put_old > 0 else None
+        c_premium = (call_prem - call_prem_old) / call_prem_old if finite(call_prem) and finite(call_prem_old) and call_prem_old > 0 else None
+        p_premium = (put_prem - put_prem_old) / put_prem_old if finite(put_prem) and finite(put_prem_old) and put_prem_old > 0 else None
+        if c_change is not None and call_old > 0:
+            calls_delta += call_oi - call_old; calls_base += call_old
+        if p_change is not None and put_old > 0:
+            puts_delta += put_oi - put_old; puts_base += put_old
+        if abs(strike - spot) <= max(500, 8 * strike_step):
+            wall_items.append({
+                "strike": strike, "call_oi": call_oi, "put_oi": put_oi,
+                "call_change_pct": c_change, "put_change_pct": p_change,
+                "call_premium_change_pct": c_premium, "put_premium_change_pct": p_premium,
+                "call_flow": classify_oi_flow(c_change, c_premium),
+                "put_flow": classify_oi_flow(p_change, p_premium),
+                "call_volume": number(row.get("call_volume"), 0), "put_volume": number(row.get("put_volume"), 0),
             })
-            continue
-
-        intrabar = _scan_intrabar_level_crossings(
-            tracker, index_candles, now, direction, t1,
-            t2 if finite(t2) else float("nan"), stored_stop,
-            lookback=intrabar_monitor_lookback, prior_monitor_at=prior_monitored_at,
-        )
-        tracker["monitoring_data_status"] = str(intrabar.get("monitoring_data_status", "UNAVAILABLE"))
-        tracker["monitoring_gap_minutes"] = intrabar.get("monitoring_gap_minutes")
-        tracker["monitoring_data_note"] = str(intrabar.get("monitoring_data_note", ""))
-        # Once an OHLC-history gap makes level order unknowable, do not quietly restore
-        # target alerting on the next contiguous scan: a stop could have crossed unseen
-        # and price may since have rebounded. Keep the virtual tracker alive, continue
-        # current-spot stop monitoring, but permanently disable new T1/T2 milestones for
-        # this tracker generation. A new independently selected signal gets a fresh state.
-        existing_integrity = str(tracker.get("target_event_integrity", "UNASSESSED")).upper()
-        gap_statuses = {"GAP_UNRESOLVED", "CANDLE_FEED_STALE"}
-        if tracker["monitoring_data_status"] in gap_statuses:
-            if existing_integrity != "UNRESOLVED_AFTER_DATA_GAP":
-                tracker["target_event_integrity_since"] = ist_iso(now)
-                tracker["target_event_integrity_reason"] = tracker["monitoring_data_note"][:500]
-            tracker["target_event_integrity"] = "UNRESOLVED_AFTER_DATA_GAP"
-        elif existing_integrity in {"", "UNASSESSED", "NONE"}:
-            tracker["target_event_integrity"] = "LIVE_SPOT_ONLY" if tracker["monitoring_data_status"] == "CANDLES_UNAVAILABLE_LIVE_SPOT_ONLY" else "CONTIGUOUS_OR_NOT_YET_PROVEN_GAPPED"
-        if str(tracker.get("target_event_integrity", "")).upper() == "UNRESOLVED_AFTER_DATA_GAP":
-            sticky_note = ("Target milestones remain suppressed for this signal because candle chronology became unresolved at "
-                           f"{tracker.get('target_event_integrity_since', 'an unknown time')}. The tracker stays active for current-spot stop monitoring and the existing structural reversal guard.")
-            tracker["monitoring_data_note"] = (tracker["monitoring_data_note"] + " " + sticky_note).strip()
-        tracker["last_monitored_at"] = ist_iso(now)
-        if scenario is not None or index_candles is not None:
-            _assess_active_signal_regime(tracker, scenario, indicators, oi, future_regime, config, now, index_candles)
-        was_t1_hit = bool(tracker.get("target_1_hit", False))
-        spot_t1_cross = (direction == "BULLISH" and spot >= t1) or (direction == "BEARISH" and spot <= t1)
-        # A stop-first ambiguous OHLC bar invalidates any same-scan live-spot T1 inference.
-        # Otherwise a recovered live spot could incorrectly mark T1 after the conservative stop.
-        # Suppress T1 only when the very same OHLC bar also crossed the stop.
-        # A prior candle can reach T1 and a later candle can stop out in one cron gap;
-        # in that case both events must be retained in chronological order.
-        chronology_uncertain = (str(intrabar.get("monitoring_data_status", "")).upper() in {
-            "GAP_UNRESOLVED", "CANDLE_FEED_STALE"
-        } or str(tracker.get("target_event_integrity", "")).upper() == "UNRESOLVED_AFTER_DATA_GAP")
-        active_stop_was_crossed = bool(intrabar.get("stop_hit")) or (
-            (direction == "BULLISH" and spot <= stored_stop) or
-            (direction == "BEARISH" and spot >= stored_stop)
-        )
-        structural_failure = None
-        if not active_stop_was_crossed and not chronology_uncertain:
-            structural_failure = _detect_confirmed_structural_failure(
-                tracker, indicators, oi, future_regime, scenario, now, index_candles, config
-            )
-        t1_newly_hit = (not was_t1_hit and not bool(intrabar.get("ambiguous_bar"))
-                        and not chronology_uncertain
-                        and (spot_t1_cross or bool(intrabar.get("t1_hit"))))
-        initial_stop_before_scan = safe_float(tracker.get("initial_stop_loss", tracker.get("stop_loss")), float("nan"))
-        active_stop_before_scan = safe_float(tracker.get("trailing_stop", tracker.get("stop_loss")), float("nan"))
-        trailing_stop_active_before_scan = bool(
-            finite(initial_stop_before_scan) and finite(active_stop_before_scan) and (
-                (direction == "BULLISH" and active_stop_before_scan > initial_stop_before_scan + 0.01)
-                or (direction == "BEARISH" and active_stop_before_scan < initial_stop_before_scan - 0.01)
-            )
-        )
-        if t1_newly_hit:
-            tracker["target_1_hit"] = True
-            tracker["target_1_hit_at"] = intrabar.get("t1_timestamp") or ist_iso(now)
-
-        # Freeze the currently active SL for this scan's event determination. A refreshed
-        # structural stop is applied only after the current completed-candle interval has
-        # been evaluated; this prevents retroactive stop movement within the same scan.
-        old_stop = stored_stop
-        stop = old_stop
-        trailing_changed = False
-
-        common_event = {
-            "event_at": ist_iso(now), "tracker_fingerprint": tracker.get("signal_fingerprint", ""),
-            "direction": direction, "scenario": tracker.get("scenario", ""),
-            "instrument_key": instrument_key, "trading_symbol": tracker.get("trading_symbol", ""),
-            "option_type": tracker.get("option_type", ""), "strike": tracker.get("strike"),
-            "spot": spot, "option_ltp": option_ltp, "option_quote_status": quote_status,
-            "confidence_pct": tracker.get("confidence_pct", tracker.get("latest_signal_confidence_pct")),
-            "option_quote_age_seconds": quote.age_seconds if quote is not None else None,
-            "T1": t1, "T2": t2 if finite(t2) else None,
-            "SL": tracker.get("stop_loss"), "trailing_SL": stop,
-            "entry_reference_ltp": tracker.get("entry_reference_ltp"),
-            "nifty_entry_reference": tracker.get("nifty_entry_reference"),
-            "nifty_move_from_signal_points": (spot - safe_float(tracker.get("nifty_entry_reference")) if direction == "BULLISH" and finite(tracker.get("nifty_entry_reference")) and finite(spot) else safe_float(tracker.get("nifty_entry_reference")) - spot if direction == "BEARISH" and finite(tracker.get("nifty_entry_reference")) and finite(spot) else None),
-            "option_ltp_change_pct_from_signal": tracker.get("option_ltp_change_pct_from_signal"),
-            "T1_source": tracker.get("T1_source", tracker.get("target_1_source")),
-            "T2_source": tracker.get("T2_source", tracker.get("target_2_source")),
-            "SL_source": tracker.get("SL_source", tracker.get("stop_source")),
-            "trailing_SL_source": tracker.get("trailing_stop_source", tracker.get("SL_source")),
-            "reward_risk_ratio": tracker.get("reward_risk_ratio"),
-            "t1_distance_points": tracker.get("t1_distance_points"),
-            "sl_distance_points": tracker.get("sl_distance_points"),
-            "max_t1_distance_points": tracker.get("max_t1_distance_points"),
-            "remaining_session_minutes": tracker.get("remaining_session_minutes_at_signal"),
-            "stop_atr_points": tracker.get("stop_atr_points"),
-            "stop_atr_source": tracker.get("stop_atr_source"),
-            "intrabar_bars_processed": intrabar.get("bars_processed", 0),
-            "intrabar_stop_timestamp": intrabar.get("stop_timestamp"),
-            "intrabar_t1_timestamp": intrabar.get("t1_timestamp"),
-            "intrabar_t2_timestamp": intrabar.get("t2_timestamp"),
-            "intrabar_ambiguous_bar": bool(intrabar.get("ambiguous_bar", False)),
-            "monitoring_data_status": tracker.get("monitoring_data_status"),
-            "target_event_integrity": tracker.get("target_event_integrity"),
-            "target_event_integrity_since": tracker.get("target_event_integrity_since"),
-            "monitoring_gap_minutes": tracker.get("monitoring_gap_minutes"),
-            "monitoring_data_note": tracker.get("monitoring_data_note"),
-            "active_regime_assessment": tracker.get("regime_assessment", {}),
-        }
-        if t1_newly_hit:
-            events.append({**common_event, "event_type": "T1_REACHED",
-                           "message": (f"Completed 1m NIFTY candle reached T1 at {intrabar.get('t1_timestamp')}. " if intrabar.get("t1_hit") else "NIFTY reached T1. ") + "Further target/stop reassessment will use a new completed 3-minute structure bar and aligned market context."})
-
-        stop_hit = bool(intrabar.get("stop_hit")) or (direction == "BULLISH" and spot <= stop) or (direction == "BEARISH" and spot >= stop)
-        t2_hit = (not chronology_uncertain) and (bool(intrabar.get("t2_hit")) or
-                  (finite(t2) and ((direction == "BULLISH" and spot >= t2) or (direction == "BEARISH" and spot <= t2))))
-        if stop_hit:
-            # Classify by the stop actually crossed, not by whether T1 happened first.
-            # A tightened structural stop protects a signal before T1 just as it does after T1.
-            event_type = "TRAILING_STOP_REACHED" if trailing_stop_active_before_scan else "INITIAL_STOP_LOSS_REACHED"
-            tracker["status"] = "VIRTUAL_TRAILING_STOP_REACHED" if event_type == "TRAILING_STOP_REACHED" else "VIRTUAL_STOP_LOSS_REACHED"
-            tracker["completed_at"] = ist_iso(now)
-            events.append({**common_event, "event_type": event_type,
-                           "message": ("A completed 1m NIFTY candle crossed the active protective stop; when one OHLC bar spans a stop and target, stop is processed first. " if intrabar.get("stop_hit") else "NIFTY reached the active protective stop level. ") + "This is a virtual signal-monitor event, not an order or actual-position confirmation."})
-        elif structural_failure is not None:
-            # Fallback for a confirmed multi-minute structure failure when the spot did not
-            # touch the prior hard stop. The exit level is the already-confirmed pivot with
-            # its volatility buffer; a single 1m wick cannot trigger this path.
-            active_before_failure = safe_float(tracker.get("trailing_stop", tracker.get("stop_loss")), stop)
-            failed_level = safe_float(structural_failure.get("stop_level"), float("nan"))
-            if finite(failed_level):
-                if direction == "BULLISH":
-                    effective_level = max(active_before_failure, failed_level)
-                else:
-                    effective_level = min(active_before_failure, failed_level)
-                tracker["trailing_stop"] = float(effective_level)
-                tracker["trailing_stop_source"] = "CONFIRMED_3M_STRUCTURAL_FAILURE_EXIT"
-                tracker["trailing_stop_updated_at"] = ist_iso(now)
-                tracker["trailing_stop_pivot_timestamp"] = structural_failure.get("pivot_timestamp")
-                tracker["trailing_stop_pivot_level"] = structural_failure.get("pivot_level")
-                tracker["structural_failure_confirmed_at"] = structural_failure.get("timestamp")
-                tracker["structural_failure_evidence"] = structural_failure.get("evidence", {})
-                tracker["status"] = "VIRTUAL_TRAILING_STOP_REACHED"
-                tracker["completed_at"] = ist_iso(now)
-                events.append({**common_event, "event_type": "STRUCTURAL_STOP_LOSS_REACHED",
-                               "trailing_SL": float(effective_level),
-                               "structural_failure_timestamp": structural_failure.get("timestamp"),
-                               "structural_failure_bar_timestamp": structural_failure.get("bar_timestamp"),
-                               "structural_failure_close": structural_failure.get("close"),
-                               "structural_pivot_timestamp": structural_failure.get("pivot_timestamp"),
-                               "structural_pivot_level": structural_failure.get("pivot_level"),
-                               "structural_failure_evidence": structural_failure.get("evidence", {}),
-                               "message": "A completed 3m NIFTY close broke a previously confirmed post-entry swing pivot and at least two independent context factors opposed the active signal. Virtual signal invalidated; no order was placed."})
-        elif t2_hit:
-            # If a scan gap jumps past T2 and the T1 event was not previously observed,
-            # emit T1 before T2 so the alert history follows the proper level sequence.
-            if not bool(tracker.get("target_1_hit", False)):
-                tracker["target_1_hit"] = True
-                tracker["target_1_hit_at"] = ist_iso(now)
-                events.append({**common_event, "event_type": "T1_REACHED",
-                               "message": "NIFTY crossed T1 and T2 between scans; reporting T1 before T2."})
-            tracker["status"] = "VIRTUAL_T2_REACHED"
-            tracker["completed_at"] = ist_iso(now)
-            events.append({**common_event, "event_type": "T2_REACHED",
-                           "message": (f"Completed 1m NIFTY candle reached T2 at {intrabar.get('t2_timestamp')}. " if intrabar.get("t2_hit") else "NIFTY reached T2. ") + "Virtual recommendation monitoring is complete."})
-
-        if str(tracker.get("status", "TRACKING")).upper() == "TRACKING":
-            stagnation = evaluate_stagnation_watch(
-                tracker, index_candles, spot, indicators, oi, now,
-                range_limit_pct=stagnation_range_pct,
-                min_progress_pct=stagnation_min_progress_pct,
-                oi_velocity_trigger=oi_velocity_trigger,
-                cooldown_minutes=stagnation_warning_cooldown_minutes,
-            )
-            if stagnation.get("warning"):
-                events.append(stagnation["warning"])
-
-            # The old levels were already processed above. Tighten the protective stop from
-            # confirmed swing structure first (without waiting for directional context to
-            # remain bullish/bearish), then let the independent target routine use that stop
-            # when checking the evolving T1/T2 risk/reward plan.
-            protective_stop_event = _update_protective_structural_trailing_stop(
-                tracker, spot, indicators, now, index_candles
-            )
-            if protective_stop_event:
-                events.append(protective_stop_event)
-            level_event = _reassess_active_structural_levels(
-                tracker, spot, indicators, oi, now, scenario, future_regime, config, index_candles
-            )
-            if level_event:
-                events.append(level_event)
-            t1 = safe_float(tracker.get("target_1"), t1)
-            t2 = safe_float(tracker.get("target_2"), float("nan"))
-            stop = safe_float(tracker.get("trailing_stop", tracker.get("stop_loss")), stop)
-        else:
-            stagnation = {"status": "NOT_APPLICABLE", "warning": None}
-
-        monitor_rows.append({
-            "status": tracker.get("status", "TRACKING"), "direction": direction,
-            "stagnation_status": stagnation.get("status"),
-            "stagnation_range_pct": (safe_float(stagnation.get("range_pct"), float("nan")) * 100.0
-                                     if finite(stagnation.get("range_pct")) else None),
-            "stagnation_flow_aligned": stagnation.get("flow_aligned"),
-            "stagnation_vwap_aligned": stagnation.get("vwap_aligned"),
-            "scenario": tracker.get("scenario", ""), "instrument_key": instrument_key,
-            "trading_symbol": tracker.get("trading_symbol", ""), "option_type": tracker.get("option_type", ""),
-            "strike": tracker.get("strike"), "option_ltp": option_ltp,
-            "option_quote_status": quote_status,
-            "option_quote_age_seconds": quote.age_seconds if quote is not None else None,
-            "option_ltp_change_pct_from_signal": tracker.get("option_ltp_change_pct_from_signal"),
-            "last_nifty_spot": spot, "target_1_hit": bool(tracker.get("target_1_hit", False)),
-            "T1": t1, "T2": t2 if finite(t2) else None, "SL": tracker.get("stop_loss"),
-            "trailing_SL": tracker.get("trailing_stop", tracker.get("stop_loss")),
-            "last_monitored_at": tracker.get("last_monitored_at"),
-            "signal_fingerprint": tracker.get("signal_fingerprint", ""),
-            "monitoring_data_status": tracker.get("monitoring_data_status", "UNAVAILABLE"),
-            "monitoring_gap_minutes": tracker.get("monitoring_gap_minutes"),
-            "monitoring_data_note": tracker.get("monitoring_data_note", ""),
-            "active_regime_assessment": tracker.get("regime_assessment", {}),
-            "target_reassessment_status": tracker.get("target_reassessment_status", "NOT_YET_ASSESSED"),
-            "target_reassessment_reason": tracker.get("target_reassessment_reason", ""),
-            "target_update_count": tracker.get("target_update_count", 0),
-            "last_target_update_at": tracker.get("last_target_update_at"),
-            "last_dynamic_levels_3m_bar_timestamp": tracker.get("last_dynamic_levels_3m_bar_timestamp"),
-            "opposite_scenario_consecutive_bars": tracker.get("opposite_scenario_consecutive_bars", 0),
-        })
-
-    # Keep only a bounded same-session history; the latest recommendation is the legacy view.
-    state["recommendation_trackers"] = _compact_persisted_tracker_history(trackers)
-    if trackers:
-        primary_fp = str(state.get("last_signal_fingerprint", ""))
-        primary = next((x for x in reversed(trackers) if str(x.get("signal_fingerprint", "")) == primary_fp), trackers[-1])
-        state["recommendation_tracker"] = primary
-    else:
-        state["recommendation_tracker"] = None
-    primary = state.get("recommendation_tracker") if isinstance(state.get("recommendation_tracker"), dict) else {}
-    active_count = sum(1 for x in trackers if str(x.get("status", "")).upper() == "TRACKING")
+    tactical_available = calls_base > 0 and puts_base > 0 and age is not None
+    call_tactical = calls_delta / calls_base if calls_base > 0 else None
+    put_tactical = puts_delta / puts_base if puts_base > 0 else None
+    # Identify walls by concentration around nearby strikes, not by raw OI alone.
+    for side in ("CALL", "PUT"):
+        oi_key = "call_oi" if side == "CALL" else "put_oi"
+        values = sorted(((number(w[oi_key], 0), w) for w in wall_items), key=lambda item: item[0])
+        cutoff = values[max(0, int(len(values) * 0.60) - 1)][0] if values else float("inf")
+        for w in wall_items:
+            oi = number(w[oi_key], 0)
+            change = w["call_change_pct"] if side == "CALL" else w["put_change_pct"]
+            flow = w["call_flow"] if side == "CALL" else w["put_flow"]
+            w[f"{side.lower()}_wall"] = oi >= cutoff and oi > 0
+            w[f"{side.lower()}_state"] = "BUILDING" if finite(change) and change >= 0.002 else "WEAKENING" if finite(change) and change <= -0.002 else "STABLE" if finite(change) else "UNKNOWN"
+            w[f"{side.lower()}_flow"] = flow
+    calls_walls = sorted([w for w in wall_items if w.get("call_wall") and w["strike"] >= spot - 1e-6], key=lambda w: w["strike"])
+    puts_walls = sorted([w for w in wall_items if w.get("put_wall") and w["strike"] <= spot + 1e-6], key=lambda w: w["strike"], reverse=True)
     return {
-        "status": str(primary.get("status", "NONE")), "direction": primary.get("direction"),
-        "target_1_hit": bool(primary.get("target_1_hit", False)),
-        "target_1": primary.get("target_1"), "target_2": primary.get("target_2"),
-        "trailing_stop": primary.get("trailing_stop", primary.get("stop_loss")),
-        "active_tracker_count": active_count, "trackers": monitor_rows,
-        "monitoring_data_quality": {
-            "unresolved_gap_count": sum(1 for row in monitor_rows if row.get("monitoring_data_status") in {"GAP_UNRESOLVED", "CANDLE_FEED_STALE"} or row.get("target_event_integrity") == "UNRESOLVED_AFTER_DATA_GAP"),
-            "candleless_live_spot_count": sum(1 for row in monitor_rows if row.get("monitoring_data_status") == "CANDLES_UNAVAILABLE_LIVE_SPOT_ONLY"),
-            "active_context_conflict_count": sum(1 for row in monitor_rows if isinstance(row.get("active_regime_assessment"), dict) and row["active_regime_assessment"].get("context_state") in {"CONFLICT_PRESENT", "OPPOSITE_PRESSURE_PRESENT_PENDING_GUARD"}),
-        },
-        "events": events,
-        "message": ("Virtual recommendation(s) monitored using NIFTY index levels and the selected option's live quote. No order was placed."
-                    if monitor_rows else "No active recommendation tracker."),
+        "snapshot": current, "snapshot_age_minutes": age, "tactical_available": tactical_available,
+        "call_tactical_change_pct": call_tactical, "put_tactical_change_pct": put_tactical,
+        "call_total_oi": all_calls, "put_total_oi": all_puts, "pcr": pcr,
+        "walls": sorted(wall_items, key=lambda w: w["strike"]),
+        "call_resistance_walls": calls_walls[:8], "put_support_walls": puts_walls[:8],
+        "source": "SAME_SESSION_OI_AND_PREMIUM_SNAPSHOTS" if tactical_available else "OI_CONCENTRATION_WITHOUT_VALID_TACTICAL_BASELINE",
     }
 
 
-def register_recommendation_tracker(
-    state: dict[str, Any], signal: dict[str, Any], fingerprint: str, now: datetime,
-    max_active_trackers: int = 5, reentry_cooldown_minutes: int = 6,
-) -> dict[str, Any]:
-    """Register a signal for virtual monitoring without resetting an identical tracker.
+def make_structure_levels(frame: pd.DataFrame, indicators: Indicators, oi: Mapping[str, Any], step: float, now: Optional[datetime] = None) -> list[Level]:
+    bars = completed_candles(frame, (now or now_ist()).astimezone(IST))
+    recent = bars.tail(90)
+    tolerance = max(8.0, min(22.0, indicators.atr * 0.22))
+    raw: list[tuple[float, str, str, float]] = []
+    for val in _pivot_prices(recent, "high", "high"):
+        if abs(indicators.spot - val) <= max(500, indicators.atr * 12):
+            raw.append((val, "RESISTANCE", "PRICE_PIVOT_HIGH", 0.55))
+    for val in _pivot_prices(recent, "low", "low"):
+        if abs(indicators.spot - val) <= max(500, indicators.atr * 12):
+            raw.append((val, "SUPPORT", "PRICE_PIVOT_LOW", 0.55))
+    raw += [(indicators.session_high, "RESISTANCE", "SESSION_HIGH", 0.65),
+            (indicators.session_low, "SUPPORT", "SESSION_LOW", 0.65)]
+    for w in oi.get("walls", []):
+        strike = number(w.get("strike"))
+        if not finite(strike) or abs(strike - indicators.spot) > max(500, indicators.atr * 12):
+            continue
+        call_oi = number(w.get("call_oi"), 0)
+        put_oi = number(w.get("put_oi"), 0)
+        if w.get("call_wall") and strike >= indicators.spot:
+            raw.append((strike, "RESISTANCE", "CALL_OI_WALL", 0.55 + 0.30 * clamp(call_oi / max(1.0, max((number(x.get("call_oi"), 0) for x in oi.get("walls", [])), default=1.0)), 0, 1)))
+        if w.get("put_wall") and strike <= indicators.spot:
+            raw.append((strike, "SUPPORT", "PUT_OI_WALL", 0.55 + 0.30 * clamp(put_oi / max(1.0, max((number(x.get("put_oi"), 0) for x in oi.get("walls", [])), default=1.0)), 0, 1)))
+    levels: list[Level] = []
+    used: set[int] = set()
+    for i, (price, kind, source, strength) in enumerate(raw):
+        if i in used or not finite(price):
+            continue
+        cluster = [(j, item) for j, item in enumerate(raw) if j not in used and item[1] == kind and abs(item[0] - price) <= tolerance]
+        for j, _ in cluster: used.add(j)
+        weights = [max(0.05, item[3]) for _, item in cluster]
+        level_price = sum(item[0] * weight for (_, item), weight in zip(cluster, weights)) / sum(weights)
+        sources = sorted({item[2] for _, item in cluster})
+        matching_walls = [w for w in oi.get("walls", []) if abs(number(w.get("strike"), -999999) - level_price) <= max(tolerance, step * .15)]
+        w = max(matching_walls, key=lambda x: number(x.get("call_oi" if kind == "RESISTANCE" else "put_oi"), 0), default={})
+        change = number(w.get("call_change_pct" if kind == "RESISTANCE" else "put_change_pct"))
+        state_key = "call_state" if kind == "RESISTANCE" else "put_state"
+        flow_key = "call_flow" if kind == "RESISTANCE" else "put_flow"
+        touches = sum(1 for _, x in cluster if "PIVOT" in x[2])
+        cluster_strength = clamp(max(weights) + min(0.20, max(0, len(cluster)-1)*0.04), 0.0, 0.98)
+        levels.append(Level(float(level_price), kind, "+".join(sources), cluster_strength, max(1, touches),
+                            change if finite(change) else None, str(w.get(state_key, "UNKNOWN")), str(w.get(flow_key, "UNKNOWN")),
+                            "OI-confirmed" if w else "price-structure"))
+    # Do not inject every 50-point strike as a market level; strike spacing is for routing only.
+    return sorted(levels, key=lambda x: x.price)
 
-    The active-recommendation guard suppresses unrelated new selections, but permits same-scan opposite-side evaluation after a confirmed structural failure.
-    The tracker-list compatibility remains for older persisted states; active legacy
-    records continue to be monitored rather than silently discarded during migration.
-    """
-    raw = state.get("recommendation_trackers")
-    trackers = [dict(x) for x in raw if isinstance(x, dict)] if isinstance(raw, list) else []
-    legacy = state.get("recommendation_tracker")
-    if not trackers and isinstance(legacy, dict):
-        trackers = [dict(legacy)]
-    base_identity = str(fingerprint)
-    old = next((x for x in reversed(trackers)
-                if str(x.get("base_signal_fingerprint", x.get("signal_fingerprint", ""))) == base_identity
-                and str(x.get("status", "")).upper() == "TRACKING"), None)
-    if old is None:
-        terminal_match = next((x for x in reversed(trackers)
-                               if str(x.get("base_signal_fingerprint", x.get("signal_fingerprint", ""))) == base_identity
-                               and str(x.get("status", "")).upper() in {"VIRTUAL_STOP_LOSS_REACHED", "VIRTUAL_TRAILING_STOP_REACHED", "VIRTUAL_T2_REACHED", "INVALIDATED_STATE", "VIRTUAL_SESSION_ENDED", "VIRTUAL_MONITOR_CAP_REACHED"}), None)
-        if terminal_match is not None:
-            completed_at = parse_timestamp(terminal_match.get("completed_at"))
-            elapsed = (now - completed_at).total_seconds() / 60.0 if completed_at else 0.0
-            if elapsed < max(1, int(reentry_cooldown_minutes)):
-                primary = terminal_match
-                state["recommendation_trackers"] = trackers
-                state["recommendation_tracker"] = primary
-                state["last_signal_fingerprint"] = str(primary.get("signal_fingerprint", fingerprint))
-                state["last_signal_timestamp"] = now.isoformat()
-                return {"status": primary.get("status"), "direction": primary.get("direction"),
-                        "target_1": primary.get("target_1"), "target_2": primary.get("target_2"),
-                        "trailing_stop": primary.get("trailing_stop", primary.get("stop_loss")),
-                        "target_1_hit": bool(primary.get("target_1_hit", False)),
-                        "active_tracker_count": sum(1 for x in trackers if str(x.get("status", "")).upper() == "TRACKING"),
-                        "signal_fingerprint": primary.get("signal_fingerprint"),
-                        "message": f"Same-contract re-entry blocked until {max(1, int(reentry_cooldown_minutes))} minutes after terminal level."}
-            # Create a new signal generation only after the cooldown and a fresh current scan.
-            fingerprint = hashlib.sha256(f"{fingerprint}|REENTRY|{ist_iso(now)[:16]}".encode()).hexdigest()
-    old = next((x for x in trackers if str(x.get("signal_fingerprint", "")) == fingerprint), None)
-    if old is not None and str(old.get("status", "")).upper() == "TRACKING":
-        old["last_signal_seen_at"] = now.isoformat()
-        old["latest_signal_score"] = signal.get("score")
-        old["latest_signal_confidence_pct"] = signal.get("confidence_pct")
-        # Preserve initial levels and progress for a repeated scan; never reset T1/SL.
-        primary = old
-        result_message = "Same recommendation retained; target/stop progress is not reset by repeated scans."
+
+def nearest_level(levels: Sequence[Level], spot: float, kind: str) -> Optional[Level]:
+    candidates = [l for l in levels if l.kind == kind and ((l.price > spot + 0.5) if kind == "RESISTANCE" else (l.price < spot - 0.5))]
+    if not candidates: return None
+    return min(candidates, key=lambda l: abs(l.price - spot))
+
+
+def _touch_evidence(frame: pd.DataFrame, level: float, side: str, atr: float, now: Optional[datetime] = None) -> tuple[int, bool, float]:
+    """Count distinct recent tests and return away-close evidence, latest extremum, using completed candles."""
+    bars = completed_candles(frame, (now or now_ist()).astimezone(IST)).tail(18)
+    if len(bars) < 4:
+        return 0, False, float("nan")
+    tolerance = max(6.0, min(18.0, atr * 0.30))
+    col = "low" if side == "SUPPORT" else "high"
+    touches = 0
+    armed = True
+    for _, row in bars.iterrows():
+        extremum = number(row[col])
+        close_i = number(row["close"])
+        bar_high = number(row["high"])
+        touched = (extremum <= level + tolerance and bar_high >= level - tolerance)
+        # A new test is counted only after price moved away from the level and retested it.
+        if touched and armed:
+            touches += 1
+            armed = False
+        if not touched and side == "SUPPORT" and close_i > level + tolerance * 1.2:
+            armed = True
+        elif not touched and side == "RESISTANCE" and close_i < level - tolerance * 1.2:
+            armed = True
+    close = number(bars.iloc[-1]["close"])
+    away = close > level + tolerance * .25 if side == "SUPPORT" else close < level - tolerance * .25
+    return touches, away, number(bars.iloc[-1][col])
+
+
+def _oi_local_evidence(oi: Mapping[str, Any], direction: str, spot: float, step: float) -> tuple[float, list[str]]:
+    """Score both sides of the option chain; OI is interpreted with premium change, not alone."""
+    walls = [w for w in oi.get("walls", []) if isinstance(w, dict) and finite(w.get("strike"))]
+    evidence: list[str] = []
+    score = 0.0
+
+    if direction == "BULLISH":
+        # Put writing is support; falling OI with falling premium can be put-long liquidation.
+        put_rows = [w for w in walls if number(w.get("strike"), 1e9) <= spot + step * 0.30]
+        put_rows.sort(key=lambda w: abs(spot - number(w.get("strike"), spot)))
+        if not put_rows:
+            evidence.append("LOCAL_PUT_FLOW_UNAVAILABLE")
+        else:
+            row = put_rows[0]; flow = str(row.get("put_flow", "UNKNOWN")); state = str(row.get("put_state", "UNKNOWN"))
+            if flow == "SHORT_BUILDUP_WRITING": score += 24; evidence.append(f"PUT_WRITING_SUPPORT_{number(row.get('strike')):.0f}")
+            elif flow == "LONG_UNWINDING": score += 10; evidence.append(f"PUT_LONG_UNWINDING_{number(row.get('strike')):.0f}")
+            elif flow == "LONG_BUILDUP_BUYING": score -= 12; evidence.append(f"PUT_BUYING_COUNTERFLOW_{number(row.get('strike')):.0f}")
+            elif flow == "SHORT_COVERING": score -= 8; evidence.append(f"PUT_SHORT_COVERING_COUNTERFLOW_{number(row.get('strike')):.0f}")
+            elif state == "BUILDING": score += 8; evidence.append(f"PUT_OI_BUILDING_{number(row.get('strike')):.0f}_FLOW_UNCLASSIFIED")
+            elif state == "WEAKENING": score -= 8; evidence.append(f"PUT_SUPPORT_WEAKENING_{number(row.get('strike')):.0f}")
+        call_rows = [w for w in walls if number(w.get("strike"), -1e9) > spot]
+        call_rows.sort(key=lambda w: number(w.get("strike"), 1e9))
+        if call_rows:
+            row = call_rows[0]; flow = str(row.get("call_flow", "UNKNOWN")); state = str(row.get("call_state", "UNKNOWN"))
+            if flow == "SHORT_COVERING" or state == "WEAKENING": score += 10; evidence.append(f"CALL_RESISTANCE_EASING_{number(row.get('strike')):.0f}")
+            elif flow == "LONG_BUILDUP_BUYING": score += 7; evidence.append(f"CALL_BUYING_MOMENTUM_{number(row.get('strike')):.0f}")
+            elif flow == "SHORT_BUILDUP_WRITING": score -= 7; evidence.append(f"CALL_WRITING_OVERHEAD_{number(row.get('strike')):.0f}")
     else:
-        tracker = {
-            "status": "TRACKING", "signal_fingerprint": fingerprint,
-            "base_signal_fingerprint": str(signal.get("base_signal_fingerprint", base_identity)),
-            "created_at": now.isoformat(), "last_signal_seen_at": now.isoformat(),
-            "session_date": str(signal.get("timestamp", now.isoformat()))[:10],
-            "direction": signal["direction"], "scenario": signal.get("scenario", ""),
-            "instrument_key": signal["instrument_key"], "trading_symbol": signal["trading_symbol"],
-            "strike": signal["strike"], "option_type": signal["option_type"],
-            "confidence_pct": signal.get("confidence_pct"),
-            "entry_reference_ltp": signal["option_ltp"],
-            "last_option_ltp_observed": signal["option_ltp"],
-            "last_option_quote_status": "FRESH",
-            "last_nifty_spot": signal["nifty_spot"],
-            "nifty_entry_reference": signal["nifty_spot"],
-            "target_1": signal["T1"], "target_2": signal.get("T2"),
-            "stop_loss": signal["SL"], "initial_stop_loss": signal["SL"], "trailing_stop": signal["SL"],
-            "T1_source": signal.get("T1_source"), "T2_source": signal.get("T2_source"),
-            "SL_source": signal.get("SL_source"), "reward_risk_ratio": signal.get("reward_risk_ratio"),
-            "t1_distance_points": signal.get("t1_distance_points"), "sl_distance_points": signal.get("sl_distance_points"),
-            "max_t1_distance_points": signal.get("max_t1_distance_points"),
-            "remaining_session_minutes_at_signal": signal.get("remaining_session_minutes"),
-            "stop_atr_points": signal.get("stop_atr_points"), "stop_atr_source": signal.get("stop_atr_source"),
-            "target_1_hit": False, "alerted_events": [],
-            "max_favorable_spot": safe_float(signal.get("nifty_spot"), float("nan")),
-            "max_favorable_excursion_points": 0.0,
-            "protective_trail_status": "WAITING_FOR_FAVORABLE_EXCURSION",
-            "latest_signal_score": signal.get("score"),
-            "latest_signal_confidence_pct": signal.get("confidence_pct"),
-            "tracker_notice": "Hypothetical signal monitoring only; this is not evidence of an actual open position.",
-        }
-        trackers.append(tracker)
-        primary = tracker
-        result_message = "New recommendation tracker initialized; hypothetical signal only."
+        # Call writing/long liquidation is bearish; put buying can confirm a rejection before support breaks.
+        call_rows = [w for w in walls if number(w.get("strike"), -1e9) >= spot - step * 0.30]
+        call_rows.sort(key=lambda w: abs(spot - number(w.get("strike"), spot)))
+        if not call_rows:
+            evidence.append("LOCAL_CALL_FLOW_UNAVAILABLE")
+        else:
+            row = call_rows[0]; flow = str(row.get("call_flow", "UNKNOWN")); state = str(row.get("call_state", "UNKNOWN"))
+            if flow == "SHORT_BUILDUP_WRITING": score += 24; evidence.append(f"CALL_WRITING_RESISTANCE_{number(row.get('strike')):.0f}")
+            elif flow == "LONG_UNWINDING": score += 10; evidence.append(f"CALL_LONG_UNWINDING_{number(row.get('strike')):.0f}")
+            elif flow == "LONG_BUILDUP_BUYING": score -= 12; evidence.append(f"CALL_BUYING_COUNTERFLOW_{number(row.get('strike')):.0f}")
+            elif flow == "SHORT_COVERING": score -= 8; evidence.append(f"CALL_SHORT_COVERING_COUNTERFLOW_{number(row.get('strike')):.0f}")
+            elif state == "BUILDING": score += 7; evidence.append(f"CALL_OI_BUILDING_{number(row.get('strike')):.0f}_FLOW_UNCLASSIFIED")
+            elif state == "WEAKENING": score -= 7; evidence.append(f"CALL_RESISTANCE_WEAKENING_{number(row.get('strike')):.0f}")
+        put_rows = [w for w in walls if number(w.get("strike"), 1e9) < spot]
+        put_rows.sort(key=lambda w: abs(spot - number(w.get("strike"), spot)))
+        if put_rows:
+            row = put_rows[0]; flow = str(row.get("put_flow", "UNKNOWN")); state = str(row.get("put_state", "UNKNOWN"))
+            if flow == "LONG_BUILDUP_BUYING": score += 16; evidence.append(f"PUT_BUYING_BEARISH_CONFIRMATION_{number(row.get('strike')):.0f}")
+            elif flow == "SHORT_COVERING": score += 8; evidence.append(f"PUT_SHORT_COVERING_{number(row.get('strike')):.0f}")
+            elif flow == "SHORT_BUILDUP_WRITING": score -= 10; evidence.append(f"PUT_WRITING_SUPPORT_COUNTERFLOW_{number(row.get('strike')):.0f}")
+            elif flow == "LONG_UNWINDING": score -= 6; evidence.append(f"PUT_LONG_UNWINDING_COUNTERFLOW_{number(row.get('strike')):.0f}")
+            elif state == "WEAKENING": score += 5; evidence.append(f"PUT_SUPPORT_WEAKENING_{number(row.get('strike')):.0f}")
 
-        # Bound concurrently monitored recommendations without silently dropping state.
-        max_active = min(12, max(1, int(max_active_trackers)))
-        while sum(1 for x in trackers if str(x.get("status", "")).upper() == "TRACKING") > max_active:
-            oldest = next((x for x in trackers if str(x.get("status", "")).upper() == "TRACKING" and x is not primary), None)
-            if oldest is None:
-                break
-            oldest["status"] = "VIRTUAL_MONITOR_CAP_REACHED"
-            oldest["completed_at"] = now.isoformat()
-            oldest["completion_reason"] = "Retired because the configured virtual-monitor tracker cap was reached."
-            # The warning event is returned to the caller and emailed below.
-            primary.setdefault("tracker_cap_retirements", []).append({
-                "signal_fingerprint": oldest.get("signal_fingerprint"),
-                "instrument_key": oldest.get("instrument_key"), "strike": oldest.get("strike"),
-                "direction": oldest.get("direction"), "retired_at": now.isoformat(),
-            })
-
-    trackers = _compact_persisted_tracker_history(trackers)
-    state["recommendation_trackers"] = trackers
-    state["recommendation_tracker"] = primary
-    state["last_signal_fingerprint"] = fingerprint
-    state["last_signal_timestamp"] = now.isoformat()
-    return {"status": primary.get("status", "TRACKING"), "direction": primary.get("direction"),
-            "target_1": primary.get("target_1"), "target_2": primary.get("target_2"),
-            "trailing_stop": primary.get("trailing_stop", primary.get("stop_loss")),
-            "target_1_hit": bool(primary.get("target_1_hit", False)),
-            "active_tracker_count": sum(1 for x in trackers if str(x.get("status", "")).upper() == "TRACKING"),
-            "tracker_cap_retirements": list(primary.get("tracker_cap_retirements", [])),
-            "signal_fingerprint": primary.get("signal_fingerprint"),
-            "message": result_message}
+    # Include any locally material OI change in diagnostics without treating OI growth alone as writing.
+    relevant = []
+    for row in walls:
+        if abs(number(row.get("strike"), spot) - spot) <= step * 1.5:
+            key = "put_change_pct" if direction == "BULLISH" else "call_change_pct"
+            value = number(row.get(key))
+            if finite(value): relevant.append((abs(number(row.get("strike"), spot)-spot), value, number(row.get("strike"), spot)))
+    if relevant:
+        _, change, strike = min(relevant, key=lambda item: item[0])
+        if abs(change) >= 0.005:
+            evidence.append(f"LOCAL_OI_CHANGE_{strike:.0f}_{change*100:+.2f}%")
+    return clamp(score, -18, 34), evidence
 
 
-# =============================================================================
-# Stage 3 — execution readiness (separate from detection and ranking)
-# =============================================================================
-
-def evaluate_trade_readiness(
-    now: datetime, scenario: Scenario, indicators: IndicatorSet, oi: OIAnalysis,
-    risk: RiskPlan, index_quote: LiveQuote, future_regime: str,
-    candidate: Optional[OptionContract], config: Config,
-    candidate_diagnostics: Optional[Sequence[Mapping[str, Any]]] = None,
-) -> dict[str, Any]:
-    """Apply the final readiness gate; diagnostic candidates are never selected."""
-    blockers: list[str] = []
-    if scenario.hard_veto:
-        blockers.append(scenario.hard_veto)
-    if index_quote.freshness != "FRESH":
-        blockers.append("NIFTY_QUOTE_NOT_FRESH")
-    if not finite(indicators.adx):
-        blockers.append("ADX_UNAVAILABLE_NO_DIRECTIONAL_ENTRY")
-    local_time = now.astimezone(IST).time() if now.tzinfo else now.replace(tzinfo=IST).time()
-    if local_time < ENTRY_START:
-        blockers.append("BASELINE_ONLY_BEFORE_09_16")
-    if local_time >= ENTRY_CUTOFF:
-        blockers.append("NEW_ENTRY_CUTOFF_15_15_MONITOR_ONLY")
-    if scenario.direction in {"BULLISH", "BEARISH"}:
-        opposing = "STRONG_SHORT_BUILDUP" if scenario.direction == "BULLISH" else "STRONG_LONG_BUILDUP"
-        if future_regime == opposing:
-            blockers.append(f"FUTURES_CONFLICT_{future_regime}")
-    if not risk.valid:
-        blockers.append(f"STRUCTURAL_RISK_PLAN_INVALID:{risk.reason}")
-    if scenario.direction not in {"BULLISH", "BEARISH"} or not scenario.executable_candidate:
-        blockers.append("NO_DIRECTIONAL_EXECUTABLE_SETUP")
-    if candidate is None:
-        diagnostics = [dict(item) for item in (candidate_diagnostics or []) if isinstance(item, Mapping)]
-        review_rows = [item for item in diagnostics if item.get("instrument_key") or item.get("strike") is not None]
-        if review_rows:
-            blockers.append("NO_OPTION_PASSED_ALL_OPTION_GATES")
-            best_review = next((item for item in review_rows if item.get("best_candidate_for_review")), review_rows[0])
-            reasons = best_review.get("vetoes", [])
-            if isinstance(reasons, (list, tuple)):
-                blockers.extend(str(reason) for reason in reasons if str(reason).strip())
-        elif diagnostics:
-            route_reason = diagnostics[0].get("vetoes", [])
-            if isinstance(route_reason, (list, tuple)):
-                blockers.extend(str(reason) for reason in route_reason if str(reason).strip())
+def score_market_signal(frame: pd.DataFrame, indicators: Indicators, oi: Mapping[str, Any], levels: Sequence[Level],
+                        now: datetime, min_score: float, step: float) -> tuple[Signal, dict[str, Any]]:
+    spot, atr = indicators.spot, indicators.atr
+    support = nearest_level(levels, spot + 0.5, "SUPPORT")
+    resistance = nearest_level(levels, spot - 0.5, "RESISTANCE")
+    # Relevant interaction level may sit very near spot or have just been crossed.
+    all_supports = sorted([l for l in levels if l.kind == "SUPPORT"], key=lambda l: abs(spot-l.price))
+    all_resists = sorted([l for l in levels if l.kind == "RESISTANCE"], key=lambda l: abs(spot-l.price))
+    near_support = all_supports[0] if all_supports and abs(spot-all_supports[0].price) <= max(1.8*atr, 100) else support
+    near_resistance = all_resists[0] if all_resists and abs(spot-all_resists[0].price) <= max(1.8*atr, 100) else resistance
+    last = indicators.last_close
+    closes = completed_candles(frame, now)["close"]
+    buf = max(2.0, atr * 0.06)
+    # Structure and momentum are measured separately from OI; OI is confluence, not the only trigger.
+    bull_struct = 0.0; bear_struct = 0.0
+    bull_ev: list[str] = []; bear_ev: list[str] = []
+    setup_bull = "NONE"; setup_bear = "NONE"; level_bull = None; level_bear = None
+    if near_support:
+        touches, away, _ = _touch_evidence(frame, near_support.price, "SUPPORT", atr, now)
+        dist = abs(spot-near_support.price)
+        if touches >= 2 and away and last > near_support.price:
+            bull_struct += 33 + min(8, 2*touches)
+            bull_ev += [f"REPEATED_SUPPORT_TESTS_{touches}", f"SUPPORT_RECLAIM_{near_support.price:.2f}"]
+            setup_bull, level_bull = "SUPPORT_BOUNCE", near_support.price
+        elif dist <= max(0.45*atr, 18) and last >= near_support.price - buf:
+            bull_struct += 17
+            bull_ev.append(f"SUPPORT_TEST_WATCH_{near_support.price:.2f}")
+            setup_bull, level_bull = "EARLY_SUPPORT_RECLAIM", near_support.price
+    if near_resistance:
+        touches, away, _ = _touch_evidence(frame, near_resistance.price, "RESISTANCE", atr, now)
+        dist = abs(spot-near_resistance.price)
+        if touches >= 2 and away and last < near_resistance.price:
+            bear_struct += 33 + min(8, 2*touches)
+            bear_ev += [f"REPEATED_RESISTANCE_TESTS_{touches}", f"RESISTANCE_REJECTION_{near_resistance.price:.2f}"]
+            setup_bear, level_bear = "RESISTANCE_REJECTION", near_resistance.price
+        elif (near_resistance.price > spot + 0.5 and dist <= max(0.45*atr, 18)
+              and last <= near_resistance.price + max(buf, 6.0)
+              and indicators.momentum_1m < 0 and indicators.momentum_3m < 0):
+            # A repeated-test rejection watch may qualify before two closes below resistance,
+            # but only when live spot is back below the level and both short horizons weaken.
+            bear_struct += 30 if touches >= 2 else 19
+            if touches >= 2:
+                bear_ev.append(f"REPEATED_RESISTANCE_REJECTION_WATCH_{touches}_{near_resistance.price:.2f}")
             else:
-                blockers.append("OPTION_ROUTING_NOT_PERFORMED")
-        else:
-            blockers.append("NO_CANDIDATE_WITH_A_LIVE_QUOTE")
-        if not oi.tactical_available:
-            blockers.append("TACTICAL_COI_BASELINE_UNAVAILABLE_NO_COLD_START_VELOCITY_CLAIM")
+                bear_ev.append(f"RESISTANCE_REJECTION_WATCH_{near_resistance.price:.2f}")
+            bear_ev.append("LIVE_SPOT_BACK_BELOW_RESISTANCE_WITH_NEGATIVE_1M_3M_MOMENTUM")
+            setup_bear, level_bear = "EARLY_RESISTANCE_REJECTION", near_resistance.price
+        elif (near_resistance.price > spot + 0.5 and dist <= max(0.65*atr, 25.0)
+              and indicators.momentum_1m > 0 and indicators.momentum_3m > 0
+              and len(closes) >= 3 and float(closes.iloc[-1]) > float(closes.iloc[-3]) and bull_struct < 25):
+            # Pressure beneath a confirmed resistance level is the predictive path; it still
+            # needs supportive local OI flow/score and a complete structural risk plan.
+            bull_struct = max(bull_struct, 22)
+            bull_ev.append(f"PREBREAKOUT_PRESSURE_BELOW_{near_resistance.price:.2f}")
+            setup_bull, level_bull = "PREBREAKOUT_RESISTANCE_PRESSURE", near_resistance.price
+    if near_support:
+        dist_to_support = abs(spot-near_support.price)
+        if (near_support.price < spot - 0.5 and dist_to_support <= max(0.65*atr, 25.0)
+                and indicators.momentum_1m < 0 and indicators.momentum_3m < 0
+                and len(closes) >= 3 and float(closes.iloc[-1]) < float(closes.iloc[-3]) and bear_struct < 25):
+            # Pressure above support is not labelled a breakdown until price closes through;
+            # it is a predictive watch that can qualify only with OI and risk confluence.
+            bear_struct = max(bear_struct, 22)
+            bear_ev.append(f"PREBREAKDOWN_PRESSURE_ABOVE_{near_support.price:.2f}")
+            setup_bear, level_bear = "PREBREAKDOWN_SUPPORT_PRESSURE", near_support.price
+    crossed_resistances = [l for l in levels if l.kind == "RESISTANCE" and l.price < spot]
+    crossed_supports = [l for l in levels if l.kind == "SUPPORT" and l.price > spot]
+    crossed_resistance = max(crossed_resistances, key=lambda l: l.price, default=None)
+    crossed_support = min(crossed_supports, key=lambda l: l.price, default=None)
+    if crossed_resistance and len(closes) >= 2 and float(closes.iloc[-1]) > crossed_resistance.price + buf and float(closes.iloc[-2]) > crossed_resistance.price + buf:
+        bull_struct = max(bull_struct, 52)
+        bull_ev += [f"TWO_CLOSE_BREAKOUT_{crossed_resistance.price:.2f}"]
+        setup_bull, level_bull = "CONFIRMED_BREAKOUT", crossed_resistance.price
+    if crossed_support and len(closes) >= 2 and float(closes.iloc[-1]) < crossed_support.price - buf and float(closes.iloc[-2]) < crossed_support.price - buf:
+        bear_struct = max(bear_struct, 52)
+        bear_ev += [f"TWO_CLOSE_BREAKDOWN_{crossed_support.price:.2f}"]
+        setup_bear, level_bear = "CONFIRMED_BREAKDOWN", crossed_support.price
+    # Smooth momentum component avoids requiring every indicator to be available.
+    bull_momentum = (12 if indicators.momentum_1m > 0 else 0) + (8 if indicators.momentum_3m > 0 else 0)
+    bear_momentum = (12 if indicators.momentum_1m < 0 else 0) + (8 if indicators.momentum_3m < 0 else 0)
+    if finite(indicators.rsi):
+        bull_momentum += 5 if 48 <= indicators.rsi <= 75 else 0
+        bear_momentum += 5 if 25 <= indicators.rsi <= 52 else 0
+    if finite(indicators.plus_di) and finite(indicators.minus_di):
+        bull_momentum += 5 if indicators.plus_di > indicators.minus_di else 0
+        bear_momentum += 5 if indicators.minus_di > indicators.plus_di else 0
+    if finite(indicators.vwap):
+        bull_momentum += 5 if spot > indicators.vwap and indicators.vwap_slope >= 0 else 0
+        bear_momentum += 5 if spot < indicators.vwap and indicators.vwap_slope <= 0 else 0
     else:
-        blockers.extend(candidate.vetoes)
-    wall_clearance = opposing_wall_clearance_reason(scenario, indicators.spot, indicators, oi, config)
-    if wall_clearance:
-        blockers.append(wall_clearance)
-    blockers = list(dict.fromkeys(blockers))
-    ready = not blockers and candidate is not None
-    return {
-        "status": "READY" if ready else "BLOCKED",
-        "ready": ready,
-        "blocking_reasons": blockers,
-        "hard_safety_gates": [
-            "fresh index quote", "API/data integrity", "NSE entry cutoff",
-            "strict sideways/pinning veto", "valid T1 and structural stop",
-        ],
-        "strategy_filters": [
-            "ADX regime availability", "tactical COI for executable scoring",
-            "non-conflicting futures regime", "fresh option quote", "bid/ask spread threshold",
-            "premium above its own 1-minute VWAP", "minimum delta", "full 40/30/30 score threshold",
-        ],
-        "strategy_thresholds": {
-            "min_score": config.min_score, "default_min_score": 0.650,
-            "max_spread_ratio": config.max_spread_ratio,
-            "spread_policy": "LIQUIDITY_ADJUSTED: thinner books use 0.10%-0.15%; active books up to 0.20%; exceptionally liquid books up to configured cap (default 0.25%)",
-            "minimum_delta": config.min_exhaustion_delta if "EXHAUSTION" in scenario.state else config.min_directional_delta,
-            "target_2_required": False,
-        },
-    }
+        bull_ev.append("VWAP_UNAVAILABLE_NOT_ASSUMED")
+        bear_ev.append("VWAP_UNAVAILABLE_NOT_ASSUMED")
+    bull_oi, bull_oi_ev = _oi_local_evidence(oi, "BULLISH", spot, step)
+    bear_oi, bear_oi_ev = _oi_local_evidence(oi, "BEARISH", spot, step)
+    # Market structure is the anchor. The setup cannot be created from OI alone.
+    bull_score = clamp(bull_struct + bull_momentum + bull_oi, 0, 100)
+    bear_score = clamp(bear_struct + bear_momentum + bear_oi, 0, 100)
+    bull_ev += bull_oi_ev; bear_ev += bear_oi_ev
+    # Open-auction/late-session safeguards, avoid first-minute noisy selections.
+    clock = now.astimezone(IST).time()
+    blockers = []
+    if clock < ENTRY_OPEN:
+        blockers.append("BEFORE_ENTRY_WINDOW")
+    if clock >= ENTRY_CUTOFF:
+        blockers.append("ENTRY_CUTOFF_MONITOR_ONLY")
+    if indicators.candles < 8:
+        blockers.append("INSUFFICIENT_COMPLETED_CANDLES")
+    if max(bull_score, bear_score) < min_score:
+        direction, setup, score, level, evidence = "NEUTRAL", "NO_QUALIFYING_STRUCTURE", max(bull_score, bear_score), None, ["MARKET_STRUCTURE_SCORE_BELOW_THRESHOLD"]
+    elif abs(bull_score - bear_score) < 7:
+        direction, setup, score, level, evidence = "NEUTRAL", "CONFLICTING_DIRECTIONAL_EVIDENCE", max(bull_score, bear_score), None, ["BULL_BEAR_SCORE_SPREAD_LT_7", f"BULL={bull_score:.1f}", f"BEAR={bear_score:.1f}"]
+    elif bull_score > bear_score:
+        direction, setup, score, level, evidence = "BULLISH", setup_bull, bull_score, level_bull, bull_ev
+    else:
+        direction, setup, score, level, evidence = "BEARISH", setup_bear, bear_score, level_bear, bear_ev
+    if direction != "NEUTRAL" and not setup or setup == "NONE":
+        direction, setup, level = "NEUTRAL", "NO_STRUCTURAL_TRIGGER", None
+    if direction != "NEUTRAL" and blockers:
+        evidence.extend(blockers)
+    signal = Signal(direction, setup, round(score, 1), round(clamp(score, 0, 92), 1),
+                    "; ".join(evidence[:8]), level, tuple(dict.fromkeys(evidence)), tuple(blockers))
+    diag = {"bull_score": round(bull_score, 1), "bear_score": round(bear_score, 1),
+            "nearest_support": asdict(support) if support else None, "nearest_resistance": asdict(resistance) if resistance else None,
+            "interaction_support": asdict(near_support) if near_support else None, "interaction_resistance": asdict(near_resistance) if near_resistance else None,
+            "bull_momentum_score": round(bull_momentum, 1), "bear_momentum_score": round(bear_momentum, 1),
+            "bull_oi_score": round(bull_oi, 1), "bear_oi_score": round(bear_oi, 1), "threshold": min_score}
+    return signal, diag
 
 
-def candidate_report(candidate: Optional[OptionContract]) -> Optional[dict[str, Any]]:
-    """Return a reviewable candidate record; this does not imply execution readiness."""
-    if candidate is None:
-        return None
-    return {
-        "instrument_key": candidate.instrument_key, "trading_symbol": candidate.trading_symbol,
-        "option_type": candidate.option_type, "strike": candidate.strike, "expiry": candidate.expiry,
-        "ltp": candidate.ltp, "delta": candidate.delta, "delta_source": candidate.delta_source,
-        "premium_vwap": candidate.premium_vwap, "score": candidate.total_score,
-        "score_basis": candidate.score_basis,
-        "score_components_available": list(candidate.score_components_available),
-        "flow_score": candidate.flow_score, "vwap_lift_score": candidate.vwap_lift_score,
-        "coi_score": candidate.coi_score, "local_oi_score": candidate.local_oi_score,
-        "delta_fit_score": candidate.delta_fit_score,
-        "theta_efficiency_score": candidate.theta_efficiency_score,
-        "ranking_score": candidate.ranking_score,
-        "expected_underlying_move_points": candidate.expected_underlying_move_points,
-        "expected_option_move_rupees": candidate.expected_option_move_rupees,
-        "expected_option_move_pct": candidate.expected_option_move_pct,
-        "projection_rank_score": candidate.projection_rank_score,
-        "projection_method": "DELTA_GAMMA_ESTIMATE_EXCLUDES_IV_CHANGE_AND_TIME_DECAY",
-        "gamma": candidate.gamma, "vega": candidate.vega, "theta": candidate.theta,
-        "spread_ratio": candidate.spread_ratio,
-        "quote_freshness": candidate.quote_freshness, "quote_age_seconds": candidate.quote_age_seconds,
-        "execution_eligible": not candidate.vetoes, "blocking_reasons": list(candidate.vetoes),
-    }
+def calculate_risk_plan(signal: Signal, levels: Sequence[Level], indicators: Indicators, min_rr: float) -> RiskPlan:
+    if signal.direction not in {"BULLISH", "BEARISH"} or not signal.level:
+        return RiskPlan(False, None, None, None, "", "", None, None, None, "No directional structural trigger.")
+    direction = signal.direction
+    spot, atr = indicators.spot, indicators.atr
+    meaningful_buffer = max(8.0, 0.20 * atr)
+    supports = sorted([l for l in levels if l.kind == "SUPPORT" and l.price < spot - meaningful_buffer], key=lambda x: x.price, reverse=True)
+    resistances = sorted([l for l in levels if l.kind == "RESISTANCE" and l.price > spot + meaningful_buffer], key=lambda x: x.price)
+    buffer = max(5.0, min(20.0, atr * 0.30))
+    if direction == "BULLISH":
+        # A reclaimed/broken resistance becomes a support candidate; a support-bounce level
+        # remains the primary invalidation boundary. This prevents a generic distant stop.
+        protect_candidates: list[tuple[float, str]] = [(l.price, l.source) for l in supports]
+        if signal.level < spot - 0.5:
+            protect_candidates.append((signal.level, "SIGNAL_TRIGGER_LEVEL"))
+        protect_price, protect_source = max(protect_candidates, key=lambda x: x[0]) if protect_candidates else (min(indicators.swing_low, spot-atr), "SWING_LOW_FALLBACK")
+        sl = protect_price - buffer
+        raw_targets = [l for l in resistances if l.price > spot + max(0.45*atr, 12.0)]
+        targets = raw_targets
+        target_source_base = "OPPOSING_PRICE_STRUCTURE_OR_CALL_OI_WALL"
+    else:
+        # A broken support becomes resistance for the invalidation stop.
+        protect_candidates = [(l.price, l.source) for l in resistances]
+        if signal.level > spot + 0.5:
+            protect_candidates.append((signal.level, "SIGNAL_TRIGGER_LEVEL"))
+        protect_price, protect_source = min(protect_candidates, key=lambda x: x[0]) if protect_candidates else (max(indicators.swing_high, spot+atr), "SWING_HIGH_FALLBACK")
+        sl = protect_price + buffer
+        raw_targets = [l for l in supports if l.price < spot - max(0.45*atr, 12.0)]
+        targets = raw_targets
+        target_source_base = "OPPOSING_PRICE_STRUCTURE_OR_PUT_OI_WALL"
+    risk = abs(spot - sl)
+    if not finite(sl) or sl <= 0 or risk < 4 or risk > max(4*atr, 150):
+        return RiskPlan(False, None, None, round(sl, 2) if finite(sl) else None, "STRUCTURAL_INVALIDATION", "", None, round(risk, 2) if finite(risk) else None, None, "Stop is invalid or structurally too distant.")
+    viable = []
+    for level in targets:
+        reward = abs(level.price - spot)
+        rr = reward / risk if risk > 0 else 0
+        # Ignore micro pivots; require a target that can reasonably pay the structural risk.
+        if reward >= max(0.45*atr, 12.0) and rr >= min_rr:
+            viable.append((level, reward, rr))
+    if not viable:
+        return RiskPlan(False, None, None, round(sl, 2), "STRUCTURAL_INVALIDATION", target_source_base, None, round(risk, 2), None,
+                        "No observed opposing structural level meets minimum reward/risk; refusing an arbitrary grid/ATR target.")
+    viable.sort(key=lambda x: x[0].price if direction == "BULLISH" else -x[0].price)
+    first = viable[0]
+    second = viable[1] if len(viable) > 1 else None
+    return RiskPlan(True, round(first[0].price, 2), round(second[0].price, 2) if second else None, round(sl, 2),
+                    f"{protect_source}_PLUS_ATR_BUFFER", target_source_base,
+                    round(first[1], 2), round(risk, 2), round(first[2], 2),
+                    "Structural levels pass the configured reward/risk floor." + (" T2 available." if second else " T2 unavailable; T1 remains structural."))
 
 
-# =============================================================================
-# Main orchestration and reporting
-# =============================================================================
-
-# =============================================================================
-# Durable email outbox and alert deduplication
-# =============================================================================
-
-def email_is_configured(config: Config) -> bool:
-    return bool(config.email_sender and config.email_password and config.email_receiver and config.smtp_host and config.smtp_port > 0)
-
-
-def _bounded_mapping(mapping: dict[str, Any], limit: int = 600) -> dict[str, Any]:
-    if len(mapping) <= limit:
-        return mapping
-    ordered = sorted(mapping.items(), key=lambda item: str((item[1] or {}).get("last_at", "") if isinstance(item[1], dict) else item[1]))
-    return dict(ordered[-limit:])
-
-
-def enqueue_email_alert(
-    state: dict[str, Any], *, now: datetime, event_type: str, dedupe_key: str,
-    subject: str, payload: Mapping[str, Any], cooldown_minutes: Optional[int] = None,
-) -> Optional[dict[str, Any]]:
-    """Queue one-time selection, T1/T2 milestone, and confirmed failure emails."""
-    event_type = str(event_type or "").upper()
-    if event_type not in EMAIL_ALLOWED_EVENT_TYPES:
-        LOGGER.debug("EMAIL SUPPRESSED BY V81 POLICY: event=%s", event_type or "UNKNOWN")
-        return None
-    dedupe = state.setdefault("alert_dedupe", {})
-    if not isinstance(dedupe, dict):
-        dedupe = {}
-        state["alert_dedupe"] = dedupe
-    prior = dedupe.get(dedupe_key)
-    prior_ts = parse_timestamp(prior.get("last_at")) if isinstance(prior, dict) else parse_timestamp(prior)
-    if prior_ts is not None:
-        if cooldown_minutes is None:
-            return None
-        if (now - prior_ts).total_seconds() < max(1, cooldown_minutes) * 60:
-            return None
-    serial_payload = _compact_email_payload(payload)
-    event_seed = f"{dedupe_key}|{ist_iso(now)}"
-    event_id = hashlib.sha256(event_seed.encode("utf-8")).hexdigest()
-    alert = {
-        "event_id": event_id, "event_type": event_type, "subject": str(subject)[:240],
-        "created_at": ist_iso(now), "dedupe_key": dedupe_key,
-        "payload": serial_payload, "status": "PENDING", "attempts": 0,
-        "last_error": "",
-    }
-    outbox = state.setdefault("alert_outbox", [])
-    if not isinstance(outbox, list):
-        outbox = []
-        state["alert_outbox"] = outbox
-    if not any(isinstance(item, dict) and item.get("event_id") == event_id for item in outbox):
-        outbox.append(alert)
-    dedupe[dedupe_key] = {"last_at": ist_iso(now), "event_id": event_id, "event_type": event_type}
-    state["alert_dedupe"] = _bounded_mapping(dedupe, 600)
-    # Keep pending alerts intact, while bounding delivery history/state-file growth.
-    sent = [x for x in outbox if isinstance(x, dict) and str(x.get("status", "")).upper() == "SENT"]
-    pending = [x for x in outbox if isinstance(x, dict) and str(x.get("status", "PENDING")).upper() != "SENT"]
-    state["alert_outbox"] = (pending[-300:] + sent[-100:])[-400:]
-    return alert
+def _candidate_strikes(spot: float, contracts: Mapping[tuple[float, str], Contract], direction: str, step: float) -> list[Contract]:
+    """Compare a five-contract local window; never invent strikes missing from the chain."""
+    side = "CE" if direction == "BULLISH" else "PE"
+    available = [c for (strike, opt_side), c in contracts.items()
+                 if opt_side == side and abs(float(strike) - spot) <= 3.0 * step]
+    # Distance establishes a local window, but contract scoring—not an ITM-only shortcut—
+    # chooses among ATM, slightly OTM, and ITM candidates.
+    available.sort(key=lambda c: (abs(spot - c.strike), c.strike))
+    picked: list[Contract] = []
+    seen: set[float] = set()
+    for c in available:
+        if c.strike in seen or not c.instrument_key:
+            continue
+        seen.add(c.strike)
+        picked.append(c)
+        if len(picked) == 5:
+            break
+    return picked
 
 
-def _alert_display_value(value: Any, *, fallback: str = "Not available") -> str:
-    if value is None:
-        return fallback
-    if isinstance(value, float) and not math.isfinite(value):
-        return fallback
-    if isinstance(value, bool):
-        return "Yes" if value else "No"
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return f"{float(value):,.2f}"
-    text = str(value).strip()
-    return text if text else fallback
+def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote], spot: float, direction: str,
+                    oi: Mapping[str, Any], config: Config, target_delta: float = 0.62) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    if not candidates: return None, rows
+    vol_max = max((c.volume for c in candidates), default=0.0)
+    step = config.strike_step
+    for c in candidates:
+        q = quotes.get(c.instrument_key)
+        reasons: list[str] = []
+        warnings: list[str] = []
+        ltp = q.ltp if q and finite(q.ltp) and q.ltp > 0 else c.ltp
+        if q and finite(q.bid) and finite(q.ask) and 0 < q.bid <= q.ask:
+            bid, ask = q.bid, q.ask
+        else:
+            bid, ask = c.bid, c.ask
+        volume = max(c.volume, q.volume if q else 0.0)
+        spread = (ask-bid)/((ask+bid)/2) if finite(bid) and finite(ask) and 0 < bid <= ask else float("inf")
+        delta = c.delta
+        if not finite(delta) or delta == 0:
+            reasons.append("DELTA_UNAVAILABLE")
+            delta_score = 0.0
+        else:
+            abs_delta = abs(delta)
+            delta_score = clamp(1.0 - abs(abs_delta - target_delta) / 0.32, 0, 1)
+            if abs_delta < 0.50 or abs_delta > 0.85:
+                warnings.append("DELTA_OUTSIDE_PREFERRED_RANGE")
+        age_ok = bool(q and q.freshness == "FRESH" and finite(q.age_seconds) and -5 <= q.age_seconds <= config.max_quote_age)
+        if not age_ok: reasons.append("QUOTE_STALE_OR_UNVERIFIED")
+        if not finite(ltp) or ltp <= 0: reasons.append("INVALID_OPTION_PREMIUM")
+        if not finite(spread) or spread > config.max_spread: reasons.append("SPREAD_LIMIT_EXCEEDED")
+        if volume <= 0: reasons.append("NO_OPTION_VOLUME")
+        # Contract-level options flow: growing OI with rising premium is buying activity; avoid equating OI rise with bullish writing.
+        flow_score = 0.45
+        wall = next((w for w in oi.get("walls", []) if abs(number(w.get("strike"), -99999)-c.strike) < 0.01), {})
+        side_flow = str(wall.get("call_flow" if direction == "BULLISH" else "put_flow", "UNKNOWN"))
+        if side_flow == "LONG_BUILDUP_BUYING": flow_score += 0.35
+        elif side_flow == "SHORT_COVERING": flow_score += 0.25
+        elif side_flow == "SHORT_BUILDUP_WRITING": flow_score -= 0.15
+        else: flow_score += 0.05 if finite(c.prev_oi) and c.prev_oi > 0 and c.oi > c.prev_oi else 0.0
+        volume_score = clamp(volume / vol_max, 0, 1) if vol_max > 0 else 0.0
+        spread_score = clamp(1.0 - spread / config.max_spread, 0, 1) if finite(spread) else 0.0
+        depth_imbalance = q.depth_imbalance if q else 0.0
+        liquidity_score = 0.60*spread_score + 0.25*volume_score + 0.15*clamp((depth_imbalance + 1)/2, 0, 1)
+        # Rank: contract selection quality is distinct from market setup confidence.
+        total = 100 * (0.40*delta_score + 0.30*liquidity_score + 0.22*clamp(flow_score, 0, 1) + 0.08*clamp(1 - abs(spot-c.strike)/(3*step), 0, 1))
+        hard_ok = (age_ok and finite(ltp) and ltp > 0 and finite(spread) and spread <= config.max_spread
+                   and volume > 0 and finite(delta) and 0.45 <= abs(delta) <= 0.90)
+        rows.append({
+            "instrument_key": c.instrument_key, "trading_symbol": c.symbol, "side": c.side,
+            "strike": c.strike, "expiry": c.expiry, "ltp": round(ltp, 2) if finite(ltp) else None,
+            "delta": round(delta, 4) if finite(delta) else None, "target_abs_delta": round(target_delta, 3),
+            "spread_ratio_pct": round(spread*100, 3) if finite(spread) else None,
+            "quote_age_seconds": round(q.age_seconds, 2) if q and finite(q.age_seconds) else None,
+            "quote_freshness": q.freshness if q else "UNAVAILABLE", "volume": volume,
+            "oi": c.oi, "local_oi_flow": side_flow, "score": round(total, 2), "execution_eligible": bool(hard_ok),
+            "warnings": warnings, "vetoes": reasons,
+        })
+    eligible = [r for r in rows if r["execution_eligible"]]
+    eligible.sort(key=lambda x: (-x["score"], abs(spot-x["strike"]), x["spread_ratio_pct"] or 999))
+    rows.sort(key=lambda x: (-x["score"], abs(spot-x["strike"])) )
+    return (eligible[0] if eligible else None), rows
 
 
-def _alert_fields(alert: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]], str]:
-    """Build the minimal user-requested signal/level email fields only."""
-    payload_raw = alert.get("payload", {})
-    payload = payload_raw if isinstance(payload_raw, Mapping) else {}
-    event_type = str(alert.get("event_type", "SCANNER_ALERT")).upper()
-    selected = payload.get("selected_option") if isinstance(payload.get("selected_option"), Mapping) else {}
-    best = payload.get("best_candidate") if isinstance(payload.get("best_candidate"), Mapping) else {}
-    tracker = payload.get("tracker") if isinstance(payload.get("tracker"), Mapping) else {}
-    levels = payload.get("nifty_levels") if isinstance(payload.get("nifty_levels"), Mapping) else {}
-    risk = payload.get("risk_plan") if isinstance(payload.get("risk_plan"), Mapping) else {}
-
-    def first(*values: Any) -> Any:
-        return next((value for value in values if value is not None and value != ""), None)
-
-    symbol = first(payload.get("trading_symbol"), selected.get("trading_symbol"), best.get("trading_symbol"), tracker.get("trading_symbol"))
-    option_type = first(payload.get("option_type"), selected.get("option_type"), best.get("option_type"), tracker.get("option_type"))
-    strike = first(payload.get("strike"), selected.get("strike"), best.get("strike"), tracker.get("strike"))
-    if symbol is None and (option_type is not None or strike is not None):
-        symbol = f"{first(option_type, 'OPTION')} {safe_float(strike, float('nan')):.0f}" if finite(safe_float(strike)) else str(option_type or "OPTION")
-
-    confidence = first(payload.get("confidence_pct"), payload.get("confidence"), selected.get("confidence_pct"),
-                       tracker.get("confidence_pct"), best.get("confidence_pct"))
-    entry_spot = first(payload.get("nifty_entry_reference"), payload.get("nifty_spot"), selected.get("nifty_spot"),
-                       tracker.get("nifty_entry_reference"), payload.get("spot"))
-    t1 = first(payload.get("T1"), payload.get("target_1"), levels.get("T1"), risk.get("target_1"), tracker.get("target_1"), selected.get("T1"))
-    t2 = first(payload.get("T2"), payload.get("target_2"), levels.get("T2"), risk.get("target_2"), tracker.get("target_2"), selected.get("T2"))
-    initial_sl = first(payload.get("SL"), payload.get("stop_loss"), levels.get("SL"), risk.get("stop_loss"), tracker.get("stop_loss"), selected.get("SL"))
-    trailing_sl = first(payload.get("trailing_SL"), payload.get("trailing_stop"), tracker.get("trailing_stop"))
-    sl = trailing_sl if event_type in {"T1_REACHED", "T2_REACHED", "TRAILING_STOP_REACHED", "STRUCTURAL_STOP_LOSS_REACHED"} and trailing_sl is not None else initial_sl
-
-    event_time = None
-    if event_type == "T1_REACHED":
-        event_time = payload.get("intrabar_t1_timestamp")
-    elif event_type == "T2_REACHED":
-        event_time = payload.get("intrabar_t2_timestamp")
-    elif event_type in {"INITIAL_STOP_LOSS_REACHED", "TRAILING_STOP_REACHED"}:
-        event_time = payload.get("intrabar_stop_timestamp")
-    elif event_type == "STRUCTURAL_STOP_LOSS_REACHED":
-        event_time = payload.get("structural_failure_timestamp")
-    event_time = first(event_time, payload.get("timestamp"), payload.get("event_at"), alert.get("created_at"))
-    event_dt = parse_timestamp(event_time) if event_time else None
-    time_text = event_dt.astimezone(IST).strftime("%d %b %Y, %I:%M:%S %p IST") if event_dt else str(event_time or "Not available")
-
-    title_map = {
-        "SIGNAL_READY": "STRIKE SELECTED",
-        "T1_REACHED": "T1 REACHED",
-        "T2_REACHED": "T2 REACHED",
-        "INITIAL_STOP_LOSS_REACHED": "STOP LOSS REACHED",
-        "TRAILING_STOP_REACHED": "TRAILING STOP REACHED",
-        "STRUCTURAL_STOP_LOSS_REACHED": "STRUCTURAL STOP LOSS REACHED",
-        "MARKET_REVERSAL_CONFIRMED": "MARKET STRUCTURE REVERSAL CONFIRMED",
-    }
-    title = title_map.get(event_type, event_type.replace("_", " ").strip().title())
-
-    def fmt(value: Any, fallback: str = "Not available") -> str:
-        if value is None:
-            return fallback
-        try:
-            number = float(value)
-            if not math.isfinite(number):
-                return fallback
-            return f"{number:.2f}"
-        except (TypeError, ValueError):
-            return str(value).strip() or fallback
-
-    confidence_text = "Not available"
-    if confidence is not None:
-        try:
-            confidence_value = float(confidence)
-            if math.isfinite(confidence_value):
-                confidence_text = f"{confidence_value:.1f}%" if abs(confidence_value - round(confidence_value)) > 0.05 else f"{confidence_value:.0f}%"
-        except (TypeError, ValueError):
-            confidence_text = str(confidence).strip() or "Not available"
-    fields = [
-        ("Strike selection", str(symbol or "Not available")),
-        ("Strike selection spot price", fmt(entry_spot)),
-        ("Confidence", confidence_text),
-        ("Time (IST)", time_text),
-        ("Nifty T1", fmt(t1)),
-        ("Nifty T2", fmt(t2)),
-        ("Nifty SL", fmt(sl)),
-    ]
-    return title, fields, ""
+def update_active_signal(state: dict[str, Any], frame: pd.DataFrame, now: datetime) -> list[dict[str, Any]]:
+    tracker = state.get("active_signal")
+    if not isinstance(tracker, dict) or tracker.get("status") not in {"TRACKING", "T1_REACHED"}:
+        return []
+    signal_time = parse_dt(tracker.get("signal_timestamp"))
+    levels = {name: number(tracker.get(name)) for name in ("T1", "T2", "SL")}
+    if not signal_time:
+        tracker["status"] = "INVALID_TRACKER_TIMESTAMP"
+        return []
+    bars = completed_candles(frame, now)
+    last_checked = parse_dt(tracker.get("last_checked_candle"))
+    boundary = max(signal_time, last_checked) if last_checked else signal_time
+    bars = bars.loc[bars["timestamp"] > pd.Timestamp(boundary).tz_convert("UTC")] if not bars.empty else bars
+    events = []
+    direction = str(tracker.get("direction", "")).upper()
+    for _, bar in bars.iterrows():
+        high, low = number(bar["high"]), number(bar["low"])
+        stamp = bar["timestamp"].to_pydatetime().astimezone(IST).isoformat()
+        sl_hit = finite(levels["SL"]) and ((low <= levels["SL"]) if direction == "BULLISH" else (high >= levels["SL"]))
+        t1_hit = finite(levels["T1"]) and ((high >= levels["T1"]) if direction == "BULLISH" else (low <= levels["T1"]))
+        t2_hit = finite(levels["T2"]) and ((high >= levels["T2"]) if direction == "BULLISH" else (low <= levels["T2"]))
+        # Conservative ambiguity policy: stop wins if stop and target occur in the same OHLC bar.
+        if sl_hit:
+            events.append({"type": "STRUCTURAL_STOP_REACHED", "timestamp": stamp, "level": levels["SL"], "note": "Stop-first when bar order is unknowable."})
+            tracker["status"] = "STOPPED"
+            tracker["terminal_timestamp"] = stamp
+            break
+        if t1_hit and not tracker.get("T1_reached"):
+            tracker["T1_reached"] = True; tracker["status"] = "T1_REACHED"
+            events.append({"type": "T1_REACHED", "timestamp": stamp, "level": levels["T1"]})
+        if t2_hit and not tracker.get("T2_reached"):
+            tracker["T2_reached"] = True; tracker["status"] = "T2_REACHED"
+            events.append({"type": "T2_REACHED", "timestamp": stamp, "level": levels["T2"]})
+            tracker["terminal_timestamp"] = stamp
+            break
+        tracker["last_checked_candle"] = stamp
+    return events
 
 
-def _alert_body(alert: Mapping[str, Any]) -> str:
-    title, fields, _ = _alert_fields(alert)
-    return "\n".join([title, "", *(f"{label}: {value}" for label, value in fields)])
+def can_issue_signal(state: Mapping[str, Any], new_signal: Signal, now: Optional[datetime] = None,
+                    cooldown_minutes: int = 6) -> tuple[bool, str]:
+    active = state.get("active_signal")
+    if not isinstance(active, dict):
+        return True, "NO_ACTIVE_SIGNAL"
+    status = str(active.get("status", "")).upper()
+    active_direction = str(active.get("direction", "")).upper()
+    if status in {"TRACKING", "T1_REACHED"}:
+        if active_direction == new_signal.direction:
+            return False, "SAME_DIRECTION_SIGNAL_ALREADY_TRACKING"
+        if status == "T1_REACHED" or active.get("T1_reached"):
+            return True, "OPPOSITE_SETUP_ALLOWED_AFTER_T1"
+        return False, "ACTIVE_SIGNAL_PROTECTED_UNTIL_T1_OR_STRUCTURAL_STOP"
+    # Prevent repeated same-direction entries on the same structure after a terminal event;
+    # the opposite direction remains eligible when its own setup/risk gates pass.
+    terminal = parse_dt(active.get("terminal_timestamp"))
+    reference = (now or now_ist()).astimezone(IST)
+    if active_direction == new_signal.direction and terminal and (reference - terminal).total_seconds() < max(1, cooldown_minutes) * 60:
+        return False, "SAME_DIRECTION_REENTRY_COOLDOWN"
+    return True, "TERMINAL_SIGNAL_OR_OPPOSITE_SETUP"
 
 
-def _alert_html_body(alert: Mapping[str, Any]) -> str:
-    title, fields, _ = _alert_fields(alert)
-    rows = "".join(
-        "<tr><td style='padding:5px 8px;font-weight:600;border-bottom:1px solid #e5e7eb;'>"
-        + html_lib.escape(label) + "</td><td style='padding:5px 8px;border-bottom:1px solid #e5e7eb;'>"
-        + html_lib.escape(value) + "</td></tr>"
-        for label, value in fields
-    )
-    return (
-        "<!doctype html><html><body style='font-family:Arial,Helvetica,sans-serif;color:#111827;'>"
-        f"<h3 style='margin:0 0 10px;'>{html_lib.escape(title)}</h3>"
-        f"<table role='presentation' style='border-collapse:collapse;font-size:14px;'>{rows}</table>"
-        "</body></html>"
-    )
-
-def _schedule_email_retry(alert: dict[str, Any], now: datetime) -> None:
-    """Apply bounded exponential retry delay to a persistently queued email."""
-    attempts = max(1, int(safe_float(alert.get("attempts"), 1)))
-    delay_seconds = min(300, 15 * (2 ** min(attempts - 1, 5)))
-    alert["next_attempt_at"] = ist_iso(now + timedelta(seconds=delay_seconds))
+def audit_append(config: Config, report: Mapping[str, Any]) -> None:
+    config.audit_dir.mkdir(parents=True, exist_ok=True)
+    local_date = parse_date(report.get("timestamp")) or now_ist().date()
+    path = config.audit_dir / f"market_scan_{local_date.isoformat()}_v83.jsonl"
+    record = {"audit_schema_version": 1, "recorded_at": report.get("timestamp"), "scanner_version": VERSION, "scan": safe_json(report)}
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
 
 
-def deliver_email_outbox(state: dict[str, Any], config: Config, now: datetime, *, max_messages: int = 12) -> dict[str, Any]:
-    """Attempt queued messages with retry-on-next-run semantics and clear delivery status."""
-    outbox = state.get("alert_outbox")
-    if not isinstance(outbox, list):
-        state["alert_outbox"] = []
-        outbox = state["alert_outbox"]
-    for alert in outbox:
-        if (isinstance(alert, dict)
-                and str(alert.get("status", "PENDING")).upper() == "PENDING"
-                and str(alert.get("event_type", "")).upper() not in EMAIL_ALLOWED_EVENT_TYPES):
-            alert["status"] = "SUPPRESSED_POLICY"
-            alert["suppressed_at"] = ist_iso(now)
-            alert["last_error"] = "Suppressed by V81 email policy."
-            alert.pop("next_attempt_at", None)
-    all_pending = [x for x in outbox if isinstance(x, dict) and str(x.get("status", "PENDING")).upper() == "PENDING"]
-    if not all_pending:
-        return {"status": "IDLE", "attempted": 0, "sent": 0, "pending": 0, "smtp_configured": email_is_configured(config)}
-    if not email_is_configured(config):
-        LOGGER.warning("EMAIL OUTBOX has %d pending alert(s), but EMAIL_SENDER / EMAIL_PASSWORD / EMAIL_RECEIVER are not fully configured; alerts remain queued.", len(all_pending))
-        return {"status": "NOT_CONFIGURED", "attempted": 0, "sent": 0,
-                "pending": len(all_pending), "smtp_configured": False}
-    due: list[dict[str, Any]] = []
-    for alert in all_pending:
-        retry_at = parse_timestamp(alert.get("next_attempt_at"))
-        if retry_at is None or retry_at <= now:
-            due.append(alert)
-    pending = due[:max(1, max_messages)]
-    if not pending:
-        return {"status": "RETRY_QUEUED", "attempted": 0, "sent": 0,
-                "pending": len(all_pending), "smtp_configured": True,
-                "next_attempt_at": min((str(x.get("next_attempt_at", "")) for x in all_pending if x.get("next_attempt_at")), default=None)}
-
-    sent_count = 0
-    attempted = 0
-    connection = None
+def send_email(config: Config, subject: str, body: str) -> bool:
+    if not (config.email_sender and config.email_password and config.email_receiver):
+        return False
+    msg = MIMEMultipart()
+    msg["From"], msg["To"], msg["Subject"] = config.email_sender, config.email_receiver, subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
     try:
-        if int(config.smtp_port) == 465:
-            connection = smtplib.SMTP_SSL(config.smtp_host, config.smtp_port, timeout=15, context=ssl.create_default_context())
+        if config.smtp_port == 465:
+            with smtplib.SMTP_SSL(config.smtp_host, config.smtp_port, timeout=15, context=ssl.create_default_context()) as smtp:
+                smtp.login(config.email_sender, config.email_password); smtp.send_message(msg)
         else:
-            connection = smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=15)
-            connection.ehlo()
-            connection.starttls(context=ssl.create_default_context())
-            connection.ehlo()
-        connection.login(config.email_sender, config.email_password)
-        for alert in pending:
-            attempted += 1
-            alert["attempts"] = int(alert.get("attempts", 0)) + 1
-            try:
-                message = MIMEMultipart("alternative")
-                message["Subject"] = str(alert.get("subject", "NIFTY V81 scanner alert"))
-                message["From"] = config.email_sender
-                message["To"] = config.email_receiver
-                message.attach(MIMEText(_alert_body(alert), "plain", "utf-8"))
-                message.attach(MIMEText(_alert_html_body(alert), "html", "utf-8"))
-                refused = connection.sendmail(config.email_sender, [config.email_receiver], message.as_string())
-                if refused:
-                    raise smtplib.SMTPRecipientsRefused(refused)
-                alert["status"] = "SENT"
-                alert["sent_at"] = ist_iso(now)
-                alert["last_error"] = ""
-                alert.pop("next_attempt_at", None)
-                sent_count += 1
-                LOGGER.info("EMAIL SENT: event=%s id=%s", alert.get("event_type"), str(alert.get("event_id", ""))[:12])
-            except (OSError, smtplib.SMTPException, ValueError) as exc:
-                alert["last_error"] = str(exc)[:800]
-                _schedule_email_retry(alert, now)
-                LOGGER.error("EMAIL DELIVERY FAILED: event=%s error=%s; retained for retry at %s.", alert.get("event_type"), exc, alert.get("next_attempt_at"))
-                # A per-message SMTP failure can leave the connection in an uncertain state.
-                break
-    except (OSError, smtplib.SMTPException, ssl.SSLError) as exc:
-        for alert in pending:
-            alert["attempts"] = int(alert.get("attempts", 0)) + 1
-            alert["last_error"] = str(exc)[:800]
-            _schedule_email_retry(alert, now)
-        LOGGER.error("SMTP CONNECTION/AUTHENTICATION FAILURE; queued alerts retained for backoff retry: %s", exc)
-    finally:
-        if connection is not None:
-            try:
-                connection.quit()
-            except (OSError, smtplib.SMTPException):
-                pass
-    # Trim only already-sent history; pending records are retained for subsequent runs.
-    outbox = state.get("alert_outbox", [])
-    sent = [x for x in outbox if isinstance(x, dict) and str(x.get("status", "")).upper() == "SENT"]
-    pending_all = [x for x in outbox if isinstance(x, dict) and str(x.get("status", "PENDING")).upper() != "SENT"]
-    state["alert_outbox"] = pending_all[-300:] + sent[-100:]
-    pending_count = sum(1 for x in state["alert_outbox"] if isinstance(x, dict) and str(x.get("status", "")).upper() == "PENDING")
-    status = "SENT" if sent_count and not pending_count else "PARTIAL" if sent_count else "RETRY_QUEUED"
-    next_attempt = min((str(x.get("next_attempt_at", "")) for x in state["alert_outbox"]
-                        if isinstance(x, dict) and str(x.get("status", "")).upper() == "PENDING" and x.get("next_attempt_at")), default=None)
-    return {"status": status, "attempted": attempted, "sent": sent_count, "pending": pending_count,
-            "smtp_configured": True, "next_attempt_at": next_attempt}
-
-
-
-def _mapping_subset(value: Any, keys: Sequence[str]) -> dict[str, Any]:
-    if not isinstance(value, Mapping):
-        return {}
-    return {key: value.get(key) for key in keys if key in value}
-
-
-def _compact_quote_payload(value: Any) -> dict[str, Any]:
-    return _mapping_subset(value, (
-        "instrument_key", "symbol", "ltp", "bid", "ask", "bid_qty", "ask_qty",
-        "volume", "oi", "previous_oi", "previous_close", "timestamp",
-        "last_trade_time", "freshness", "age_seconds", "last_trade_age_seconds",
-        "delta", "gamma", "theta", "vega", "iv", "greeks_source", "source",
-    ))
-
-
-def _compact_candidate_payload(value: Any) -> dict[str, Any]:
-    return _mapping_subset(value, (
-        "route_status", "instrument_key", "trading_symbol", "option_type", "strike",
-        "moneyness", "ltp", "delta", "delta_source", "score", "total_score",
-        "flow_score", "vwap_lift_score", "coi_score", "premium_vwap",
-        "option_premium_vwap", "spread_ratio", "quote_freshness", "quote_age_seconds",
-        "execution_eligible", "selected_for_execution", "best_candidate_for_review",
-        "provisional_only", "vetoes", "reason", "score_basis",
-    ))
-
-
-def _compact_audit_scan(scan: Mapping[str, Any]) -> dict[str, Any]:
-    """Project a full in-memory scan into a compact, decision-relevant audit record.
-
-    The live state and detector still use the full option chain and candle data. Only the
-    GitHub-persisted audit is reduced: raw chain rows, quote payload blobs, long historical
-    seed candles, and full candidate internals are replaced by compact market-structure
-    summaries. Set AUDIT_DETAIL_LEVEL=full to retain the legacy detailed record when needed.
-    """
-    levels = scan.get("nifty_levels") if isinstance(scan.get("nifty_levels"), Mapping) else {}
-    indicators = scan.get("indicators") if isinstance(scan.get("indicators"), Mapping) else {}
-    oi = scan.get("oi") if isinstance(scan.get("oi"), Mapping) else {}
-    futures = scan.get("futures") if isinstance(scan.get("futures"), Mapping) else {}
-    risk = scan.get("risk") if isinstance(scan.get("risk"), Mapping) else {}
-    selected = scan.get("selected_option") if isinstance(scan.get("selected_option"), Mapping) else None
-    ranking = scan.get("candidate_ranking") if isinstance(scan.get("candidate_ranking"), Mapping) else {}
-    readiness = scan.get("trade_readiness") if isinstance(scan.get("trade_readiness"), Mapping) else {}
-    report: dict[str, Any] = {
-        "scanner_version": scan.get("scanner_version"),
-        "timestamp": scan.get("timestamp"),
-        "market_state": scan.get("market_state"),
-        "scenario": scan.get("scenario"),
-        "direction": scan.get("direction"),
-        "confidence_pct": scan.get("confidence_pct"),
-        "trigger_rationale": str(scan.get("trigger_rationale", ""))[:500],
-        "oi_structure_confirmation": _mapping_subset(scan.get("oi_structure_confirmation"), (
-            "applicable", "passed", "reason", "evidence",
-        )),
-        "signal_ready": bool(scan.get("signal_ready", False)),
-        "execution_mode": scan.get("execution_mode"),
-        "market_status": scan.get("market_status"),
-        "execution_gap_minutes": scan.get("execution_gap_minutes"),
-        "execution_gap_reset": scan.get("execution_gap_reset"),
-        "nifty_levels": _mapping_subset(levels, ("spot", "T1", "T2", "SL", "trailing_SL")),
-        "indicators": _mapping_subset(indicators, (
-            "spot", "vwap", "vwap_slope", "atr", "atr_5m", "adx", "plus_di", "minus_di",
-            "rsi", "momentum_1m_pct", "momentum_3m_pct", "recent_range", "prior_range",
-            "compressed", "swing_low", "swing_high", "swing_low_5m", "swing_high_5m",
-            "session_high", "session_low", "candles_count", "indicators_seeded", "volume_source",
-        )),
-        "oi": {
-            **_mapping_subset(oi, (
-                "expiry", "atm", "strike_step", "call_total_oi", "put_total_oi", "pcr",
-                "pcr_previous", "pcr_spiking", "call_coi_tactical_pct", "put_coi_tactical_pct",
-                "call_coi_1m_pct", "put_coi_1m_pct", "call_coi_3m_pct", "put_coi_3m_pct",
-                "call_coi_5m_pct", "put_coi_5m_pct", "call_coi_session_pct", "put_coi_session_pct",
-                "tactical_source", "tactical_available", "tactical_age_minutes", "baseline_quality",
-                "session_baseline_source", "wall_change_source", "change_oi_fallback_available",
-                "both_sides_building", "pin_strikes", "reasons",
-            )),
-            "resistance_walls": [_mapping_subset(row, ("strike", "side", "oi", "change_pct", "state", "source", "distance"))
-                                   for row in (oi.get("resistance_walls", [])[:8]
-                                               if isinstance(oi.get("resistance_walls"), list) else []) if isinstance(row, Mapping)],
-            "support_walls": [_mapping_subset(row, ("strike", "side", "oi", "change_pct", "state", "source", "distance"))
-                               for row in (oi.get("support_walls", [])[:8]
-                                           if isinstance(oi.get("support_walls"), list) else []) if isinstance(row, Mapping)],
-        },
-        "futures": _mapping_subset(futures, (
-            "quote_freshness", "quote_age_seconds", "regime", "alignment", "oi_change_pct",
-            "price_change_pct", "last_price", "previous_close", "source", "reasons",
-        )),
-        "risk": _mapping_subset(risk, (
-            "valid", "target_1", "target_2", "stop_loss", "stop_source", "target_1_source",
-            "target_2_source", "reason", "reward_points", "risk_points", "reward_risk_ratio",
-            "max_t1_distance_points", "remaining_session_minutes", "stop_atr_points",
-            "stop_atr_source", "skipped_weak_walls", "skipped_unreachable_walls",
-        )),
-        "selected_option": _mapping_subset(selected, (
-            "timestamp", "scenario", "direction", "confidence_pct", "trigger_reason",
-            "entry_trigger_confirmation", "selection_mode", "option_type", "strike",
-            "trading_symbol", "instrument_key", "delta", "delta_source", "option_ltp",
-            "option_premium_vwap", "score", "flow_score", "vwap_lift_score", "coi_score",
-            "nifty_spot", "T1", "T2", "SL", "trailing_SL", "T1_source", "T2_source",
-            "SL_source", "reward_risk_ratio", "active_regime_assessment",
-        )) if selected else None,
-        "predictive_detection": _mapping_subset(scan.get("predictive_detection"), (
-            "detected", "stage", "scenario", "direction", "confidence_pct", "execution_candidate",
-            "entry_trigger_confirmed", "entry_trigger_reason", "selection_mode",
-            "provisional_ranking_allowed", "provisional_ranking_direction", "confidence_type",
-        )),
-        "candidate_ranking": {
-            "best_candidate": _compact_candidate_payload(ranking.get("best_candidate")),
-            "provisional_candidate": _compact_candidate_payload(ranking.get("provisional_candidate")),
-            "best_candidate_for_review": _compact_candidate_payload(ranking.get("best_candidate_for_review")),
-            "ranking_basis": ranking.get("ranking_basis"),
-            "expected_underlying_move_points": ranking.get("expected_underlying_move_points"),
-            "expected_move_source": ranking.get("expected_move_source"),
-            "option_gate_eligible_count": ranking.get("option_gate_eligible_count"),
-            "candidate_count": ranking.get("candidate_count"),
-            "provisional_only": ranking.get("provisional_only"),
-        },
-        "trade_readiness": {
-            **_mapping_subset(readiness, ("ready", "status", "selection_mode", "blocking_reasons", "minimum_score", "candidate_count")),
-        },
-        "candidate_diagnostics": [
-            _compact_candidate_payload(row) for row in (
-                scan.get("candidate_diagnostics", [])[:4]
-                if isinstance(scan.get("candidate_diagnostics"), list) else []
-            ) if isinstance(row, Mapping)
-        ],
-        "vetoes": [str(value)[:220] for value in (scan.get("vetoes", [])[:6]
-                   if isinstance(scan.get("vetoes"), list) else [])],
-        "market_data_quality": _mapping_subset(scan.get("market_data_quality"), (
-            "index_1m_candles", "new_entries", "existing_virtual_monitoring", "quote", "option_chain",
-            "nifty_future_1m_candles", "change_oi_fallback", "oi_analysis",
-        )),
-        "active_regime_reassessment": _mapping_subset(scan.get("active_regime_reassessment"), (
-            "current_resolved_scenario", "current_resolved_direction", "current_direction_flip_guard",
-            "active_signal_count", "policy",
-        )),
-        "active_recommendation_guard": _mapping_subset(scan.get("active_recommendation_guard"), (
-            "active_tracker_count", "new_selection_suppressed", "policy",
-        )),
-        "v68_direction_resolution": _mapping_subset(scan.get("v68_direction_resolution"), (
-            "primary_scenario_before_resolution", "price_structure_candidate",
-            "price_structure_candidate_direction", "reversal_watch", "resolved_scenario",
-            "resolved_direction", "price_led_route",
-        )),
-        "scenario_features": _mapping_subset(scan.get("scenario_features"), (
-            "reaction", "boundary_role", "boundary_level", "touch_count", "rejection_count",
-            "breakout_confirmation_count", "setup_route", "market_structure", "structure_state",
-            "compression", "reason_codes", "price_action_confirmed", "directional_confirmation",
-        )),
-        "recommendation_tracker": _mapping_subset(scan.get("recommendation_tracker"), (
-            "status", "direction", "target_1_hit", "target_1", "target_2", "trailing_stop",
-            "active_tracker_count", "message",
-        )),
-    }
-    monitored = scan.get("monitoring") if isinstance(scan.get("monitoring"), Mapping) else {}
-    tracker_rows = monitored.get("active_and_recent_trackers", [])
-    report["monitoring"] = {
-        "active_and_recent_trackers": [
-            _mapping_subset(row, (
-                "status", "direction", "scenario", "trading_symbol", "option_type", "strike",
-                "last_nifty_spot", "target_1_hit", "T1", "T2", "SL", "trailing_SL",
-                "monitoring_data_status", "target_event_integrity", "monitoring_gap_minutes",
-                "opposite_scenario_consecutive_bars", "target_reassessment_status", "target_update_count",
-            )) for row in (tracker_rows[-6:] if isinstance(tracker_rows, list) else []) if isinstance(row, Mapping)
-        ],
-        "events_this_scan": [
-            _mapping_subset(event, (
-                "event_type", "event_at", "intrabar_t1_timestamp", "intrabar_t2_timestamp",
-                "intrabar_stop_timestamp", "direction", "strike", "spot", "T1", "T2", "SL",
-                "trailing_SL", "previous_T1", "new_T1", "previous_T2", "new_T2",
-                "previous_trailing_SL", "new_trailing_SL", "target_reassessment_reason",
-                "monitoring_data_status", "target_event_integrity",
-            )) for event in (monitored.get("events_this_scan", []) if isinstance(monitored.get("events_this_scan"), list) else [])
-            if isinstance(event, Mapping)
-        ],
-    }
-    audit_inputs = scan.get("audit_inputs") if isinstance(scan.get("audit_inputs"), Mapping) else {}
-    spot = safe_float(levels.get("spot", indicators.get("spot")), float("nan"))
-    strike_step = max(1.0, safe_float(oi.get("strike_step"), 50.0))
-    band = max(500.0, strike_step * 10.0)
-    oi_by_strike = audit_inputs.get("oi_by_strike") if isinstance(audit_inputs.get("oi_by_strike"), Mapping) else {}
-    local_rows: list[dict[str, Any]] = []
-    if finite(spot):
-        for strike_text, row in oi_by_strike.items():
-            strike = safe_float(strike_text, float("nan"))
-            if not finite(strike) or not isinstance(row, Mapping):
-                continue
-            if abs(strike - spot) <= band:
-                local_rows.append({"strike": strike, **_mapping_subset(row, (
-                    "call_oi", "put_oi", "call_prev_oi", "put_prev_oi", "call_coi_pct", "put_coi_pct",
-                ))})
-        local_rows.sort(key=lambda row: row["strike"])
-    chain = audit_inputs.get("option_chain", [])
-    live_quotes = audit_inputs.get("live_quotes", {})
-    index_quote = audit_inputs.get("index_quote", {})
-    change_data = audit_inputs.get("change_oi_fallback_data", {})
-    fallback_rows = change_data.get("by_strike", {}) if isinstance(change_data, Mapping) else {}
-    compact_fallback_rows: list[dict[str, Any]] = []
-    if isinstance(fallback_rows, Mapping) and finite(spot):
-        rows = []
-        for strike_text, row in fallback_rows.items():
-            strike = safe_float(strike_text, float("nan"))
-            if finite(strike) and isinstance(row, Mapping):
-                rows.append((abs(strike - spot), strike, row))
-        for _distance, strike, row in sorted(rows)[:12]:
-            compact_fallback_rows.append({"strike": strike, **_mapping_subset(row, (
-                "call_change_oi", "put_change_oi", "call_change", "put_change", "call_oi_change", "put_oi_change",
-            ))})
-    candles = audit_inputs.get("candles_1m", {}) if isinstance(audit_inputs.get("candles_1m"), Mapping) else {}
-    option_candle_map = candles.get("option_candidates", {}) if isinstance(candles.get("option_candidates"), Mapping) else {}
-    selected_key = str((selected or {}).get("instrument_key", ""))
-    option_candle_rows: dict[str, Any] = {}
-    ordered_option_keys = []
-    if selected_key and selected_key in option_candle_map:
-        ordered_option_keys.append(selected_key)
-    ordered_option_keys.extend(key for key in option_candle_map if key not in ordered_option_keys)
-    for key in ordered_option_keys[:2]:
-        item = option_candle_map.get(key)
-        if isinstance(item, Mapping):
-            option_candle_rows[key] = {
-                "candle_status": item.get("candle_status"),
-                "candles": (item.get("candles", [])[-8:] if isinstance(item.get("candles"), list) else []),
-            }
-    report["audit_inputs"] = {
-        "capture_version": audit_inputs.get("capture_version"),
-        "capture_scope": audit_inputs.get("capture_scope"),
-        "data_coverage": _mapping_subset(audit_inputs.get("data_coverage"), (
-            "index_quote", "option_chain", "option_chain_expiry", "option_chain_strikes",
-            "option_chain_contract_sides", "live_quote_instruments", "nifty_index_1m_candles",
-            "nifty_future_1m_candles", "change_oi_fallback", "oi_analysis",
-        )),
-        "index_quote": _compact_quote_payload(index_quote),
-        "option_chain_summary": {
-            "row_count": len(chain) if isinstance(chain, list) else 0,
-            "min_strike": min((safe_float(row.get("strike_price"), float("inf")) for row in chain if isinstance(row, Mapping)), default=None) if isinstance(chain, list) else None,
-            "max_strike": max((safe_float(row.get("strike_price"), float("-inf")) for row in chain if isinstance(row, Mapping)), default=None) if isinstance(chain, list) else None,
-            "local_oi_rows": local_rows,
-        },
-        "oi_comparison_snapshot_timestamps": audit_inputs.get("oi_comparison_snapshot_timestamps", [])[-6:] if isinstance(audit_inputs.get("oi_comparison_snapshot_timestamps"), list) else [],
-        "change_oi_fallback_summary": {
-            **_mapping_subset(change_data, ("total_call_change_oi", "total_put_change_oi", "interval_days", "date", "expiry", "source")),
-            "nearest_strike_rows": compact_fallback_rows,
-        },
-        "live_quotes": {},
-        "historical_seed_info": _mapping_subset(audit_inputs.get("historical_seed_info"), (
-            "date", "instrument_key", "candle_count", "first_timestamp", "last_timestamp", "sha256",
-        )),
-        "candles_1m": {
-            "nifty_index_recent": candles.get("nifty_index_recent", [])[-8:] if isinstance(candles.get("nifty_index_recent"), list) else [],
-            "nifty_future_recent": candles.get("nifty_future_recent", [])[-8:] if isinstance(candles.get("nifty_future_recent"), list) else [],
-            "option_candidates": option_candle_rows,
-        },
-    }
-    compact_quote_keys: list[str] = []
-    if selected_key:
-        compact_quote_keys.append(selected_key)
-    for candidate_field in ("best_candidate", "provisional_candidate", "best_candidate_for_review"):
-        candidate = ranking.get(candidate_field) if isinstance(ranking.get(candidate_field), Mapping) else {}
-        candidate_key = str(candidate.get("instrument_key", ""))
-        if candidate_key and candidate_key not in compact_quote_keys:
-            compact_quote_keys.append(candidate_key)
-    if isinstance(live_quotes, Mapping):
-        for key in live_quotes:
-            key_text = str(key)
-            if key_text not in compact_quote_keys:
-                compact_quote_keys.append(key_text)
-            if len(compact_quote_keys) >= 6:
-                break
-        report["audit_inputs"]["live_quotes"] = {
-            key: _compact_quote_payload(live_quotes[key]) for key in compact_quote_keys[:6]
-            if key in live_quotes and isinstance(live_quotes[key], Mapping)
-        }
-
-    # Keep important direction/watch lifecycle fields, but never persist raw candle/chain dumps.
-    watch = scan.get("reversal_watch")
-    if isinstance(watch, Mapping):
-        report["reversal_watch"] = _mapping_subset(watch, (
-            "timestamp", "scenario", "direction", "confidence_pct", "trigger_reason", "nifty_spot",
-            "vwap", "adx", "rsi", "momentum_3m_pct", "plus_di", "minus_di",
-            "tactical_coi_available", "tactical_coi_source", "call_coi_tactical_pct", "put_coi_tactical_pct",
-            "current_scenario", "current_hard_veto",
-        ))
-    else:
-        report["reversal_watch"] = None
-    lifecycle = scan.get("directional_watch_lifecycle") if isinstance(scan.get("directional_watch_lifecycle"), Mapping) else {}
-    active_watch = lifecycle.get("active_watch") if isinstance(lifecycle.get("active_watch"), Mapping) else {}
-    report["directional_watch_lifecycle"] = {
-        "active_watch": _mapping_subset(active_watch, (
-            "direction", "scenario", "started_at", "last_seen_at", "last_nifty_spot",
-            "last_vwap", "last_adx", "readiness_blockers", "last_tactical_coi_source",
-            "last_tactical_coi_available",
-        )),
-        "policy": _mapping_subset(lifecycle.get("policy"), (
-            "neutral_scans_to_invalidate", "opposite_scans_to_invalidate", "max_age_minutes",
-            "strong_tactical_opposite_flow_overrides",
-        )),
-    }
-    report["audit_compaction"] = {
-        "mode": "COMPACT_DECISION_AND_NEAR_SPOT_MARKET_DATA",
-        "raw_option_chain_rows_omitted": True,
-        "full_historical_seed_snapshot_omitted": True,
-        "note": "Full calculations use unabridged live data; this persisted audit keeps indicator values, structural walls, near-spot OI, recent candles, quote health, gates and event chronology.",
-    }
-    return json_safe(report)
-
-
-def _compact_email_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Persist only the values consumed by the minimal email renderer; retain retry safety."""
-    out = _mapping_subset(payload, (
-        "timestamp", "event_at", "intrabar_t1_timestamp", "intrabar_t2_timestamp",
-        "intrabar_stop_timestamp", "structural_failure_timestamp", "trading_symbol", "option_type", "strike", "direction",
-        "confidence_pct", "confidence", "nifty_entry_reference", "nifty_spot", "spot",
-        "T1", "T2", "SL", "trailing_SL", "target_1", "target_2", "stop_loss",
-        "trailing_stop", "replacement_direction", "invalidated_direction", "message",
-    ))
-    for key in ("selected_option", "best_candidate"):
-        value = payload.get(key)
-        if isinstance(value, Mapping):
-            out[key] = _mapping_subset(value, (
-                "trading_symbol", "option_type", "strike", "confidence_pct", "nifty_spot",
-                "T1", "T2", "SL", "trailing_SL",
-            ))
-    for key in ("tracker",):
-        value = payload.get(key)
-        if isinstance(value, Mapping):
-            out[key] = _mapping_subset(value, (
-                "trading_symbol", "option_type", "strike", "confidence_pct", "nifty_entry_reference",
-                "target_1", "target_2", "stop_loss", "trailing_stop",
-            ))
-    for key in ("nifty_levels", "risk_plan"):
-        value = payload.get(key)
-        if isinstance(value, Mapping):
-            out[key] = _mapping_subset(value, ("spot", "T1", "T2", "SL", "target_1", "target_2", "stop_loss"))
-    return json_safe(out)
-
-
-def _compact_persisted_tracker_history(trackers: Any, terminal_keep: int = 12) -> list[dict[str, Any]]:
-    rows = [dict(item) for item in trackers if isinstance(item, dict)] if isinstance(trackers, list) else []
-    active = [item for item in rows if str(item.get("status", "")).upper() == "TRACKING"]
-    terminal = [item for item in rows if str(item.get("status", "")).upper() != "TRACKING"][-max(0, terminal_keep):]
-    active_ids = {str(item.get("signal_fingerprint", "")) for item in active}
-    return sorted(active + [item for item in terminal if str(item.get("signal_fingerprint", "")) not in active_ids],
-                  key=lambda item: str(item.get("created_at", "")))
-
-
-def _compact_existing_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
-    """Convert one legacy full audit record to the current compact schema without losing its decision trail."""
-    raw_scan = record.get("scan") if isinstance(record.get("scan"), Mapping) else record.get("scan_report")
-    if not isinstance(raw_scan, Mapping):
-        raise ValueError("Legacy audit row has no scan mapping; refusing to rewrite the audit file.")
-    compact_scan = _compact_audit_scan(raw_scan)
-    context = record.get("state_context") if isinstance(record.get("state_context"), Mapping) else {}
-    raw_trackers = context.get("active_or_recent_trackers", [])
-    tracker_keys = (
-        "signal_fingerprint", "status", "direction", "scenario", "option_type", "strike",
-        "trading_symbol", "instrument_key", "created_at", "completed_at", "completion_reason",
-        "target_1", "target_2", "stop_loss", "trailing_stop", "target_1_hit", "target_2_hit",
-        "last_nifty_spot", "last_option_ltp_observed", "last_option_quote_status",
-        "last_intrabar_bar_timestamp", "target_update_count", "last_target_update_at",
-        "last_dynamic_levels_3m_bar_timestamp", "target_reassessment_status",
-    )
-    compact_trackers = [
-        _mapping_subset(item, tracker_keys) for item in raw_trackers[-8:]
-        if isinstance(item, Mapping)
-    ] if isinstance(raw_trackers, list) else []
-    selected = compact_scan.get("selected_option") if isinstance(compact_scan.get("selected_option"), Mapping) else {}
-    monitoring = compact_scan.get("monitoring") if isinstance(compact_scan.get("monitoring"), Mapping) else {}
-    outcome_old = record.get("scan_outcome") if isinstance(record.get("scan_outcome"), Mapping) else {}
-    raw_events = monitoring.get("events_this_scan", [])
-    scan_outcome = {
-        "scenario": compact_scan.get("scenario"),
-        "market_state": compact_scan.get("market_state"),
-        "direction": compact_scan.get("direction"),
-        "confidence_pct": compact_scan.get("confidence_pct"),
-        "signal_ready": bool(compact_scan.get("signal_ready", False)),
-        "selected_option": _mapping_subset(selected, (
-            "trading_symbol", "option_type", "strike", "option_ltp", "nifty_spot",
-            "confidence_pct", "T1", "T2", "SL", "score",
-        )),
-        "vetoes": compact_scan.get("vetoes", [])[:6] if isinstance(compact_scan.get("vetoes"), list) else [],
-        "monitoring_events": [
-            _mapping_subset(item, ("event_type", "event_at", "spot", "T1", "T2", "SL",
-                                   "previous_T1", "new_T1", "previous_T2", "new_T2",
-                                   "previous_trailing_SL", "new_trailing_SL"))
-            for item in (raw_events if isinstance(raw_events, list) else [])[:8]
-            if isinstance(item, Mapping)
-        ],
-        "email_delivery": _mapping_subset(outcome_old.get("email_delivery"),
-                                           ("status", "attempted", "sent", "pending", "smtp_configured")),
-    }
-    return json_safe({
-        "audit_schema_version": 2,
-        "audit_detail_level": "compact",
-        "record_id": record.get("record_id"),
-        "recorded_at": record.get("recorded_at"),
-        "scanner_version": record.get("scanner_version", compact_scan.get("scanner_version", SCANNER_VERSION)),
-        "scan_outcome": scan_outcome,
-        "state_context": {
-            "session_date": context.get("session_date"),
-            "option_expiry": context.get("option_expiry"),
-            "session_oi_baseline_source": context.get("session_oi_baseline_source"),
-            "session_oi_baseline_timestamp": context.get("session_oi_baseline_timestamp"),
-            "recent_chain_snapshot_timestamps": context.get("recent_chain_snapshot_timestamps", [])[-12:]
-                if isinstance(context.get("recent_chain_snapshot_timestamps"), list) else [],
-            "active_or_recent_trackers": compact_trackers,
-            "last_signal_fingerprint": context.get("last_signal_fingerprint"),
-        },
-        "scan": compact_scan,
-    })
-
-
-class ScanAuditWriter:
-    """Append one complete, JSON-safe audit record per scanner invocation.
-
-    The daily JSONL log is intentionally separate from market_state.json so the active
-    state remains compact while every scan can later be reconstructed and reviewed.
-    """
-
-    def __init__(self, directory: Optional[Path] = None) -> None:
-        raw = os.getenv("AUDIT_DIR", "").strip()
-        if directory is not None:
-            self.directory = Path(directory).expanduser()
-        elif raw:
-            candidate = Path(raw).expanduser()
-            self.directory = candidate if candidate.is_absolute() else (Path.cwd() / candidate).resolve()
-        else:
-            self.directory = Path(__file__).resolve().parent / "audit"
-
-    @staticmethod
-    def _record_id(report: Mapping[str, Any]) -> str:
-        version = str(report.get("scanner_version", SCANNER_VERSION))
-        stamp = str(report.get("timestamp", ""))
-        return hashlib.sha256(f"{version}|{stamp}".encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _last_record_id(path: Path) -> Optional[str]:
-        """Read the last JSONL record without loading the entire daily file."""
-        try:
-            with path.open("rb") as handle:
-                handle.seek(0, os.SEEK_END)
-                size = handle.tell()
-                if size <= 0:
-                    return None
-                chunk_size = min(size, 2 * 1024 * 1024)
-                handle.seek(-chunk_size, os.SEEK_END)
-                tail = handle.read(chunk_size)
-            lines = [line for line in tail.splitlines() if line.strip()]
-            if not lines:
-                return None
-            payload = json.loads(lines[-1].decode("utf-8"))
-            return str(payload.get("record_id", "")) or None if isinstance(payload, dict) else None
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
-            return None
-
-    @staticmethod
-    def _is_compact_file(path: Path) -> bool:
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                line = handle.readline()
-            row = json.loads(line) if line.strip() else {}
-            return bool(isinstance(row, Mapping)
-                        and str(row.get("audit_detail_level", "")).lower() == "compact"
-                        and int(safe_float(row.get("audit_schema_version"), 0)) >= 2)
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            return False
-
-    def _compact_existing_file(self, path: Path) -> bool:
-        """Rewrite a legacy full same-day audit once, preserving all scans in compact form.
-
-        This prevents V81 from only compacting *new* lines while leaving a large V74/V76
-        audit file tracked in GitHub. A parse/conversion failure aborts atomically, leaving
-        the original untouched; the scanner can continue writing a new compact record.
-        """
-        if not path.exists() or path.stat().st_size == 0:
-            return False
-        try:
-            with path.open("r", encoding="utf-8") as source:
-                first_line = source.readline()
-            first = json.loads(first_line) if first_line.strip() else {}
-            if (isinstance(first, Mapping) and str(first.get("audit_detail_level", "")).lower() == "compact"
-                    and int(safe_float(first.get("audit_schema_version"), 0)) >= 2):
-                return False
-            old_size = path.stat().st_size
-            fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".compact.tmp", dir=str(path.parent))
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8", newline="") as target, path.open("r", encoding="utf-8") as source:
-                    for line_number, line in enumerate(source, start=1):
-                        if not line.strip():
-                            continue
-                        try:
-                            row = json.loads(line)
-                        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                            raise ValueError(f"Invalid JSON at audit line {line_number}; rewrite cancelled.") from exc
-                        if not isinstance(row, Mapping):
-                            raise ValueError(f"Non-object audit row at line {line_number}; rewrite cancelled.")
-                        if (str(row.get("audit_detail_level", "")).lower() == "compact"
-                                and int(safe_float(row.get("audit_schema_version"), 0)) >= 2):
-                            compact_row = json_safe(row)
-                        else:
-                            compact_row = _compact_existing_audit_record(row)
-                        target.write(json.dumps(compact_row, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
-                    target.flush()
-                    os.fsync(target.fileno())
-                os.replace(tmp_name, path)
-                new_size = path.stat().st_size
-                LOGGER.info("LEGACY AUDIT COMPACTED: %s bytes=%d->%d reduction=%.1f%%", path.name, old_size, new_size,
-                            (1.0 - new_size / old_size) * 100.0 if old_size else 0.0)
-                return True
-            except Exception:
-                try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
-                raise
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            LOGGER.warning("LEGACY AUDIT COMPACTION SKIPPED; original retained: %s", exc)
-            return False
-
-    def append(self, now: datetime, report: Mapping[str, Any], state: Mapping[str, Any]) -> dict[str, Any]:
-        local_now = now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
-        day = local_now.date().isoformat()
-        path = self.directory / f"market_scan_{day}.jsonl"
-        record_id = self._record_id(report)
-        audit_detail_level = os.getenv("AUDIT_DETAIL_LEVEL", "compact").strip().lower()
-        if audit_detail_level not in {"compact", "full"}:
-            audit_detail_level = "compact"
-        try:
-            self.directory.mkdir(parents=True, exist_ok=True)
-            if audit_detail_level == "compact":
-                migration_done = bool(state.get("audit_v77_legacy_compaction_done", False))
-                if not migration_done and isinstance(state, dict):
-                    compaction_complete = True
-                    # Compact all legacy daily audit files, not only today's file. This matters
-                    # when V81 is first deployed on a later date than the large audit being fixed.
-                    for existing_path in sorted(self.directory.glob("market_scan_*.jsonl")):
-                        if not self._is_compact_file(existing_path):
-                            self._compact_existing_file(existing_path)
-                        if not self._is_compact_file(existing_path):
-                            compaction_complete = False
-                    if compaction_complete:
-                        state["audit_v77_legacy_compaction_done"] = True
-                elif path.exists() and not self._is_compact_file(path):
-                    self._compact_existing_file(path)
-            if path.exists() and self._last_record_id(path) == record_id:
-                return {"status": "ALREADY_PRESENT", "path": str(path), "record_id": record_id}
-
-            scan_report = dict(report)
-            # The write result belongs to market_state.json/console, not inside the
-            # immutable record itself, so the record does not claim it wrote itself.
-            scan_report.pop("audit_log", None)
-            trackers_raw = state.get("recommendation_trackers", [])
-            trackers = [
-                {
-                    key: item.get(key)
-                    for key in ("signal_fingerprint", "status", "direction", "scenario", "option_type",
-                                "strike", "trading_symbol", "instrument_key", "created_at", "completed_at",
-                                "completion_reason", "target_1", "target_2", "stop_loss", "trailing_stop",
-                                "target_1_hit", "target_2_hit", "last_nifty_spot", "last_option_ltp_observed",
-                                "last_option_quote_status", "last_intrabar_bar_timestamp", "target_update_count",
-                                "last_target_update_at", "last_dynamic_levels_3m_bar_timestamp", "target_reassessment_status")
-                    if key in item
-                }
-                for item in trackers_raw if isinstance(item, dict)
-            ] if isinstance(trackers_raw, list) else []
-            snapshots = state.get("chain_snapshots", [])
-            snapshot_times = [str(row.get("timestamp", "")) for row in snapshots if isinstance(row, dict)] if isinstance(snapshots, list) else []
-            persisted_scan = scan_report if audit_detail_level == "full" else _compact_audit_scan(scan_report)
-            if audit_detail_level == "full":
-                scan_outcome = {
-                    "scenario": report.get("scenario"),
-                    "market_state": report.get("market_state"),
-                    "direction": report.get("direction"),
-                    "confidence_pct": report.get("confidence_pct"),
-                    "signal_ready": bool(report.get("signal_ready", False)),
-                    "selected_option": report.get("selected_option"),
-                    "candidate_ranking": report.get("candidate_ranking"),
-                    "trade_readiness": report.get("trade_readiness"),
-                    "vetoes": report.get("vetoes", []),
-                    "monitoring_events": ((report.get("monitoring") or {}).get("events_this_scan", [])
-                                           if isinstance(report.get("monitoring"), Mapping) else []),
-                    "email_delivery": report.get("email_delivery"),
-                }
-            else:
-                compact_selected = persisted_scan.get("selected_option") if isinstance(persisted_scan.get("selected_option"), Mapping) else {}
-                compact_monitor = persisted_scan.get("monitoring") if isinstance(persisted_scan.get("monitoring"), Mapping) else {}
-                raw_monitor_events = compact_monitor.get("events_this_scan", [])
-                scan_outcome = {
-                    "scenario": persisted_scan.get("scenario"),
-                    "market_state": persisted_scan.get("market_state"),
-                    "direction": persisted_scan.get("direction"),
-                    "confidence_pct": persisted_scan.get("confidence_pct"),
-                    "signal_ready": bool(persisted_scan.get("signal_ready", False)),
-                    "selected_option": _mapping_subset(compact_selected, (
-                        "trading_symbol", "option_type", "strike", "option_ltp", "nifty_spot",
-                        "confidence_pct", "T1", "T2", "SL", "score",
-                    )),
-                    "vetoes": persisted_scan.get("vetoes", [])[:6] if isinstance(persisted_scan.get("vetoes"), list) else [],
-                    "monitoring_events": [
-                        _mapping_subset(event, ("event_type", "event_at", "spot", "T1", "T2", "SL",
-                                                 "previous_T1", "new_T1", "previous_T2", "new_T2",
-                                                 "previous_trailing_SL", "new_trailing_SL"))
-                        for event in (raw_monitor_events if isinstance(raw_monitor_events, list) else [])[:8]
-                        if isinstance(event, Mapping)
-                    ],
-                    "email_delivery": _mapping_subset(report.get("email_delivery"), ("status", "attempted", "sent", "pending", "smtp_configured")),
-                }
-            record = {
-                "audit_schema_version": 1 if audit_detail_level == "full" else 2,
-                "audit_detail_level": audit_detail_level,
-                "record_id": record_id,
-                "recorded_at": ist_iso(local_now),
-                "scanner_version": str(report.get("scanner_version", SCANNER_VERSION)),
-                "scan_outcome": scan_outcome,
-                "state_context": {
-                    "session_date": state.get("session_date"),
-                    "option_expiry": state.get("option_expiry"),
-                    "session_oi_baseline_source": state.get("session_oi_baseline_source"),
-                    "session_oi_baseline_timestamp": ((state.get("session_oi_baseline") or {}).get("timestamp")
-                                                       if isinstance(state.get("session_oi_baseline"), Mapping) else None),
-                    "recent_chain_snapshot_timestamps": snapshot_times,
-                    "active_or_recent_trackers": trackers,
-                    "last_signal_fingerprint": state.get("last_signal_fingerprint"),
-                },
-                # Default compact projection preserves decision evidence without full-chain/history bloat.
-                # AUDIT_DETAIL_LEVEL=full is available for short-lived deep diagnostics.
-                "scan": json_safe(persisted_scan),
-            }
-            line = json.dumps(json_safe(record), ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
-            with path.open("a", encoding="utf-8", newline="") as handle:
-                handle.write(line)
-                handle.flush()
-                os.fsync(handle.fileno())
-            return {"status": "APPENDED", "path": str(path), "record_id": record_id,
-                    "record_bytes": len(line.encode("utf-8"))}
-        except (OSError, TypeError, ValueError) as exc:
-            LOGGER.error("AUDIT LOG WRITE FAILURE: %s", exc)
-            return {"status": "FAILED", "path": str(path), "record_id": record_id,
-                    "error": f"{type(exc).__name__}: {str(exc)[:800]}"}
+            with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=15) as smtp:
+                smtp.ehlo(); smtp.starttls(context=ssl.create_default_context()); smtp.ehlo()
+                smtp.login(config.email_sender, config.email_password); smtp.send_message(msg)
+        return True
+    except (OSError, smtplib.SMTPException) as exc:
+        LOG.error("Email delivery failed (signal remains in state/audit): %s", exc)
+        return False
 
 
 class PredictiveScanner:
-    def __init__(self, config: Config, client: Optional[UpstoxClient] = None,
-                 store: Optional[StateStore] = None) -> None:
+    def __init__(self, config: Config, client: Optional[UpstoxClient] = None):
         self.config = config
         self.client = client or UpstoxClient(config)
-        self.store = store or StateStore(config.state_file)
-        self.audit_writer = ScanAuditWriter()
-
-    def _append_audit(self, state: Mapping[str, Any], report: dict[str, Any], now: datetime) -> None:
-        result = self.audit_writer.append(now, report, state)
-        report["audit_log"] = result
-        if result.get("status") == "FAILED":
-            report.setdefault("warnings", []).append("Detailed scan audit could not be written; inspect audit_log.error.")
-
-    def _get_quotes_or_empty(self, keys: Sequence[str]) -> dict[str, LiveQuote]:
-        try:
-            return self.client.quotes(keys)
-        except ScannerError as exc:
-            LOGGER.warning("QUOTE BATCH FAILURE: %s", exc)
-            return {}
-
-    def _queue_monitor_events(self, state: dict[str, Any], events: Sequence[Mapping[str, Any]], now: datetime) -> None:
-        """Queue deduplicated monitoring/level events for email delivery."""
-        for raw_event in events:
-            event = dict(raw_event)
-            event_type = str(event.get("event_type", "MONITOR_EVENT")).upper()
-            if event_type == "VIRTUAL_RECOMMENDATION_INVALIDATED_BY_STRUCTURE":
-                event_type = "MARKET_REVERSAL_CONFIRMED"
-                event["event_type"] = event_type
-            if event_type not in EMAIL_ALLOWED_EVENT_TYPES:
-                LOGGER.debug("MONITOR EVENT INTERNAL ONLY: event=%s", event_type)
-                continue
-            tracker_id = str(event.get("tracker_fingerprint", "NO_TRACKER"))
-            if event_type == "TRAILING_STOP_UPDATED":
-                identity = f"{event_type}|{tracker_id}"
-                cooldown = None
-            elif event_type in {"SELECTED_OPTION_QUOTE_UNAVAILABLE", "SELECTED_OPTION_QUOTE_RECOVERED"}:
-                identity = f"{event_type}|{tracker_id}"
-                cooldown = self.config.monitor_quote_alert_cooldown_minutes if event_type == "SELECTED_OPTION_QUOTE_UNAVAILABLE" else None
-            elif event_type == "STAGNATION_RISK_WARNING":
-                identity = f"{event_type}|{tracker_id}"
-                cooldown = None
-            else:
-                identity = f"{event_type}|{tracker_id}"
-                cooldown = None
-            if event_type == "MARKET_REVERSAL_CONFIRMED":
-                subject = "NIFTY 50 — MARKET REVERSAL CONFIRMED"
-            else:
-                subject = f"NIFTY 50 — {event_type.replace('_', ' ')}"
-            enqueue_email_alert(
-                state, now=now, event_type=event_type,
-                dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{identity}",
-                subject=subject, payload=event, cooldown_minutes=cooldown,
-            )
-
-    def _finish(self, state: dict[str, Any], report: dict[str, Any], now: datetime) -> dict[str, Any]:
-        """Persist outbox, the last full report and bounded summaries before/after delivery."""
-        def state_report_copy(item: Mapping[str, Any]) -> dict[str, Any]:
-            """Persist a small last-scan summary; compact JSONL is the durable scan audit."""
-            levels = item.get("nifty_levels") if isinstance(item.get("nifty_levels"), Mapping) else {}
-            indicators = item.get("indicators") if isinstance(item.get("indicators"), Mapping) else {}
-            oi = item.get("oi") if isinstance(item.get("oi"), Mapping) else {}
-            risk = item.get("risk") if isinstance(item.get("risk"), Mapping) else {}
-            selected = item.get("selected_option") if isinstance(item.get("selected_option"), Mapping) else None
-            readiness = item.get("trade_readiness") if isinstance(item.get("trade_readiness"), Mapping) else {}
-            monitoring = item.get("monitoring") if isinstance(item.get("monitoring"), Mapping) else {}
-            return json_safe({
-                "scanner_version": item.get("scanner_version"), "timestamp": item.get("timestamp"),
-                "market_state": item.get("market_state"), "scenario": item.get("scenario"),
-                "direction": item.get("direction"), "confidence_pct": item.get("confidence_pct"),
-                "trigger_rationale": str(item.get("trigger_rationale", ""))[:350],
-                "signal_ready": bool(item.get("signal_ready", False)),
-                "nifty_levels": _mapping_subset(levels, ("spot", "T1", "T2", "SL", "trailing_SL")),
-                "indicators": _mapping_subset(indicators, (
-                    "spot", "vwap", "atr", "atr_5m", "adx", "plus_di", "minus_di", "rsi",
-                    "momentum_1m_pct", "momentum_3m_pct", "swing_low_5m", "swing_high_5m",
-                    "session_high", "session_low", "candles_count", "indicators_seeded",
-                )),
-                "oi": _mapping_subset(oi, (
-                    "expiry", "atm", "strike_step", "pcr", "tactical_source", "tactical_available",
-                    "call_coi_tactical_pct", "put_coi_tactical_pct", "call_coi_1m_pct", "put_coi_1m_pct",
-                    "call_coi_3m_pct", "put_coi_3m_pct", "call_coi_5m_pct", "put_coi_5m_pct",
-                    "baseline_quality", "session_baseline_source",
-                )),
-                "risk": _mapping_subset(risk, (
-                    "valid", "target_1", "target_2", "stop_loss", "target_1_source", "target_2_source",
-                    "stop_source", "reward_risk_ratio", "reason",
-                )),
-                "selected_option": _mapping_subset(selected, (
-                    "trading_symbol", "option_type", "strike", "direction", "confidence_pct", "nifty_spot",
-                    "option_ltp", "T1", "T2", "SL", "trailing_SL", "score",
-                )) if selected else None,
-                "trade_readiness": _mapping_subset(readiness, ("ready", "status", "selection_mode", "blocking_reasons")),
-                "monitoring": {
-                    "status": monitoring.get("status"), "events_this_scan": [
-                        _mapping_subset(event, ("event_type", "event_at", "direction", "strike", "spot", "T1", "T2", "SL", "trailing_SL", "previous_T1", "new_T1", "previous_T2", "new_T2"))
-                        for event in monitoring.get("events_this_scan", [])[:8] if isinstance(event, Mapping)
-                    ] if isinstance(monitoring.get("events_this_scan"), list) else [],
-                },
-                "vetoes": [str(value)[:180] for value in (item.get("vetoes", [])[:4] if isinstance(item.get("vetoes"), list) else [])],
-                "email_delivery": _mapping_subset(item.get("email_delivery"), ("status", "attempted", "sent", "pending", "smtp_configured")),
-                "audit_status": ((item.get("audit_log") or {}).get("status") if isinstance(item.get("audit_log"), Mapping) else None),
-            })
-
-        def summarize(item: Mapping[str, Any]) -> dict[str, Any]:
-            levels = item.get("nifty_levels") if isinstance(item.get("nifty_levels"), Mapping) else {}
-            indicators = item.get("indicators") if isinstance(item.get("indicators"), Mapping) else {}
-            selected = item.get("selected_option") if isinstance(item.get("selected_option"), Mapping) else {}
-            ranking = item.get("candidate_ranking") if isinstance(item.get("candidate_ranking"), Mapping) else {}
-            provisional = ranking.get("provisional_candidate") if isinstance(ranking.get("provisional_candidate"), Mapping) else {}
-            signal_ready = bool(item.get("signal_ready", False) and selected)
-            return json_safe({
-                "timestamp": item.get("timestamp", ist_iso(now)), "scenario": item.get("scenario", "UNKNOWN"),
-                "market_state": item.get("market_state", "NO_TRADE"), "direction": item.get("direction", "NEUTRAL"),
-                "confidence_pct": item.get("confidence_pct", 0), "spot": levels.get("spot", indicators.get("spot")),
-                "vwap": indicators.get("vwap"), "signal_ready": signal_ready,
-                "option": selected.get("trading_symbol") if signal_ready else None,
-                "provisional_only": bool(provisional and not signal_ready),
-                "provisional_option": provisional.get("trading_symbol") if not signal_ready else None,
-                "provisional_strike": provisional.get("strike") if not signal_ready else None,
-                "provisional_score": provisional.get("score") if not signal_ready else None,
-                "candidate_preview_only": not signal_ready, "T1": levels.get("T1") if signal_ready else None,
-                "T2": levels.get("T2") if signal_ready else None, "SL": levels.get("SL") if signal_ready else None,
-                "top_vetoes": (item.get("vetoes") or [])[:3] if isinstance(item.get("vetoes"), list) else [],
-                "email_status": (item.get("email_delivery") or {}).get("status") if isinstance(item.get("email_delivery"), Mapping) else "PENDING",
-                "audit_status": (item.get("audit_log") or {}).get("status") if isinstance(item.get("audit_log"), Mapping) else "PENDING",
-            })
-
-        try:
-            state["last_run_timestamp"] = ist_iso(now)
-            report["state_persistence"] = {"status": "PENDING", "path": str(self.config.state_file)}
-            report["email_delivery"] = {"status": "PENDING", "attempted": 0, "sent": 0, "pending": 0,
-                                         "smtp_configured": email_is_configured(self.config)}
-            history_raw = state.get("scan_history", [])
-            history = [dict(item) for item in history_raw if isinstance(item, dict)] if isinstance(history_raw, list) else []
-            summary = summarize(report)
-            if history and str(history[-1].get("timestamp", "")) == str(summary.get("timestamp", "")):
-                history[-1] = summary
-            else:
-                history.append(summary)
-            state["scan_history"] = history[-60:]
-            state["last_scan_summary"] = summary
-            state["last_scan_report"] = state_report_copy(report)
-            self.store.save()
-        except Exception as exc:
-            LOGGER.error("STATE PERSISTENCE FAILURE before email delivery: %s", exc)
-            report["state_persistence"] = {"status": "FAILED", "error": str(exc)}
-            report["email_delivery"] = {"status": "NOT_ATTEMPTED_STATE_SAVE_FAILED", "sent": 0, "pending": None}
-            self._append_audit(state, report, now)
-            return json_safe(report)
-
-        delivery = deliver_email_outbox(state, self.config, now)
-        state["last_email_delivery_summary"] = {
-            "timestamp": ist_iso(now), "status": delivery.get("status"),
-            "attempted": delivery.get("attempted", 0), "sent": delivery.get("sent", 0),
-            "pending": delivery.get("pending", 0), "smtp_configured": delivery.get("smtp_configured", False),
-        }
-        report["email_delivery"] = delivery
-        report["state_persistence"] = {"status": "SAVED", "path": str(self.config.state_file)}
-        if delivery.get("status") == "NOT_CONFIGURED":
-            report.setdefault("warnings", []).append("Email secrets are incomplete; notifications remain queued in state for retry.")
-        elif delivery.get("status") in {"RETRY_QUEUED", "PARTIAL"}:
-            report.setdefault("warnings", []).append("One or more emails could not be sent; they remain queued for retry on the next invocation.")
-        # Write the immutable full scan record after delivery status is known. Audit
-        # failure is surfaced in the report and process exit code, but never triggers
-        # a repeat strike-selection email.
-        self._append_audit(state, report, now)
-        try:
-            state["last_scan_report"] = state_report_copy(report)
-            summary = summarize(report)
-            state["last_scan_summary"] = summary
-            history = state.get("scan_history", [])
-            if isinstance(history, list) and history:
-                history[-1] = summary
-                state["scan_history"] = history[-60:]
-            self.store.save()
-        except Exception as exc:
-            LOGGER.error("STATE PERSISTENCE FAILURE after email delivery: %s", exc)
-            report["state_persistence"] = {"status": "FAILED_AFTER_DELIVERY", "error": str(exc)}
-        return json_safe(report)
-
-    def _queue_scan_error(self, state: dict[str, Any], now: datetime, exc: Exception, error_kind: str) -> None:
-        enqueue_email_alert(
-            state, now=now, event_type=error_kind,
-            dedupe_key=f"{now.astimezone(IST).date().isoformat()}|{error_kind}|{type(exc).__name__}",
-            subject=f"NIFTY V81 scanner {error_kind.replace('_', ' ').lower()}",
-            payload={"timestamp": ist_iso(now), "scanner_version": SCANNER_VERSION,
-                     "error_type": type(exc).__name__, "error": str(exc)[:1200],
-                     "note": "No new recommendation was produced by the failed scan."},
-            cooldown_minutes=15,
-        )
+        self.store = AtomicState(config.state_file)
 
     def scan_once(self, now: Optional[datetime] = None) -> dict[str, Any]:
-        current = now or now_ist()
-        if current.tzinfo is None:
-            current = current.replace(tzinfo=IST)
+        current = parse_dt(now) if now is not None else now_ist()
+        if current is None:
+            current = now_ist()
         current = current.astimezone(IST)
-        state = self.store.load(current.date())
-        previous_run = parse_timestamp(state.get("last_run_timestamp") or state.get("last_scan_timestamp"))
-        gap_minutes = ((current - previous_run.astimezone(IST)).total_seconds() / 60.0
-                       if previous_run is not None else None)
-        gap_exceeded = bool(previous_run is not None and previous_run.astimezone(IST).date() == current.date()
-                            and gap_minutes is not None and gap_minutes > 15.0)
-        if gap_exceeded:
-            LOGGER.warning("EXECUTION GAP %.1f minutes exceeds 15-minute hard cap; resetting tactical OI and intrabar baselines.", gap_minutes)
-            state["chain_snapshots"] = []
-            state["gap_reset_pending"] = True
-            state["last_gap_reset_at"] = ist_iso(current)
-            state["last_gap_reset_minutes"] = gap_minutes
-        report: dict[str, Any] = {
-            "scanner_version": SCANNER_VERSION,
-            "timestamp": current.isoformat(),
-            "market_state": "NO_TRADE",
-            "scenario": "UNINITIALIZED",
-            "direction": "NEUTRAL",
-            "confidence_pct": 0.0,
-            "trigger_rationale": "",
-            "selected_option": None,
-            "nifty_levels": {"spot": None, "T1": None, "T2": None, "SL": None, "trailing_SL": None},
-            "indicators": {}, "oi": {}, "futures": {}, "risk": {}, "candidate_diagnostics": [],
-            "audit_inputs": {
-                "capture_version": 1,
-                "capture_scope": "NORMALIZED_FULL_OPTION_CHAIN_QUOTES_AND_RECENT_1M_CANDLES_WHEN_AVAILABLE",
-                "index_quote": None, "option_chain": [], "live_quotes": {},
-                "oi_by_strike": {}, "oi_comparison_snapshot_timestamps": [],
-                "change_oi_fallback_data": None,
-                "historical_seed_info": None, "historical_seed_snapshot": None,
-                "candles_1m": {"nifty_index_recent": [], "nifty_future_recent": [], "option_candidates": {}},
-                "data_coverage": {},
-            },
-            "predictive_detection": {"detected": False, "stage": "NOT_RUN"},
-            "candidate_ranking": {"best_candidate": None, "ranking_basis": "NOT_RUN"},
-            "trade_readiness": {"status": "NOT_EVALUATED", "blocking_reasons": []},
-            "vetoes": [], "state_file": str(self.config.state_file),
-            "execution_gap_minutes": gap_minutes, "execution_gap_reset": gap_exceeded,
-            "execution_mode": "SIGNAL_ONLY_NO_ORDER_PLACEMENT",
-            "signal_ready": False,
-        }
-        # Trading-holiday scheduling is handled by the external Cloudflare Worker.
-        # This scanner retains only weekday/session-hours and live Upstox market-status
-        # safeguards; it no longer calls NSE holiday endpoints or applies a local holiday list.
-        # Explicitly end virtual monitoring after the NSE regular session instead of carrying
-        # yesterday's levels into a new date without telling the user.
-        if current.weekday() < 5 and current.time() >= MARKET_END:
-            trackers = state.get("recommendation_trackers")
-            if not isinstance(trackers, list):
-                legacy_tracker = state.get("recommendation_tracker")
-                trackers = [legacy_tracker] if isinstance(legacy_tracker, dict) else []
-            for tracker in trackers:
-                if not isinstance(tracker, dict) or str(tracker.get("status", "")).upper() != "TRACKING":
-                    continue
-                tracker["status"] = "VIRTUAL_SESSION_ENDED"
-                tracker["completed_at"] = ist_iso(current)
-                tracker["completion_reason"] = "Regular NSE session ended; no overnight signal-level monitoring is performed."
-                event = {
-                    "event_type": "VIRTUAL_SESSION_ENDED", "event_at": ist_iso(current),
-                    "tracker_fingerprint": tracker.get("signal_fingerprint", ""),
-                    "direction": tracker.get("direction"), "scenario": tracker.get("scenario"),
-                    "instrument_key": tracker.get("instrument_key"), "trading_symbol": tracker.get("trading_symbol"),
-                    "option_type": tracker.get("option_type"), "strike": tracker.get("strike"),
-                    "spot": tracker.get("last_nifty_spot"), "option_ltp": tracker.get("last_option_ltp_observed"),
-                    "option_quote_status": tracker.get("last_option_quote_status", "LAST_OBSERVED"),
-                    "T1": tracker.get("target_1"), "T2": tracker.get("target_2"),
-                    "SL": tracker.get("stop_loss"), "trailing_SL": tracker.get("trailing_stop", tracker.get("stop_loss")),
-                    "target_1_hit": tracker.get("target_1_hit", False),
-                    "message": "The regular session has ended. This virtual recommendation is no longer actively monitored; levels are not carried forward overnight.",
-                }
-                self._queue_monitor_events(state, [event], current)
-            if isinstance(state.get("recommendation_trackers"), list):
-                state["recommendation_trackers"] = _compact_persisted_tracker_history(trackers)
-                primary = state.get("recommendation_tracker")
-                if isinstance(primary, dict):
-                    for item in trackers:
-                        if item.get("signal_fingerprint") == primary.get("signal_fingerprint"):
-                            state["recommendation_tracker"] = item
-                            break
-            report["scenario"] = "SESSION_MONITOR_CLOSED"
-            report["market_state"] = "MONITORING_ENDED"
-            report["trigger_rationale"] = "NSE regular session ended; active virtual trackers were finalized and overnight monitoring is disabled."
-            state["last_scan_timestamp"] = current.isoformat()
-            return self._finish(state, report, current)
-
-        allowed, time_reason = market_time_allowed(current)
-        if not allowed:
-            report["trigger_rationale"] = time_reason
-            report["vetoes"] = [time_reason]
-            return self._finish(state, report, current)
+        self.store.load(current.date())
+        state = self.store.data
+        report: dict[str, Any] = {"timestamp": current.isoformat(), "scanner_version": VERSION,
+                                  "execution_mode": "SIGNAL_ONLY_NO_ORDER_PLACEMENT", "signal_ready": False,
+                                  "selected_option": None, "vetoes": [], "events": []}
         try:
-            status = self.client.market_status()
-            report["market_status"] = status
-            if status != "OPEN":
-                report["trigger_rationale"] = f"NSE market status is {status}; live entries suppressed."
-                report["vetoes"] = ["NSE_MARKET_NOT_NORMAL_OPEN"]
-                return self._finish(state, report, current)
-        except ScannerError as exc:
-            report["market_status"] = "UNVERIFIED"
-            report["trigger_rationale"] = f"Market-status API unavailable; fail-closed: {exc}"
-            report["vetoes"] = ["MARKET_STATUS_UNVERIFIED"]
-            self._queue_scan_error(state, current, exc, "MARKET_STATUS_API_ERROR")
-            return self._finish(state, report, current)
-
-        try:
-            # Fetch index quote first: it is the true spot source and is required to choose ATM.
-            index_quotes = self.client.quotes([self.config.nifty_key])
-            index_quote = index_quotes.get(self.config.nifty_key)
-            if index_quote is None or not finite(index_quote.ltp) or index_quote.ltp <= 0:
-                raise ScannerError("Fresh NIFTY index quote unavailable.")
-            spot = index_quote.ltp
-            report["nifty_levels"]["spot"] = spot
-            report["audit_inputs"]["index_quote"] = json_safe(asdict(index_quote))
-            report["audit_inputs"]["data_coverage"]["index_quote"] = "AVAILABLE"
-            if index_quote.freshness != "FRESH":
-                raise ScannerError(f"NIFTY index quote is {index_quote.freshness}; entry triggers suppressed.")
-
-            expiry = self.client.option_expiry(state, current.date())
-            chain = self.client.option_chain(expiry)
-            chain_map = chain_rows_by_strike(chain)
-            report["audit_inputs"]["option_chain"] = audit_option_chain_rows(chain)
-            report["audit_inputs"]["data_coverage"].update({
-                "option_chain": "AVAILABLE",
-                "option_chain_expiry": expiry,
-                "option_chain_strikes": len(chain_map),
-                "option_chain_contract_sides": sum(
-                    bool(parse_option_side(row, side).get("instrument_key"))
-                    for row in chain if isinstance(row, dict) for side in ("CE", "PE")
-                ),
-            })
-            strikes = sorted(chain_map)
-            atm = nearest_strike(spot, strikes)
-            step = infer_strike_step(strikes)
-            # A 09:15 warm-up pass only fetches index/chain and persists an authentic OI
-            # snapshot. It deliberately does not require a first 1m candle to have formed.
-            # This gives the scheduled 09:16 scan a true elapsed-time COI baseline.
-            if current.time() < ENTRY_START:
-                prior = self.store.recent_chain_snapshots(current)
-                warm_oi = analyze_option_oi(chain, prior, current, spot, self.config,
-                                            session_baseline=state.get("session_oi_baseline"),
-                                            session_baseline_source=str(state.get("session_oi_baseline_source", "UNAVAILABLE")))
-                warm_snapshot = make_chain_snapshot(chain, warm_oi, current, expiry)
-                report["audit_inputs"]["oi_by_strike"] = json_safe(warm_oi.rows)
-                report["audit_inputs"]["oi_comparison_snapshot_timestamps"] = [
-                    str(x.get("timestamp", "")) for x in prior if isinstance(x, dict)
-                ]
-                report["audit_inputs"]["data_coverage"]["oi_analysis"] = "AVAILABLE_WARMUP_BASELINE"
-                self.store.append_chain_snapshot(warm_snapshot, current)
-                if not isinstance(state.get("session_oi_baseline"), dict):
-                    state["session_oi_baseline"] = warm_snapshot
-                    state["session_oi_baseline_source"] = "MARKET_OPEN_09_15"
-                report.update({
-                    "scenario": "PREOPENING_BASELINE_WARMUP",
-                    "market_state": "BASELINE_WARMUP",
-                    "direction": "NEUTRAL",
-                    "confidence_pct": 0.0,
-                    "trigger_rationale": "09:15 OI baseline stored for the first tactical COI comparison. No entry is eligible before 09:16 IST.",
-                    "oi": {"expiry": expiry, "atm": atm, "strike_step": step,
-                           "call_total_oi": warm_oi.call_total, "put_total_oi": warm_oi.put_total,
-                           "pcr": warm_oi.pcr, "tactical_available": warm_oi.tactical_available,
-                           "baseline_quality": warm_oi.baseline_quality,
-                           "session_baseline_source": state.get("session_oi_baseline_source", "UNAVAILABLE")},
-                    "vetoes": ["BASELINE_ONLY_BEFORE_09_16"],
-                    "signal_ready": False,
-                })
-                state["last_scan_timestamp"] = current.isoformat()
-                return self._finish(state, report, current)
-            # Always analyze the full returned chain for PCR / walls; the execution universe is constrained later.
-            future = self.client.nearest_future(state, current.date())
-            future_key = future["instrument_key"] if future else ""
-            all_keys = [self.config.nifty_key] + ([future_key] if future_key else [])
-            # Persisted recommendation trackers may have a strike outside the current ATM window.
-            # Include those instruments in this same quote batch so monitoring never relies on chain LTP.
-            active_trackers = state.get("recommendation_trackers")
-            if isinstance(active_trackers, list):
-                all_keys.extend(str(item.get("instrument_key", "")) for item in active_trackers
-                                if isinstance(item, dict) and str(item.get("status", "")).upper() == "TRACKING")
-            elif isinstance(state.get("recommendation_tracker"), dict):
-                old_tracker = state["recommendation_tracker"]
-                if str(old_tracker.get("status", "")).upper() == "TRACKING":
-                    all_keys.append(str(old_tracker.get("instrument_key", "")))
-            for s in (atm, atm - step, atm - 2 * step, atm + step, atm + 2 * step):
-                row = chain_map.get(round(s, 2))
-                if not row:
-                    continue
-                for typ in ("CE", "PE"):
-                    key = parse_option_side(row, typ)["instrument_key"]
-                    if key:
-                        all_keys.append(key)
-            quote_map = self._get_quotes_or_empty(all_keys)
-            report["audit_inputs"]["live_quotes"] = {
-                key: json_safe(asdict(quote)) for key, quote in quote_map.items()
-            }
-            report["audit_inputs"]["data_coverage"]["live_quote_instruments"] = len(quote_map)
-            # Keep initial index quote if bulk quote batch omitted it.
-            quote_map.setdefault(self.config.nifty_key, index_quote)
-            index_quote = quote_map[self.config.nifty_key]
-            futures_quote = quote_map.get(future_key) if future_key else None
-
-            try:
-                index_session = self.client.candles(self.config.nifty_key, interval=1, historical=False)
-            except ScannerError as candle_exc:
-                LOGGER.error("NIFTY 1m candle feed unavailable; new entries suppressed, continuing quote-based tracker monitoring: %s", candle_exc)
-                index_session = pd.DataFrame()
-            index_candles_available = not index_session.empty
-            report["audit_inputs"]["candles_1m"]["nifty_index_recent"] = audit_candle_tail(index_session, 45)
-            report["audit_inputs"]["data_coverage"]["nifty_index_1m_candles"] = "AVAILABLE" if index_candles_available else "UNAVAILABLE"
-            if state.get("gap_reset_pending") and index_candles_available:
-                completed_gap_bars = completed_one_minute_candles(index_session, current)
-                if not completed_gap_bars.empty:
-                    latest_gap_bar = parse_timestamp(completed_gap_bars.iloc[-1].get("timestamp"))
-                    if latest_gap_bar is not None:
-                        trackers_to_reset = state.get("recommendation_trackers", [])
-                        if isinstance(trackers_to_reset, list):
-                            for tracker_to_reset in trackers_to_reset:
-                                if isinstance(tracker_to_reset, dict) and str(tracker_to_reset.get("status", "")).upper() == "TRACKING":
-                                    tracker_to_reset["last_intrabar_bar_timestamp"] = ist_iso(latest_gap_bar)
-                                    tracker_to_reset["gap_baseline_reset_at"] = ist_iso(current)
-                        state["gap_reset_pending"] = False
-                        report["intrabar_baseline_reset_to"] = ist_iso(latest_gap_bar)
-            if not index_candles_available:
-                self._queue_scan_error(
-                    state, current,
-                    ScannerError("NIFTY current-session 1-minute candles unavailable; indicator-based entries are disabled for this scan."),
-                    "INDEX_1M_CANDLE_FEED_UNAVAILABLE",
-                )
-                report["market_data_quality"] = {
-                    "index_1m_candles": "UNAVAILABLE",
-                    "new_entries": "SUPPRESSED",
-                    "existing_virtual_monitoring": "LIVE_SPOT_AND_OPTION_QUOTES_ONLY",
-                }
-            else:
-                report["market_data_quality"] = {"index_1m_candles": "AVAILABLE", "new_entries": "ELIGIBLE_FOR_ANALYSIS"}
-            futures_session = pd.DataFrame()
-            if future_key:
-                try:
-                    futures_session = self.client.candles(future_key, interval=1, historical=False)
-                except ScannerError as exc:
-                    LOGGER.warning("FUTURES 1m candles unavailable; price regime uses live quote snapshots only: %s", exc)
-            report["audit_inputs"]["candles_1m"]["nifty_future_recent"] = audit_candle_tail(futures_session, 45)
-            report["audit_inputs"]["data_coverage"]["nifty_future_1m_candles"] = "AVAILABLE" if not futures_session.empty else "UNAVAILABLE"
-            historical_seed = load_historical_seed(self.client, state, self.config.nifty_key, current)
-            seed_state = state.get("historical_seed") if isinstance(state.get("historical_seed"), dict) else {}
-            seed_blob = json.dumps(json_safe(seed_state), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-            seed_hash = hashlib.sha256(seed_blob.encode("utf-8")).hexdigest()
-            seed_rows = seed_state.get("candles", []) if isinstance(seed_state.get("candles"), list) else []
-            seed_timestamps = [str(row[0]) for row in seed_rows if isinstance(row, (list, tuple)) and row]
-            report["audit_inputs"]["historical_seed_info"] = {
-                "date": seed_state.get("date"), "instrument_key": seed_state.get("instrument_key"),
-                "candle_count": len(seed_rows), "first_timestamp": seed_timestamps[0] if seed_timestamps else None,
-                "last_timestamp": seed_timestamps[-1] if seed_timestamps else None, "sha256": seed_hash,
-                "captured_in_audit_record": seed_hash != str(state.get("audit_historical_seed_hash", "")),
-            }
-            if seed_hash != str(state.get("audit_historical_seed_hash", "")):
-                report["audit_inputs"]["historical_seed_snapshot"] = json_safe(seed_state)
-                state["audit_historical_seed_hash"] = seed_hash
-            if index_candles_available:
-                indicators = build_indicators(current, spot, index_session, futures_session, historical_seed,
-                                              self.config, previous_close=index_quote.previous_close)
-                # Use live NIFTY price as spot; candles calculate the indicators only.
-                indicators = IndicatorSet(**{**asdict(indicators), "spot": spot})
-            else:
-                indicators = unavailable_current_session_indicators(spot, index_quote.previous_close)
-
-            prior_snapshots = self.store.recent_chain_snapshots(current)
-            has_tactical_baseline = has_usable_tactical_snapshot_baseline(chain, prior_snapshots, current)
-            api_change_oi: Optional[dict[str, Any]] = None
-            if self.config.change_oi_fallback_enabled and not has_tactical_baseline:
-                try:
-                    api_change_oi = self.client.change_oi_by_strike(expiry, current.date())
-                    report["audit_inputs"]["change_oi_fallback_data"] = json_safe(api_change_oi)
-                    report["audit_inputs"]["data_coverage"]["change_oi_fallback"] = "AVAILABLE_SESSION_CONTEXT_ONLY"
-                    LOGGER.info("CHANGE-OI FALLBACK: loaded %d strike rows for structural/session context only; not tactical velocity.",
-                                len(api_change_oi.get("by_strike", {})))
-                except ScannerError as change_exc:
-                    report["audit_inputs"]["data_coverage"]["change_oi_fallback"] = "UNAVAILABLE"
-                    report["audit_inputs"]["data_coverage"]["change_oi_fallback_error"] = str(change_exc)[:600]
-                    LOGGER.warning("CHANGE-OI fallback unavailable; OI concentration remains structural-only: %s", change_exc)
-            oi = analyze_option_oi(chain, prior_snapshots, current, spot, self.config,
-                                   session_baseline=state.get("session_oi_baseline"),
-                                   session_baseline_source=str(state.get("session_oi_baseline_source", "UNAVAILABLE")),
-                                   api_change_oi=api_change_oi)
-            report["audit_inputs"]["oi_by_strike"] = json_safe(oi.rows)
-            report["audit_inputs"]["oi_comparison_snapshot_timestamps"] = [
-                str(x.get("timestamp", "")) for x in prior_snapshots if isinstance(x, dict)
-            ]
-            report["audit_inputs"]["data_coverage"]["oi_analysis"] = "AVAILABLE"
-            report["audit_inputs"]["data_coverage"]["change_oi_fallback"] = (
-                "AVAILABLE" if api_change_oi else "NOT_USED_OR_UNAVAILABLE"
-            )
-            future_regime, future_detail = futures_regime_from_snapshots(futures_quote, state, current)
-            if index_candles_available:
-                scenario = detect_scenario(current, indicators, oi, future_regime, self.config)
-            else:
-                scenario = Scenario(
-                    "INDEX_CANDLE_FEED_UNAVAILABLE", "NEUTRAL", 0.0,
-                    "Fresh index/option quotes are available, but the current-session NIFTY 1m candle feed is unavailable. New entries are suppressed; persisted virtual recommendations continue using live spot and option quotes.",
-                    None, "", False, "INDEX_1M_CANDLE_FEED_UNAVAILABLE",
-                    {"new_entries_blocked": True, "spot_quote_fresh": True},
-                )
-            # Mean-reversion exceptions are evaluated before the dynamic low-ADX veto.
-            # A wall reaction only bypasses the veto when both 1m price action and
-            # aligned tactical OI/VWAP confirm it; otherwise the global trend-entry veto wins.
-            sideways_dual_build = bool(finite(indicators.adx) and indicators.adx < 20.0 and oi.both_sides_building)
-            wall_exception_confirmed = False
-            if index_candles_available:
-                wall_reaction = detect_structural_wall_reaction(
-                    index_session, indicators, oi, current, self.config, future_regime=future_regime
-                )
-                if wall_reaction is not None:
-                    preserve_confirmed_boundary_scenario = scenario.state in {
-                        "CONFIRMED_BULLISH_BREAKOUT", "CONFIRMED_BEARISH_BREAKDOWN"
-                    }
-                    if (wall_reaction.state == "STRUCTURAL_BOUNDARY_COMPRESSION"
-                            and not preserve_confirmed_boundary_scenario):
-                        # Repeated unresolved boundary tests must neutralize generic direction.
-                        scenario = wall_reaction
-                        wall_exception_confirmed = False
-                    elif wall_reaction.executable_candidate and not preserve_confirmed_boundary_scenario:
-                        # Confirmed reaction/break outranks generic continuation labels.
-                        scenario = wall_reaction
-                        wall_exception_confirmed = True
-                    elif scenario.direction == "NEUTRAL" and not sideways_dual_build:
-                        scenario = wall_reaction
-            if (sideways_dual_build and scenario.state not in {"EXHAUSTION_REVERSAL", "STRUCTURAL_BOUNDARY_COMPRESSION"}
-                    and not wall_exception_confirmed):
-                scenario = Scenario(
-                    "SIDEWAYS_CHOP", "NEUTRAL", 0.0,
-                    f"Dynamic sideways veto: ADX={indicators.adx:.1f}<20 and aggregate Call and Put OI are simultaneously building. Continuation/breakout entries are blocked; only confirmed 1m wall rejection/bounce or exhaustion-reversal setups bypass this veto.",
-                    None, "", False, "SIDEWAYS_ADX_DUAL_SIDE_OI_BUILD",
-                    {"adx": indicators.adx, "both_sides_building": True,
-                     "wall_exception_confirmed": wall_exception_confirmed},
-                )
-            if index_candles_available:
-                scenario = confirm_wall_breakout_scenario(
-                    scenario, index_session, indicators, oi, future_regime, current, self.config
-                )
-            reversal_watch = detect_reversal_watch(index_session, indicators, oi, current, self.config) if index_candles_available else None
-            price_structure_candidate = detect_price_structure_candidate(
-                index_session, indicators, oi, current, future_regime, self.config
-            ) if index_candles_available else None
-            primary_scenario_before_v68_resolution = scenario.state
-            scenario = resolve_v68_direction(
-                scenario, price_structure_candidate, reversal_watch, indicators, oi, future_regime
-            )
-            # Existing virtual recommendations are monitored independently of fresh-signal routing.
-            tracked = update_recommendation_tracker(
-                state, spot, indicators, oi, current, quote_map,
-                quote_alert_cooldown_minutes=self.config.monitor_quote_alert_cooldown_minutes,
-                index_candles=index_session,
-                intrabar_monitor_lookback=self.config.intrabar_monitor_lookback,
-                stagnation_warning_cooldown_minutes=self.config.stagnation_warning_cooldown_minutes,
-                stagnation_range_pct=self.config.stagnation_range_pct,
-                stagnation_min_progress_pct=self.config.stagnation_min_progress_pct,
-                oi_velocity_trigger=self.config.oi_velocity_trigger,
-                scenario=scenario, future_regime=future_regime, config=self.config,
-            )
-            self._queue_monitor_events(state, tracked.get("events", []), current)
-            # Unified active-signal lifecycle: first close/monitor the prior signal using
-            # its original levels, then allow a confirmed 3m structural failure to seed an
-            # opposite-direction setup in this same scan. Reversal watches alone never do
-            # this; the builder also requires current tactical OI and momentum alignment.
-            reversal_events, reversal_event_source = _derive_structural_reversal_event_from_stop(
-                state, tracked.get("events", []), indicators, oi, future_regime,
-                scenario, current, index_session, self.config,
-            )
-            active_reversal_scenario, active_transition = _build_confirmed_active_reversal_scenario(
-                reversal_events, spot, indicators, oi, future_regime, current, self.config
-            )
-            active_transition["event_derivation"] = reversal_event_source
-            report["active_signal_state_machine"] = active_transition
-            if active_reversal_scenario is not None:
-                scenario = active_reversal_scenario
-            # Apply the direction-flip guard only after monitoring the prior recommendation
-            # on this scan; this prevents a reversal from suppressing a level event that
-            # was already crossed in the latest completed 1m candle. A confirmed active
-            # structural reversal can invalidate any remaining old-direction trackers now.
-            scenario, flip_events = apply_direction_flip_guard(
-                state, scenario, oi, indicators, index_session, current, self.config,
-                future_regime=future_regime,
-            )
-            if flip_events:
-                self._queue_monitor_events(state, flip_events, current)
-                status_by_fp = {
-                    str(item.get("signal_fingerprint", "")): str(item.get("status", ""))
-                    for item in state.get("recommendation_trackers", []) if isinstance(item, dict)
-                }
-                for monitor_row in tracked.get("trackers", []):
-                    if isinstance(monitor_row, dict):
-                        fp = str(monitor_row.get("signal_fingerprint", ""))
-                        if fp in status_by_fp:
-                            monitor_row["status"] = status_by_fp[fp]
-                tracked["active_tracker_count"] = sum(
-                    1 for item in state.get("recommendation_trackers", [])
-                    if isinstance(item, dict) and str(item.get("status", "")).upper() == "TRACKING"
-                )
-
-            active_regime_rows = []
-            for active_tracker in state.get("recommendation_trackers", []):
-                if not isinstance(active_tracker, dict):
-                    continue
-                if str(active_tracker.get("status", "")).upper() != "TRACKING" and not active_tracker.get("regime_assessment"):
-                    continue
-                assessment = active_tracker.get("regime_assessment") if isinstance(active_tracker.get("regime_assessment"), dict) else {}
-                if scenario.features.get("direction_flip_guard"):
-                    assessment["direction_flip_guard_state"] = scenario.features.get("direction_flip_guard")
-                    assessment["flip_confirmation_count"] = scenario.features.get("flip_confirmation_count")
-                    assessment["flip_confirmations_required"] = scenario.features.get("flip_confirmations_required")
-                    active_tracker["regime_assessment"] = assessment
-                active_regime_rows.append({
-                    "signal_fingerprint": active_tracker.get("signal_fingerprint", ""),
-                    "direction": active_tracker.get("direction", ""),
-                    "status": active_tracker.get("status", ""),
-                    "monitoring_data_status": active_tracker.get("monitoring_data_status", "UNAVAILABLE"),
-                    "target_event_integrity": active_tracker.get("target_event_integrity", "UNASSESSED"),
-                    "target_event_integrity_since": active_tracker.get("target_event_integrity_since"),
-                    "monitoring_gap_minutes": active_tracker.get("monitoring_gap_minutes"),
-                    "monitoring_data_note": active_tracker.get("monitoring_data_note", ""),
-                    "regime_assessment": assessment,
-                })
-            report["active_regime_reassessment"] = {
-                "current_resolved_scenario": scenario.state,
-                "current_resolved_direction": scenario.direction,
-                "current_direction_flip_guard": scenario.features.get("direction_flip_guard", "NOT_REQUIRED_OR_CONFIRMED"),
-                "active_signal_count": sum(1 for row in active_regime_rows if str(row.get("status", "")).upper() == "TRACKING"),
-                "signals": active_regime_rows,
-                "policy": "Diagnostic-only context review; no aggregate voting and no exit from regime weakness alone. Structural stops and the established confirmation guard remain authoritative.",
-            }
-
-            # V81 follows an existing recommendation to completion unless a confirmed structural failure authorizes an opposite-side evaluation
-            # one. The active recommendation is monitored above on every scan; a different
-            # contract cannot replace it merely because its rank fluctuates between runs.
-            active_tracker_rows = state.get("recommendation_trackers", [])
-            if not isinstance(active_tracker_rows, list):
-                active_tracker_rows = []
-            active_recommendation_in_progress = any(
-                isinstance(item, dict) and str(item.get("status", "")).upper() == "TRACKING"
-                for item in active_tracker_rows
-            )
-            report["active_recommendation_guard"] = {
-                "active_tracker_count": sum(
-                    1 for item in active_tracker_rows
-                    if isinstance(item, dict) and str(item.get("status", "")).upper() == "TRACKING"
-                ),
-                "new_selection_suppressed": active_recommendation_in_progress,
-                "policy": "Monitor active signal each scan; on confirmed 3m structural failure plus current directional OI/momentum, invalidate old direction and evaluate the opposite setup in the same scan. The opposite contract still requires a valid structural risk plan and all option-quality gates.",
-            }
-
-            # Candidate ranking may remain diagnostic while an unconfirmed setup is watched;
-            # only a resolved structural interaction can pass the final selection route.
-            risk = route_targets_and_stop(scenario, spot, indicators, oi, self.config, now=current) if scenario.direction in {"BULLISH", "BEARISH"} else RiskPlan(False, None, None, None, "", "", "", (), "No directional scenario.")
-            # Preserve the final resolved scenario as the only scenario allowed to
-            # determine readiness. A neutralized reversal watch can be used only to
-            # rank provisional strikes for diagnostics, fixing the V71 direction-loss bug.
-            provisional_reversal_scenario = provisional_reversal_ranking_scenario(
-                scenario, reversal_watch, self.config
-            )
-            ranking_scenario = (scenario if scenario.direction in {"BULLISH", "BEARISH"}
-                                else provisional_reversal_scenario)
-            ranking_risk = risk
-            if ranking_scenario is not None and ranking_scenario is not scenario:
-                ranking_risk = route_targets_and_stop(ranking_scenario, spot, indicators, oi, self.config, now=current)
-            option_candles: dict[str, pd.DataFrame] = {}
-            entry_trigger_ok, entry_trigger_reason = selection_trigger_confirmation(
-                scenario, indicators, oi, self.config, future_regime=future_regime
-            )
-            oi_structure_ok, oi_structure_reason, oi_structure_evidence = directional_oi_structure_confirmation(
-                scenario, indicators, oi, self.config
-            )
-            report["oi_structure_confirmation"] = {
-                "applicable": bool(oi_structure_evidence.get("applicable", False)),
-                "passed": bool(oi_structure_ok), "reason": oi_structure_reason,
-                "evidence": oi_structure_evidence,
-            }
-            _, _, predictive_selection_evidence = predictive_prebreakout_selection_gate(
-                scenario, indicators, oi, risk, current, future_regime, self.config
-            )
-            # Structural interaction/confirmed break is the single route to selection.
-            # Predictive evidence remains diagnostic-only; it cannot bypass this gate.
-            routing_scenario = scenario
-            route_market_confirmed = bool(
-                scenario.direction in {"BULLISH", "BEARISH"}
-                and scenario.executable_candidate
-                and not scenario.hard_veto and risk.valid
-                and entry_trigger_ok and not active_recommendation_in_progress
-            )
-            provisional_rank_allowed = bool(
-                ranking_scenario is not None
-                and ranking_scenario.direction in {"BULLISH", "BEARISH"}
-                and not ranking_scenario.hard_veto
-                and ranking_scenario.confidence >= self.config.watch_alert_min_confidence
-                and not route_market_confirmed
-                and not active_recommendation_in_progress
-            )
-            move_scenario = scenario if route_market_confirmed else (ranking_scenario or scenario)
-            move_risk = risk if route_market_confirmed else ranking_risk
-            expected_move_points, expected_move_source = expected_underlying_move_for_ranking(
-                move_scenario, spot, indicators, oi, move_risk
-            )
-            if route_market_confirmed or provisional_rank_allowed:
-                strike_scenario = scenario if route_market_confirmed else (ranking_scenario or scenario)
-                _, permitted_candles = allowed_strikes(spot, strikes, strike_scenario.direction, current, strike_scenario, indicators)
-                option_side = "CE" if strike_scenario.direction == "BULLISH" else "PE"
-                for strike_value, _moneyness in permitted_candles:
-                    option_row = chain_map.get(round(strike_value, 2))
-                    if not isinstance(option_row, dict):
-                        continue
-                    option_key = parse_option_side(option_row, option_side)["instrument_key"]
-                    if not option_key:
-                        continue
-                    try:
-                        option_candles[option_key] = self.client.candles(option_key, interval=1, historical=False)
-                    except ScannerError as exc:
-                        option_candles[option_key] = pd.DataFrame()
-                        LOGGER.warning("OPTION 1m candle unavailable key=%s: %s", option_key, exc)
-                    report["audit_inputs"]["candles_1m"]["option_candidates"][option_key] = {
-                        "candles": audit_candle_tail(option_candles[option_key], 30),
-                        "candle_status": "AVAILABLE" if not option_candles[option_key].empty else "UNAVAILABLE",
-                    }
-
+            in_market_clock = MARKET_OPEN <= current.time() < MARKET_CLOSE
+            if not in_market_clock:
+                report.update({"market_state": "OUTSIDE_MARKET", "scenario": "MONITOR_ONLY", "direction": "NEUTRAL",
+                               "vetoes": ["OUTSIDE_NSE_MARKET_HOURS"]})
+                return self._finish(report, state)
+            market_status = self.client.market_status()
+            report["market_status"] = market_status
+            if market_status != "OPEN":
+                report.update({"market_state": "MARKET_CLOSED", "scenario": "MONITOR_ONLY", "direction": "NEUTRAL",
+                               "vetoes": [f"UPSTOX_MARKET_STATUS_{market_status}"]})
+                return self._finish(report, state)
+            expiry = self.client.expiry(state, current.date())
+            chain = self.client.chain(expiry)
+            rows_by_strike, contracts = chain_to_contracts(chain, expiry)
+            strikes = sorted(rows_by_strike)
+            strike_step = self.config.strike_step
+            diffs = [b-a for a, b in zip(strikes, strikes[1:]) if 1 <= b-a <= 100]
+            if diffs:
+                # User's NIFTY contract grid is 50 points; only accept observed spacing consistent with that grid.
+                observed = float(np.median(diffs))
+                strike_step = 50.0 if abs(observed-50.0) <= 1.0 else observed
+            index_quote_map = self.client.quotes([self.config.nifty_key])
+            index_quote = index_quote_map.get(self.config.nifty_key)
+            spot = index_quote.ltp if index_quote and finite(index_quote.ltp) and index_quote.ltp > 0 else float("nan")
+            if not finite(spot):
+                raise ScannerError("Fresh NIFTY index LTP was not returned; refusing a stale or inferred spot.")
+            if not index_quote or index_quote.freshness != "FRESH" or not finite(index_quote.age_seconds) or not (-5 <= index_quote.age_seconds <= self.config.max_quote_age):
+                raise ScannerError("NIFTY index quote is stale or its timestamp cannot be verified; refusing to build levels from it.")
+            frame_raw = self.client.candles(self.config.nifty_key, 1)
+            frame = completed_candles(frame_raw, current)
+            if len(frame) < 8:
+                raise ScannerError(f"Only {len(frame)} completed NIFTY one-minute candles are available; at least 8 are required.")
+            latest_candle_time = frame["timestamp"].iloc[-1].to_pydatetime().astimezone(IST)
+            candle_age_seconds = (current - latest_candle_time).total_seconds()
+            if candle_age_seconds < -5 or candle_age_seconds > self.config.max_candle_age:
+                raise ScannerError(f"Latest completed NIFTY candle is stale or future-dated (age={candle_age_seconds:.1f}s; limit={self.config.max_candle_age:.1f}s).")
+            indicators = indicator_set(frame_raw, spot, current)
+            snapshots = state.get("chain_snapshots", []) if isinstance(state.get("chain_snapshots", []), list) else []
+            oi = analyze_oi(chain, snapshots, spot, expiry, current, strike_step)
+            levels = make_structure_levels(frame_raw, indicators, oi, strike_step, current)
+            signal, signal_diagnostics = score_market_signal(frame_raw, indicators, oi, levels, current, self.config.min_signal_score, strike_step)
+            risk = calculate_risk_plan(signal, levels, indicators, self.config.min_t1_rr)
+            events = update_active_signal(state, frame_raw, current)
+            report["events"].extend(events)
+            if events:
+                event_tracker = dict(state.get("active_signal") or {})
+                report["_pending_event_notifications"] = [{**event, "_tracker": event_tracker.copy()} for event in events]
+            direction = signal.direction
             report.update({
-                "scenario": scenario.state,
-                "v68_direction_resolution": {"primary_scenario_before_resolution": primary_scenario_before_v68_resolution, "price_structure_candidate": price_structure_candidate.state if price_structure_candidate else None, "price_structure_candidate_direction": price_structure_candidate.direction if price_structure_candidate else None, "reversal_watch": reversal_watch.state if reversal_watch else None, "resolved_scenario": scenario.state, "resolved_direction": scenario.direction, "price_led_route": bool(isinstance(scenario.features, Mapping) and scenario.features.get("setup_route") == "PRICE_STRUCTURE_CONTINUATION")},
-                "market_state": scenario.state if scenario.direction != "NEUTRAL" else "SIDEWAYS" if scenario.state.startswith("SIDEWAYS") else "WATCH",
-                "direction": scenario.direction,
-                "confidence_pct": round(scenario.confidence, 1),
-                "trigger_rationale": scenario.trigger_reason,
-                "future_contract": future,
-                "futures": {"quote_freshness": futures_quote.freshness if futures_quote else "UNAVAILABLE",
-                            "quote_age_seconds": futures_quote.age_seconds if futures_quote else None,
-                            "regime": future_regime, **future_detail},
-                "indicators": {
-                    "spot": spot, "vwap": indicators.vwap, "vwap_slope": indicators.vwap_slope,
-                    "stddev": indicators.stddev, "upper_1sd": indicators.upper_1sd,
-                    "lower_1sd": indicators.lower_1sd, "upper_2sd": indicators.upper_2sd,
-                    "lower_2sd": indicators.lower_2sd, "atr_1m": indicators.atr, "atr_5m": indicators.atr_5m,
-                    "adx": indicators.adx, "plus_di": indicators.plus_di, "minus_di": indicators.minus_di,
-                    "rsi": indicators.rsi, "momentum_1m_pct": indicators.momentum_1m_pct,
-                    "momentum_3m_pct": indicators.momentum_3m_pct,
-                    "compressed": indicators.compressed, "recent_range": indicators.recent_range,
-                    "prior_range": indicators.prior_range, "swing_low_1m": indicators.swing_low,
-                    "swing_high_1m": indicators.swing_high,
-                    "swing_low_5m": indicators.swing_low_5m, "swing_high_5m": indicators.swing_high_5m,
-                    "session_high": indicators.session_high, "session_low": indicators.session_low,
-                    "vwap_volume_source": indicators.volume_source,
-                    "seeded_from_history": indicators.indicators_seeded, "one_minute_bars": indicators.candles_count,
-                },
-                "oi": {
-                    "expiry": expiry, "atm": atm, "strike_step": step,
-                    "call_total_oi": oi.call_total, "put_total_oi": oi.put_total, "pcr": oi.pcr,
-                    "pcr_previous": oi.pcr_previous, "pcr_spiking": oi.pcr_spiking,
-                    "call_coi_tactical_pct": oi.call_coi_pct * 100.0 if finite(oi.call_coi_pct) else None,
-                    "put_coi_tactical_pct": oi.put_coi_pct * 100.0 if finite(oi.put_coi_pct) else None,
-                    "call_coi_1m_pct": oi.call_coi_1m_pct * 100.0 if finite(oi.call_coi_1m_pct) else None,
-                    "put_coi_1m_pct": oi.put_coi_1m_pct * 100.0 if finite(oi.put_coi_1m_pct) else None,
-                    "call_coi_3m_pct": oi.call_coi_3m_pct * 100.0 if finite(oi.call_coi_3m_pct) else None,
-                    "put_coi_3m_pct": oi.put_coi_3m_pct * 100.0 if finite(oi.put_coi_3m_pct) else None,
-                    "call_coi_5m_pct": oi.call_coi_5m_pct * 100.0 if finite(oi.call_coi_5m_pct) else None,
-                    "put_coi_5m_pct": oi.put_coi_5m_pct * 100.0 if finite(oi.put_coi_5m_pct) else None,
-                    "call_coi_session_pct": oi.session_call_coi_pct * 100.0 if finite(oi.session_call_coi_pct) else None,
-                    "put_coi_session_pct": oi.session_put_coi_pct * 100.0 if finite(oi.session_put_coi_pct) else None,
-                    "tactical_source": oi.tactical_source, "tactical_available": oi.tactical_available,
-                    "call_coi_acceleration_pct": oi.call_coi_acceleration_pct * 100.0 if finite(oi.call_coi_acceleration_pct) else None,
-                    "put_coi_acceleration_pct": oi.put_coi_acceleration_pct * 100.0 if finite(oi.put_coi_acceleration_pct) else None,
-                    "acceleration_available": oi.acceleration_available,
-                    "baseline_quality": oi.baseline_quality,
-                    "tactical_age_minutes": oi.tactical_age_minutes,
-                    "session_baseline_source": oi.session_baseline_source,
-                    "wall_change_source": oi.wall_change_source,
-                    "change_oi_fallback_available": oi.change_oi_fallback_available,
-                    "change_oi_fallback_interval_days": oi.change_oi_fallback_interval_days,
-                    "pin_strikes": oi.pin_strikes,
-                    "both_sides_building": oi.both_sides_building, "reasons": oi.reasons,
-                    "resistance_walls": [asdict(w) for w in oi.walls_resistance[:8]],
-                    "support_walls": [asdict(w) for w in oi.walls_support[:8]],
-                },
-                "risk": asdict(risk),
-                "recommendation_tracker": {k: v for k, v in tracked.items() if k not in {"events", "trackers"}},
-                "monitoring": {
-                    "active_and_recent_trackers": tracked.get("trackers", []),
-                    "events_this_scan": tracked.get("events", []),
-                    "note": "NIFTY structural levels are authoritative; option LTP/freshness is shown alongside them. Virtual alerts do not confirm an actual position.",
-                },
-                "wall_level": scenario.wall_level,
-                "wall_state": scenario.wall_state,
-                "scenario_features": scenario.features,
+                "market_state": "DIRECTIONAL_SETUP" if direction != "NEUTRAL" else "WATCH",
+                "scenario": signal.setup, "direction": direction, "confidence_pct": signal.confidence_pct,
+                "trigger": signal.trigger, "signal_evidence": list(signal.evidence), "signal_blockers": list(signal.blockers),
+                "indicators": safe_json(asdict(indicators)), "structure_levels": [safe_json(asdict(l)) for l in levels],
+                "oi_analysis": {k: safe_json(v) for k, v in oi.items() if k != "snapshot"},
+                "signal_diagnostics": signal_diagnostics, "risk_plan": safe_json(asdict(risk)),
+                "active_signal": safe_json(state.get("active_signal")), "expiry": expiry,
+                "market_data_quality": {"index_quote_freshness": index_quote.freshness if index_quote else "UNAVAILABLE",
+                                        "index_quote_age_seconds": index_quote.age_seconds if index_quote else None,
+                                        "completed_1m_candles": len(frame), "last_completed_candle_timestamp": latest_candle_time.isoformat(),
+                                        "last_completed_candle_age_seconds": round(candle_age_seconds, 2),
+                                        "volume_source": indicators.volume_source,
+                                        "same_session_tactical_oi_available": oi["tactical_available"]},
             })
-            if reversal_watch is not None and (scenario.hard_veto is not None or scenario.direction != reversal_watch.direction or scenario.direction == "NEUTRAL"):
-                # Reversal watches remain internal diagnostics only; V81 never emails watch-only alerts.
-                watch_payload = {
-                    "timestamp": current.isoformat(), "scenario": reversal_watch.state,
-                    "direction": reversal_watch.direction, "confidence_pct": round(reversal_watch.confidence, 1),
-                    "trigger_reason": reversal_watch.trigger_reason,
-                    "nifty_spot": spot, "vwap": indicators.vwap, "adx": indicators.adx,
-                    "rsi": indicators.rsi, "momentum_3m_pct": indicators.momentum_3m_pct,
-                    "plus_di": indicators.plus_di, "minus_di": indicators.minus_di,
-                    "tactical_coi_available": oi.tactical_available, "tactical_coi_source": oi.tactical_source,
-                    "call_coi_tactical_pct": oi.call_coi_pct * 100.0 if finite(oi.call_coi_pct) else None,
-                    "put_coi_tactical_pct": oi.put_coi_pct * 100.0 if finite(oi.put_coi_pct) else None,
-                    "pin_strikes_local": reversal_watch.features.get("pin_strikes", []),
-                    "current_scenario": scenario.state, "current_hard_veto": scenario.hard_veto,
-                    "note": "INTERNAL REVERSAL WATCH ONLY. No email is sent until a structural trigger becomes trade-ready or an active signal is invalidated by confirmed opposite structure.",
-                }
-                report["reversal_watch"] = watch_payload
+            if current.time() < ENTRY_OPEN:
+                report["vetoes"].append("BEFORE_ENTRY_WINDOW")
+            elif current.time() >= ENTRY_CUTOFF:
+                report["vetoes"].append("ENTRY_CUTOFF_15_15_MONITOR_ONLY")
+            elif direction == "NEUTRAL":
+                report["vetoes"].append("NO_DIRECTIONAL_STRUCTURAL_SETUP")
+            elif signal.score < self.config.min_signal_score:
+                report["vetoes"].append("MARKET_SETUP_SCORE_BELOW_THRESHOLD")
+            elif not risk.valid:
+                report["vetoes"].append(f"STRUCTURAL_RISK_PLAN_INVALID:{risk.reason}")
             else:
-                report["reversal_watch"] = None
-
-            # Maintain watch lifecycle as diagnostic state only; it never creates email.
-            watch_invalidation = reconcile_directional_watch(
-                state, scenario, reversal_watch, indicators, oi, index_session, current, self.config
-            )
-            if watch_invalidation is not None:
-                LOGGER.info("INTERNAL DIRECTIONAL WATCH INVALIDATED: %s", watch_invalidation.get("invalidation_type", "UNKNOWN"))
-            report["directional_watch_lifecycle"] = {
-                "active_watch": state.get("active_directional_watch"),
-                "last_invalidation": watch_invalidation,
-                "policy": {
-                    "neutral_scans_to_invalidate": self.config.watch_neutral_invalidation_scans,
-                    "opposite_scans_to_invalidate": self.config.watch_opposite_invalidation_scans,
-                    "max_age_minutes": self.config.watch_max_age_minutes,
-                    "strong_tactical_opposite_flow_overrides": True,
-                },
-            }
-
-            # STAGE 1 — directional market prediction is reported before any option-quality gate.
-            report["predictive_detection"] = {
-                "detected": scenario.direction in {"BULLISH", "BEARISH"},
-                "stage": ("ENTRY_TRIGGER_CONFIRMED" if entry_trigger_ok
-                          else "WAITING_FOR_STRUCTURAL_INTERACTION")
-                         if scenario.direction in {"BULLISH", "BEARISH"} else "NO_DIRECTIONAL_SETUP",
-                "scenario": scenario.state, "direction": scenario.direction,
-                "confidence_pct": round(scenario.confidence, 1),
-                "trigger_rationale": scenario.trigger_reason,
-                "execution_candidate": bool(route_market_confirmed),
-                "entry_trigger_confirmed": entry_trigger_ok,
-                "entry_trigger_reason": entry_trigger_reason,
-                "selection_mode": "CONFIRMED_STRUCTURAL_INTERACTION" if route_market_confirmed else "WATCH_ONLY",
-                "predictive_prebreakout_gate": predictive_selection_evidence,
-                "provisional_ranking_allowed": bool(provisional_rank_allowed),
-                "provisional_ranking_direction": (ranking_scenario.direction if provisional_rank_allowed and scenario.direction == "NEUTRAL" and ranking_scenario is not None else None),
-                "provisional_ranking_confidence_pct": (round(ranking_scenario.confidence, 1) if provisional_rank_allowed and scenario.direction == "NEUTRAL" and ranking_scenario is not None else None),
-                "features": scenario.features,
-                "confidence_type": "RULE_BASED_HEURISTIC_NOT_CALIBRATED_PROBABILITY",
-            }
-
-            prior_tracker = state.get("recommendation_tracker")
-            preferred_key = None
-            if (isinstance(prior_tracker, dict)
-                    and str(prior_tracker.get("status", "")).upper() == "TRACKING"
-                    and str(prior_tracker.get("direction", "")).upper() == scenario.direction
-                    and str(prior_tracker.get("created_at", ""))[:10] == current.date().isoformat()):
-                preferred_key = str(prior_tracker.get("instrument_key", "")) or None
-            # STAGE 2 — route only a market-confirmed setup with a valid structural plan.
-            # If a contract fails any option gate, its row remains in diagnostics but it
-            # is not returned as a selected candidate.
-            provisional_candidate: Optional[OptionContract] = None
-            if route_market_confirmed:
-                candidate, diagnostics = select_option_contract(
-                    chain, spot, routing_scenario, current, indicators, oi, quote_map, option_candles,
-                    expiry, self.config, preferred_instrument_key=preferred_key, provisional=False,
-                    expected_underlying_move=expected_move_points,
-                )
-            else:
-                candidate = None
-                if provisional_rank_allowed:
-                    provisional_candidate, diagnostics = select_option_contract(
-                        chain, spot, (ranking_scenario or scenario), current, indicators, oi, quote_map, option_candles,
-                        expiry, self.config, preferred_instrument_key=None, provisional=True,
-                        expected_underlying_move=expected_move_points,
-                    )
-                    route_reason = ("PROVISIONAL_STRIKE_RANKING_ONLY; "
-                                   f"final selection held: {entry_trigger_reason}; no email or tracker created")
-                    diagnostics.insert(0, {
-                        "route_status": "PROVISIONAL_RANKING_ONLY",
-                        "execution_eligible": False,
-                        "selected_for_execution": False,
-                        "provisional_only": True,
-                        "vetoes": [route_reason],
-                    })
+                allowed, allow_reason = can_issue_signal(state, signal, current, self.config.reentry_cooldown_minutes)
+                report["active_signal_gate"] = {"allowed": allowed, "reason": allow_reason}
+                if not allowed:
+                    report["vetoes"].append(allow_reason)
                 else:
-                    if active_recommendation_in_progress:
-                        route_reason = "ACTIVE_RECOMMENDATION_IN_PROGRESS_NEW_SELECTION_SUPPRESSED"
-                    elif scenario.direction not in {"BULLISH", "BEARISH"}:
-                        route_reason = "NO_DIRECTIONAL_SETUP_STRIKE_ROUTING_SKIPPED"
-                    elif scenario.hard_veto:
-                        route_reason = f"HARD_VETO_STRIKE_ROUTING_SKIPPED:{scenario.hard_veto}"
-                    elif not scenario.executable_candidate:
-                        route_reason = "MARKET_SCENARIO_NOT_CONFIRMED_STRIKE_ROUTING_SKIPPED"
-                    elif not risk.valid:
-                        route_reason = "STRUCTURAL_RISK_PLAN_INVALID_STRIKE_ROUTING_SKIPPED"
-                    elif not entry_trigger_ok:
-                        route_reason = f"ENTRY_TRIGGER_BLOCKED:{entry_trigger_reason}"
+                    candidates = _candidate_strikes(spot, contracts, direction, strike_step)
+                    candidate_keys = [c.instrument_key for c in candidates]
+                    option_quotes = self.client.quotes(candidate_keys)
+                    # Use a near-ATM delta preference for early reversals; confirmed bounce/breakout
+                    # structures prefer a higher-delta contract that tracks the underlying more directly.
+                    target_delta = 0.55 if signal.setup in {"EARLY_RESISTANCE_REJECTION", "EARLY_SUPPORT_RECLAIM"} else 0.62
+                    selected, ranked = score_contracts(candidates, option_quotes, spot, direction, oi, self.config, target_delta)
+                    report["candidate_diagnostics"] = ranked
+                    if not selected:
+                        report["vetoes"].append("NO_NEARBY_CONTRACT_PASSED_QUOTE_SPREAD_VOLUME_AND_DELTA_GATES")
                     else:
-                        route_reason = "STRIKE_ROUTING_NOT_PERMITTED"
-                    diagnostics = [{"route_status": "SKIPPED", "execution_eligible": False,
-                                    "selected_for_execution": False, "provisional_only": False,
-                                    "vetoes": [route_reason]}]
-            report["candidate_diagnostics"] = diagnostics
-
-            # Provisional rows are not final-selection failures. Keep them in the full
-            # report, but give readiness only a routing-status diagnostic until the
-            # market trigger is confirmed; otherwise a valid provisional candidate can
-            # incorrectly create a misleading NO_OPTION_PASSED_ALL_OPTION_GATES blocker.
-            readiness_diagnostics = diagnostics
-            if provisional_rank_allowed and not route_market_confirmed:
-                readiness_diagnostics = [{
-                    "route_status": "PROVISIONAL_RANKING_ONLY",
-                    "execution_eligible": False,
-                    "selected_for_execution": False,
-                    "provisional_only": True,
-                    "vetoes": ["FINAL_SELECTION_NOT_ATTEMPTED_BEFORE_MARKET_CONFIRMATION"],
-                }]
-
-            # STAGE 3 — one authoritative, testable readiness decision.
-            readiness = evaluate_trade_readiness(current, routing_scenario, indicators, oi, risk,
-                                                 index_quote, future_regime, candidate, self.config,
-                                                 candidate_diagnostics=readiness_diagnostics)
-            readiness["selection_mode"] = "CONFIRMED_STRUCTURAL_INTERACTION" if route_market_confirmed else "WATCH_ONLY"
-            readiness["predictive_prebreakout_gate"] = predictive_selection_evidence
-            if not entry_trigger_ok:
-                readiness["blocking_reasons"] = list(dict.fromkeys(
-                    list(readiness.get("blocking_reasons", [])) + [f"ENTRY_TRIGGER_BLOCKED:{entry_trigger_reason}"]
-                ))
-                readiness["ready"] = False
-                readiness["status"] = "BLOCKED"
-            if candidate is not None and scenario.direction in {"BULLISH", "BEARISH"}:
-                base_fingerprint = hashlib.sha256(
-                    f"{current.date()}|{scenario.direction}|{candidate.instrument_key}|{candidate.strike}".encode()
-                ).hexdigest()
-                completed_statuses = {"VIRTUAL_STOP_LOSS_REACHED", "VIRTUAL_TRAILING_STOP_REACHED", "VIRTUAL_T2_REACHED", "INVALIDATED_STATE", "VIRTUAL_SESSION_ENDED", "VIRTUAL_MONITOR_CAP_REACHED"}
-                matching_terminal = next((item for item in reversed(state.get("recommendation_trackers", []))
-                    if isinstance(item, dict)
-                    and str(item.get("base_signal_fingerprint", item.get("signal_fingerprint", ""))) == base_fingerprint
-                    and str(item.get("status", "")).upper() in completed_statuses), None)
-                if matching_terminal is not None:
-                    ended = parse_timestamp(matching_terminal.get("completed_at"))
-                    if ended is None or (current - ended).total_seconds() < self.config.reentry_cooldown_minutes * 60:
-                        readiness["ready"] = False
-                        readiness["status"] = "BLOCKED"
-                        readiness["blocking_reasons"] = list(dict.fromkeys(
-                            list(readiness.get("blocking_reasons", [])) + ["SAME_CONTRACT_REENTRY_COOLDOWN"]
-                        ))
-            report["trade_readiness"] = readiness
-            selected_is_ready = bool(readiness.get("ready") and candidate is not None and risk.valid)
-            for diagnostic in diagnostics:
-                diagnostic["selected_for_execution"] = bool(
-                    selected_is_ready
-                    and diagnostic.get("instrument_key") == candidate.instrument_key
-                    and diagnostic.get("strike") == candidate.strike
-                )
-            review_row = next((item for item in diagnostics if item.get("best_candidate_for_review")), None)
-            provisional_report = candidate_report(provisional_candidate)
-            if provisional_report is not None:
-                provisional_report["provisional_only"] = True
-                provisional_report["selection_status"] = "WATCH_ONLY_NOT_SELECTED"
-                provisional_report["reason"] = "Early strike ranking for a directional watch; final market/option/risk gates have not all passed."
-            report["candidate_ranking"] = {
-                "best_candidate": candidate_report(candidate) if selected_is_ready else None,
-                "provisional_candidate": provisional_report if not selected_is_ready else None,
-                "provisional_only": bool(provisional_report is not None and not selected_is_ready),
-                "best_candidate_for_review": review_row,
-                "ranking_basis": (candidate.score_basis if candidate and selected_is_ready else
-                                  "PROVISIONAL_RANKING_ONLY" if provisional_candidate is not None else
-                                  "DIAGNOSTICS_ONLY_OR_ROUTING_SKIPPED"),
-                "expected_underlying_move_points": expected_move_points if finite(expected_move_points) else None,
-                "expected_move_source": expected_move_source,
-                "option_move_estimate_method": "DELTA_GAMMA_ESTIMATE_EXCLUDES_IV_CHANGE_AND_TIME_DECAY",
-                "option_gate_eligible_count": sum(1 for item in diagnostics if item.get("execution_eligible")),
-                "candidate_count": sum(1 for item in diagnostics if item.get("strike") is not None),
-                "note": "Provisional candidates are diagnostics only and never create trackers or emails. New selections require a confirmed repeated support bounce, resistance rejection, or a tested boundary broken by two completed 1-minute closes with aligned market context. Delta/gamma estimates exclude IV change and time decay.",
-            }
-            active_watch = state.get("active_directional_watch")
-            if isinstance(active_watch, dict) and str(active_watch.get("direction", "")).upper() == scenario.direction:
-                # The directional watch is market-structure state only; never store a strike here.
-                active_watch.pop("best_candidate", None)
-                active_watch["readiness_blockers"] = list(readiness.get("blocking_reasons", []))
-                active_watch["last_candidate_observed_at"] = current.isoformat()
-                active_watch["last_nifty_spot"] = spot
-                active_watch["last_vwap"] = indicators.vwap
-                active_watch["last_adx"] = indicators.adx
-                active_watch["last_tactical_coi_source"] = oi.tactical_source
-                active_watch["last_tactical_coi_available"] = oi.tactical_available
-            hard_vetoes = list(readiness["blocking_reasons"])
-            if (scenario.direction in {"BULLISH", "BEARISH"} and not oi_structure_ok
-                    and oi_structure_evidence.get("applicable") and oi_structure_reason
-                    and not any(str(item).startswith("OI_STRUCTURE_GATE:") for item in hard_vetoes)):
-                hard_vetoes.append(f"OI_STRUCTURE_GATE:{oi_structure_reason}")
-            report["vetoes"] = hard_vetoes
-            current_chain_snapshot = make_chain_snapshot(chain, oi, current, expiry)
-            self.store.append_chain_snapshot(current_chain_snapshot, current)
-            if not isinstance(state.get("session_oi_baseline"), dict):
-                state["session_oi_baseline"] = current_chain_snapshot
-                state["session_oi_baseline_source"] = "FIRST_OBSERVATION_AFTER_SCANNER_START_NOT_MARKET_OPEN"
-            append_futures_snapshot(state, futures_quote, current)
-            state["market_history"] = (state.get("market_history", []) + [{
-                "timestamp": ist_iso(current), "spot": spot, "direction": scenario.direction,
-                "scenario": scenario.state, "confidence_pct": scenario.confidence,
-            }])[-120:]
-            if readiness["ready"] and candidate and risk.valid:
-                signal_payload = {
-                    "timestamp": current.isoformat(), "scenario": scenario.state, "direction": scenario.direction,
-                    "confidence_pct": round(scenario.confidence, 1), "trigger_reason": scenario.trigger_reason,
-                    "entry_trigger_confirmation": entry_trigger_reason,
-                    "selection_mode": readiness.get("selection_mode", "CONFIRMED_STRUCTURAL_INTERACTION"),
-                    "option_type": candidate.option_type, "strike": candidate.strike,
-                    "trading_symbol": candidate.trading_symbol, "instrument_key": candidate.instrument_key,
-                    "delta": candidate.delta, "delta_source": candidate.delta_source,
-                    "option_ltp": candidate.ltp, "option_premium_vwap": candidate.premium_vwap,
-                    "score": round(candidate.total_score, 4), "flow_score": round(candidate.flow_score, 4),
-                    "vwap_lift_score": round(candidate.vwap_lift_score, 4), "coi_score": round(candidate.coi_score, 4),
-                    "nifty_spot": spot, "T1": risk.target_1, "T2": risk.target_2,
-                    "SL": risk.stop_loss, "trailing_SL": risk.stop_loss,
-                    "SL_source": risk.stop_source, "T1_source": risk.target_1_source,
-                    "T2_source": risk.target_2_source, "skipped_weak_walls": list(risk.skipped_weak_walls),
-                    "skipped_unreachable_walls": list(risk.skipped_unreachable_walls),
-                    "t1_distance_points": risk.reward_points, "sl_distance_points": risk.risk_points,
-                    "reward_risk_ratio": risk.reward_risk_ratio,
-                    "max_t1_distance_points": risk.max_t1_distance_points,
-                    "remaining_session_minutes": risk.remaining_session_minutes,
-                    "stop_atr_points": risk.stop_atr_points, "stop_atr_source": risk.stop_atr_source,
-                    "atr_1m": indicators.atr, "atr_5m": indicators.atr_5m,
-                    "atr_buffer_multiple": dynamic_atr_buffer_multiple(indicators),
-                    "invalidation": f"Invalidate if NIFTY crosses {risk.stop_loss:.2f} against the position or the supporting/defending OI structure flips materially; this is a signal plan, not an order.",
-                    "vwap": indicators.vwap, "adx": indicators.adx, "rsi": indicators.rsi,
-                    "pcr": oi.pcr, "tactical_coi_source": oi.tactical_source,
-                    "call_coi_acceleration_pct": oi.call_coi_acceleration_pct * 100.0 if finite(oi.call_coi_acceleration_pct) else None,
-                    "put_coi_acceleration_pct": oi.put_coi_acceleration_pct * 100.0 if finite(oi.put_coi_acceleration_pct) else None,
-                    "coi_acceleration_available": oi.acceleration_available,
-                }
-                report["market_state"] = scenario.state
-                report["selected_option"] = signal_payload
-                report["nifty_levels"] = {"spot": spot, "T1": risk.target_1, "T2": risk.target_2,
-                                          "SL": risk.stop_loss, "trailing_SL": risk.stop_loss}
-                report["vetoes"] = []
-                report["signal_ready"] = True
-                fingerprint = hashlib.sha256(f"{current.date()}|{scenario.direction}|{candidate.instrument_key}|{candidate.strike}".encode()).hexdigest()
-                # Preserve T1/trailing-stop progress for a repeated identical signal;
-                # a genuinely changed direction/scenario/contract gets a fresh tracker.
-                registration = register_recommendation_tracker(
-                    state, signal_payload, fingerprint, current, self.config.max_active_trackers,
-                    self.config.reentry_cooldown_minutes,
-                )
-                fingerprint = str(registration.get("signal_fingerprint", fingerprint))
-                # Reconcile the first scan's report and SIGNAL_READY email with the tracker
-                # just registered. The earlier active-monitor pass happens before selection,
-                # so a newly created tracker would otherwise be missing from active regime
-                # telemetry and its first email would incorrectly show no context assessment.
-                registered_tracker = next((item for item in reversed(state.get("recommendation_trackers", []))
-                                            if isinstance(item, dict)
-                                            and str(item.get("signal_fingerprint", "")) == fingerprint
-                                            and str(item.get("status", "")).upper() == "TRACKING"), None)
-                if registered_tracker is not None:
-                    active_assessment = _assess_active_signal_regime(
-                        registered_tracker, scenario, indicators, oi, future_regime,
-                        self.config, current, None,
-                    )
-                    initial_monitor_note = (
-                        "Signal registered on this scan; completed-candle continuity and level crossings "
-                        "will be assessed on the next monitoring scan. This first email is not a claim "
-                        "that post-selection target/stop chronology has been monitored."
-                    )
-                    registered_tracker["monitoring_data_status"] = "AWAITING_FIRST_MONITOR_SCAN"
-                    registered_tracker.setdefault("target_event_integrity", "UNASSESSED")
-                    registered_tracker["monitoring_data_note"] = initial_monitor_note
-                    signal_payload["active_regime_assessment"] = active_assessment
-                    signal_payload["monitoring_data_status"] = "AWAITING_FIRST_MONITOR_SCAN"
-                    signal_payload["target_event_integrity"] = registered_tracker["target_event_integrity"]
-                    signal_payload["monitoring_gap_minutes"] = None
-                    signal_payload["monitoring_data_note"] = initial_monitor_note
-
-                    regime_report = report.get("active_regime_reassessment")
-                    if isinstance(regime_report, dict):
-                        signal_row = {
-                            "signal_fingerprint": fingerprint,
-                            "direction": registered_tracker.get("direction", scenario.direction),
-                            "status": registered_tracker.get("status", "TRACKING"),
-                            "monitoring_data_status": registered_tracker["monitoring_data_status"],
-                            "target_event_integrity": registered_tracker["target_event_integrity"],
-                            "target_event_integrity_since": registered_tracker.get("target_event_integrity_since"),
-                            "monitoring_gap_minutes": None,
-                            "monitoring_data_note": initial_monitor_note,
-                            "regime_assessment": active_assessment,
+                        report["signal_ready"] = True
+                        report["selected_option"] = selected
+                        event_key = f"{current.date()}|{direction}|{selected['strike']}|{selected['side']}|{risk.t1}|{risk.sl}"
+                        tracker = {
+                            "signal_timestamp": current.isoformat(), "direction": direction, "setup": signal.setup,
+                            "confidence_pct": signal.confidence_pct, "spot": spot,
+                            "instrument_key": selected["instrument_key"], "symbol": selected["trading_symbol"],
+                            "strike": selected["strike"], "side": selected["side"], "expiry": expiry,
+                            "T1": risk.t1, "T2": risk.t2, "SL": risk.sl,
+                            "status": "TRACKING", "T1_reached": False, "T2_reached": False,
+                            "last_checked_candle": current.isoformat(), "event_key": event_key,
                         }
-                        rows = [row for row in regime_report.get("signals", [])
-                                if isinstance(row, dict) and str(row.get("signal_fingerprint", "")) != fingerprint]
-                        regime_report["signals"] = rows + [signal_row]
-                        regime_report["active_signal_count"] = sum(
-                            1 for row in regime_report["signals"]
-                            if str(row.get("status", "")).upper() == "TRACKING"
-                        )
-                    guard_report = report.get("active_recommendation_guard")
-                    if isinstance(guard_report, dict):
-                        guard_report["active_tracker_count"] = sum(
-                            1 for item in state.get("recommendation_trackers", [])
-                            if isinstance(item, dict) and str(item.get("status", "")).upper() == "TRACKING"
-                        )
-                        guard_report["active_signal_registered_this_scan"] = True
-                report["recommendation_tracker"] = registration
-                report["recommendation_trackers"] = [
-                    {"status": item.get("status"), "direction": item.get("direction"),
-                     "scenario": item.get("scenario"), "trading_symbol": item.get("trading_symbol"),
-                     "option_type": item.get("option_type"), "strike": item.get("strike"),
-                     "T1": item.get("target_1"), "T2": item.get("target_2"),
-                     "SL": item.get("stop_loss"), "trailing_SL": item.get("trailing_stop"),
-                     "target_1_hit": item.get("target_1_hit", False),
-                     "last_option_ltp_observed": item.get("last_option_ltp_observed"),
-                     "last_option_quote_status": item.get("last_option_quote_status")}
-                    for item in state.get("recommendation_trackers", []) if isinstance(item, dict)
-                ]
-                enqueue_email_alert(
-                    state, now=current, event_type="SIGNAL_READY",
-                    dedupe_key=f"{current.date().isoformat()}|SIGNAL_READY|{fingerprint}",
-                    subject="NIFTY 50 — STRIKE SELECTED",
-                    payload={**signal_payload, "alert_type": "TRADE_READY_RECOMMENDATION",
-                             "execution_mode": "VIRTUAL_SIGNAL_ONLY_NO_ORDER_PLACEMENT",
-                             "readiness": readiness,
-                             "tracker": registration},
-                )
-            else:
-                report["signal_ready"] = False
-                if scenario.hard_veto and "SIDEWAYS" in scenario.hard_veto:
-                    report["market_state"] = "SIDEWAYS"
-                elif scenario.direction in {"BULLISH", "BEARISH"}:
-                    report["market_state"] = (
-                        "WAITING_FOR_STRUCTURAL_INTERACTION" if not entry_trigger_ok
-                        else "PREDICTIVE_WATCH_BLOCKED" if not scenario.executable_candidate
-                        else "DIRECTIONAL_SETUP_NOT_TRADE_READY"
-                    )
-                else:
-                    report["market_state"] = scenario.state
-                # No watch/blocked-candidate emails are permitted in V81. Blockers remain
-                # in the JSON/console diagnostics; email is reserved for confirmed selection
-                # and post-selection failure events only.
-                LOGGER.info("NO EMAIL: signal not trade-ready; market_state=%s blockers=%s",
-                            report["market_state"], "; ".join(readiness.get("blocking_reasons", [])))
-            # Ensure state/outbox are durable, then send; failures remain queued for the next invocation.
-            state["last_scan_timestamp"] = current.isoformat()
-            return self._finish(state, report, current)
-        except (ScannerError, requests.RequestException, ValueError, KeyError, TypeError, IndexError) as exc:
-            LOGGER.error("SCAN FAILED CLOSED: %s", exc)
-            report["scenario"] = "DATA_ERROR_NO_TRADE"
-            report["market_state"] = "NO_TRADE"
-            report["trigger_rationale"] = f"Data/API/integration error; no entry emitted: {exc}"
-            report["vetoes"] = ["DATA_QUALITY_OR_API_FAILURE", str(exc)]
-            report["signal_ready"] = False
-            self._queue_scan_error(state, current, exc, "SCAN_DATA_ERROR")
-            state["last_scan_timestamp"] = current.isoformat()
-            return self._finish(state, report, current)
+                        prior = state.get("active_signal")
+                        if isinstance(prior, dict):
+                            hist = state.setdefault("signal_history", [])
+                            hist.append(prior); state["signal_history"] = hist[-20:]
+                        state["active_signal"] = tracker
+                        report["_pending_signal_email"] = {"selected": selected, "signal": signal, "risk": risk, "now": current}
+                        report["email_status"] = "PENDING_STATE_SAVE"
+                        report["active_signal"] = safe_json(tracker)
+            # Append only snapshots that represent a valid chain, and cap memory/state size.
+            if chain:
+                snaps = state.setdefault("chain_snapshots", [])
+                snap = oi["snapshot"]
+                if not snaps or str(snaps[-1].get("timestamp")) != str(snap.get("timestamp")):
+                    snaps.append(snap)
+                state["chain_snapshots"] = [s for s in snaps if isinstance(s, dict) and parse_dt(s.get("timestamp")) and parse_dt(s.get("timestamp")).date() == current.date()][-40:]
+            report["strike_grid"] = {"step_points": strike_step, "nearby_available_strikes": [s for s in strikes if abs(s-spot) <= 300]}
+            report["risk_disclaimer"] = "Rule-based scenario score is a ranking heuristic, not a calibrated probability or guarantee. Scanner provides signal research only; it places no orders."
+            return self._finish(report, state)
         except Exception as exc:
-            LOGGER.error("UNEXPECTED SCAN FAILURE CLOSED: %s\n%s", exc, traceback.format_exc())
-            report["scenario"] = "UNEXPECTED_ERROR_NO_TRADE"
-            report["market_state"] = "NO_TRADE"
-            report["trigger_rationale"] = f"Unexpected error; no entry emitted: {exc}"
-            report["vetoes"] = ["UNEXPECTED_ERROR_NO_TRADE"]
-            report["signal_ready"] = False
-            self._queue_scan_error(state, current, exc, "UNEXPECTED_SCAN_ERROR")
-            return self._finish(state, report, current)
+            # The scan boundary is fail-closed: an unforeseen provider/schema error must not create a selection.
+            LOG.exception("V83 scan failed safely")
+            report.update({"market_state": "DATA_OR_SCAN_ERROR", "scenario": "NO_SELECTION", "direction": "NEUTRAL",
+                           "signal_ready": False, "selected_option": None, "confidence_pct": 0.0,
+                           "vetoes": [f"SCAN_ERROR:{type(exc).__name__}:{str(exc)[:350]}"]})
+            report.pop("_pending_signal_email", None)
+            return self._finish(report, state)
+
+    def _signal_notification(self, report: Mapping[str, Any], selected: Mapping[str, Any],
+                             signal: Signal, risk: RiskPlan, now: datetime,
+                             tracker: Mapping[str, Any]) -> dict[str, Any]:
+        event_key = str(tracker.get("event_key", ""))
+        subject = f"NIFTY V83 {signal.direction}: {selected['strike']:.0f}{selected['side']}"
+        body = (f"V83 market-structure signal\nTime (IST): {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Direction: {signal.direction}\nSetup: {signal.setup}\nStrike: {selected['strike']:.0f} {selected['side']}\n"
+                f"Spot at signal: {number(report.get('indicators', {}).get('spot')):.2f}\n"
+                f"Confidence heuristic: {signal.confidence_pct:.1f}/100 (not calibrated probability)\n"
+                f"T1: {risk.t1}\nT2: {risk.t2 if risk.t2 is not None else 'Unavailable'}\nSL: {risk.sl}\n"
+                f"Structural reason: {signal.trigger}\nOption score: {selected['score']}\n"
+                "Signal only: no order was placed.")
+        return {"notification_key": f"SIGNAL|{event_key}", "kind": "SIGNAL", "event_key": event_key,
+                "created_at": now.isoformat(), "subject": subject, "body": body}
+
+    def _event_notification(self, event: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+        tracker = event.get("_tracker") if isinstance(event.get("_tracker"), dict) else {}
+        if not tracker:
+            return None
+        event_type = str(event.get("type", "EVENT"))
+        timestamp = str(event.get("timestamp", ""))
+        event_key = str(tracker.get("event_key", ""))
+        key = f"EVENT|{event_key}|{event_type}|{timestamp}"
+        subject = f"NIFTY V83 {event_type}: {tracker.get('strike')}{tracker.get('side')}"
+        body = (f"Time (IST): {timestamp}\nEvent: {event_type}\nDirection: {tracker.get('direction')}\n"
+                f"Strike: {tracker.get('strike')} {tracker.get('side')}\nLevel: {event.get('level')}\n"
+                f"Original T1/T2/SL: {tracker.get('T1')} / {tracker.get('T2')} / {tracker.get('SL')}\n"
+                "Signal only: no order was placed.")
+        return {"notification_key": key, "kind": "EVENT", "event_key": event_key,
+                "created_at": timestamp, "subject": subject, "body": body}
+
+    def _finish(self, report: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+        state["last_scan_timestamp"] = report.get("timestamp")
+        pending_events = report.pop("_pending_event_notifications", [])
+        pending_signal = report.pop("_pending_signal_email", None)
+        has_email_config = bool(self.config.email_sender and self.config.email_password and self.config.email_receiver)
+        current_signal_key = ""
+        current_event_keys: set[str] = set()
+        if has_email_config:
+            queue = state.get("pending_email_notifications", [])
+            if not isinstance(queue, list):
+                queue = []
+            known_keys = {str(x.get("notification_key", "")) for x in queue if isinstance(x, dict)}
+            emailed = set(str(x) for x in state.get("emailed_notification_keys", []) if isinstance(x, str))
+            for event in pending_events if isinstance(pending_events, list) else []:
+                if not isinstance(event, dict):
+                    continue
+                item = self._event_notification(event)
+                if item and item["notification_key"] not in emailed and item["notification_key"] not in known_keys:
+                    queue.append(item); known_keys.add(item["notification_key"]); current_event_keys.add(item["notification_key"])
+            if isinstance(pending_signal, dict) and report.get("signal_ready"):
+                active = state.get("active_signal") if isinstance(state.get("active_signal"), dict) else {}
+                item = self._signal_notification(report, pending_signal["selected"], pending_signal["signal"],
+                                                 pending_signal["risk"], pending_signal["now"], active)
+                current_signal_key = item["notification_key"]
+                if current_signal_key not in emailed and current_signal_key not in known_keys:
+                    queue.append(item); known_keys.add(current_signal_key)
+            state["pending_email_notifications"] = queue[-100:]
+        elif isinstance(pending_signal, dict):
+            report["email_status"] = "NOT_CONFIGURED"
+
+        state_saved = True
+        try:
+            self.store.save()
+        except OSError as exc:
+            state_saved = False
+            LOG.error("State save failed: %s", exc)
+            report.setdefault("vetoes", []).append(f"STATE_SAVE_FAILED:{exc}")
+            # A selection without durable tracking is not released to the user.
+            if report.get("signal_ready"):
+                report["signal_ready"] = False
+                report["selected_option"] = None
+                report["market_state"] = "DATA_OR_SCAN_ERROR"
+                report["email_status"] = "SUPPRESSED_STATE_SAVE_FAILED"
+
+        sent_now: set[str] = set()
+        if state_saved and has_email_config:
+            queue = state.get("pending_email_notifications", [])
+            remaining = []
+            emailed = state.setdefault("emailed_notification_keys", [])
+            emailed_set = set(str(x) for x in emailed if isinstance(x, str))
+            for item in queue if isinstance(queue, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("notification_key", ""))
+                if not key or key in emailed_set:
+                    continue
+                if send_email(self.config, str(item.get("subject", "NIFTY V83 notification")), str(item.get("body", ""))):
+                    emailed.append(key); emailed_set.add(key); sent_now.add(key)
+                    if item.get("kind") == "SIGNAL":
+                        state["last_email_key"] = str(item.get("event_key", ""))
+                    elif item.get("kind") == "EVENT":
+                        sent_events = state.setdefault("emailed_event_keys", [])
+                        sent_events.append(key); state["emailed_event_keys"] = sent_events[-100:]
+                else:
+                    # Keep failed deliveries so a later scan can retry without recreating the signal.
+                    remaining.append(item)
+            state["pending_email_notifications"] = remaining[-100:]
+            state["emailed_notification_keys"] = emailed[-200:]
+            try:
+                self.store.save()
+            except OSError as exc:
+                LOG.error("State save after notification attempts failed: %s", exc)
+            report["pending_email_notifications"] = len(state.get("pending_email_notifications", []))
+            if isinstance(pending_signal, dict):
+                if current_signal_key in sent_now or current_signal_key in state.get("emailed_notification_keys", []):
+                    report["email_status"] = "SENT"
+                elif any(isinstance(x, dict) and x.get("notification_key") == current_signal_key for x in state.get("pending_email_notifications", [])):
+                    report["email_status"] = "PENDING_RETRY"
+                else:
+                    report["email_status"] = "NOT_SENT"
+            if current_event_keys:
+                report["event_email_status"] = {"queued_or_sent": len(current_event_keys),
+                                                  "sent_this_scan": len(current_event_keys & sent_now),
+                                                  "pending_retry": len(current_event_keys - sent_now)}
+        elif not has_email_config:
+            report["pending_email_notifications"] = len(state.get("pending_email_notifications", []))
+
+        try:
+            audit_append(self.config, report)
+        except OSError as exc:
+            LOG.error("Audit append failed: %s", exc)
+            report.setdefault("vetoes", []).append(f"AUDIT_WRITE_FAILED:{exc}")
+        return report
 
 
-
-
-def print_report(report: dict[str, Any]) -> None:
-    """Print one compact JSON summary without leaking blocked option previews."""
-    levels = report.get("nifty_levels") if isinstance(report.get("nifty_levels"), Mapping) else {}
-    indicators = report.get("indicators") if isinstance(report.get("indicators"), Mapping) else {}
-    selected = report.get("selected_option") if isinstance(report.get("selected_option"), Mapping) else {}
-    delivery = report.get("email_delivery") if isinstance(report.get("email_delivery"), Mapping) else {}
-    persistence = report.get("state_persistence") if isinstance(report.get("state_persistence"), Mapping) else {}
-    signal_ready = bool(report.get("signal_ready", False) and selected)
-    compact = {
-        "timestamp": report.get("timestamp"), "version": SCANNER_VERSION,
-        "market_regime": report.get("market_regime", report.get("scenario")),
-        "v68_direction_resolution": report.get("v68_direction_resolution"),
-        "scenario": report.get("scenario"), "market_state": report.get("market_state"),
-        "direction": report.get("direction"), "confidence_pct": report.get("confidence_pct"),
-        "spot": levels.get("spot", indicators.get("spot")), "vwap": indicators.get("vwap"),
-        "signal_ready": signal_ready,
-        "option": selected.get("trading_symbol") if signal_ready else None,
-        "candidate_preview_only": not signal_ready,
-        "T1": levels.get("T1") if signal_ready else None,
-        "T2": levels.get("T2") if signal_ready else None,
-        "SL": levels.get("SL") if signal_ready else None,
-        "reversal_watch": report.get("reversal_watch"),
-        "top_vetoes": (report.get("vetoes") or [])[:3],
-        "email": delivery.get("status", "UNKNOWN"), "pending_emails": delivery.get("pending"),
-        "state_persistence": persistence.get("status", "UNKNOWN"),
-        "audit_log": report.get("audit_log", {"status": "UNKNOWN"}),
-    }
-    print(json.dumps(json_safe(compact), separators=(",", ":"), ensure_ascii=False, allow_nan=False))
-
-
-def scan_exit_code(report: Mapping[str, Any]) -> int:
-    """Return a non-zero exit code for failed/unverified scans and alert delivery failures.
-
-    A closed market or a clean no-signal scan is a successful scan. API/data errors,
-    failed state persistence, or queued-but-unsent email alerts should be visible to
-    GitHub Actions while its `if: always()` persistence step still records state.
-    """
-    scenario = str(report.get("scenario", "")).upper()
-    vetoes = {str(x).upper() for x in report.get("vetoes", [])} if isinstance(report.get("vetoes"), list) else set()
-    persistence = report.get("state_persistence")
-    if scenario in {"DATA_ERROR_NO_TRADE", "UNEXPECTED_ERROR_NO_TRADE", "CONFIGURATION_ERROR"}:
-        return 2
-    if "MARKET_STATUS_UNVERIFIED" in vetoes:
-        return 2
-    if isinstance(persistence, dict) and str(persistence.get("status", "")).startswith("FAILED"):
-        return 3
-    audit = report.get("audit_log")
-    if isinstance(audit, dict) and str(audit.get("status", "")).upper() == "FAILED":
-        return 5
-    delivery = report.get("email_delivery")
-    if isinstance(delivery, dict):
-        status = str(delivery.get("status", "")).upper()
-        pending = int(safe_float(delivery.get("pending"), 0))
-        if pending > 0 and status in {"NOT_CONFIGURED", "RETRY_QUEUED", "PARTIAL"}:
-            return 4
-    return 0
+def print_report(report: Mapping[str, Any]) -> None:
+    print(json.dumps(safe_json(report), indent=2, ensure_ascii=False, allow_nan=False))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 Predictive Market Scanner & Strike Router V81")
-    parser.add_argument("--loop", action="store_true", help="Scan approximately once per minute during market hours.")
-    parser.add_argument("--interval", type=float, default=60.0, help="Loop interval seconds (minimum 15).")
+    parser = argparse.ArgumentParser(description="V83 NIFTY market-structure and OI-flow scanner (signal only)")
+    parser.add_argument("--loop", action="store_true", help="run continuously at SCAN_INTERVAL_SECONDS")
+    parser.add_argument("--interval", type=int, default=None, help="override the loop interval in seconds")
     args = parser.parse_args(argv)
     config = Config()
     try:
-        config.validate(require_token=True)
+        config.validate()
     except ScannerError as exc:
-        current = now_ist()
-        report = {"scanner_version": SCANNER_VERSION, "timestamp": current.isoformat(),
-                  "scenario": "CONFIGURATION_ERROR", "market_state": "NO_TRADE",
-                  "direction": "NEUTRAL", "confidence_pct": 0.0, "signal_ready": False,
-                  "trigger_rationale": str(exc), "vetoes": ["CONFIGURATION_ERROR"],
-                  "execution_mode": "SIGNAL_ONLY_NO_ORDER_PLACEMENT"}
-        # Configuration failures are also written to the durable outbox. If email is
-        # configured, the operator can be notified that a required secret/config is missing.
-        try:
-            store = StateStore(config.state_file)
-            state = store.load(current.date())
-            enqueue_email_alert(
-                state, now=current, event_type="CONFIGURATION_ERROR",
-                dedupe_key=f"{current.date().isoformat()}|CONFIGURATION_ERROR|{type(exc).__name__}",
-                subject="NIFTY V81 scanner configuration error",
-                payload={"timestamp": current.isoformat(), "scanner_version": SCANNER_VERSION,
-                         "error_type": type(exc).__name__, "error": str(exc),
-                         "note": "The scan was stopped before market analysis; no recommendation or order was produced."},
-                cooldown_minutes=15,
-            )
-            store.save()
-            delivery = deliver_email_outbox(state, config, current)
-            store.save()
-            report["email_delivery"] = delivery
-            report["state_persistence"] = {"status": "SAVED", "path": str(config.state_file)}
-        except Exception as persist_exc:
-            LOGGER.error("Unable to persist configuration-error alert: %s", persist_exc)
-            report["state_persistence"] = {"status": "FAILED", "error": str(persist_exc)}
-        audit_state = locals().get("state", {})
-        report["audit_log"] = ScanAuditWriter().append(current, report, audit_state if isinstance(audit_state, Mapping) else {})
-        print_report(report)
+        LOG.error("Configuration error: %s", exc)
         return 2
     scanner = PredictiveScanner(config)
-    if not args.loop:
-        report = scanner.scan_once()
-        print_report(report)
-        return scan_exit_code(report)
-    interval = max(15.0, float(args.interval))
-    LOGGER.info("V81 scan loop started; interval=%.1fs; new entries stop at 15:15 IST.", interval)
+    interval = int(clamp(args.interval if args.interval is not None else config.scan_interval, 60, 900))
     while True:
-        cycle_start = time_module.monotonic()
         report = scanner.scan_once()
         print_report(report)
-        elapsed = time_module.monotonic() - cycle_start
-        # Default minute loop aligns to the next minute to keep COI snapshot spacing meaningful.
-        if interval == 60.0:
-            sleep_for = max(2.0, 60.0 - now_ist().second - now_ist().microsecond / 1_000_000.0)
-        else:
-            sleep_for = max(1.0, interval - elapsed)
-        time_module.sleep(sleep_for)
+        if not args.loop:
+            return 0 if report.get("market_state") != "DATA_OR_SCAN_ERROR" else 1
+        time_module.sleep(interval)
 
 
 if __name__ == "__main__":
