@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""NIFTY 50 market-structure, regime and strict local-OI scanner — V86.
+"""NIFTY 50 persistent price-action and local-OI confirmation scanner — V87.
 
-V86 is a regime-first NIFTY scanner with setup-specific local OI-flow confirmation. It preserves
+V87 is a price-action-first NIFTY scanner with persistent level memory and setup-specific local OI confirmation. It preserves
 reliable Upstox transport/state/reporting primitives and uses one canonical unversioned market_state
 file (explicit STATE_FILE overrides discovery). Its entry authorization requires:
 (1) a stable higher-context market regime, (2) a price-structure setup, (3) same-session,
@@ -42,7 +42,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-VERSION = "V86-STRUCTURE-REGIME-SETUP-OI-CONFLUENCE"
+VERSION = "V87-PERSISTENT-PRICE-ACTION-LOCAL-OI"
 BASE_URL = "https://api.upstox.com"
 IST = ZoneInfo("Asia/Kolkata")
 NIFTY_KEY_DEFAULT = "NSE_INDEX|Nifty 50"
@@ -50,7 +50,7 @@ MARKET_OPEN = time(9, 15)
 ENTRY_OPEN = time(9, 16)
 ENTRY_CUTOFF = time(15, 15)
 MARKET_CLOSE = time(15, 30)
-LOG = logging.getLogger("market_scanner_v86")
+LOG = logging.getLogger("market_scanner_v87")
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -97,6 +97,8 @@ def clamp(value: float, low: float, high: float) -> float:
 
 
 DIVERGENCE_RSI_DELTA = clamp(env_float("DIVERGENCE_RSI_DELTA", 2.0), 1.0, 10.0)
+STRUCTURE_WATCH_TTL_MINUTES = int(clamp(env_int("STRUCTURE_WATCH_TTL_MINUTES", 9), 3, 15))
+STRUCTURE_WATCH_MAX_EXTENSION_ATR = clamp(env_float("STRUCTURE_WATCH_MAX_EXTENSION_ATR", 1.25), 0.75, 2.0)
 
 
 def round_to_grid(value: float, step: float = 50.0) -> float:
@@ -332,7 +334,7 @@ class Indicators:
 
 class AtomicState:
     """Atomic state store backed by one canonical, unversioned market_state file."""
-    SNAPSHOT_SCHEMAS = {80, 81, 82, 83, 84, 85, 86}
+    SNAPSHOT_SCHEMAS = {80, 81, 82, 83, 84, 85, 86, 87}
 
     def __init__(self, path: Path):
         self.path = path
@@ -403,7 +405,7 @@ class AtomicState:
         schema = int(number(loaded.get("schema_version"), 0))
         prior_date = parse_date(loaded.get("session_date"))
         same_session = prior_date == today
-        current_schema = same_session and schema == 86 and loaded.get("scanner_version") == VERSION
+        current_schema = same_session and schema == 87 and loaded.get("scanner_version") == VERSION
         known_migration = same_session and schema in self.SNAPSHOT_SCHEMAS
         expected_expiry = str(loaded.get("option_expiry", "")) if same_session else ""
         old_snaps = loaded.get("chain_snapshots", []) if isinstance(loaded.get("chain_snapshots"), list) else []
@@ -434,7 +436,7 @@ class AtomicState:
         sent_keys = loaded.get("emailed_notification_keys", []) if same_session and isinstance(loaded.get("emailed_notification_keys", []), list) else []
         sent_events = loaded.get("emailed_event_keys", []) if same_session and isinstance(loaded.get("emailed_event_keys", []), list) else []
         self.data = {
-            "schema_version": 86,
+            "schema_version": 87,
             "scanner_version": VERSION,
             "session_date": today.isoformat(),
             "option_expiry": expected_expiry,
@@ -445,7 +447,7 @@ class AtomicState:
             "emailed_event_keys": [str(x) for x in sent_events if isinstance(x, str)][-200:],
             "emailed_notification_keys": [str(x) for x in sent_keys if isinstance(x, str)][-300:],
             # Do not import queued messages from a prior scanner generation: their stale
-            # bodies/selection assumptions must not be sent by V86.
+            # bodies/selection assumptions must not be sent by V87.
             "pending_email_notifications": loaded.get("pending_email_notifications", [])[-50:]
                 if current_schema and isinstance(loaded.get("pending_email_notifications", []), list) else [],
             "last_scan_timestamp": loaded.get("last_scan_timestamp") if same_session else None,
@@ -457,6 +459,9 @@ class AtomicState:
                                   "NEW_EMPTY_STATE" if not existed else "SAME_SESSION_STATE_NO_COMPATIBLE_SNAPSHOTS"),
             "state_integrity_ok": not corrupt,
             "snapshot_migrated_from_schema": schema if snapshots and known_migration and not current_schema else None,
+            "pending_structure_setup": (loaded.get("pending_structure_setup")
+                                        if same_session and not corrupt and isinstance(loaded.get("pending_structure_setup"), dict)
+                                        else None),
         }
         return self.data
 
@@ -1320,141 +1325,385 @@ def _oi_local_evidence(oi: Mapping[str, Any], direction: str, spot: float, step:
     return clamp(score, -18, 34), evidence
 
 
-def score_market_signal(frame: pd.DataFrame, indicators: Indicators, oi: Mapping[str, Any], levels: Sequence[Level],
-                        now: datetime, min_score: float, step: float) -> tuple[Signal, dict[str, Any]]:
-    spot, atr = indicators.spot, indicators.atr
-    support = nearest_level(levels, spot + 0.5, "SUPPORT")
-    resistance = nearest_level(levels, spot - 0.5, "RESISTANCE")
-    # Relevant interaction level may sit very near spot or have just been crossed.
-    all_supports = sorted([l for l in levels if l.kind == "SUPPORT"], key=lambda l: abs(spot-l.price))
-    all_resists = sorted([l for l in levels if l.kind == "RESISTANCE"], key=lambda l: abs(spot-l.price))
-    near_support = all_supports[0] if all_supports and abs(spot-all_supports[0].price) <= max(1.8*atr, 100) else support
-    near_resistance = all_resists[0] if all_resists and abs(spot-all_resists[0].price) <= max(1.8*atr, 100) else resistance
-    last = indicators.last_close
-    closes = completed_candles(frame, now)["close"]
-    buf = max(2.0, atr * 0.06)
-    # Structure and momentum are measured separately from OI; OI is confluence, not the only trigger.
-    bull_struct = 0.0; bear_struct = 0.0
-    bull_ev: list[str] = []; bear_ev: list[str] = []
-    setup_bull = "NONE"; setup_bear = "NONE"; level_bull = None; level_bear = None
-    if near_support:
-        touches, away, _ = _touch_evidence(frame, near_support.price, "SUPPORT", atr, now)
-        dist = abs(spot-near_support.price)
-        if touches >= 2 and away and last > near_support.price:
-            bull_struct += 33 + min(8, 2*touches)
-            bull_ev += [f"REPEATED_SUPPORT_TESTS_{touches}", f"SUPPORT_RECLAIM_{near_support.price:.2f}"]
-            setup_bull, level_bull = "SUPPORT_BOUNCE", near_support.price
-        elif dist <= max(0.45*atr, 18) and last >= near_support.price - buf:
-            bull_struct += 17
-            bull_ev.append(f"SUPPORT_TEST_WATCH_{near_support.price:.2f}")
-            setup_bull, level_bull = "EARLY_SUPPORT_RECLAIM", near_support.price
-    if near_resistance:
-        touches, away, _ = _touch_evidence(frame, near_resistance.price, "RESISTANCE", atr, now)
-        dist = abs(spot-near_resistance.price)
-        if touches >= 2 and away and last < near_resistance.price:
-            bear_struct += 33 + min(8, 2*touches)
-            bear_ev += [f"REPEATED_RESISTANCE_TESTS_{touches}", f"RESISTANCE_REJECTION_{near_resistance.price:.2f}"]
-            setup_bear, level_bear = "RESISTANCE_REJECTION", near_resistance.price
-        elif (near_resistance.price > spot + 0.5 and dist <= max(0.45*atr, 18)
-              and last <= near_resistance.price + max(buf, 6.0)
-              and indicators.momentum_1m < 0 and indicators.momentum_3m < 0):
-            # A repeated-test rejection watch may qualify before two closes below resistance,
-            # but only when live spot is back below the level and both short horizons weaken.
-            bear_struct += 30 if touches >= 2 else 19
-            if touches >= 2:
-                bear_ev.append(f"REPEATED_RESISTANCE_REJECTION_WATCH_{touches}_{near_resistance.price:.2f}")
-            else:
-                bear_ev.append(f"RESISTANCE_REJECTION_WATCH_{near_resistance.price:.2f}")
-            bear_ev.append("LIVE_SPOT_BACK_BELOW_RESISTANCE_WITH_NEGATIVE_1M_3M_MOMENTUM")
-            setup_bear, level_bear = "EARLY_RESISTANCE_REJECTION", near_resistance.price
-        elif (near_resistance.price > spot + 0.5 and dist <= max(0.65*atr, 25.0)
-              and indicators.momentum_1m > 0 and indicators.momentum_3m > 0
-              and len(closes) >= 3 and float(closes.iloc[-1]) > float(closes.iloc[-3]) and bull_struct < 25):
-            # Pressure beneath a confirmed resistance level is the predictive path; it still
-            # needs supportive local OI flow/score and a complete structural risk plan.
-            bull_struct = max(bull_struct, 22)
-            bull_ev.append(f"PREBREAKOUT_PRESSURE_BELOW_{near_resistance.price:.2f}")
-            setup_bull, level_bull = "PREBREAKOUT_RESISTANCE_PRESSURE", near_resistance.price
-    if near_support:
-        dist_to_support = abs(spot-near_support.price)
-        if (near_support.price < spot - 0.5 and dist_to_support <= max(0.65*atr, 25.0)
-                and indicators.momentum_1m < 0 and indicators.momentum_3m < 0
-                and len(closes) >= 3 and float(closes.iloc[-1]) < float(closes.iloc[-3]) and bear_struct < 25):
-            # Pressure above support is not labelled a breakdown until price closes through;
-            # it is a predictive watch that can qualify only with OI and risk confluence.
-            bear_struct = max(bear_struct, 22)
-            bear_ev.append(f"PREBREAKDOWN_PRESSURE_ABOVE_{near_support.price:.2f}")
-            setup_bear, level_bear = "PREBREAKDOWN_SUPPORT_PRESSURE", near_support.price
-    crossed_resistances = [l for l in levels if l.kind == "RESISTANCE" and l.price < spot
-                           and spot - l.price <= max(1.5 * atr, 45.0)]
-    crossed_supports = [l for l in levels if l.kind == "SUPPORT" and l.price > spot
-                        and l.price - spot <= max(1.5 * atr, 45.0)]
-    crossed_resistance = max(crossed_resistances, key=lambda l: l.price, default=None)
-    crossed_support = min(crossed_supports, key=lambda l: l.price, default=None)
-    if (crossed_resistance and len(closes) >= 2
-            and float(closes.iloc[-1]) > crossed_resistance.price + buf
-            and float(closes.iloc[-2]) > crossed_resistance.price + buf
-            and spot - crossed_resistance.price <= max(1.5 * atr, 45.0)):
-        bull_struct = max(bull_struct, 52)
-        bull_ev += [f"TWO_CLOSE_BREAKOUT_{crossed_resistance.price:.2f}"]
-        setup_bull, level_bull = "CONFIRMED_BREAKOUT", crossed_resistance.price
-    if (crossed_support and len(closes) >= 2
-            and float(closes.iloc[-1]) < crossed_support.price - buf
-            and float(closes.iloc[-2]) < crossed_support.price - buf
-            and crossed_support.price - spot <= max(1.5 * atr, 45.0)):
-        bear_struct = max(bear_struct, 52)
-        bear_ev += [f"TWO_CLOSE_BREAKDOWN_{crossed_support.price:.2f}"]
-        setup_bear, level_bear = "CONFIRMED_BREAKDOWN", crossed_support.price
-    # Smooth momentum component avoids requiring every indicator to be available.
-    bull_momentum = (12 if indicators.momentum_1m > 0 else 0) + (8 if indicators.momentum_3m > 0 else 0)
-    bear_momentum = (12 if indicators.momentum_1m < 0 else 0) + (8 if indicators.momentum_3m < 0 else 0)
-    if finite(indicators.rsi):
-        bull_momentum += 5 if 48 <= indicators.rsi <= 75 else 0
-        bear_momentum += 5 if 25 <= indicators.rsi <= 52 else 0
-    if finite(indicators.plus_di) and finite(indicators.minus_di):
-        bull_momentum += 5 if indicators.plus_di > indicators.minus_di else 0
-        bear_momentum += 5 if indicators.minus_di > indicators.plus_di else 0
-    if finite(indicators.vwap):
-        bull_momentum += 5 if spot > indicators.vwap and indicators.vwap_slope >= 0 else 0
-        bear_momentum += 5 if spot < indicators.vwap and indicators.vwap_slope <= 0 else 0
+def _level_touch_stats_v87(frame: pd.DataFrame, level: float, kind: str, atr: float,
+                          now: datetime, lookback: int = 36) -> dict[str, Any]:
+    """Count separate visits to a level, not adjacent candles within one visit."""
+    bars = completed_candles(frame, now.astimezone(IST)).tail(max(8, int(lookback))).reset_index(drop=True)
+    if bars.empty or not finite(level):
+        return {"touches": 0, "recent_touch": False, "last_touch_age_bars": None,
+                "reclaimed": False, "rejected": False, "last_extreme": None}
+    tolerance = max(5.0, min(16.0, 0.24 * atr if finite(atr) else 5.0))
+    col = "low" if kind == "SUPPORT" else "high"
+    visits: list[int] = []
+    in_visit = False
+    for i, row in bars.iterrows():
+        hi, lo, close = number(row.get("high")), number(row.get("low")), number(row.get("close"))
+        # A touch must occur at the actual side-specific extremum. Merely travelling through
+        # a higher level while rebounding from a lower one does not count as support there.
+        if kind == "SUPPORT":
+            touched = finite(lo) and level - 2.0 * tolerance <= lo <= level + tolerance
+        else:
+            touched = finite(hi) and level - tolerance <= hi <= level + 2.0 * tolerance
+        if touched and not in_visit:
+            visits.append(int(i))
+            in_visit = True
+        elif not touched:
+            if kind == "SUPPORT" and finite(close) and close > level + 1.35 * tolerance:
+                in_visit = False
+            elif kind == "RESISTANCE" and finite(close) and close < level - 1.35 * tolerance:
+                in_visit = False
+    last_close = number(bars.iloc[-1]["close"])
+    previous_close = number(bars.iloc[-2]["close"]) if len(bars) > 1 else last_close
+    buffer = max(1.5, min(5.0, 0.06 * atr if finite(atr) else 1.5))
+    reclaimed = kind == "SUPPORT" and finite(last_close) and last_close > level + buffer
+    rejected = kind == "RESISTANCE" and finite(last_close) and last_close < level - buffer
+    age = len(bars) - 1 - visits[-1] if visits else None
+    return {"touches": len(visits), "touch_indices": visits[-8:],
+            "recent_touch": bool(age is not None and age <= 7),
+            "last_touch_age_bars": age, "reclaimed": bool(reclaimed),
+            "rejected": bool(rejected), "last_extreme": number(bars.iloc[-1][col]),
+            "tolerance": round(tolerance, 2), "last_close": last_close,
+            "previous_close": previous_close}
+
+
+def _local_pair_strength_v87(oi: Mapping[str, Any], direction: str, level: float,
+                             step: float) -> dict[str, Any]:
+    """Price-action scoring aid; final eligibility is still decided by qualify_local_oi."""
+    rows = [r for r in oi.get("walls", []) if isinstance(r, Mapping) and finite(r.get("strike"))
+            and abs(number(r.get("strike")) - level) <= max(2.0 * step, 75.0)]
+    threshold = 0.02  # User-mandated strict local writing OI threshold.
+    prem_floor = 0.002  # Aligned with the OI-flow classifier's minimum directional premium movement.
+    if direction == "BULLISH":
+        writing_key, covering_key = "put", "call"
     else:
-        bull_ev.append("VWAP_UNAVAILABLE_NOT_ASSUMED")
-        bear_ev.append("VWAP_UNAVAILABLE_NOT_ASSUMED")
+        writing_key, covering_key = "call", "put"
+
+    def writing_ok(row: Mapping[str, Any]) -> bool:
+        oi_change = number(row.get(f"{writing_key}_change_pct"))
+        prem_change = number(row.get(f"{writing_key}_premium_change_pct"))
+        strike = number(row.get("strike"))
+        location_ok = strike <= level + step + 0.01 if direction == "BULLISH" else strike >= level - step - 0.01
+        return bool(location_ok and oi_change > threshold and prem_change <= -prem_floor
+                    and str(row.get(f"{writing_key}_flow", "")) == "SHORT_BUILDUP_WRITING")
+
+    def covering_ok(row: Mapping[str, Any]) -> bool:
+        oi_change = number(row.get(f"{covering_key}_change_pct"))
+        prem_change = number(row.get(f"{covering_key}_premium_change_pct"))
+        return bool(oi_change < -0.005 and prem_change >= prem_floor
+                    and str(row.get(f"{covering_key}_flow", "")) == "SHORT_COVERING")
+
+    writers = [r for r in rows if writing_ok(r)]
+    covers = [r for r in rows if covering_ok(r)]
+    writers.sort(key=lambda r: (abs(number(r.get("strike")) - level), -number(r.get(f"{writing_key}_change_pct"), 0)))
+    covers.sort(key=lambda r: (abs(number(r.get("strike")) - level), number(r.get(f"{covering_key}_change_pct"), 0)))
+    pair = bool(writers and covers)
+    nearest_side = "put" if direction == "BULLISH" else "call"
+    contra_flow = False
+    for row in rows:
+        strike = number(row.get("strike"))
+        if abs(strike - level) > step + 0.01:
+            continue
+        flow = str(row.get(f"{nearest_side}_flow", ""))
+        if direction == "BULLISH" and flow == "LONG_BUILDUP_BUYING":
+            contra_flow = True
+        elif direction == "BEARISH" and flow == "LONG_BUILDUP_BUYING":
+            contra_flow = True
+    return {"pair_confirmed": pair,
+            "writing_leg": ({"strike": number(writers[0].get("strike")),
+                             "oi_change_pct": round(100 * number(writers[0].get(f"{writing_key}_change_pct")), 3),
+                             "premium_change_pct": round(100 * number(writers[0].get(f"{writing_key}_premium_change_pct")), 3)} if writers else None),
+            "covering_leg": ({"strike": number(covers[0].get("strike")),
+                              "oi_change_pct": round(100 * number(covers[0].get(f"{covering_key}_change_pct")), 3),
+                              "premium_change_pct": round(100 * number(covers[0].get(f"{covering_key}_premium_change_pct")), 3)} if covers else None),
+            "score": (20.0 if pair else 10.0 if writers else 0.0) - (8.0 if contra_flow else 0.0),
+            "contra_flow": contra_flow}
+
+
+def resolve_pending_structure_watch(state: dict[str, Any], fresh: Signal, indicators: Indicators,
+                                   now: datetime) -> tuple[Signal, dict[str, Any]]:
+    """Carry a recent level-reaction hypothesis across scans while price remains valid."""
+    watch = state.get("pending_structure_setup")
+    if not isinstance(watch, Mapping):
+        return fresh, {"status": "NONE"}
+    created = parse_dt(watch.get("first_seen"))
+    level = number(watch.get("level"))
+    direction = str(watch.get("direction", "")).upper()
+    setup = str(watch.get("setup", "")).upper()
+    if not created or not finite(level) or direction not in {"BULLISH", "BEARISH"}:
+        state.pop("pending_structure_setup", None)
+        return fresh, {"status": "DISCARDED", "reason": "INVALID_WATCH_SCHEMA"}
+    age_minutes = (now.astimezone(IST) - created.astimezone(IST)).total_seconds() / 60.0
+    distance = abs(indicators.spot - level)
+    max_extension = max(STRUCTURE_WATCH_MAX_EXTENSION_ATR * indicators.atr, 45.0)
+    buffer = max(0.25 * indicators.atr, 10.0)
+    invalidated = (indicators.spot < level - buffer if direction == "BULLISH" else indicators.spot > level + buffer)
+    expired = age_minutes > STRUCTURE_WATCH_TTL_MINUTES
+    extended = distance > max_extension
+    opposite_fresh = fresh.direction in {"BULLISH", "BEARISH"} and fresh.direction != direction
+    same_fresh = fresh.direction == direction and finite(fresh.level) and abs(number(fresh.level) - level) <= max(0.8 * indicators.atr, 30.0)
+    if expired or extended or invalidated or opposite_fresh:
+        state.pop("pending_structure_setup", None)
+        reasons = []
+        if expired: reasons.append("TTL_EXPIRED")
+        if extended: reasons.append("PRICE_EXTENDED_FROM_WATCH_LEVEL")
+        if invalidated: reasons.append("WATCH_LEVEL_INVALIDATED")
+        if opposite_fresh: reasons.append("OPPOSITE_STRUCTURAL_SETUP_DETECTED")
+        return fresh, {"status": "DISCARDED", "reason": ";".join(reasons), "age_minutes": round(age_minutes, 2),
+                       "distance_from_level": round(distance, 2)}
+    if fresh.direction == direction and same_fresh:
+        return fresh, {"status": "CURRENT_SETUP_CONFIRMS_WATCH", "age_minutes": round(age_minutes, 2),
+                       "distance_from_level": round(distance, 2), "level": level}
+    if fresh.direction == "NEUTRAL":
+        evidence = list(watch.get("evidence", [])) if isinstance(watch.get("evidence"), list) else []
+        evidence += ["PERSISTED_STRUCTURE_WATCH_REVALIDATED", f"WATCH_AGE_MINUTES_{age_minutes:.1f}"]
+        restored = Signal(direction, setup, round(number(watch.get("score"), 68.0), 1),
+                          round(clamp(number(watch.get("score"), 68.0), 0.0, 92.0), 1),
+                          "Persisted level-reaction hypothesis; current OI and risk gates must requalify.",
+                          level, tuple(dict.fromkeys(evidence)), ())
+        return restored, {"status": "REACTIVATED", "age_minutes": round(age_minutes, 2),
+                          "distance_from_level": round(distance, 2), "level": level}
+    return fresh, {"status": "WATCH_RETAINED_BUT_FRESH_SIGNAL_USED", "age_minutes": round(age_minutes, 2)}
+
+
+def persist_structure_watch(state: dict[str, Any], signal: Signal, now: datetime,
+                            local_oi: Mapping[str, Any]) -> dict[str, Any]:
+    """Persist only a price-action setup, never an authorization or pseudo-selection."""
+    watchable = {"SUPPORT_CLUSTER_RECLAIM", "RESISTANCE_CLUSTER_REJECTION",
+                 "SUPPORT_BOUNCE", "RESISTANCE_REJECTION"}
+    if signal.direction not in {"BULLISH", "BEARISH"} or signal.setup not in watchable or not finite(signal.level):
+        return {"status": "NOT_WATCHABLE"}
+    prior = state.get("pending_structure_setup")
+    prior_created = parse_dt(prior.get("first_seen")) if isinstance(prior, Mapping) else None
+    similar = bool(isinstance(prior, Mapping) and str(prior.get("direction")) == signal.direction
+                   and abs(number(prior.get("level"), -1e9) - signal.level) <= 30.0
+                   and prior_created and (now.astimezone(IST) - prior_created.astimezone(IST)).total_seconds() / 60.0 <= STRUCTURE_WATCH_TTL_MINUTES)
+    first_seen = prior.get("first_seen") if similar else now.isoformat()
+    watch = {"status": "WAITING_FOR_LOCAL_OI_OR_FINAL_GATES",
+             "direction": signal.direction, "setup": signal.setup, "level": round(float(signal.level), 2),
+             "first_seen": first_seen, "last_seen": now.isoformat(),
+             "score": round(float(signal.score), 1), "evidence": list(signal.evidence)[:12],
+             "local_oi_qualified_at_last_scan": bool(local_oi.get("qualified")),
+             "local_oi_reason_at_last_scan": str(local_oi.get("reason", "")),
+             "expires_after_minutes": STRUCTURE_WATCH_TTL_MINUTES,
+             "source_version": VERSION}
+    state["pending_structure_setup"] = watch
+    return {"status": "UPDATED" if similar else "CREATED", "direction": watch["direction"],
+            "setup": watch["setup"], "level": watch["level"], "first_seen": first_seen,
+            "oi_qualified": watch["local_oi_qualified_at_last_scan"]}
+
+
+def score_market_signal(frame: pd.DataFrame, indicators: Indicators, oi: Mapping[str, Any], levels: Sequence[Level],
+                        now: datetime, min_score: float, step: float,
+                        fib: Optional[Mapping[str, Any]] = None,
+                        divergence: Optional[Mapping[str, Any]] = None) -> tuple[Signal, dict[str, Any]]:
+    """Prioritize persistent tested levels, then price turn; OI gates authorize the entry.
+
+    This deliberately separates (a) a price-action setup/watch from (b) the final local-OI
+    pair. A candidate can exist while OI is still forming, but can never be selected until
+    qualify_local_oi and the remaining gates pass.
+    """
+    spot, atr = indicators.spot, indicators.atr
+    bars = completed_candles(frame, now.astimezone(IST)).tail(180).reset_index(drop=True)
+    if bars.empty or not finite(spot) or not finite(atr) or atr <= 0:
+        neutral = Signal("NEUTRAL", "NO_USABLE_PRICE_STRUCTURE", 0.0, 0.0,
+                         "No usable completed-candle structure.", None,
+                         ("NO_USABLE_PRICE_STRUCTURE",), ("PRICE_DATA_UNAVAILABLE",))
+        return neutral, {"threshold": min_score, "interaction_level_method": "REPEATED_TOUCH_REACTION_OI"}
+
+    last_close = number(bars.iloc[-1]["close"])
+    previous_close = number(bars.iloc[-2]["close"]) if len(bars) > 1 else last_close
+    close_series = bars["close"].astype(float)
+    break_buffer = max(2.0, 0.08 * atr)
+    max_near = max(1.8 * atr, 65.0)
+    entry_near = max(1.25 * atr, 45.0)
+
+    def fib_near(direction: str, level: float) -> bool:
+        f = fib if isinstance(fib, Mapping) else {}
+        if direction == "BULLISH":
+            zone = f.get("bullish_support_zone") if isinstance(f.get("bullish_support_zone"), Mapping) else {}
+            raw_levels = [number(zone.get("fib_50")), number(zone.get("fib_61_8"))]
+        else:
+            zone = f.get("bearish_resistance_levels") if isinstance(f.get("bearish_resistance_levels"), Mapping) else {}
+            raw_levels = [number(zone.get("fib_50")), number(zone.get("fib_61_8")), number(zone.get("fib_100"))]
+        tolerance = max(12.0, min(28.0, 0.45 * atr))
+        return bool(f.get("available") and any(finite(x) and min(abs(x-level), abs(x-spot)) <= tolerance for x in raw_levels))
+
+    div = divergence if isinstance(divergence, Mapping) else {}
+    bull_div = div.get("bullish") if isinstance(div.get("bullish"), Mapping) else None
+    bear_div = div.get("bearish") if isinstance(div.get("bearish"), Mapping) else None
+
+    support_diag: list[dict[str, Any]] = []
+    resistance_diag: list[dict[str, Any]] = []
+    bull_candidates: list[dict[str, Any]] = []
+    bear_candidates: list[dict[str, Any]] = []
+
+    for level in levels:
+        if level.kind not in {"SUPPORT", "RESISTANCE"} or not finite(level.price):
+            continue
+        distance = abs(spot - level.price)
+        if distance > max_near:
+            continue
+        kind = level.kind
+        stat = _level_touch_stats_v87(frame, level.price, kind, atr, now)
+        actual_touches = int(stat.get("touches", 0))
+        level_touches = max(actual_touches, int(level.touches) if finite(level.touches) else 1)
+        # Retain evidence of multiple pivot/level tests even if a recent retest candle overlaps
+        # several one-minute candles; the separate-visit count still dominates the ranking.
+        touches = min(8, level_touches)
+        recent_touch = bool(stat.get("recent_touch"))
+        strength_component = 10.0 * clamp(level.strength, 0.0, 1.0)
+        proximity_component = 8.0 * clamp(1.0 - distance / max_near, 0.0, 1.0)
+
+        if kind == "SUPPORT":
+            pair_context = _local_pair_strength_v87(oi, "BULLISH", level.price, step)
+            touch_near = recent_touch or (touches >= 3 and distance <= max(0.8 * atr, 35.0))
+            reclaimed = bool(last_close > level.price + max(1.5, 0.05 * atr)
+                             and spot >= level.price - max(0.25 * atr, 10.0)
+                             and (indicators.momentum_1m > -0.00015 or last_close >= previous_close))
+            turn = indicators.momentum_1m > 0 or last_close > previous_close
+            structure_qual = bool(touches >= 2 and touch_near and reclaimed and turn and distance <= entry_near)
+            if structure_qual:
+                strict_fib_div = bool(bull_div and fib_near("BULLISH", level.price))
+                setup_name = "SUPPORT_BOUNCE" if strict_fib_div else "SUPPORT_CLUSTER_RECLAIM"
+                structure_score = 34.0 + min(touches, 5) * 4.5 + (10.0 if recent_touch else 5.0) + 8.0 + strength_component + proximity_component
+                evidence = [f"PERSISTENT_SUPPORT_TESTS_{touches}", f"RECENT_SUPPORT_TEST_{level.price:.2f}",
+                            f"SUPPORT_RECLAIMED_{level.price:.2f}", "PRICE_TURNING_UP_FROM_TESTED_SUPPORT"]
+                if pair_context.get("pair_confirmed"):
+                    evidence.append("LOCAL_OI_PAIR_CONTEXT_ALREADY_PRESENT")
+                if strict_fib_div:
+                    evidence.append("FIB_SUPPORT_AND_BULLISH_RSI_DIVERGENCE_CONFLUENCE")
+                bull_candidates.append({"score": structure_score, "setup": setup_name, "level": level,
+                                        "touches": touches, "evidence": evidence, "oi_context": pair_context,
+                                        "distance": distance, "price_action_confirmed": True})
+            else:
+                support_diag.append({"level": round(level.price, 2), "strength": round(level.strength, 3),
+                                     "source": level.source, "stored_touches": int(level.touches),
+                                     "observed_touches": actual_touches, "recent_touch": recent_touch,
+                                     "reclaimed": stat.get("reclaimed"), "distance_points": round(distance, 2),
+                                     "oi_context": pair_context})
+        else:
+            pair_context = _local_pair_strength_v87(oi, "BEARISH", level.price, step)
+            touch_near = recent_touch or (touches >= 3 and distance <= max(0.8 * atr, 35.0))
+            rejected = bool(last_close < level.price - max(1.5, 0.05 * atr)
+                            and spot <= level.price + max(0.25 * atr, 10.0)
+                            and (indicators.momentum_1m < 0.00015 or last_close <= previous_close))
+            turn = indicators.momentum_1m < 0 or last_close < previous_close
+            structure_qual = bool(touches >= 2 and touch_near and rejected and turn and distance <= entry_near)
+            if structure_qual:
+                strict_fib_div = bool(bear_div and fib_near("BEARISH", level.price))
+                setup_name = "RESISTANCE_REJECTION" if strict_fib_div else "RESISTANCE_CLUSTER_REJECTION"
+                structure_score = 34.0 + min(touches, 5) * 4.5 + (10.0 if recent_touch else 5.0) + 8.0 + strength_component + proximity_component
+                evidence = [f"PERSISTENT_RESISTANCE_TESTS_{touches}", f"RECENT_RESISTANCE_TEST_{level.price:.2f}",
+                            f"RESISTANCE_REJECTED_{level.price:.2f}", "PRICE_TURNING_DOWN_FROM_TESTED_RESISTANCE"]
+                if pair_context.get("pair_confirmed"):
+                    evidence.append("LOCAL_OI_PAIR_CONTEXT_ALREADY_PRESENT")
+                if strict_fib_div:
+                    evidence.append("FIB_RESISTANCE_AND_BEARISH_RSI_DIVERGENCE_CONFLUENCE")
+                bear_candidates.append({"score": structure_score, "setup": setup_name, "level": level,
+                                        "touches": touches, "evidence": evidence, "oi_context": pair_context,
+                                        "distance": distance, "price_action_confirmed": True})
+            else:
+                resistance_diag.append({"level": round(level.price, 2), "strength": round(level.strength, 3),
+                                        "source": level.source, "stored_touches": int(level.touches),
+                                        "observed_touches": actual_touches, "recent_touch": recent_touch,
+                                        "rejected": stat.get("rejected"), "distance_points": round(distance, 2),
+                                        "oi_context": pair_context})
+
+    # A clean two-close break is detected even if the scan catches it after a rapid extension.
+    # The setup/risk gate decides whether it is still safe to enter or should be watched for a retest.
+    closes = close_series.to_numpy(dtype=float)
+    for level in levels:
+        if level.kind == "RESISTANCE" and level.price < spot and spot - level.price <= max(3.0 * atr, 150.0):
+            if len(closes) >= 2 and closes[-1] > level.price + break_buffer and closes[-2] > level.price + break_buffer:
+                mom_score = (8.0 if indicators.momentum_1m > 0 else 0.0) + (7.0 if indicators.momentum_3m > 0 else 0.0)
+                rsi_score = 8.0 if finite(indicators.rsi) and indicators.rsi > 60 else 0.0
+                break_strength_component = 10.0 * clamp(level.strength, 0.0, 1.0)
+                bull_candidates.append({"score": 61.0 + mom_score + rsi_score + break_strength_component,
+                                        "setup": "CONFIRMED_BREAKOUT", "level": level, "touches": int(level.touches),
+                                        "evidence": [f"TWO_COMPLETED_CLOSES_ABOVE_{level.price:.2f}",
+                                                     "BREAKOUT_BOUNDARY_RETAINED_FOR_RETEST_MONITORING"],
+                                        "oi_context": _local_pair_strength_v87(oi, "BULLISH", level.price, step),
+                                        "distance": abs(spot-level.price), "price_action_confirmed": True})
+        if level.kind == "SUPPORT" and level.price > spot and level.price - spot <= max(3.0 * atr, 150.0):
+            if len(closes) >= 2 and closes[-1] < level.price - break_buffer and closes[-2] < level.price - break_buffer:
+                mom_score = (8.0 if indicators.momentum_1m < 0 else 0.0) + (7.0 if indicators.momentum_3m < 0 else 0.0)
+                rsi_score = 8.0 if finite(indicators.rsi) and indicators.rsi < 40 else 0.0
+                break_strength_component = 10.0 * clamp(level.strength, 0.0, 1.0)
+                bear_candidates.append({"score": 61.0 + mom_score + rsi_score + break_strength_component,
+                                        "setup": "CONFIRMED_BREAKDOWN", "level": level, "touches": int(level.touches),
+                                        "evidence": [f"TWO_COMPLETED_CLOSES_BELOW_{level.price:.2f}",
+                                                     "BREAKDOWN_BOUNDARY_RETAINED_FOR_RETEST_MONITORING"],
+                                        "oi_context": _local_pair_strength_v87(oi, "BEARISH", level.price, step),
+                                        "distance": abs(spot-level.price), "price_action_confirmed": True})
+
+    # Setup confidence is a ranking heuristic—not a probability. Local OI is scored as context;
+    # final approval still requires the formal paired-OI gate.
     bull_oi, bull_oi_ev = _oi_local_evidence(oi, "BULLISH", spot, step)
     bear_oi, bear_oi_ev = _oi_local_evidence(oi, "BEARISH", spot, step)
-    # Market structure is the anchor. The setup cannot be created from OI alone.
-    bull_score = clamp(bull_struct + bull_momentum + bull_oi, 0, 100)
-    bear_score = clamp(bear_struct + bear_momentum + bear_oi, 0, 100)
-    bull_ev += bull_oi_ev; bear_ev += bear_oi_ev
-    # Open-auction/late-session safeguards, avoid first-minute noisy selections.
-    clock = now.astimezone(IST).time()
-    blockers = []
-    if clock < ENTRY_OPEN:
-        blockers.append("BEFORE_ENTRY_WINDOW")
-    if clock >= ENTRY_CUTOFF:
-        blockers.append("ENTRY_CUTOFF_MONITOR_ONLY")
-    if indicators.candles < 8:
-        blockers.append("INSUFFICIENT_COMPLETED_CANDLES")
-    if max(bull_score, bear_score) < min_score:
-        direction, setup, score, level, evidence = "NEUTRAL", "NO_QUALIFYING_STRUCTURE", max(bull_score, bear_score), None, ["MARKET_STRUCTURE_SCORE_BELOW_THRESHOLD"]
-    elif abs(bull_score - bear_score) < 7:
-        direction, setup, score, level, evidence = "NEUTRAL", "CONFLICTING_DIRECTIONAL_EVIDENCE", max(bull_score, bear_score), None, ["BULL_BEAR_SCORE_SPREAD_LT_7", f"BULL={bull_score:.1f}", f"BEAR={bear_score:.1f}"]
-    elif bull_score > bear_score:
-        direction, setup, score, level, evidence = "BULLISH", setup_bull, bull_score, level_bull, bull_ev
+    momentum_bull = (7.0 if indicators.momentum_1m > 0 else 0.0) + (7.0 if indicators.momentum_3m > 0 else 0.0)
+    momentum_bear = (7.0 if indicators.momentum_1m < 0 else 0.0) + (7.0 if indicators.momentum_3m < 0 else 0.0)
+    if finite(indicators.rsi):
+        momentum_bull += 4.0 if 50 <= indicators.rsi <= 75 else 0.0
+        momentum_bear += 4.0 if 25 <= indicators.rsi <= 50 else 0.0
+    if finite(indicators.plus_di) and finite(indicators.minus_di):
+        momentum_bull += 3.0 if indicators.plus_di > indicators.minus_di else 0.0
+        momentum_bear += 3.0 if indicators.minus_di > indicators.plus_di else 0.0
+
+    def total(candidates: list[dict[str, Any]], momentum: float, oi_score: float) -> tuple[Optional[dict[str, Any]], float]:
+        if not candidates:
+            return None, 0.0
+        enriched = []
+        for row in candidates:
+            context_score = number(row.get("oi_context", {}).get("score"), 0.0)
+            score = clamp(number(row.get("score"), 0.0) + momentum * 0.45 + max(-8.0, min(18.0, oi_score * 0.55)) + context_score, 0.0, 100.0)
+            enriched.append(({**row, "score": score}, score))
+        enriched.sort(key=lambda item: (-item[1], -int(item[0].get("touches", 0)), number(item[0].get("distance"), 99999)))
+        return enriched[0][0], enriched[0][1]
+
+    best_bull, bull_score = total(bull_candidates, momentum_bull, bull_oi)
+    best_bear, bear_score = total(bear_candidates, momentum_bear, bear_oi)
+    clock_blockers = []
+    if now.astimezone(IST).time() < ENTRY_OPEN:
+        clock_blockers.append("BEFORE_ENTRY_WINDOW")
+    if now.astimezone(IST).time() >= ENTRY_CUTOFF:
+        clock_blockers.append("ENTRY_CUTOFF_MONITOR_ONLY")
+    if indicators.candles < 20:
+        clock_blockers.append("INSUFFICIENT_COMPLETED_CANDLES")
+
+    score_gap = abs(bull_score - bear_score)
+    if best_bull and best_bear and score_gap < 8.0:
+        direction, setup, score, level, evidence = "NEUTRAL", "CONFLICTING_EDGE_EVIDENCE", max(bull_score, bear_score), None, [
+            "BULLISH_AND_BEARISH_STRUCTURE_CANDIDATES_CONFLICT", f"BULL={bull_score:.1f}", f"BEAR={bear_score:.1f}"]
+    elif best_bull and (not best_bear or bull_score > bear_score):
+        direction, setup, score, level = "BULLISH", str(best_bull["setup"]), bull_score, best_bull["level"].price
+        evidence = list(best_bull["evidence"]) + list(bull_oi_ev)
+        if best_bull["distance"] > max(1.5 * atr, 45.0) and setup in {"CONFIRMED_BREAKOUT", "CONFIRMED_BREAKDOWN"}:
+            evidence.append("BREAKOUT_EXTENDED_ENTRY_REQUIRES_RETEST_OR_NEW_BASE")
+    elif best_bear:
+        direction, setup, score, level = "BEARISH", str(best_bear["setup"]), bear_score, best_bear["level"].price
+        evidence = list(best_bear["evidence"]) + list(bear_oi_ev)
+        if best_bear["distance"] > max(1.5 * atr, 45.0) and setup in {"CONFIRMED_BREAKOUT", "CONFIRMED_BREAKDOWN"}:
+            evidence.append("BREAKDOWN_EXTENDED_ENTRY_REQUIRES_RETEST_OR_NEW_BASE")
     else:
-        direction, setup, score, level, evidence = "BEARISH", setup_bear, bear_score, level_bear, bear_ev
-    if direction != "NEUTRAL" and not setup or setup == "NONE":
-        direction, setup, level = "NEUTRAL", "NO_STRUCTURAL_TRIGGER", None
-    if direction != "NEUTRAL" and blockers:
-        evidence.extend(blockers)
+        direction, setup, score, level, evidence = "NEUTRAL", "NO_QUALIFYING_PRICE_ACTION", max(bull_score, bear_score), None, [
+            "NO_REPEATED_LEVEL_REACTION_OR_TWO_CLOSE_BREAK"]
+    if direction != "NEUTRAL" and clock_blockers:
+        evidence.extend(clock_blockers)
     signal = Signal(direction, setup, round(score, 1), round(clamp(score, 0, 92), 1),
-                    "; ".join(evidence[:8]), level, tuple(dict.fromkeys(evidence)), tuple(blockers))
+                    "; ".join(evidence[:8]), level, tuple(dict.fromkeys(evidence)), tuple(clock_blockers))
     diag = {"bull_score": round(bull_score, 1), "bear_score": round(bear_score, 1),
-            "nearest_support": asdict(support) if support else None, "nearest_resistance": asdict(resistance) if resistance else None,
-            "interaction_support": asdict(near_support) if near_support else None, "interaction_resistance": asdict(near_resistance) if near_resistance else None,
-            "bull_momentum_score": round(bull_momentum, 1), "bear_momentum_score": round(bear_momentum, 1),
-            "bull_oi_score": round(bull_oi, 1), "bear_oi_score": round(bear_oi, 1), "threshold": min_score}
+            "bullish_candidates": [{"setup": c["setup"], "level": round(c["level"].price, 2), "score": round(number(c.get("score"), 0), 1), "touches": c.get("touches"), "distance": round(number(c.get("distance"), 0), 2)} for c in bull_candidates[:6]],
+            "bearish_candidates": [{"setup": c["setup"], "level": round(c["level"].price, 2), "score": round(number(c.get("score"), 0), 1), "touches": c.get("touches"), "distance": round(number(c.get("distance"), 0), 2)} for c in bear_candidates[:6]],
+            "nearest_support": asdict(nearest_level(levels, spot + 0.5, "SUPPORT")) if nearest_level(levels, spot + 0.5, "SUPPORT") else None,
+            "nearest_resistance": asdict(nearest_level(levels, spot - 0.5, "RESISTANCE")) if nearest_level(levels, spot - 0.5, "RESISTANCE") else None,
+            "support_interaction_diagnostics": support_diag[:8], "resistance_interaction_diagnostics": resistance_diag[:8],
+            "oi_context_bullish": {"score": round(bull_oi, 2), "evidence": bull_oi_ev},
+            "oi_context_bearish": {"score": round(bear_oi, 2), "evidence": bear_oi_ev},
+            "threshold": min_score,
+            "decision_model": "PERSISTENT_TESTED_LEVELS_THEN_PRICE_TURN_THEN_STRICT_LOCAL_OI_AUTHORIZATION",
+            "vwap_role": "CONTEXT_ONLY_WHEN_VOLUME_IS_AVAILABLE"}
     return signal, diag
+
 
 
 def classify_market_regime(frame: pd.DataFrame, indicators: Indicators, now: datetime) -> dict[str, Any]:
@@ -1538,13 +1787,12 @@ def qualify_local_oi(oi: Mapping[str, Any], signal: Signal, spot: float, step: f
     Aggregate PCR/session OI cannot substitute for the local pair.
     """
     threshold = max(0.02, min(0.10, number(min_change_pct, 2.0) / 100.0))
-    premium_floor = 0.005  # at least 0.5% option-premium movement to classify a local flow
-    min_abs_delta_oi = 1300.0
+    premium_floor = 0.002  # Use the same minimum directional premium-change scale as the flow classifier.
     direction = str(signal.direction).upper()
     setup = str(signal.setup).upper()
     empty = {"qualified": False, "writing_oi_threshold_pct_exclusive": threshold * 100,
              "covering_oi_decline_threshold_pct_exclusive": 0.5,
-             "premium_change_min_pct": premium_floor * 100, "min_absolute_delta_oi": min_abs_delta_oi,
+             "premium_change_min_pct": premium_floor * 100, "absolute_oi_delta_floor": None,
              "supporting_rows": [], "opposing_rows": [], "reference_strikes": [],
              "primary_flow": None, "secondary_flow": None}
     if direction not in {"BULLISH", "BEARISH"}:
@@ -1552,10 +1800,10 @@ def qualify_local_oi(oi: Mapping[str, Any], signal: Signal, spot: float, step: f
     if not bool(oi.get("tactical_available")):
         return {**empty, "reason": "SAME_SESSION_LOCAL_OI_BASELINE_UNAVAILABLE_OR_STALE",
                 "tactical_age_minutes": oi.get("snapshot_age_minutes")}
-    if setup in {"SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM", "CONFIRMED_BREAKOUT", "PREBREAKOUT_RESISTANCE_PRESSURE"}:
+    if setup in {"SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM", "SUPPORT_CLUSTER_RECLAIM", "CONFIRMED_BREAKOUT", "PREBREAKOUT_RESISTANCE_PRESSURE"}:
         primary_side, primary_flow = "put", "SHORT_BUILDUP_WRITING"
         secondary_side, secondary_flow = "call", "SHORT_COVERING"
-    elif setup in {"RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION", "CONFIRMED_BREAKDOWN", "PREBREAKDOWN_SUPPORT_PRESSURE"}:
+    elif setup in {"RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION", "RESISTANCE_CLUSTER_REJECTION", "CONFIRMED_BREAKDOWN", "PREBREAKDOWN_SUPPORT_PRESSURE"}:
         primary_side, primary_flow = "call", "SHORT_BUILDUP_WRITING"
         secondary_side, secondary_flow = "put", "SHORT_COVERING"
     else:
@@ -1576,7 +1824,7 @@ def qualify_local_oi(oi: Mapping[str, Any], signal: Signal, spot: float, step: f
         current_premium = number(row.get(f"{side}_ltp"))
         if not all(finite(v) for v in (change, premium_change, delta_oi, base_oi, old_premium, current_premium)):
             return None
-        if base_oi < 10000 or old_premium < 5 or current_premium < 5 or abs(delta_oi) < min_abs_delta_oi:
+        if base_oi < 10000 or old_premium < 5 or current_premium < 5:
             return None
         if expected_flow == "SHORT_BUILDUP_WRITING":
             passed = change > threshold and premium_change <= -premium_floor
@@ -1619,7 +1867,7 @@ def qualify_local_oi(oi: Mapping[str, Any], signal: Signal, spot: float, step: f
             new_ltp = number(row.get(f"{side}_ltp"))
             if not all(finite(v) for v in (change, prem, delta, base, old_ltp, new_ltp)):
                 continue
-            if base < 10000 or min(old_ltp, new_ltp) < 5 or abs(delta) < min_abs_delta_oi or abs(change) <= threshold or abs(prem) < premium_floor:
+            if base < 10000 or min(old_ltp, new_ltp) < 5 or abs(change) <= threshold or abs(prem) < premium_floor:
                 continue
             flow = classify_oi_flow(change, prem)
             if direction == "BULLISH":
@@ -1665,7 +1913,7 @@ def qualify_regime(signal: Signal, regime: Mapping[str, Any], indicators: Indica
                    fib_divergence: Optional[Mapping[str, Any]] = None,
                    local_oi: Optional[Mapping[str, Any]] = None,
                    setup_rules: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
-    """Require higher-context alignment, or very high-confluence structural reversal/range edge."""
+    """Require regime alignment, but do not confuse range-edge price action with midrange chop."""
     direction = str(signal.direction).upper()
     name = str(regime.get("regime", "TRANSITION")).upper()
     setup = str(signal.setup).upper()
@@ -1674,91 +1922,98 @@ def qualify_regime(signal: Signal, regime: Mapping[str, Any], indicators: Indica
     oi_ok = bool((local_oi or {}).get("qualified"))
     setup_ok = bool((setup_rules or {}).get("qualified"))
     evidence = " ".join(signal.evidence).upper()
-    reversal_setups = {"SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM", "RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION"}
-    bullish_reversal = direction == "BULLISH" and setup in {"SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM"}
-    bearish_reversal = direction == "BEARISH" and setup in {"RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION"}
-    reversal = bullish_reversal or bearish_reversal
     if direction not in {"BULLISH", "BEARISH"}:
         return {"qualified": False, "reason": "NO_DIRECTIONAL_STRUCTURE", "regime": name}
     if name == "WARMUP":
         return {"qualified": False, "reason": "CANDLE_WARMUP_MONITOR_ONLY", "regime": name}
 
-    # Countertrend trades are possible only at a real reversal: confirmed matching RSI divergence,
-    # Fib support/resistance confluence, paired local OI flow, and price already turning off the level.
-    reversal_confluence = bool(reversal and fib_ok and oi_ok and finite(signal.level) and
-        abs(spot - float(signal.level)) <= max(1.0 * indicators.atr, 45.0) and
-        ((direction == "BULLISH" and indicators.momentum_1m > 0 and indicators.momentum_3m > -0.0010) or
-         (direction == "BEARISH" and indicators.momentum_1m < 0 and indicators.momentum_3m < 0.0010)))
+    structure_first = setup in {"SUPPORT_CLUSTER_RECLAIM", "RESISTANCE_CLUSTER_REJECTION"}
+    if structure_first:
+        is_bull_edge = direction == "BULLISH" and setup == "SUPPORT_CLUSTER_RECLAIM" and "PERSISTENT_SUPPORT_TESTS_" in evidence
+        is_bear_edge = direction == "BEARISH" and setup == "RESISTANCE_CLUSTER_REJECTION" and "PERSISTENT_RESISTANCE_TESTS_" in evidence
+        matching_trend = (name == "TREND_BULLISH" and direction == "BULLISH") or (name == "TREND_BEARISH" and direction == "BEARISH")
+        countertrend = (name == "TREND_BEARISH" and direction == "BULLISH") or (name == "TREND_BULLISH" and direction == "BEARISH")
+        range_loc = number(regime.get("range_location_pct"))
+        at_range_edge = (is_bull_edge and (not finite(range_loc) or range_loc <= 52.0)) or (is_bear_edge and (not finite(range_loc) or range_loc >= 48.0))
+        if not oi_ok:
+            return {"qualified": False, "reason": "EDGE_RECLAIM_REQUIRES_STRICT_LOCAL_OI_PAIR", "regime": name}
+        if not setup_ok:
+            return {"qualified": False, "reason": "EDGE_RECLAIM_PRICE_ACTION_NOT_CURRENTLY_VALID", "regime": name}
+        if not (is_bull_edge or is_bear_edge):
+            return {"qualified": False, "reason": "EDGE_SETUP_LACKS_PERSISTENT_LEVEL_EVIDENCE", "regime": name}
+        if name in {"SIDEWAYS", "WHIPSAW"} and (at_range_edge or "PERSISTENT_SUPPORT_TESTS_" in evidence or "PERSISTENT_RESISTANCE_TESTS_" in evidence):
+            return {"qualified": True, "reason": "REPEATED_RANGE_EDGE_RECLAIM_WITH_LOCAL_OI_CONFIRMATION", "regime": name,
+                    "session_bias": session_bias, "range_location_pct": range_loc}
+        if matching_trend:
+            return {"qualified": True, "reason": "PERSISTENT_LEVEL_RECLAIM_ALIGNED_WITH_TREND_AND_LOCAL_OI", "regime": name,
+                    "session_bias": session_bias}
+        if countertrend and (at_range_edge or "PERSISTENT_SUPPORT_TESTS_" in evidence or "PERSISTENT_RESISTANCE_TESTS_" in evidence) and oi_ok and setup_ok:
+            return {"qualified": True, "reason": "COUNTERTREND_EDGE_RECLAIM_WITH_PRICE_AND_OI_CONTEXT", "regime": name,
+                    "session_bias": session_bias, "range_location_pct": range_loc}
+        if name == "TRANSITION" and oi_ok and setup_ok:
+            return {"qualified": True, "reason": "TRANSITION_LEVEL_RECLAIM_WITH_LOCAL_OI_CONFIRMATION", "regime": name,
+                    "session_bias": session_bias}
+        return {"qualified": False, "reason": "EDGE_RECLAIM_NOT_ALIGNED_WITH_RANGE_EDGE_OR_MARKET_REGIME", "regime": name,
+                "session_bias": session_bias, "range_location_pct": range_loc}
 
+    reversal_setups = {"SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM", "RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION"}
+    bullish_reversal = direction == "BULLISH" and setup in {"SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM"}
+    bearish_reversal = direction == "BEARISH" and setup in {"RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION"}
+    reversal = bullish_reversal or bearish_reversal
+    reversal_confluence = bool(reversal and fib_ok and oi_ok and finite(signal.level)
+        and abs(spot - float(signal.level)) <= max(1.0 * indicators.atr, 45.0)
+        and ((direction == "BULLISH" and indicators.momentum_1m > 0 and indicators.momentum_3m > -0.0010)
+             or (direction == "BEARISH" and indicators.momentum_1m < 0 and indicators.momentum_3m < 0.0010)))
     strict_break_setup = setup in {"CONFIRMED_BREAKOUT", "CONFIRMED_BREAKDOWN"} and setup_ok and oi_ok
     strong_break = bool(
         (direction == "BULLISH" and setup == "CONFIRMED_BREAKOUT" and finite(indicators.rsi) and indicators.rsi > 60
          and indicators.momentum_1m > 0 and indicators.momentum_3m > 0) or
         (direction == "BEARISH" and setup == "CONFIRMED_BREAKDOWN" and finite(indicators.rsi) and indicators.rsi < 40
          and indicators.momentum_1m < 0 and indicators.momentum_3m < 0))
-
     if name in {"TREND_BULLISH", "TREND_BEARISH"}:
         trend_direction = "BULLISH" if name == "TREND_BULLISH" else "BEARISH"
         aligned = direction == trend_direction
         session_opposes = session_bias in {"BULLISH", "BEARISH"} and session_bias != direction
         if aligned and not session_opposes:
-            return {"qualified": True, "reason": "ALIGNED_WITH_DOMINANT_TREND_AND_SESSION", "regime": name,
-                    "session_bias": session_bias, "countertrend_reversal_confluence": False}
+            return {"qualified": True, "reason": "ALIGNED_WITH_DOMINANT_TREND_AND_SESSION", "regime": name, "session_bias": session_bias}
         if aligned and session_opposes and (strict_break_setup or reversal_confluence):
-            return {"qualified": True, "reason": "LOCAL_STRUCTURE_AND_SETUP_GATES_OVERRIDE_LAGGING_SESSION_BIAS",
-                    "regime": name, "session_bias": session_bias,
-                    "strict_two_close_break_with_oi": strict_break_setup,
+            return {"qualified": True, "reason": "LOCAL_STRUCTURE_AND_SETUP_GATES_OVERRIDE_LAGGING_SESSION_BIAS", "regime": name,
+                    "session_bias": session_bias, "strict_two_close_break_with_oi": strict_break_setup,
                     "countertrend_reversal_confluence": reversal_confluence}
         if not aligned and strict_break_setup:
-            return {"qualified": True, "reason": "STRICT_TWO_CLOSE_BREAK_AND_LOCAL_OI_OVERRIDE_LAGGING_TREND_CLASSIFIER",
-                    "regime": name, "session_bias": session_bias,
-                    "strict_two_close_break_with_oi": True}
+            return {"qualified": True, "reason": "STRICT_TWO_CLOSE_BREAK_AND_LOCAL_OI_OVERRIDE_LAGGING_TREND_CLASSIFIER", "regime": name, "session_bias": session_bias}
         if not aligned and reversal_confluence:
-            return {"qualified": True, "reason": "COUNTERTREND_REVERSAL_CONFIRMED_BY_FIB_DIVERGENCE_LOCAL_OI_AND_PRICE",
-                    "regime": name, "session_bias": session_bias, "countertrend_reversal_confluence": True}
-        return {"qualified": False,
-                "reason": "TREND_OR_SESSION_CONFLICT_WITHOUT_CONFIRMED_REVERSAL_OR_TWO_CLOSE_FLIP",
-                "regime": name, "session_bias": session_bias, "strong_break": strong_break,
-                "countertrend_reversal_confluence": reversal_confluence}
-
+            return {"qualified": True, "reason": "COUNTERTREND_REVERSAL_CONFIRMED_BY_FIB_DIVERGENCE_LOCAL_OI_AND_PRICE", "regime": name, "session_bias": session_bias}
+        return {"qualified": False, "reason": "TREND_OR_SESSION_CONFLICT_WITHOUT_CONFIRMED_REVERSAL_OR_TWO_CLOSE_FLIP", "regime": name,
+                "session_bias": session_bias, "strong_break": strong_break, "countertrend_reversal_confluence": reversal_confluence}
     if name in {"SIDEWAYS", "WHIPSAW"}:
         location = number(regime.get("range_location_pct"))
         lower_edge = finite(location) and location <= 32.0
         upper_edge = finite(location) and location >= 68.0
         repeated_support = "REPEATED_SUPPORT_TESTS" in evidence
         repeated_resistance = "REPEATED_RESISTANCE_TESTS" in evidence or "REPEATED_RESISTANCE_REJECTION_WATCH" in evidence
-        bull_fade = (bullish_reversal and repeated_support and lower_edge and
-                     indicators.momentum_1m > 0 and indicators.momentum_3m > -0.0005 and fib_ok and oi_ok)
-        bear_fade = (bearish_reversal and repeated_resistance and upper_edge and
-                     indicators.momentum_1m < 0 and indicators.momentum_3m < 0.0005 and fib_ok and oi_ok)
-        prior_high = number(regime.get("prior_range_high"))
-        prior_low = number(regime.get("prior_range_low"))
+        bull_fade = (bullish_reversal and repeated_support and lower_edge and indicators.momentum_1m > 0
+                     and indicators.momentum_3m > -0.0005 and fib_ok and oi_ok and setup_ok)
+        bear_fade = (bearish_reversal and repeated_resistance and upper_edge and indicators.momentum_1m < 0
+                     and indicators.momentum_3m < 0.0005 and fib_ok and oi_ok and setup_ok)
+        prior_high, prior_low = number(regime.get("prior_range_high")), number(regime.get("prior_range_low"))
         buffer = max(3.0, 0.10 * indicators.atr)
-        bull_range_break = (setup == "CONFIRMED_BREAKOUT" and direction == "BULLISH" and strict_break_setup and
-                            strong_break and finite(prior_high) and spot > prior_high + buffer)
-        bear_range_break = (setup == "CONFIRMED_BREAKDOWN" and direction == "BEARISH" and strict_break_setup and
-                            strong_break and finite(prior_low) and spot < prior_low - buffer)
+        bull_break = setup == "CONFIRMED_BREAKOUT" and direction == "BULLISH" and strict_break_setup and strong_break and finite(prior_high) and spot > prior_high + buffer
+        bear_break = setup == "CONFIRMED_BREAKDOWN" and direction == "BEARISH" and strict_break_setup and strong_break and finite(prior_low) and spot < prior_low - buffer
         if bull_fade or bear_fade:
-            return {"qualified": True, "reason": "CONFIRMED_RANGE_EDGE_FADE_WITH_OI_FIB_DIVERGENCE",
-                    "regime": name, "session_bias": session_bias, "range_location_pct": location}
-        if bull_range_break or bear_range_break:
-            return {"qualified": True, "reason": "TWO_CLOSE_BREAKOUT_OF_PRIOR_RANGE_WITH_STRICT_MOMENTUM",
-                    "regime": name, "session_bias": session_bias, "range_location_pct": location}
-        return {"qualified": False,
-                "reason": "SIDEWAYS_WHIPSAW_BLOCKS_MIDRANGE_AND_UNCONFIRMED_ENTRIES",
-                "regime": name, "session_bias": session_bias, "range_location_pct": location,
-                "lower_edge": lower_edge, "upper_edge": upper_edge}
-
-    # TRANSITION is not assigned an arbitrary direction. Permit a confirmed break only when
-    # its own strict breakout/breakdown rule is met, or a complete reversal at a structural level.
+            return {"qualified": True, "reason": "CONFIRMED_RANGE_EDGE_FADE_WITH_OI_FIB_DIVERGENCE", "regime": name,
+                    "session_bias": session_bias, "range_location_pct": location}
+        if bull_break or bear_break:
+            return {"qualified": True, "reason": "TWO_CLOSE_BREAKOUT_OF_PRIOR_RANGE_WITH_STRICT_MOMENTUM", "regime": name,
+                    "session_bias": session_bias, "range_location_pct": location}
+        return {"qualified": False, "reason": "SIDEWAYS_WHIPSAW_BLOCKS_MIDRANGE_AND_UNCONFIRMED_ENTRIES", "regime": name,
+                "session_bias": session_bias, "range_location_pct": location, "lower_edge": lower_edge, "upper_edge": upper_edge}
     if reversal_confluence:
-        return {"qualified": True, "reason": "TRANSITION_REVERSAL_CONFIRMED_BY_FULL_CONFLUENCE",
-                "regime": name, "session_bias": session_bias}
+        return {"qualified": True, "reason": "TRANSITION_REVERSAL_CONFIRMED_BY_FULL_CONFLUENCE", "regime": name, "session_bias": session_bias}
     if setup in {"CONFIRMED_BREAKOUT", "CONFIRMED_BREAKDOWN"} and strict_break_setup and strong_break:
-        return {"qualified": True, "reason": "TRANSITION_CONFIRMED_BREAK_WITH_ALIGNED_MOMENTUM_AND_OI",
-                "regime": name, "session_bias": session_bias}
-    return {"qualified": False, "reason": "TRANSITION_REQUIRES_CONFIRMED_BREAK_OR_FULL_REVERSAL_CONFLUENCE",
-            "regime": name, "session_bias": session_bias}
+        return {"qualified": True, "reason": "TRANSITION_CONFIRMED_BREAK_WITH_ALIGNED_MOMENTUM_AND_OI", "regime": name, "session_bias": session_bias}
+    return {"qualified": False, "reason": "TRANSITION_REQUIRES_CONFIRMED_BREAK_OR_FULL_REVERSAL_CONFLUENCE", "regime": name, "session_bias": session_bias}
+
 
 
 def diagnose_expiry_pin(oi: Mapping[str, Any], fib: Mapping[str, Any], indicators: Indicators,
@@ -1802,64 +2057,60 @@ def diagnose_expiry_pin(oi: Mapping[str, Any], fib: Mapping[str, Any], indicator
 
 def qualify_fib_divergence(signal: Signal, regime: Mapping[str, Any], fib: Mapping[str, Any],
                             divergence: Mapping[str, Any], spot: float, atr: float) -> dict[str, Any]:
-    """Apply Fib/divergence only where structurally relevant; missing data is not an opposing signal.
+    """Use strict Fib/divergence for spreadsheet reversal setups; do not require it for a distinct price-action reclaim.
 
-    Spreadsheet-derived policy: reversals require confirmed matching RSI divergence plus a nearby
-    50/61.8% Fibonacci zone. Breakouts/breakdowns do not require divergence to be available, but a
-    *confirmed* opposing divergence blocks them. No signal can bypass the independent >2% local-OI
-    or overall-regime gates.
+    The dedicated SUPPORT_CLUSTER_RECLAIM / RESISTANCE_CLUSTER_REJECTION path is based on
+    repeated tested levels and a live price turn. It still needs the independent strict local-OI,
+    regime, contract and structural-risk gates. A confirmed opposing divergence near the trigger
+    remains a veto; a distant divergence is recorded as context rather than globally blocking the signal.
     """
     direction = str(signal.direction).upper()
     setup = str(signal.setup).upper()
-    regime_name = str(regime.get("regime", "TRANSITION")).upper()
     if direction not in {"BULLISH", "BEARISH"}:
         return {"qualified": False, "reason": "NO_DIRECTIONAL_SIGNAL", "fib_confluence": False,
                 "divergence_required": False, "opposing_divergence_confirmed": False}
-
     matching_div = divergence.get("bullish") if direction == "BULLISH" else divergence.get("bearish")
     opposing_div = divergence.get("bearish") if direction == "BULLISH" else divergence.get("bullish")
-    opposing_confirmed = isinstance(opposing_div, Mapping) and bool(opposing_div)
-    if opposing_confirmed:
-        return {"qualified": False, "reason": "CONFIRMED_OPPOSING_RSI_DIVERGENCE",
+    opposing = dict(opposing_div) if isinstance(opposing_div, Mapping) else None
+    trigger_level = number(signal.level, spot)
+    opposition_price = number((opposing or {}).get("price_high_2" if direction == "BULLISH" else "price_low_2"))
+    opposing_near = bool(opposing and finite(opposition_price) and abs(opposition_price-trigger_level) <= max(1.0*atr, 45.0))
+    if opposing_near:
+        return {"qualified": False, "reason": "CONFIRMED_OPPOSING_RSI_DIVERGENCE_NEAR_TRIGGER",
                 "fib_confluence": False, "divergence_required": False,
                 "matching_divergence": matching_div, "opposing_divergence_confirmed": True,
-                "opposing_divergence": opposing_div, "fib_levels_checked": []}
+                "opposing_divergence": opposing, "opposing_divergence_distance": round(abs(opposition_price-trigger_level), 2)}
 
-    reversal_setups = {
-        "SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM", "RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION"
-    }
-    # In choppy conditions only genuine boundary fades can qualify; generic pre-break pressure remains vetoed by regime gate.
-    reversal = setup in reversal_setups
-    if not reversal:
+    structure_first = setup in {"SUPPORT_CLUSTER_RECLAIM", "RESISTANCE_CLUSTER_REJECTION"}
+    if structure_first:
         return {"qualified": True,
-                "reason": "NO_OPPOSING_DIVERGENCE_CONFIRMED; DIVERGENCE_UNAVAILABLE_IS_NOT_A_VETO",
+                "reason": "PRICE_ACTION_LEVEL_RECLAIM_WITH_OI_CONFIRMATION_PATH;FIB_DIVERGENCE_NOT_MANDATORY",
                 "fib_confluence": None, "divergence_required": False,
                 "matching_divergence": matching_div, "opposing_divergence_confirmed": False,
-                "fib_levels_checked": [], "fib_available": bool(fib.get("available")),
-                "divergence_available": bool(divergence.get("available"))}
+                "opposing_divergence_present_but_not_near_trigger": bool(opposing),
+                "fib_available": bool(fib.get("available")), "divergence_available": bool(divergence.get("available"))}
 
-    # Reversal signals need a fresh, confirmed same-direction divergence; no divergence and
-    # unavailable divergence are different states and both conservatively fail reversal entry.
+    reversal_setups = {"SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM", "RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION"}
+    reversal = setup in reversal_setups
+    if not reversal:
+        return {"qualified": True, "reason": "NO_NEARBY_OPPOSING_DIVERGENCE;CONTINUATION_RULES_APPLY",
+                "fib_confluence": None, "divergence_required": False,
+                "matching_divergence": matching_div, "opposing_divergence_confirmed": False,
+                "fib_available": bool(fib.get("available")), "divergence_available": bool(divergence.get("available"))}
     if not isinstance(matching_div, Mapping) or not matching_div:
         return {"qualified": False, "reason": "REVERSAL_REQUIRES_CONFIRMED_MATCHING_RSI_DIVERGENCE",
                 "fib_confluence": False, "divergence_required": True,
                 "matching_divergence": None, "opposing_divergence_confirmed": False,
-                "fib_levels_checked": [], "fib_available": bool(fib.get("available")),
-                "divergence_available": bool(divergence.get("available"))}
+                "fib_available": bool(fib.get("available")), "divergence_available": bool(divergence.get("available"))}
 
     if direction == "BULLISH":
-        zone = fib.get("bullish_support_zone")
-        # If the latest qualified leg's support map is missing, no synthetic level is substituted.
-        raw_levels = []
-        if isinstance(zone, Mapping):
-            raw_levels = [number(zone.get("fib_50")), number(zone.get("fib_61_8")), number(zone.get("fib_100"))]
+        zone = fib.get("bullish_support_zone") if isinstance(fib.get("bullish_support_zone"), Mapping) else {}
+        raw_levels = [number(zone.get("fib_50")), number(zone.get("fib_61_8"))]
         level_role = "BULLISH_FIB_SUPPORT_50_61_8"
     else:
-        zone = fib.get("bearish_resistance_levels")
-        raw_levels = []
-        if isinstance(zone, Mapping):
-            raw_levels = [number(zone.get("fib_50")), number(zone.get("fib_61_8")), number(zone.get("fib_100"))]
-        level_role = "BEARISH_FIB_RESISTANCE_50_61_8"
+        zone = fib.get("bearish_resistance_levels") if isinstance(fib.get("bearish_resistance_levels"), Mapping) else {}
+        raw_levels = [number(zone.get("fib_50")), number(zone.get("fib_61_8")), number(zone.get("fib_100"))]
+        level_role = "BEARISH_FIB_RESISTANCE_50_61_8_OR_100"
     fib_levels = [x for x in raw_levels if finite(x)]
     if not bool(fib.get("available")) or not fib_levels:
         return {"qualified": False, "reason": "REVERSAL_REQUIRES_AVAILABLE_CONFIRMED_FIB_ZONE",
@@ -1867,19 +2118,14 @@ def qualify_fib_divergence(signal: Signal, regime: Mapping[str, Any], fib: Mappi
                 "matching_divergence": matching_div, "opposing_divergence_confirmed": False,
                 "fib_levels_checked": fib_levels, "fib_available": bool(fib.get("available")),
                 "divergence_available": bool(divergence.get("available"))}
-
-    # Compare both live spot and detected price-structure boundary to avoid missing a valid touch
-    # because spot has already moved a little off the pivot. The tolerance is volatility-scaled.
-    anchor = number(signal.level, spot)
     tolerance = max(12.0, min(28.0, 0.45 * atr if finite(atr) else 12.0))
-    distances = [{"level": round(level, 2), "spot_distance": round(abs(spot-level), 2),
-                  "structure_distance": round(abs(anchor-level), 2),
-                  "distance": round(min(abs(spot-level), abs(anchor-level)), 2)} for level in fib_levels]
+    distances = [{"level": round(x, 2), "spot_distance": round(abs(spot-x), 2),
+                  "structure_distance": round(abs(trigger_level-x), 2),
+                  "distance": round(min(abs(spot-x), abs(trigger_level-x)), 2)} for x in fib_levels]
     closest = min(distances, key=lambda item: item["distance"])
     confluence = closest["distance"] <= tolerance
     return {"qualified": bool(confluence),
-            "reason": ("REVERSAL_CONFIRMED_DIVERGENCE_AND_FIB_CONFLUENCE" if confluence else
-                       "REVERSAL_DIVERGENCE_CONFIRMED_BUT_PRICE_STRUCTURE_NOT_NEAR_FIB_ZONE"),
+            "reason": "REVERSAL_CONFIRMED_DIVERGENCE_AND_FIB_CONFLUENCE" if confluence else "REVERSAL_DIVERGENCE_CONFIRMED_BUT_PRICE_STRUCTURE_NOT_NEAR_FIB_ZONE",
             "fib_confluence": bool(confluence), "fib_role": level_role, "fib_tolerance_points": round(tolerance, 2),
             "closest_fib_level": closest["level"], "closest_fib_distance_points": closest["distance"],
             "fib_levels_checked": distances, "divergence_required": True,
@@ -1888,10 +2134,11 @@ def qualify_fib_divergence(signal: Signal, regime: Mapping[str, Any], fib: Mappi
 
 
 
+
 def qualify_setup_rules(signal: Signal, frame: pd.DataFrame, indicators: Indicators,
                         regime: Mapping[str, Any], fib_gate: Mapping[str, Any],
                         oi_gate: Mapping[str, Any], now: datetime) -> dict[str, Any]:
-    """Apply the distinct spreadsheet entry rules after detection and before authorization."""
+    """Setup-specific validation; predictive watches are not entry authorization."""
     direction = str(signal.direction).upper()
     setup = str(signal.setup).upper()
     bars = completed_candles(frame, now.astimezone(IST))
@@ -1914,7 +2161,7 @@ def qualify_setup_rules(signal: Signal, frame: pd.DataFrame, indicators: Indicat
     max_entry_extension = max(1.5 * indicators.atr, 45.0)
     spot_dist = abs(indicators.spot - level)
     if spot_dist > max_entry_extension:
-        return {**out, "reason": "PRICE_TOO_EXTENDED_FROM_TRIGGER_LEVEL",
+        return {**out, "reason": "PRICE_TOO_EXTENDED_FROM_TRIGGER_LEVEL;WAIT_FOR_RETEST",
                 "distance_from_level_points": round(spot_dist, 2),
                 "max_allowed_distance_points": round(max_entry_extension, 2)}
 
@@ -1924,9 +2171,13 @@ def qualify_setup_rules(signal: Signal, frame: pd.DataFrame, indicators: Indicat
     expanding_down = current_3m < 0 and current_3m < prior_3m
     last_close = float(closes.iloc[-1])
     prev_close = float(closes.iloc[-2])
-    matching_div = (fib_gate.get("matching_divergence") if isinstance(fib_gate.get("matching_divergence"), Mapping) else None)
+    matching_div = fib_gate.get("matching_divergence") if isinstance(fib_gate.get("matching_divergence"), Mapping) else None
     fib_ok = bool(fib_gate.get("qualified")) and bool(fib_gate.get("fib_confluence"))
     rsi = float(indicators.rsi)
+    evidence = " ".join(signal.evidence).upper()
+    repeated_support = "PERSISTENT_SUPPORT_TESTS_" in evidence
+    repeated_resistance = "PERSISTENT_RESISTANCE_TESTS_" in evidence
+    recent_test = "RECENT_SUPPORT_TEST_" in evidence or "RECENT_RESISTANCE_TEST_" in evidence
 
     if setup == "CONFIRMED_BREAKOUT" and direction == "BULLISH":
         checks = {
@@ -1934,8 +2185,8 @@ def qualify_setup_rules(signal: Signal, frame: pd.DataFrame, indicators: Indicat
             "live_spot_above_boundary": indicators.spot > level + buffer,
             "rsi_strictly_above_60": rsi > 60.0,
             "momentum_positive_1m_3m": indicators.momentum_1m > 0 and indicators.momentum_3m > 0,
-            "upward_momentum_expanding": expanding_up,
-            "no_confirmed_opposing_divergence": not bool(fib_gate.get("opposing_divergence_confirmed")),
+            "upward_momentum_expanding_or_follow_through": expanding_up or (last_close > prev_close and indicators.momentum_1m > 0),
+            "no_confirmed_opposing_divergence_near_trigger": not bool(fib_gate.get("opposing_divergence_confirmed")),
         }
     elif setup == "CONFIRMED_BREAKDOWN" and direction == "BEARISH":
         checks = {
@@ -1943,8 +2194,32 @@ def qualify_setup_rules(signal: Signal, frame: pd.DataFrame, indicators: Indicat
             "live_spot_below_boundary": indicators.spot < level - buffer,
             "rsi_strictly_below_40": rsi < 40.0,
             "momentum_negative_1m_3m": indicators.momentum_1m < 0 and indicators.momentum_3m < 0,
-            "downward_momentum_expanding": expanding_down,
-            "no_confirmed_opposing_divergence": not bool(fib_gate.get("opposing_divergence_confirmed")),
+            "downward_momentum_expanding_or_follow_through": expanding_down or (last_close < prev_close and indicators.momentum_1m < 0),
+            "no_confirmed_opposing_divergence_near_trigger": not bool(fib_gate.get("opposing_divergence_confirmed")),
+        }
+    elif setup in {"SUPPORT_CLUSTER_RECLAIM"} and direction == "BULLISH":
+        range_location = number(regime.get("range_location_pct"))
+        checks = {
+            "at_least_two_persistent_support_tests": repeated_support,
+            "recent_support_test_is_present": recent_test,
+            "completed_close_reclaimed_support": last_close > level + max(1.5, 0.05*indicators.atr),
+            "live_spot_not_below_invalidation_zone": indicators.spot >= level - max(0.25*indicators.atr, 10.0),
+            "price_turning_up": indicators.momentum_1m > -0.00015 or last_close >= prev_close,
+            "3m_momentum_not_materially_bearish": indicators.momentum_3m > -0.0025,
+            "level_reclaim_and_retest_evidence_present": repeated_support and recent_test,
+            "no_nearby_opposing_divergence": not bool(fib_gate.get("opposing_divergence_confirmed")),
+        }
+    elif setup == "RESISTANCE_CLUSTER_REJECTION" and direction == "BEARISH":
+        range_location = number(regime.get("range_location_pct"))
+        checks = {
+            "at_least_two_persistent_resistance_tests": repeated_resistance,
+            "recent_resistance_test_is_present": recent_test,
+            "completed_close_rejected_below_resistance": last_close < level - max(1.5, 0.05*indicators.atr),
+            "live_spot_not_above_invalidation_zone": indicators.spot <= level + max(0.25*indicators.atr, 10.0),
+            "price_turning_down": indicators.momentum_1m < 0.00015 or last_close <= prev_close,
+            "3m_momentum_not_materially_bullish": indicators.momentum_3m < 0.0025,
+            "level_rejection_and_retest_evidence_present": repeated_resistance and recent_test,
+            "no_nearby_opposing_divergence": not bool(fib_gate.get("opposing_divergence_confirmed")),
         }
     elif setup in {"SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM"} and direction == "BULLISH":
         checks = {
@@ -1970,7 +2245,7 @@ def qualify_setup_rules(signal: Signal, frame: pd.DataFrame, indicators: Indicat
             "price_near_but_not_far_above_resistance": indicators.spot <= level + buffer and level - indicators.spot <= max(0.75*indicators.atr, 35.0),
             "rsi_supports_upside_pressure": rsi >= 55.0,
             "momentum_positive_and_expanding": indicators.momentum_1m > 0 and indicators.momentum_3m > 0 and expanding_up,
-            "no_confirmed_opposing_divergence": not bool(fib_gate.get("opposing_divergence_confirmed")),
+            "no_confirmed_opposing_divergence_near_trigger": not bool(fib_gate.get("opposing_divergence_confirmed")),
         }
     elif setup == "PREBREAKDOWN_SUPPORT_PRESSURE" and direction == "BEARISH":
         checks = {
@@ -1978,29 +2253,31 @@ def qualify_setup_rules(signal: Signal, frame: pd.DataFrame, indicators: Indicat
             "price_near_but_not_far_below_support": indicators.spot >= level - buffer and indicators.spot - level <= max(0.75*indicators.atr, 35.0),
             "rsi_supports_downside_pressure": rsi <= 45.0,
             "momentum_negative_and_expanding": indicators.momentum_1m < 0 and indicators.momentum_3m < 0 and expanding_down,
-            "no_confirmed_opposing_divergence": not bool(fib_gate.get("opposing_divergence_confirmed")),
+            "no_confirmed_opposing_divergence_near_trigger": not bool(fib_gate.get("opposing_divergence_confirmed")),
         }
     else:
         return {**out, "reason": "UNSUPPORTED_SETUP_DIRECTION_PAIR"}
 
     failed = [name for name, passed in checks.items() if not passed]
     return {**out, "qualified": not failed,
-            "reason": "SETUP_SPECIFIC_SPREADSHEET_RULES_PASSED" if not failed else "SETUP_SPECIFIC_REQUIRED_RULES_FAILED",
+            "reason": "SETUP_SPECIFIC_PRICE_ACTION_RULES_PASSED" if not failed else "SETUP_SPECIFIC_REQUIRED_RULES_FAILED",
             "checks": checks, "failed_checks": failed,
             "last_completed_close": round(last_close, 2), "previous_completed_close": round(prev_close, 2),
             "boundary": round(level, 2), "boundary_buffer_points": round(buffer, 2),
             "current_3m_return_pct": round(current_3m * 100.0, 4),
-            "prior_3m_return_pct": round(prior_3m * 100.0, 4),
-            "rsi": round(rsi, 2), "fib_confluence": fib_ok,
-            "local_oi_pair_confirmed": bool(oi_gate.get("qualified"))}
+            "prior_3m_return_pct": round(prior_3m * 100.0, 4), "rsi": round(rsi, 2),
+            "fib_confluence": fib_ok, "local_oi_pair_confirmed": bool(oi_gate.get("qualified"))}
 
-def can_issue_signal_v86(state: Mapping[str, Any], signal: Signal, now: datetime,
+
+def can_issue_signal_v87(state: Mapping[str, Any], signal: Signal, now: datetime,
                          cooldown_minutes: int, regime: Mapping[str, Any],
                          full_confluence: bool = False,
                          regime_confirmation: Optional[Mapping[str, Any]] = None) -> tuple[bool, str]:
-    """Anti-churn lifecycle: no opposite flip from a live/T1 signal without structure changing regime."""
+    """Prevent signal churn, but permit a fully confirmed opposite edge reaction after an observed stop."""
     active = state.get("active_signal")
     current = now.astimezone(IST)
+    edge_setups = {"SUPPORT_CLUSTER_RECLAIM", "RESISTANCE_CLUSTER_REJECTION",
+                   "SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM", "RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION"}
     if isinstance(active, Mapping):
         status = str(active.get("status", "")).upper()
         old_direction = str(active.get("direction", "")).upper()
@@ -2010,14 +2287,10 @@ def can_issue_signal_v86(state: Mapping[str, Any], signal: Signal, now: datetime
                 return False, "ACTIVE_SIGNAL_ALREADY_TRACKING_SAME_DIRECTION"
             setup = signal.setup.upper()
             confirmed_flip = setup in {"CONFIRMED_BREAKOUT", "CONFIRMED_BREAKDOWN"}
-            reversal = setup in {"SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM", "RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION"}
             regime_name = str(regime.get("regime", ""))
             regime_aligned = (regime_name == "TREND_BULLISH" and signal.direction == "BULLISH") or (regime_name == "TREND_BEARISH" and signal.direction == "BEARISH")
-            # While the first target has not printed, do not churn into an opposite signal.
-            # After T1, allow an opposite signal only if all structural/Fib/OI/market gates
-            # already passed; otherwise require a trend-aligned two-close break.
-            if status == "T1_REACHED" and full_confluence and reversal and bool((regime_confirmation or {}).get("qualified")):
-                return True, "OPPOSITE_REVERSAL_CONFIRMED_AFTER_T1_WITH_FULL_CONFLUENCE"
+            if status == "T1_REACHED" and full_confluence and setup in edge_setups and bool((regime_confirmation or {}).get("qualified")):
+                return True, "OPPOSITE_STRUCTURAL_REACTION_CONFIRMED_AFTER_T1"
             if not (confirmed_flip and regime_aligned and full_confluence):
                 return False, "OPPOSITE_SIGNAL_BLOCKED_UNTIL_T1_OR_CONFIRMED_REGIME_FLIP"
             return True, "STRICT_BREAK_AND_REGIME_FLIP_CONFIRMED"
@@ -2026,13 +2299,19 @@ def can_issue_signal_v86(state: Mapping[str, Any], signal: Signal, now: datetime
             if elapsed < max(1, cooldown_minutes):
                 if old_direction == signal.direction:
                     return False, "SAME_DIRECTION_REENTRY_COOLDOWN"
-                # Opposite side can enter during the cooldown only on a clean break and regime alignment.
+                terminal_status = status
+                # A completed stop can immediately free the tracker for a fully qualified,
+                # opposite structural reclaim at a persistent level. This is not a blanket flip bypass.
+                just_stopped = terminal_status in {"STOPPED", "TERMINAL"} and elapsed <= 4.0
+                if just_stopped and signal.setup.upper() in edge_setups and full_confluence and bool((regime_confirmation or {}).get("qualified")):
+                    return True, "OPPOSITE_LEVEL_RECLAIM_CONFIRMED_ON_STOP_EVENT"
                 setup = signal.setup.upper()
                 name = str(regime.get("regime", ""))
                 aligned = (name == "TREND_BULLISH" and signal.direction == "BULLISH") or (name == "TREND_BEARISH" and signal.direction == "BEARISH")
                 if not (setup in {"CONFIRMED_BREAKOUT", "CONFIRMED_BREAKDOWN"} and aligned):
                     return False, "POST_TERMINAL_COOLDOWN_BLOCKS_UNCONFIRMED_FLIP"
     return True, "STRUCTURE_OI_AND_REGIME_GATES_PASSED"
+
 
 
 def calculate_risk_plan(signal: Signal, levels: Sequence[Level], indicators: Indicators, min_rr: float) -> RiskPlan:
@@ -2219,7 +2498,7 @@ def update_active_signal(state: dict[str, Any], frame: pd.DataFrame, now: dateti
 def audit_append(config: Config, report: Mapping[str, Any]) -> None:
     config.audit_dir.mkdir(parents=True, exist_ok=True)
     local_date = parse_date(report.get("timestamp")) or now_ist().date()
-    path = config.audit_dir / f"market_scan_{local_date.isoformat()}_v86.jsonl"
+    path = config.audit_dir / f"market_scan_{local_date.isoformat()}_v87.jsonl"
     record = {"audit_schema_version": 1, "recorded_at": report.get("timestamp"), "scanner_version": VERSION, "scan": safe_json(report)}
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
@@ -2325,9 +2604,11 @@ class PredictiveScanner:
             oi = analyze_oi(chain, snapshots, spot, expiry, current, strike_step, self.config.scan_interval)
             fib = analyze_fibonacci(frame_raw, indicators.atr, current)
             levels = make_structure_levels(frame_raw, indicators, oi, strike_step, current, fib)
-            signal, signal_diagnostics = score_market_signal(frame_raw, indicators, oi, levels, current, self.config.min_signal_score, strike_step)
             regime = classify_market_regime(frame_raw, indicators, current)
             divergence = detect_rsi_divergence(frame_raw, indicators.atr, current)
+            signal, signal_diagnostics = score_market_signal(frame_raw, indicators, oi, levels, current,
+                                                              self.config.min_signal_score, strike_step, fib, divergence)
+            signal, structure_watch_resolution = resolve_pending_structure_watch(state, signal, indicators, current)
             expiry_pin = diagnose_expiry_pin(oi, fib, indicators, expiry, current, strike_step,
                                              self.config.min_local_oi_change_pct)
             local_oi_confirmation = qualify_local_oi(oi, signal, spot, strike_step, self.config.min_local_oi_change_pct)
@@ -2337,6 +2618,11 @@ class PredictiveScanner:
             regime_confirmation = qualify_regime(signal, regime, indicators, spot,
                                                  fib_divergence_confirmation, local_oi_confirmation, setup_confirmation)
             raw_signal = signal
+            structure_watch_update = {"status": "NOT_APPLICABLE"}
+            watchable_setups = {"SUPPORT_CLUSTER_RECLAIM", "RESISTANCE_CLUSTER_REJECTION",
+                                "SUPPORT_BOUNCE", "RESISTANCE_REJECTION"}
+            if raw_signal.direction in {"BULLISH", "BEARISH"} and raw_signal.setup in watchable_setups:
+                structure_watch_update = persist_structure_watch(state, raw_signal, current, local_oi_confirmation)
             gate_failures = []
             if not bool(state.get("state_integrity_ok", True)):
                 gate_failures.append("CANONICAL_STATE_CORRUPT_OR_UNREADABLE_ENTRIES_SUPPRESSED_FOR_RECOVERY_SCAN")
@@ -2352,8 +2638,8 @@ class PredictiveScanner:
                 if not setup_confirmation.get("qualified"):
                     gate_failures.append(str(setup_confirmation.get("reason", "SETUP_RULE_GATE_FAILED")))
                 if gate_failures:
-                    gate_evidence = tuple(dict.fromkeys(list(signal.evidence) + [f"V86_HARD_GATE:{x}" for x in gate_failures]))
-                    signal = Signal("NEUTRAL", "V86_ENTRY_GATES_BLOCKED", signal.score, 0.0,
+                    gate_evidence = tuple(dict.fromkeys(list(signal.evidence) + [f"V87_HARD_GATE:{x}" for x in gate_failures]))
+                    signal = Signal("NEUTRAL", "V87_ENTRY_GATES_BLOCKED", signal.score, 0.0,
                                     "; ".join(gate_evidence[:8]), signal.level, gate_evidence, tuple(gate_failures))
             risk = calculate_risk_plan(signal, levels, indicators, self.config.min_t1_rr)
             events = update_active_signal(state, frame_raw, current)
@@ -2375,19 +2661,23 @@ class PredictiveScanner:
                 "fibonacci_analysis": safe_json(fib), "rsi_divergence": safe_json(divergence),
                 "fib_divergence_confirmation": safe_json(fib_divergence_confirmation),
                 "expiry_pin_diagnostics": safe_json(expiry_pin),
-                "v86_policy": {"local_writing_oi_change_min_pct_exclusive": self.config.min_local_oi_change_pct,
+                "structure_watch": {"resolution": structure_watch_resolution, "update": structure_watch_update,
+                                    "active": safe_json(state.get("pending_structure_setup")),
+                                    "ttl_minutes": STRUCTURE_WATCH_TTL_MINUTES,
+                                    "max_extension_atr": STRUCTURE_WATCH_MAX_EXTENSION_ATR},
+                "v87_policy": {"local_writing_oi_change_min_pct_exclusive": self.config.min_local_oi_change_pct,
                                "paired_covering_oi_decline_min_pct_exclusive": 0.5,
                                "expiry_pin": "NO_ENTRY_WHEN_EXPIRY_PIN_CONFIRMED",
                                "reversals_require_matching_confirmed_rsi_divergence_and_fib_50_61_8_confluence": True,
                                "breakout_breakdown_divergence_policy": "ONLY_CONFIRMED_OPPOSING_DIVERGENCE_VETOES; UNAVAILABLE_DIVERGENCE_IS_NOT_A_VETO",
                                "oi_flow_requires_premium_confirmation": True,
-                               "trend_countertrend_entries": "FULL_FIB_DIVERGENCE_LOCAL_OI_REVERSAL_OR_STRICT_TWO_CLOSE_BREAK",
-                               "sideways_whipsaw_entries": "RANGE_EDGE_FADE_WITH_FULL_CONFLUENCE_OR_STRICT_RANGE_BREAK",
+                               "trend_countertrend_entries": "TREND_ALIGNED_CONTINUATION_OR_TESTED_EDGE_RECLAIM_WITH_STRICT_LOCAL_OI;FIB_DIVERGENCE_REQUIRED_FOR_SPREADSHEET_REVERSALS",
+                               "sideways_whipsaw_entries": "PERSISTENT_RANGE_EDGE_RECLAIM_WITH_STRICT_LOCAL_OI_ALLOWED;MIDRANGE_CHASE_BLOCKED",
                                "opposite_signal_lifecycle": "CONFIRMED_BREAK_AND_REGIME_ALIGNMENT_REQUIRED_WHILE_TRACKING_OR_AFTER_T1",
                                "same_direction_reentry_cooldown_minutes": self.config.reentry_cooldown_minutes},
-                "candidate_before_v86_gates": {"direction": raw_signal.direction, "setup": raw_signal.setup,
+                "candidate_before_v87_gates": {"direction": raw_signal.direction, "setup": raw_signal.setup,
                                                 "score": raw_signal.score, "trigger": raw_signal.trigger},
-                "v86_gate_failures": gate_failures,
+                "v87_gate_failures": gate_failures,
                 "active_signal": safe_json(state.get("active_signal")), "expiry": expiry,
                 "state_integrity": {"ok": bool(state.get("state_integrity_ok", True)),
                                      "load_status": state.get("state_load_status"),
@@ -2405,13 +2695,19 @@ class PredictiveScanner:
             elif current.time() >= ENTRY_CUTOFF:
                 report["vetoes"].append("ENTRY_CUTOFF_15_15_MONITOR_ONLY")
             elif direction == "NEUTRAL":
-                report["vetoes"].append("NO_DIRECTIONAL_STRUCTURAL_SETUP")
+                if raw_signal.direction in {"BULLISH", "BEARISH"}:
+                    if gate_failures:
+                        report["vetoes"].extend(gate_failures)
+                    else:
+                        report["vetoes"].append("DIRECTIONAL_CANDIDATE_BLOCKED_BY_SCORE_RISK_OR_LIFECYCLE")
+                else:
+                    report["vetoes"].append("NO_QUALIFYING_PRICE_ACTION")
             elif signal.score < self.config.min_signal_score:
                 report["vetoes"].append("MARKET_SETUP_SCORE_BELOW_THRESHOLD")
             elif not risk.valid:
                 report["vetoes"].append(f"STRUCTURAL_RISK_PLAN_INVALID:{risk.reason}")
             else:
-                allowed, allow_reason = can_issue_signal_v86(
+                allowed, allow_reason = can_issue_signal_v87(
                     state, signal, current, self.config.reentry_cooldown_minutes, regime,
                     full_confluence=not gate_failures, regime_confirmation=regime_confirmation)
                 report["active_signal_gate"] = {"allowed": allowed, "reason": allow_reason}
@@ -2432,7 +2728,8 @@ class PredictiveScanner:
                     option_quotes = self.client.quotes(candidate_keys) if candidate_keys else {}
                     # Near-ATM reversals may use target delta ~0.55; established continuation
                     # uses a higher delta for closer underlying tracking.
-                    reversal_setups = {"SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM", "RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION"}
+                    reversal_setups = {"SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM", "RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION",
+                                       "SUPPORT_CLUSTER_RECLAIM", "RESISTANCE_CLUSTER_REJECTION"}
                     target_delta = 0.55 if signal.setup in reversal_setups else 0.62
                     selected, ranked = score_contracts(candidates, option_quotes, spot, direction, oi, self.config, target_delta)
                     candidate_diagnostics = [{**row, "route": "ATM_ITM1_ITM2"} for row in ranked]
@@ -2467,6 +2764,8 @@ class PredictiveScanner:
                             hist = state.setdefault("signal_history", [])
                             hist.append(prior); state["signal_history"] = hist[-20:]
                         state["active_signal"] = tracker
+                        state.pop("pending_structure_setup", None)
+                        structure_watch_update = {"status": "CONSUMED_BY_FINAL_SELECTION", "level": round(number(signal.level), 2) if finite(signal.level) else None}
                         report["_pending_signal_email"] = {"selected": selected, "signal": signal, "risk": risk, "now": current}
                         report["email_status"] = "PENDING_STATE_SAVE"
                         report["active_signal"] = safe_json(tracker)
@@ -2478,11 +2777,11 @@ class PredictiveScanner:
                     snaps.append(snap)
                 state["chain_snapshots"] = [s for s in snaps if isinstance(s, dict) and parse_dt(s.get("timestamp")) and parse_dt(s.get("timestamp")).date() == current.date()][-40:]
             report["strike_grid"] = {"step_points": strike_step, "nearby_available_strikes": [s for s in strikes if abs(s-spot) <= 300]}
-            report["risk_disclaimer"] = "Rule-based scenario score is a ranking heuristic, not a calibrated probability or guarantee. Scanner provides signal research only; it places no orders."
+            report["risk_disclaimer"] = "Rule-based scenario score is a ranking heuristic, not a calibrated probability or guarantee. Scanner provides signal research only; it places no orders. Price-action watch paths and the >2% local-OI rule require multi-session replay before any expectancy claim."
             return self._finish(report, state)
         except Exception as exc:
             # The scan boundary is fail-closed: an unforeseen provider/schema error must not create a selection.
-            LOG.exception("V86 scan failed safely")
+            LOG.exception("V87 scan failed safely")
             report.update({"market_state": "DATA_OR_SCAN_ERROR", "scenario": "NO_SELECTION", "direction": "NEUTRAL",
                            "signal_ready": False, "selected_option": None, "confidence_pct": 0.0,
                            "vetoes": [f"SCAN_ERROR:{type(exc).__name__}:{str(exc)[:350]}"]})
@@ -2493,8 +2792,8 @@ class PredictiveScanner:
                              signal: Signal, risk: RiskPlan, now: datetime,
                              tracker: Mapping[str, Any]) -> dict[str, Any]:
         event_key = str(tracker.get("event_key", ""))
-        subject = f"NIFTY V86 {signal.direction}: {selected['strike']:.0f}{selected['side']}"
-        body = (f"V86 market-structure/local-OI signal\nTime (IST): {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        subject = f"NIFTY V87 {signal.direction}: {selected['strike']:.0f}{selected['side']}"
+        body = (f"V87 market-structure/local-OI signal\nTime (IST): {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"Direction: {signal.direction}\nSetup: {signal.setup}\nStrike: {selected['strike']:.0f} {selected['side']}\n"
                 f"Spot at signal: {number(report.get('indicators', {}).get('spot')):.2f}\n"
                 f"Confidence heuristic: {signal.confidence_pct:.1f}/100 (not calibrated probability)\n"
@@ -2512,7 +2811,7 @@ class PredictiveScanner:
         timestamp = str(event.get("timestamp", ""))
         event_key = str(tracker.get("event_key", ""))
         key = f"EVENT|{event_key}|{event_type}|{timestamp}"
-        subject = f"NIFTY V86 {event_type}: {tracker.get('strike')}{tracker.get('side')}"
+        subject = f"NIFTY V87 {event_type}: {tracker.get('strike')}{tracker.get('side')}"
         body = (f"Time (IST): {timestamp}\nEvent: {event_type}\nDirection: {tracker.get('direction')}\n"
                 f"Strike: {tracker.get('strike')} {tracker.get('side')}\nLevel: {event.get('level')}\n"
                 f"Original T1/T2/SL: {tracker.get('T1')} / {tracker.get('T2')} / {tracker.get('SL')}\n"
@@ -2576,7 +2875,7 @@ class PredictiveScanner:
                 key = str(item.get("notification_key", ""))
                 if not key or key in emailed_set:
                     continue
-                if send_email(self.config, str(item.get("subject", "NIFTY V86 notification")), str(item.get("body", ""))):
+                if send_email(self.config, str(item.get("subject", "NIFTY V87 notification")), str(item.get("body", ""))):
                     emailed.append(key); emailed_set.add(key); sent_now.add(key)
                     if item.get("kind") == "SIGNAL":
                         state["last_email_key"] = str(item.get("event_key", ""))
@@ -2616,11 +2915,32 @@ class PredictiveScanner:
 
 
 def print_report(report: Mapping[str, Any]) -> None:
-    print(json.dumps(safe_json(report), indent=2, ensure_ascii=False, allow_nan=False))
+    """Print one compact workflow line; the detailed per-scan audit remains in JSONL."""
+    ts = str(report.get("timestamp", ""))
+    indicators = report.get("indicators", {}) if isinstance(report.get("indicators"), Mapping) else {}
+    selected = report.get("selected_option") if isinstance(report.get("selected_option"), Mapping) else None
+    regime = report.get("market_regime", {}) if isinstance(report.get("market_regime"), Mapping) else {}
+    oi_gate = report.get("local_oi_confirmation", {}) if isinstance(report.get("local_oi_confirmation"), Mapping) else {}
+    risk = report.get("risk_plan", {}) if isinstance(report.get("risk_plan"), Mapping) else {}
+    vetoes = report.get("vetoes", []) if isinstance(report.get("vetoes"), list) else []
+    payload = {
+        "time_ist": ts,
+        "state": report.get("market_state"),
+        "setup": report.get("scenario"),
+        "direction": report.get("direction"),
+        "spot": number(indicators.get("spot")) if finite(indicators.get("spot")) else None,
+        "regime": regime.get("regime"),
+        "local_oi": "CONFIRMED" if oi_gate.get("qualified") else oi_gate.get("reason", "NOT_EVALUATED"),
+        "selection": (f"{selected.get('strike'):.0f}{selected.get('side')}" if selected and finite(selected.get("strike")) else None),
+        "T1": risk.get("t1"), "T2": risk.get("t2"), "SL": risk.get("sl"),
+        "reason": (str(vetoes[0])[:120] if vetoes else str(report.get("trigger", ""))[:120]),
+    }
+    print(json.dumps(safe_json(payload), separators=(",", ":"), ensure_ascii=False, allow_nan=False))
+
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="V86 NIFTY regime-first market-structure and local-OI scanner (signal only)")
+    parser = argparse.ArgumentParser(description="V87 persistent price-action and local-OI scanner (signal only)")
     parser.add_argument("--loop", action="store_true", help="run continuously at SCAN_INTERVAL_SECONDS")
     parser.add_argument("--interval", type=int, default=None, help="override the loop interval in seconds")
     args = parser.parse_args(argv)
