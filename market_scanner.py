@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""NIFTY 50 intraday options scanner — V90 persistent structure/OI confluence.
+"""NIFTY 50 intraday options scanner — V91 persistent structure/OI confluence.
 
-V90 calculates price structure and option-flow independently, persists developing directional
+V91 calculates price structure and option-flow independently, persists developing directional
 setups across scans, authorizes entries only after strict same-session paired OI confirmation,
 selects a liquid ATM/ITM option, and derives index targets from opposing OI/price barriers. It is
 signal-only and never places orders. Historical replay is required before performance claims.
@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-VERSION = "V90-PERSISTENT-STRUCTURE-OI-CONFLUENCE"
+VERSION = "V91-ADAPTIVE-PAIRED-FLOW-EARLY-TRIGGER"
 BASE_URL = "https://api.upstox.com"
 IST = ZoneInfo("Asia/Kolkata")
 NIFTY_KEY_DEFAULT = "NSE_INDEX|Nifty 50"
@@ -49,7 +49,7 @@ MARKET_OPEN = time(9, 15)
 ENTRY_OPEN = time(9, 16)
 ENTRY_CUTOFF = time(15, 15)
 MARKET_CLOSE = time(15, 30)
-LOG = logging.getLogger("market_scanner_v90")
+LOG = logging.getLogger("market_scanner_v91")
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -334,7 +334,7 @@ class Indicators:
 
 class AtomicState:
     """Atomic state store backed by one canonical, unversioned market_state file."""
-    SNAPSHOT_SCHEMAS = {80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90}
+    SNAPSHOT_SCHEMAS = {80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91}
 
     def __init__(self, path: Path):
         self.path = path
@@ -405,7 +405,7 @@ class AtomicState:
         schema = int(number(loaded.get("schema_version"), 0))
         prior_date = parse_date(loaded.get("session_date"))
         same_session = prior_date == today
-        current_schema = same_session and schema == 90 and loaded.get("scanner_version") == VERSION
+        current_schema = same_session and schema == 91 and loaded.get("scanner_version") == VERSION
         known_migration = same_session and schema in self.SNAPSHOT_SCHEMAS
         expected_expiry = str(loaded.get("option_expiry", "")) if same_session else ""
         old_snaps = loaded.get("chain_snapshots", []) if isinstance(loaded.get("chain_snapshots"), list) else []
@@ -436,7 +436,7 @@ class AtomicState:
         sent_keys = loaded.get("emailed_notification_keys", []) if same_session and isinstance(loaded.get("emailed_notification_keys", []), list) else []
         sent_events = loaded.get("emailed_event_keys", []) if same_session and isinstance(loaded.get("emailed_event_keys", []), list) else []
         self.data = {
-            "schema_version": 90,
+            "schema_version": 91,
             "scanner_version": VERSION,
             "session_date": today.isoformat(),
             "option_expiry": expected_expiry,
@@ -447,7 +447,7 @@ class AtomicState:
             "emailed_event_keys": [str(x) for x in sent_events if isinstance(x, str)][-200:],
             "emailed_notification_keys": [str(x) for x in sent_keys if isinstance(x, str)][-300:],
             # Do not import queued messages from a prior scanner generation: their stale
-            # bodies/selection assumptions must not be sent by V87.
+            # bodies/selection assumptions must not be sent by V91.
             "pending_email_notifications": loaded.get("pending_email_notifications", [])[-50:]
                 if current_schema and isinstance(loaded.get("pending_email_notifications", []), list) else [],
             "last_scan_timestamp": loaded.get("last_scan_timestamp") if same_session else None,
@@ -1753,18 +1753,28 @@ def _fib_touch_tolerance(spot: float) -> float:
 
 
 def qualify_oi_first(oi: Mapping[str, Any], spot: float, step: float,
-                     min_change_pct: float = 2.5) -> dict[str, Any]:
-    """Pre-filter on same-session local writing/covering before evaluating spot triggers.
+                     min_change_pct: float = 2.5,
+                     indicators: Optional[Indicators] = None,
+                     regime: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+    """Qualify same-session local OI flow before allowing a price trigger to authorize entry.
 
-    The writing leg must show strictly more than 2.5% OI growth and a falling premium.
-    The paired counter-leg must show short covering (OI contraction plus rising premium).
-    Aggregate PCR and static OI walls never qualify this gate.
+    Two distinct paired-flow signatures are supported:
+      * WRITER_COVERING: directional option writing (>2.5% OI growth, premium down) paired
+        with opposite-side short covering (OI down, premium up).
+      * BUYER_LED_MOMENTUM: directionally dominant option buying (>2.5% OI growth, premium up)
+        paired with opposite-side long unwinding (OI down, premium down). This second mode is
+        considered only when available price momentum/RSI context confirms the same direction.
+
+    A buyer-led pair is not a blanket replacement for writing confirmation on reversals: it is
+    intended for momentum breakouts and continuous-trend entries, where flow and price agree.
     """
     threshold_pct = max(2.5, min(10.0, number(min_change_pct, 2.5)))
     threshold = threshold_pct / 100.0
-    empty = {"qualified": False, "reason": "NO_ACTIONABLE_LOCAL_OI_PAIR", "threshold_pct_exclusive": threshold_pct,
-             "qualified_directions": [], "direction_candidates": {}, "pin_oi_candidate": False,
-             "rows_considered": 0, "tactical_available": bool(oi.get("tactical_available"))}
+    empty = {"qualified": False, "reason": "NO_ACTIONABLE_LOCAL_OI_PAIR",
+             "threshold_pct_exclusive": threshold_pct, "qualified_directions": [],
+             "direction_candidates": {}, "pin_oi_candidate": False, "rows_considered": 0,
+             "tactical_available": bool(oi.get("tactical_available")),
+             "flow_modes_considered": ["WRITER_COVERING", "BUYER_LED_MOMENTUM"]}
     rows = [r for r in oi.get("walls", []) if isinstance(r, Mapping) and finite(r.get("strike"))
             and abs(number(r.get("strike")) - spot) <= max(4.0 * step, 200.0)]
     empty["rows_considered"] = len(rows)
@@ -1772,7 +1782,7 @@ def qualify_oi_first(oi: Mapping[str, Any], spot: float, step: float,
     if not oi.get("tactical_available"):
         return {**empty, "reason": "SAME_SESSION_LOCAL_OI_BASELINE_UNAVAILABLE_OR_STALE"}
 
-    def side_item(row: Mapping[str, Any], side: str, expected: str) -> Optional[dict[str, Any]]:
+    def item(row: Mapping[str, Any], side: str, mode: str, role: str) -> Optional[dict[str, Any]]:
         change = number(row.get(f"{side}_change_pct"))
         prem_change = number(row.get(f"{side}_premium_change_pct"))
         base = number(row.get(f"{side}_prev_oi"))
@@ -1785,75 +1795,163 @@ def qualify_oi_first(oi: Mapping[str, Any], spot: float, step: float,
         if base < 10000 or current_oi < 0 or min(old_prem, new_prem) < 5:
             return None
         flow = classify_oi_flow(change, prem_change)
-        if expected == "WRITING":
-            passed = change > threshold and prem_change <= -0.002 and flow == "SHORT_BUILDUP_WRITING"
+        if mode == "WRITER_COVERING":
+            if role == "PRIMARY":
+                passed = change > threshold and prem_change <= -0.002 and flow == "SHORT_BUILDUP_WRITING"
+            else:
+                passed = change < -0.005 and prem_change >= 0.002 and flow == "SHORT_COVERING"
         else:
-            passed = change < -0.005 and prem_change >= 0.002 and flow == "SHORT_COVERING"
+            if role == "PRIMARY":
+                passed = change > threshold and prem_change >= 0.002 and flow == "LONG_BUILDUP_BUYING"
+            else:
+                passed = change < -0.005 and prem_change <= -0.002 and flow == "LONG_UNWINDING"
         if not passed:
             return None
         return {"strike": number(row.get("strike")), "option_side": side.upper(),
-                "oi_change_pct": round(change * 100, 3), "premium_change_pct": round(prem_change * 100, 3),
+                "oi_change_pct": round(change * 100.0, 3), "premium_change_pct": round(prem_change * 100.0, 3),
                 "delta_oi": round(delta, 1), "baseline_oi": round(base, 1),
                 "current_oi": round(current_oi, 1), "flow": flow}
 
-    direction_candidates: dict[str, dict[str, Any]] = {}
-    # The dominant writing leg and the expected covering leg must be local to each other.
+    def buyer_price_context(direction: str) -> tuple[bool, dict[str, Any]]:
+        reg = regime if isinstance(regime, Mapping) else {}
+        regime_name = str(reg.get("regime", "TRANSITION")).upper()
+        if indicators is None:
+            return False, {"reason": "PRICE_CONTEXT_NOT_SUPPLIED_TO_BUYER_LED_GATE", "regime": regime_name}
+        m1 = number(getattr(indicators, "momentum_1m", float("nan")))
+        m3 = number(getattr(indicators, "momentum_3m", float("nan")))
+        rsi = number(getattr(indicators, "rsi", float("nan")))
+        last_close = number(getattr(indicators, "last_close", float("nan")))
+        prev_close = number(getattr(indicators, "prev_close", float("nan")))
+        if direction == "BULLISH":
+            aligned = finite(m1) and finite(m3) and m1 > 0 and m3 >= 0.00065
+            rsi_aligned = finite(rsi) and rsi >= 55.0
+            close_aligned = not (finite(last_close) and finite(prev_close)) or last_close >= prev_close
+            regime_aligned = regime_name in {"TREND_BULLISH", "TRANSITION", "WARMUP"} or (
+                regime_name == "WHIPSAW" and finite(m1) and finite(m3) and m1 >= 0.00025
+                and m3 >= 0.0010 and finite(rsi) and rsi >= 60.0)
+        else:
+            aligned = finite(m1) and finite(m3) and m1 < 0 and m3 <= -0.00065
+            rsi_aligned = finite(rsi) and rsi <= 45.0
+            close_aligned = not (finite(last_close) and finite(prev_close)) or last_close <= prev_close
+            regime_aligned = regime_name in {"TREND_BEARISH", "TRANSITION", "WARMUP"} or (
+                regime_name == "WHIPSAW" and finite(m1) and finite(m3) and m1 <= -0.00025
+                and m3 <= -0.0010 and finite(rsi) and rsi <= 40.0)
+        ok = bool(aligned and rsi_aligned and close_aligned and regime_aligned)
+        return ok, {"direction": direction, "regime": regime_name, "momentum_1m": m1,
+                    "momentum_3m": m3, "rsi": rsi, "last_close": last_close,
+                    "previous_close": prev_close, "momentum_aligned": bool(aligned),
+                    "rsi_aligned": bool(rsi_aligned), "close_aligned": bool(close_aligned),
+                    "regime_compatible": bool(regime_aligned), "qualified": ok}
+
+    writer_candidates: dict[str, dict[str, Any]] = {}
+    buyer_candidates: dict[str, dict[str, Any]] = {}
+    buyer_context: dict[str, Any] = {}
+    # Strong writer-led pairs retain priority within each direction. Buyer-led flow is a
+    # separate momentum path and is not allowed to masquerade as writing/covering.
     for direction, write_side, cover_side in (("BULLISH", "put", "call"), ("BEARISH", "call", "put")):
         pairs: list[dict[str, Any]] = []
         for wrow in rows:
-            write = side_item(wrow, write_side, "WRITING")
-            if not write:
+            primary = item(wrow, write_side, "WRITER_COVERING", "PRIMARY")
+            if not primary:
                 continue
-            wstrike = number(write.get("strike"))
-            # Bullish put writing should be at/below the local ATM band; bearish call writing at/above it.
+            wstrike = number(primary.get("strike"))
             if direction == "BULLISH" and wstrike > atm + step + 0.01:
                 continue
             if direction == "BEARISH" and wstrike < atm - step - 0.01:
                 continue
             for crow in rows:
-                cover = side_item(crow, cover_side, "COVERING")
-                if not cover:
+                secondary = item(crow, cover_side, "WRITER_COVERING", "SECONDARY")
+                if not secondary:
                     continue
-                cstrike = number(cover.get("strike"))
-                if abs(cstrike - wstrike) > 2.0 * step + 0.01:
+                cstrike = number(secondary.get("strike"))
+                distance = abs(cstrike - wstrike)
+                if distance > 2.0 * step + 0.01:
                     continue
-                proximity = max(0.0, 1.0 - abs(cstrike - wstrike) / max(1.0, 2.0 * step))
-                score = (number(write.get("oi_change_pct"), 0.0)
-                         + 0.45 * abs(number(cover.get("oi_change_pct"), 0.0))
-                         + 0.15 * abs(number(write.get("premium_change_pct"), 0.0))
-                         + 0.10 * abs(number(cover.get("premium_change_pct"), 0.0))
-                         + proximity)
-                pairs.append({"direction": direction, "primary_flow": write, "secondary_flow": cover,
+                proximity = max(0.0, 1.0 - distance / max(1.0, 2.0 * step))
+                score = (number(primary.get("oi_change_pct"), 0.0)
+                         + 0.45 * abs(number(secondary.get("oi_change_pct"), 0.0))
+                         + 0.15 * abs(number(primary.get("premium_change_pct"), 0.0))
+                         + 0.10 * abs(number(secondary.get("premium_change_pct"), 0.0)) + proximity)
+                pairs.append({"direction": direction, "flow_mode": "WRITER_COVERING",
+                              "primary_flow": primary, "secondary_flow": secondary,
                               "score": round(score, 3), "reference_strikes": sorted({wstrike, cstrike}),
                               "writing_threshold_pct_exclusive": threshold_pct,
-                              "pair_distance_points": round(abs(cstrike - wstrike), 2)})
+                              "pair_distance_points": round(distance, 2)})
         if pairs:
-            direction_candidates[direction] = max(
-                pairs, key=lambda x: (number(x.get("score"), 0.0),
-                                      number(x.get("primary_flow", {}).get("oi_change_pct"), 0.0)))
+            writer_candidates[direction] = max(pairs, key=lambda x: (number(x.get("score"), 0.0),
+                                                                       number(x.get("primary_flow", {}).get("oi_change_pct"), 0.0)))
 
-    # A same-strike call+put writing pin is not directionally actionable; preserve it for the veto path.
+    # Buyer-led pairs: bullish = call long buildup + put long unwinding; bearish = put long
+    # buildup + call long unwinding. Require directional price context before they can authorize.
+    for direction, buy_side, unwind_side in (("BULLISH", "call", "put"), ("BEARISH", "put", "call")):
+        ctx_ok, ctx = buyer_price_context(direction)
+        buyer_context[direction] = ctx
+        if not ctx_ok:
+            continue
+        pairs = []
+        for brow in rows:
+            primary = item(brow, buy_side, "BUYER_LED_MOMENTUM", "PRIMARY")
+            if not primary:
+                continue
+            bstrike = number(primary.get("strike"))
+            # Limit dominant buyer flow to the ATM/near-ATM structure being considered.
+            if abs(bstrike - atm) > 2.0 * step + 0.01:
+                continue
+            for urow in rows:
+                secondary = item(urow, unwind_side, "BUYER_LED_MOMENTUM", "SECONDARY")
+                if not secondary:
+                    continue
+                ustrike = number(secondary.get("strike"))
+                distance = abs(ustrike - bstrike)
+                if distance > 2.0 * step + 0.01:
+                    continue
+                proximity = max(0.0, 1.0 - distance / max(1.0, 2.0 * step))
+                score = (number(primary.get("oi_change_pct"), 0.0)
+                         + 0.45 * abs(number(secondary.get("oi_change_pct"), 0.0))
+                         + 0.15 * abs(number(primary.get("premium_change_pct"), 0.0))
+                         + 0.10 * abs(number(secondary.get("premium_change_pct"), 0.0)) + proximity)
+                pairs.append({"direction": direction, "flow_mode": "BUYER_LED_MOMENTUM",
+                              "primary_flow": primary, "secondary_flow": secondary,
+                              "score": round(score, 3), "reference_strikes": sorted({bstrike, ustrike}),
+                              "writing_threshold_pct_exclusive": threshold_pct,
+                              "pair_distance_points": round(distance, 2), "price_context": ctx})
+        if pairs:
+            buyer_candidates[direction] = max(pairs, key=lambda x: (number(x.get("score"), 0.0),
+                                                                      number(x.get("primary_flow", {}).get("oi_change_pct"), 0.0)))
+
+    direction_candidates: dict[str, dict[str, Any]] = {}
+    for direction in ("BULLISH", "BEARISH"):
+        candidate = writer_candidates.get(direction) or buyer_candidates.get(direction)
+        if candidate:
+            direction_candidates[direction] = candidate
+
+    # Same-strike ATM call+put writing remains a separate non-directional pin candidate.
     pin_row = next((r for r in rows if finite(r.get("strike")) and finite(atm)
                     and abs(number(r.get("strike")) - atm) < 0.5
-                    and side_item(r, "call", "WRITING") and side_item(r, "put", "WRITING")), None)
+                    and item(r, "call", "WRITER_COVERING", "PRIMARY")
+                    and item(r, "put", "WRITER_COVERING", "PRIMARY")), None)
     pin_oi_candidate = pin_row is not None
-
     if len(direction_candidates) == 2:
         bull_score = number(direction_candidates["BULLISH"].get("score"), 0.0)
         bear_score = number(direction_candidates["BEARISH"].get("score"), 0.0)
         gap = abs(bull_score - bear_score)
         if gap < max(0.5, 0.12 * max(bull_score, bear_score)):
             return {**empty, "reason": "CONFLICTING_BULLISH_AND_BEARISH_LOCAL_OI_PAIRS",
-                    "direction_candidates": direction_candidates, "pin_oi_candidate": pin_oi_candidate}
+                    "direction_candidates": direction_candidates, "pin_oi_candidate": pin_oi_candidate,
+                    "buyer_price_context": buyer_context}
         dominant = "BULLISH" if bull_score > bear_score else "BEARISH"
         direction_candidates = {dominant: direction_candidates[dominant]}
     if not direction_candidates:
-        return {**empty, "reason": "NO_LOCAL_PAIR_WITH_STRICTLY_MORE_THAN_2_5_PERCENT_WRITING_OI",
-                "pin_oi_candidate": pin_oi_candidate}
-    return {**empty, "qualified": True, "reason": "OI_FIRST_DIRECTIONAL_PAIR_CONFIRMED",
+        reason = ("NO_LOCAL_PAIR_WITH_STRICTLY_MORE_THAN_2_5_PERCENT_WRITING_OI"
+                  if writer_candidates or not any(ctx.get("qualified") for ctx in buyer_context.values())
+                  else "NO_QUALIFYING_DIRECTIONAL_BUYER_LED_PAIR")
+        return {**empty, "reason": reason, "pin_oi_candidate": pin_oi_candidate,
+                "buyer_price_context": buyer_context,
+                "writer_pair_directions": list(writer_candidates), "buyer_pair_directions": list(buyer_candidates)}
+    return {**empty, "qualified": True, "reason": "DIRECTIONAL_LOCAL_OI_PAIR_CONFIRMED",
             "qualified_directions": list(direction_candidates.keys()), "direction_candidates": direction_candidates,
-            "pin_oi_candidate": pin_oi_candidate}
-
+            "pin_oi_candidate": pin_oi_candidate, "buyer_price_context": buyer_context,
+            "flow_mode": next(iter(direction_candidates.values())).get("flow_mode")}
 
 def score_market_signal(frame: pd.DataFrame, indicators: Indicators, oi: Mapping[str, Any], levels: Sequence[Level],
                         now: datetime, min_score: float, step: float,
@@ -1862,12 +1960,12 @@ def score_market_signal(frame: pd.DataFrame, indicators: Indicators, oi: Mapping
                         regime: Optional[Mapping[str, Any]] = None,
                         oi_first: Optional[Mapping[str, Any]] = None,
                         min_rr: float = 1.25) -> tuple[Signal, dict[str, Any]]:
-    """Score OI-first scenarios, then choose the highest-ranked candidate that passes every entry gate."""
+    """Combine independently computed price structure and paired OI, then rank fully qualified entries."""
     spot, atr = indicators.spot, indicators.atr
     bars = completed_candles(frame, now.astimezone(IST)).tail(180).reset_index(drop=True)
     prefilter = dict(oi_first) if isinstance(oi_first, Mapping) else qualify_oi_first(oi, spot, step, 2.5)
     oi_directions = {str(x).upper() for x in prefilter.get("qualified_directions", [])}
-    base_diag = {"threshold": min_score, "decision_model": "OI_FIRST_THEN_GENERATE_CANDIDATES_THEN_FULL_GATE_PREFLIGHT_THEN_RANK",
+    base_diag = {"threshold": min_score, "decision_model": "INDEPENDENT_PRICE_ANALYSIS_PLUS_WRITER_OR_BUYER_LED_PAIRED_FLOW_THEN_SCENARIO_GATES",
                  "oi_first": safe_json(prefilter), "bullish_candidates": [], "bearish_candidates": []}
     if not prefilter.get("qualified") or not oi_directions:
         reg = regime if isinstance(regime, Mapping) else {}
@@ -1928,13 +2026,23 @@ def score_market_signal(frame: pd.DataFrame, indicators: Indicators, oi: Mapping
         if val > spot + 0.5 and val - spot <= max(3.0 * atr, 150.0) and not any(abs(l.price-val) <= touch_tolerance for l in scan_levels):
             scan_levels.append(Level(float(val), "SUPPORT", "FIB_BREAKDOWN_BOUNDARY", 0.70, 1))
 
+    def flow_mode_for(direction: str) -> str:
+        pairs = prefilter.get("direction_candidates", {}) if isinstance(prefilter.get("direction_candidates"), Mapping) else {}
+        pair = pairs.get(direction, {}) if isinstance(pairs, Mapping) else {}
+        return str(pair.get("flow_mode", "WRITER_COVERING")).upper() if isinstance(pair, Mapping) else "WRITER_COVERING"
+
     def evidence_for(direction: str) -> list[str]:
         pair = prefilter.get("direction_candidates", {}).get(direction, {}) if isinstance(prefilter.get("direction_candidates"), Mapping) else {}
-        write = pair.get("primary_flow", {}) if isinstance(pair, Mapping) else {}
-        cover = pair.get("secondary_flow", {}) if isinstance(pair, Mapping) else {}
-        return ["OI_FIRST_DIRECTIONAL_PAIR_CONFIRMED",
-                f"WRITING_LEG_{write.get('option_side','UNKNOWN')}_OI_CHANGE_{write.get('oi_change_pct','NA')}PCT",
-                f"COVERING_LEG_{cover.get('option_side','UNKNOWN')}_OI_CHANGE_{cover.get('oi_change_pct','NA')}PCT"]
+        primary = pair.get("primary_flow", {}) if isinstance(pair, Mapping) else {}
+        secondary = pair.get("secondary_flow", {}) if isinstance(pair, Mapping) else {}
+        mode = flow_mode_for(direction)
+        if mode == "BUYER_LED_MOMENTUM":
+            return ["OI_FLOW_MODE_BUYER_LED", "BUYER_LED_DIRECTIONAL_OI_PAIR_CONFIRMED",
+                    f"BUYING_LEG_{primary.get('option_side','UNKNOWN')}_OI_CHANGE_{primary.get('oi_change_pct','NA')}PCT",
+                    f"UNWINDING_LEG_{secondary.get('option_side','UNKNOWN')}_OI_CHANGE_{secondary.get('oi_change_pct','NA')}PCT"]
+        return ["OI_FLOW_MODE_WRITER_COVERING", "OI_FIRST_DIRECTIONAL_PAIR_CONFIRMED",
+                f"WRITING_LEG_{primary.get('option_side','UNKNOWN')}_OI_CHANGE_{primary.get('oi_change_pct','NA')}PCT",
+                f"COVERING_LEG_{secondary.get('option_side','UNKNOWN')}_OI_CHANGE_{secondary.get('oi_change_pct','NA')}PCT"]
 
     candidates: list[dict[str, Any]] = []
     diagnostic_candidates: dict[str, list[dict[str, Any]]] = {"BULLISH": [], "BEARISH": []}
@@ -1944,17 +2052,19 @@ def score_market_signal(frame: pd.DataFrame, indicators: Indicators, oi: Mapping
     def local_candidate_gate(direction: str, setup: str, level_value: float) -> bool:
         key = f"{direction}|{setup}|{round(number(level_value), 2):.2f}"
         if key not in candidate_oi_checks:
-            proposed = Signal(direction, setup, 0.0, 0.0, "CANDIDATE_OI_PREFILTER", float(level_value), ())
+            mode_evidence = ("OI_FLOW_MODE_BUYER_LED",) if flow_mode_for(direction) == "BUYER_LED_MOMENTUM" else ("OI_FLOW_MODE_WRITER_COVERING",)
+            proposed = Signal(direction, setup, 0.0, 0.0, "CANDIDATE_OI_PREFILTER", float(level_value), mode_evidence)
             gate = qualify_local_oi(oi, proposed, spot, step, 2.5)
             candidate_oi_checks[key] = {"qualified": bool(gate.get("qualified")), "reason": gate.get("reason"),
+                                        "flow_mode": gate.get("flow_mode"),
                                         "pair_distance_points": gate.get("pair_distance_points"),
                                         "reference_strikes": gate.get("reference_strikes"),
                                         "primary_flow": ({k: gate["primary_flow"].get(k) for k in ("strike", "option_side", "oi_change_pct", "premium_change_pct", "flow")}
                                                          if isinstance(gate.get("primary_flow"), Mapping) else None),
                                         "secondary_flow": ({k: gate["secondary_flow"].get(k) for k in ("strike", "option_side", "oi_change_pct", "premium_change_pct", "flow")}
                                                            if isinstance(gate.get("secondary_flow"), Mapping) else None),
-                                        "writing_oi_change_pct": number((gate.get("primary_flow") or {}).get("oi_change_pct"), None),
-                                        "covering_oi_change_pct": number((gate.get("secondary_flow") or {}).get("oi_change_pct"), None)}
+                                        "primary_oi_change_pct": number((gate.get("primary_flow") or {}).get("oi_change_pct"), None),
+                                        "secondary_oi_change_pct": number((gate.get("secondary_flow") or {}).get("oi_change_pct"), None)}
             if not gate.get("qualified") and len(candidate_oi_failures) < 25:
                 candidate_oi_failures.append({"candidate": key, "reason": gate.get("reason")})
         return bool(candidate_oi_checks[key].get("qualified"))
@@ -1989,24 +2099,41 @@ def score_market_signal(frame: pd.DataFrame, indicators: Indicators, oi: Mapping
                             "evidence":ev,"distance":dist,"touches":touches}
                     candidates.append(cand); diagnostic_candidates["BULLISH"].append(cand)
 
-            # Scenario 3: clean Fib-resistance breakout with RSI >=55 and aligned momentum.
+            # Scenario 3: confirmed breakout. Writer-led flow keeps the two-close rule.
+            # A buyer-led pair may use one completed close only with a stronger momentum burst,
+            # elevated RSI and spot still near the boundary; this is an explicit early-trigger path.
             if level.kind == "RESISTANCE" and bull_break_oi and level.price < spot and dist <= max(3*atr,150.0):
                 fib_boundary = any(abs(level.price-x) <= touch_tolerance for x in bull_break_fibs)
                 two_closes = len(closes) >= 2 and closes[-1] > level.price + break_buffer and closes[-2] > level.price + break_buffer
+                buyer_mode = flow_mode_for("BULLISH") == "BUYER_LED_MOMENTUM"
+                prior_close = float(closes[-2]) if len(closes) >= 2 else float("nan")
+                early_buyer_close = bool(buyer_mode and len(closes) >= 2
+                    and closes[-1] > level.price + break_buffer
+                    and prior_close <= level.price + break_buffer
+                    and spot >= level.price - max(0.15 * atr, 3.0)
+                    and indicators.momentum_1m > 0.00015 and indicators.momentum_3m >= 0.00065
+                    and finite(indicators.rsi) and indicators.rsi >= 60.0)
+                close_confirmed = two_closes or early_buyer_close
                 expanding = (indicators.momentum_1m > 0 and indicators.momentum_3m > 0
                              and (len(closes) < 7 or (closes[-1]/closes[-4]-1.0) > (closes[-4]/closes[-7]-1.0)))
                 follow_through = last_close > previous_close and indicators.momentum_1m > 0 and indicators.momentum_3m > 0
                 opposing = div.get("bearish") if isinstance(div.get("bearish"), Mapping) else None
                 opp_price = number((opposing or {}).get("price_high_2"))
                 opp_near = bool(opposing and finite(opp_price) and abs(opp_price-level.price) <= max(atr,45.0))
-                if (fib_boundary and two_closes and spot > level.price + break_buffer and finite(indicators.rsi)
+                spot_boundary_ok = spot > level.price + break_buffer or (early_buyer_close and spot >= level.price - max(0.15*atr,3.0))
+                if (fib_boundary and close_confirmed and spot_boundary_ok and finite(indicators.rsi)
                         and indicators.rsi >= 55.0 and (expanding or follow_through)):
                     if not opp_near:
-                        raw = 74.0 + (3.0 if expanding else 0.0) + min(6.0, max(0.0,(indicators.rsi-55.0)*0.25))
-                        ev = evidence_for("BULLISH") + [f"TWO_COMPLETED_CLOSES_ABOVE_FIB_RESISTANCE_{level.price:.2f}",
+                        raw = (76.0 if early_buyer_close and not two_closes else 74.0)
+                        raw += (3.0 if expanding else 0.0) + min(6.0, max(0.0,(indicators.rsi-55.0)*0.25))
+                        trigger_evidence = ([f"TWO_COMPLETED_CLOSES_ABOVE_FIB_RESISTANCE_{level.price:.2f}"] if two_closes
+                                            else [f"BUYER_LED_EARLY_SINGLE_CLOSE_BREAKOUT_{level.price:.2f}",
+                                                  "EARLY_TRIGGER_REQUIRES_MOMENTUM_1M_3M_AND_RSI_60"])
+                        ev = evidence_for("BULLISH") + trigger_evidence + [
                             "RSI_AT_LEAST_55", "1M_3M_MOMENTUM_ALIGNED", "NO_CONFIRMED_OPPOSING_DIVERGENCE_NEAR_TRIGGER"]
                         cand = {"direction":"BULLISH","setup":"CONFIRMED_BREAKOUT","level":level.price,"score":raw,
-                                "evidence":ev,"distance":dist,"touches":touches}
+                                "evidence":ev,"distance":dist,"touches":touches,
+                                "early_buyer_led_trigger":bool(early_buyer_close and not two_closes)}
                         candidates.append(cand); diagnostic_candidates["BULLISH"].append(cand)
 
         if "BEARISH" in oi_directions:
@@ -2027,24 +2154,40 @@ def score_market_signal(frame: pd.DataFrame, indicators: Indicators, oi: Mapping
                           "evidence":ev,"distance":dist,"touches":touches}
                     candidates.append(cand); diagnostic_candidates["BEARISH"].append(cand)
 
-            # Scenario 4: clean Fib-support breakdown with RSI <=45 and aligned downward momentum.
+            # Scenario 4: confirmed breakdown. Buyer-led put accumulation can use a single
+            # decisive close only when bearish momentum and RSI are notably strong.
             if level.kind == "SUPPORT" and bear_break_oi and level.price > spot and dist <= max(3*atr,150.0):
                 fib_boundary = any(abs(level.price-x) <= touch_tolerance for x in bear_break_fibs)
                 two_closes = len(closes) >= 2 and closes[-1] < level.price - break_buffer and closes[-2] < level.price - break_buffer
+                buyer_mode = flow_mode_for("BEARISH") == "BUYER_LED_MOMENTUM"
+                prior_close = float(closes[-2]) if len(closes) >= 2 else float("nan")
+                early_buyer_close = bool(buyer_mode and len(closes) >= 2
+                    and closes[-1] < level.price - break_buffer
+                    and prior_close >= level.price - break_buffer
+                    and spot <= level.price + max(0.15 * atr, 3.0)
+                    and indicators.momentum_1m < -0.00015 and indicators.momentum_3m <= -0.00065
+                    and finite(indicators.rsi) and indicators.rsi <= 40.0)
+                close_confirmed = two_closes or early_buyer_close
                 expanding = (indicators.momentum_1m < 0 and indicators.momentum_3m < 0
                              and (len(closes) < 7 or (closes[-1]/closes[-4]-1.0) < (closes[-4]/closes[-7]-1.0)))
                 follow_through = last_close < previous_close and indicators.momentum_1m < 0 and indicators.momentum_3m < 0
                 opposing = div.get("bullish") if isinstance(div.get("bullish"), Mapping) else None
                 opp_price = number((opposing or {}).get("price_low_2"))
                 opp_near = bool(opposing and finite(opp_price) and abs(opp_price-level.price) <= max(atr,45.0))
-                ok_break = (fib_boundary and two_closes and spot < level.price-break_buffer and finite(indicators.rsi)
+                spot_boundary_ok = spot < level.price - break_buffer or (early_buyer_close and spot <= level.price + max(0.15*atr,3.0))
+                ok_break = (fib_boundary and close_confirmed and spot_boundary_ok and finite(indicators.rsi)
                             and indicators.rsi <= 45.0 and (expanding or follow_through))
                 if ok_break and not opp_near:
-                    raw = 74.0 + (3.0 if expanding else 0.0) + min(6.0, max(0.0,(45.0-indicators.rsi)*0.25))
-                    ev=evidence_for("BEARISH")+[f"TWO_COMPLETED_CLOSES_BELOW_FIB_SUPPORT_{level.price:.2f}",
+                    raw = (76.0 if early_buyer_close and not two_closes else 74.0)
+                    raw += (3.0 if expanding else 0.0) + min(6.0, max(0.0,(45.0-indicators.rsi)*0.25))
+                    trigger_evidence = ([f"TWO_COMPLETED_CLOSES_BELOW_FIB_SUPPORT_{level.price:.2f}"] if two_closes
+                                        else [f"BUYER_LED_EARLY_SINGLE_CLOSE_BREAKDOWN_{level.price:.2f}",
+                                              "EARLY_TRIGGER_REQUIRES_MOMENTUM_1M_3M_AND_RSI_40"])
+                    ev=evidence_for("BEARISH")+trigger_evidence+[
                         "RSI_AT_MOST_45","1M_3M_MOMENTUM_ALIGNED","NO_CONFIRMED_OPPOSING_DIVERGENCE_NEAR_TRIGGER"]
                     cand={"direction":"BEARISH","setup":"CONFIRMED_BREAKDOWN","level":level.price,"score":raw,
-                          "evidence":ev,"distance":dist,"touches":touches}
+                          "evidence":ev,"distance":dist,"touches":touches,
+                          "early_buyer_led_trigger":bool(early_buyer_close and not two_closes)}
                     candidates.append(cand); diagnostic_candidates["BEARISH"].append(cand)
 
     # Continuous trend continuation: a strong, fresh OI pair can authorize a trend entry even
@@ -2125,7 +2268,7 @@ def score_market_signal(frame: pd.DataFrame, indicators: Indicators, oi: Mapping
                           "fib_touch_tolerance_points":touch_tolerance,"candidate_oi_gate_checks":candidate_oi_checks,
                           "candidate_oi_gate_failures":candidate_oi_failures,
                           "continuation_price_extension_guard":continuation_guard_diagnostics,
-                          "decision_model":"OI_FIRST_THEN_SETUP_SPECIFIC_OI_PAIR_THEN_FIB_PRICE_ACTION"})
+                          "decision_model":"INDEPENDENT_PRICE_AND_OI_ANALYSIS_THEN_SETUP_SPECIFIC_ENTRY_GATES"})
         return signal, base_diag
 
     candidates.sort(key=lambda x: (-number(x.get("score"),0.0), number(x.get("distance"),99999), -int(x.get("touches",0))))
@@ -2211,7 +2354,7 @@ def score_market_signal(frame: pd.DataFrame, indicators: Indicators, oi: Mapping
             "candidate_oi_gate_checks": candidate_oi_checks,
             "candidate_oi_gate_failures": candidate_oi_failures,
             "continuation_price_extension_guard": continuation_guard_diagnostics,
-            "decision_model": "OI_FIRST_THEN_GENERATE_CANDIDATES_THEN_FULL_GATE_PREFLIGHT_THEN_RANK",
+            "decision_model": "INDEPENDENT_PRICE_AND_OI_ANALYSIS_THEN_FULL_GATE_PREFLIGHT_AND_RANK",
         })
         return signal, base_diag
 
@@ -2232,7 +2375,7 @@ def score_market_signal(frame: pd.DataFrame, indicators: Indicators, oi: Mapping
         "candidate_oi_gate_checks":candidate_oi_checks,
         "candidate_oi_gate_failures":candidate_oi_failures,
         "continuation_price_extension_guard":continuation_guard_diagnostics,
-        "decision_model":"OI_FIRST_THEN_GENERATE_CANDIDATES_THEN_FULL_GATE_PREFLIGHT_THEN_RANK",
+        "decision_model":"INDEPENDENT_PRICE_AND_OI_ANALYSIS_THEN_FULL_GATE_PREFLIGHT_AND_RANK",
     })
     return signal,base_diag
 
@@ -2321,18 +2464,24 @@ def classify_market_regime(frame: pd.DataFrame, indicators: Indicators, now: dat
 
 def qualify_local_oi(oi: Mapping[str, Any], signal: Signal, spot: float, step: float,
                      min_change_pct: float = 2.5) -> dict[str, Any]:
-    """Revalidate one explicit local writing/covering pair for the proposed setup.
+    """Revalidate the exact paired-flow mode attached to a directional price setup.
 
-    Reversal writing must be on the structural side of support/resistance. Breakouts and
-    continuation use the current ATM band so the breakout boundary several points away from
-    spot cannot accidentally exclude the option flow that authorized the trend.
+    Writer-led setups require directional writing paired with short covering. Buyer-led momentum
+    setups require dominant option buying (>2.5% OI growth with premium rising) paired with
+    opposite-side long unwinding (OI and premium both falling). Buyer-led flow is restricted to
+    breakouts/breakdowns and continuous-trend setups; reversal setups continue to require writers.
     """
     threshold = max(0.025, min(0.10, number(min_change_pct, 2.5) / 100.0))
     premium_floor = 0.002
     direction = str(signal.direction).upper()
     setup = str(signal.setup).upper()
-    empty = {"qualified": False, "writing_oi_threshold_pct_exclusive": threshold * 100.0,
-             "covering_oi_decline_threshold_pct_exclusive": 0.5, "premium_change_min_pct": premium_floor * 100.0,
+    evidence = {str(x).upper() for x in signal.evidence}
+    buyer_mode = "OI_FLOW_MODE_BUYER_LED" in evidence
+    flow_mode = "BUYER_LED_MOMENTUM" if buyer_mode else "WRITER_COVERING"
+    empty = {"qualified": False, "flow_mode": flow_mode,
+             "writing_oi_threshold_pct_exclusive": threshold * 100.0,
+             "covering_oi_decline_threshold_pct_exclusive": 0.5,
+             "premium_change_min_pct": premium_floor * 100.0,
              "supporting_rows": [], "opposing_rows": [], "reference_strikes": [],
              "primary_flow": None, "secondary_flow": None, "pair_distance_points": None,
              "paired_flow": None, "candidate_pairs_considered": 0}
@@ -2347,25 +2496,30 @@ def qualify_local_oi(oi: Mapping[str, Any], signal: Signal, spot: float, step: f
     bearish_setups = {"RESISTANCE_REJECTION", "RESISTANCE_CLUSTER_REJECTION", "EARLY_RESISTANCE_REJECTION",
                       "CONFIRMED_BREAKDOWN", "CONTINUOUS_BEARISH_TREND"}
     if setup in bullish_setups:
-        primary_side, secondary_side = "put", "call"
+        default_primary, default_secondary = "put", "call"
     elif setup in bearish_setups:
-        primary_side, secondary_side = "call", "put"
+        default_primary, default_secondary = "call", "put"
     else:
         return {**empty, "reason": "UNSUPPORTED_SETUP_FOR_LOCAL_OI_PAIR", "setup": setup}
+    if buyer_mode and setup not in {"CONFIRMED_BREAKOUT", "CONFIRMED_BREAKDOWN",
+                                    "CONTINUOUS_BULLISH_TREND", "CONTINUOUS_BEARISH_TREND"}:
+        return {**empty, "reason": "BUYER_LED_FLOW_RESTRICTED_TO_MOMENTUM_SETUPS", "setup": setup}
 
+    if buyer_mode:
+        primary_side, secondary_side = ("call", "put") if direction == "BULLISH" else ("put", "call")
+    else:
+        primary_side, secondary_side = default_primary, default_secondary
     ref = number(signal.level, spot)
     reversal = setup in {"SUPPORT_BOUNCE", "SUPPORT_CLUSTER_RECLAIM", "EARLY_SUPPORT_RECLAIM",
                          "RESISTANCE_REJECTION", "RESISTANCE_CLUSTER_REJECTION", "EARLY_RESISTANCE_REJECTION"}
     center = ref if reversal else spot
     atm = round_to_grid(spot, step)
-    # Include a small tolerance beyond two strikes: spot is continuous-valued while option strikes are on a fixed grid.
-    # Pair distance is still strictly limited to two strike steps below.
     band = max(3.0 * step, 150.0)
     rows = [r for r in oi.get("walls", []) if isinstance(r, Mapping) and finite(r.get("strike"))
             and abs(number(r.get("strike")) - center) <= band + 0.01
             and abs(number(r.get("strike")) - spot) <= max(4.0 * step, 200.0) + 0.01]
 
-    def flow_item(row: Mapping[str, Any], side: str, writing: bool) -> Optional[dict[str, Any]]:
+    def flow_item(row: Mapping[str, Any], side: str, primary_role: bool) -> Optional[dict[str, Any]]:
         change = number(row.get(f"{side}_change_pct"))
         premium_change = number(row.get(f"{side}_premium_change_pct"))
         delta = number(row.get(f"{side}_delta_oi"))
@@ -2378,59 +2532,62 @@ def qualify_local_oi(oi: Mapping[str, Any], signal: Signal, spot: float, step: f
         if baseline < 10000 or current_oi < 0 or min(old_premium, new_premium) < 5:
             return None
         flow = classify_oi_flow(change, premium_change)
-        if writing:
-            passed = change > threshold and premium_change <= -premium_floor and flow == "SHORT_BUILDUP_WRITING"
+        if not buyer_mode:
+            passed = (change > threshold and premium_change <= -premium_floor and flow == "SHORT_BUILDUP_WRITING"
+                      if primary_role else change < -0.005 and premium_change >= premium_floor and flow == "SHORT_COVERING")
         else:
-            passed = change < -0.005 and premium_change >= premium_floor and flow == "SHORT_COVERING"
+            passed = (change > threshold and premium_change >= premium_floor and flow == "LONG_BUILDUP_BUYING"
+                      if primary_role else change < -0.005 and premium_change <= -premium_floor and flow == "LONG_UNWINDING")
         if not passed:
             return None
-        return {"strike": number(row.get("strike")), "option_side": side.upper(), "oi_change_pct": round(change * 100, 3),
-                "premium_change_pct": round(premium_change * 100, 3), "delta_oi": round(delta, 1),
-                "baseline_oi": round(baseline, 1), "current_oi": round(current_oi, 1), "flow": flow}
+        return {"strike": number(row.get("strike")), "option_side": side.upper(),
+                "oi_change_pct": round(change * 100, 3), "premium_change_pct": round(premium_change * 100, 3),
+                "delta_oi": round(delta, 1), "baseline_oi": round(baseline, 1),
+                "current_oi": round(current_oi, 1), "flow": flow}
 
-    writer_candidates: list[dict[str, Any]] = []
-    cover_candidates: list[dict[str, Any]] = []
+    primary_candidates: list[dict[str, Any]] = []
+    secondary_candidates: list[dict[str, Any]] = []
     for row in rows:
         strike = number(row.get("strike"))
-        writer = flow_item(row, primary_side, True)
-        cover = flow_item(row, secondary_side, False)
-        if writer:
-            if reversal:
-                # Half-grid allowance is for mapping a continuous-valued NIFTY level to a
-                # 50-point option strike; it is not an extra spot/Fib touch allowance.
+        primary = flow_item(row, primary_side, True)
+        secondary = flow_item(row, secondary_side, False)
+        if primary:
+            if buyer_mode:
+                location_ok = abs(strike - atm) <= 2.0 * step + 0.01
+            elif reversal:
                 grid_location_buffer = max(15.0, 0.5 * step)
                 location_ok = strike <= ref + grid_location_buffer if direction == "BULLISH" else strike >= ref - grid_location_buffer
             else:
                 location_ok = strike <= atm + step + 0.01 if direction == "BULLISH" else strike >= atm - step - 0.01
             if location_ok:
-                writer_candidates.append(writer)
-        if cover:
-            cover_candidates.append(cover)
+                primary_candidates.append(primary)
+        if secondary:
+            secondary_candidates.append(secondary)
 
     pairs: list[dict[str, Any]] = []
-    for writer in writer_candidates:
-        for cover in cover_candidates:
-            distance = abs(number(writer.get("strike")) - number(cover.get("strike")))
+    for primary in primary_candidates:
+        for secondary in secondary_candidates:
+            distance = abs(number(primary.get("strike")) - number(secondary.get("strike")))
             if distance > 2.0 * step + 0.01:
                 continue
             proximity = max(0.0, 1.0 - distance / max(1.0, 2.0 * step))
-            # Stronger fresh writing is the main ranking input; counter-leg cover and locality
-            # confirm it rather than allowing an unrelated nearest wall to win.
-            score = (number(writer.get("oi_change_pct"), 0.0)
-                     + 0.20 * abs(number(cover.get("oi_change_pct"), 0.0))
-                     + 0.08 * abs(number(writer.get("premium_change_pct"), 0.0))
-                     + 0.05 * abs(number(cover.get("premium_change_pct"), 0.0))
+            score = (number(primary.get("oi_change_pct"), 0.0)
+                     + 0.20 * abs(number(secondary.get("oi_change_pct"), 0.0))
+                     + 0.08 * abs(number(primary.get("premium_change_pct"), 0.0))
+                     + 0.05 * abs(number(secondary.get("premium_change_pct"), 0.0))
                      + 1.5 * proximity)
-            pairs.append({"writer": writer, "cover": cover, "distance": round(distance, 2), "score": score})
+            pairs.append({"primary": primary, "secondary": secondary,
+                          "distance": round(distance, 2), "score": score})
     pairs.sort(key=lambda p: (-number(p.get("score"), 0.0),
-                              -number(p.get("writer", {}).get("oi_change_pct"), 0.0),
+                              -number(p.get("primary", {}).get("oi_change_pct"), 0.0),
                               number(p.get("distance"), 1e9)))
 
-    center_for_conflict = center
+    # Reject only material counterflow at the setup boundary. For a buyer-led bullish setup,
+    # nearby put buying or call writing is counter-directional; inverse for bearish.
     opposing: list[dict[str, Any]] = []
     for row in rows:
         strike = number(row.get("strike"))
-        if abs(strike - center_for_conflict) > step + 0.01:
+        if abs(strike - center) > step + 0.01:
             continue
         for side in ("call", "put"):
             change = number(row.get(f"{side}_change_pct"))
@@ -2446,31 +2603,43 @@ def qualify_local_oi(oi: Mapping[str, Any], signal: Signal, spot: float, step: f
                              (direction == "BEARISH" and
                               ((side == "put" and flow == "SHORT_BUILDUP_WRITING") or
                                (side == "call" and flow == "LONG_BUILDUP_BUYING"))))
+            # A dominant buyer-led leg itself is expected to be a long buildup; do not classify
+            # it as opposing simply because it is on the primary option side.
+            if buyer_mode and side == primary_side and flow == "LONG_BUILDUP_BUYING":
+                opposing_flow = False
             if opposing_flow and abs(change) > threshold and abs(premium) >= premium_floor:
                 opposing.append({"strike": strike, "option_side": side.upper(),
                                  "oi_change_pct": round(change * 100, 3),
                                  "premium_change_pct": round(premium * 100, 3), "flow": flow})
     best = pairs[0] if pairs else None
     opposing_strength = max((abs(number(x.get("oi_change_pct"), 0.0)) for x in opposing), default=0.0)
-    writer_strength = abs(number((best or {}).get("writer", {}).get("oi_change_pct"), 0.0))
-    conflict = bool(best and opposing_strength >= writer_strength and opposing_strength > threshold * 100)
+    primary_strength = abs(number((best or {}).get("primary", {}).get("oi_change_pct"), 0.0))
+    conflict = bool(best and opposing_strength >= primary_strength and opposing_strength > threshold * 100)
     qualified = bool(best and not conflict)
-    writer = best.get("writer") if best else None
-    cover = best.get("cover") if best else None
-    refs = sorted({number(writer.get("strike")), number(cover.get("strike"))}) if writer and cover else []
-    reason = ("LOCAL_OI_PAIRED_WRITING_COVERING_CONFIRMED" if qualified else
-              "LOCAL_OI_COUNTERFLOW_CONFLICTS_AT_SETUP_BOUNDARY" if conflict else
-              "REQUIRED_LOCAL_OI_PAIR_NOT_CONFIRMED_STRICTLY_ABOVE_2_5_PERCENT")
+    primary = best.get("primary") if best else None
+    secondary = best.get("secondary") if best else None
+    refs = sorted({number(primary.get("strike")), number(secondary.get("strike"))}) if primary and secondary else []
+    if buyer_mode:
+        reason = ("LOCAL_OI_PAIRED_BUYER_MOMENTUM_AND_LONG_UNWINDING_CONFIRMED" if qualified else
+                  "LOCAL_OI_COUNTERFLOW_CONFLICTS_AT_SETUP_BOUNDARY" if conflict else
+                  "BUYER_LED_LOCAL_OI_PAIR_NOT_CONFIRMED_STRICTLY_ABOVE_2_5_PERCENT")
+        primary_desc, secondary_desc = "LONG_BUILDUP_BUYING", "LONG_UNWINDING"
+    else:
+        reason = ("LOCAL_OI_PAIRED_WRITING_COVERING_CONFIRMED" if qualified else
+                  "LOCAL_OI_COUNTERFLOW_CONFLICTS_AT_SETUP_BOUNDARY" if conflict else
+                  "REQUIRED_LOCAL_OI_PAIR_NOT_CONFIRMED_STRICTLY_ABOVE_2_5_PERCENT")
+        primary_desc, secondary_desc = "SHORT_BUILDUP_WRITING", "SHORT_COVERING"
     return {**empty, "qualified": qualified, "reason": reason, "setup": setup, "direction": direction,
-            "reference_level": round(ref, 2), "oi_search_center": round(center, 2),
-            "primary_required": {"option_side": primary_side.upper(), "flow": "SHORT_BUILDUP_WRITING"},
-            "secondary_required": {"option_side": secondary_side.upper(), "flow": "SHORT_COVERING"},
-            "primary_flow": writer, "secondary_flow": cover,
-            "supporting_rows": ([writer, cover] if writer and cover else []),
+            "flow_mode": flow_mode, "reference_level": round(ref, 2), "oi_search_center": round(center, 2),
+            "primary_required": {"option_side": primary_side.upper(), "flow": primary_desc},
+            "secondary_required": {"option_side": secondary_side.upper(), "flow": secondary_desc},
+            "primary_flow": primary, "secondary_flow": secondary,
+            "supporting_rows": ([primary, secondary] if primary and secondary else []),
             "opposing_rows": opposing[:5], "reference_strikes": refs,
             "pair_distance_points": best.get("distance") if best else None,
-            "paired_flow": {"writing_strike": writer.get("strike"), "covering_strike": cover.get("strike"),
-                            "distance_points": best.get("distance"), "score": round(number(best.get("score")), 3)} if best and writer and cover else None,
+            "paired_flow": {"primary_strike": primary.get("strike"), "secondary_strike": secondary.get("strike"),
+                            "distance_points": best.get("distance"), "score": round(number(best.get("score")), 3),
+                            "flow_mode": flow_mode} if best and primary and secondary else None,
             "candidate_pairs_considered": len(pairs), "tactical_age_minutes": oi.get("snapshot_age_minutes"),
             "tactical_available": bool(oi.get("tactical_available")), "local_rows_considered": len(rows)}
 
@@ -2490,20 +2659,31 @@ def qualify_regime(signal: Signal, regime: Mapping[str, Any], indicators: Indica
         return {"qualified": False, "reason": "NO_DIRECTIONAL_STRUCTURE", "regime": name}
     continuous = ((setup == "CONTINUOUS_BULLISH_TREND" and direction == "BULLISH")
                   or (setup == "CONTINUOUS_BEARISH_TREND" and direction == "BEARISH"))
+    is_breakout_setup = ((setup == "CONFIRMED_BREAKOUT" and direction == "BULLISH")
+                         or (setup == "CONFIRMED_BREAKDOWN" and direction == "BEARISH"))
     watch = regime.get("directional_watch") if isinstance(regime.get("directional_watch"), Mapping) else {}
     scan_time = parse_dt(regime.get("scan_timestamp")) or now_ist()
     watch_time = parse_dt(watch.get("first_seen"))
     watch_aligned = bool(str(watch.get("direction", "")).upper() == direction and watch_time is not None
                          and 0 <= (scan_time.astimezone(IST) - watch_time.astimezone(IST)).total_seconds() <= 15 * 60)
-    if name == "WARMUP" and not (continuous and watch_aligned):
-        return {"qualified": False, "reason": "SETUP_SPECIFIC_WARMUP_REQUIRES_PERSISTENT_DIRECTIONAL_WATCH", "regime": name,
-                "directional_watch_aligned": watch_aligned}
     if not oi_ok:
         return {"qualified": False, "reason": "LOCAL_OI_PAIR_NOT_CONFIRMED", "regime": name}
     if not setup_ok:
         return {"qualified": False, "reason": "SETUP_RULES_NOT_CONFIRMED", "regime": name}
     if not fib_ok:
         return {"qualified": False, "reason": "FIB_DIVERGENCE_OR_OPPOSING_DIVERGENCE_GATE_FAILED", "regime": name}
+
+    # Early-session regime classification can legitimately remain WARMUP even when enough
+    # price history exists to evaluate a specific completed-candle breakout. Permit that path
+    # only after the setup validator and paired-OI gate have both passed. Reversals and
+    # untriggered continuations still require their normal context/watch rules.
+    if name == "WARMUP" and not (continuous and watch_aligned) and not is_breakout_setup:
+        return {"qualified": False, "reason": "SETUP_SPECIFIC_WARMUP_REQUIRES_CONFIRMED_BREAK_OR_PERSISTENT_WATCH",
+                "regime": name, "directional_watch_aligned": watch_aligned}
+    if name == "WARMUP" and is_breakout_setup:
+        return {"qualified": True, "reason": "WARMUP_BREAKOUT_ALLOWED_BY_COMPLETED_PRICE_TRIGGER_AND_STRICT_LOCAL_OI",
+                "regime": name, "session_bias": session_bias, "directional_watch_aligned": watch_aligned,
+                "price_trigger_confirmed": True, "local_oi_confirmed": True}
 
     bullish_reversals = {"SUPPORT_BOUNCE", "SUPPORT_CLUSTER_RECLAIM", "EARLY_SUPPORT_RECLAIM"}
     bearish_reversals = {"RESISTANCE_REJECTION", "RESISTANCE_CLUSTER_REJECTION", "EARLY_RESISTANCE_REJECTION"}
@@ -2704,6 +2884,9 @@ def qualify_setup_rules(signal: Signal, frame: pd.DataFrame, indicators: Indicat
     regime_name=str(regime.get("regime","TRANSITION")).upper()
     session_bias=str(regime.get("session_bias","UNKNOWN")).upper()
     evidence=" ".join(signal.evidence).upper()
+    buyer_led = "OI_FLOW_MODE_BUYER_LED" in evidence
+    early_buyer_breakout = buyer_led and "BUYER_LED_EARLY_SINGLE_CLOSE_BREAKOUT" in evidence
+    early_buyer_breakdown = buyer_led and "BUYER_LED_EARLY_SINGLE_CLOSE_BREAKDOWN" in evidence
 
     if setup in {"SUPPORT_BOUNCE", "SUPPORT_CLUSTER_RECLAIM", "EARLY_SUPPORT_RECLAIM"} and direction=="BULLISH":
         checks={"confirmed_bullish_rsi_divergence":bool(fib_gate.get("matching_divergence")),
@@ -2722,18 +2905,30 @@ def qualify_setup_rules(signal: Signal, frame: pd.DataFrame, indicators: Indicat
                 "three_minute_momentum_not_materially_bullish":indicators.momentum_3m<0.0010,
                 "no_nearby_opposing_divergence":not opposing}
     elif setup=="CONFIRMED_BREAKOUT" and direction=="BULLISH":
-        checks={"fib_resistance_boundary_confirmed":"TWO_COMPLETED_CLOSES_ABOVE_FIB_RESISTANCE" in evidence,
-                "two_closes_above_boundary":last>level+buffer and prev>level+buffer,
-                "live_spot_above_boundary":indicators.spot>level+buffer,
+        early_close_ok = bool(early_buyer_breakout and last>level+buffer and prev<=level+buffer
+                              and indicators.spot>=level-max(0.15*indicators.atr,3.0)
+                              and indicators.rsi>=60.0 and indicators.momentum_1m>0.00015
+                              and indicators.momentum_3m>=0.00065)
+        two_close_ok = bool(last>level+buffer and prev>level+buffer)
+        checks={"fib_resistance_boundary_confirmed":("TWO_COMPLETED_CLOSES_ABOVE_FIB_RESISTANCE" in evidence
+                                                       or early_buyer_breakout),
+                "two_closes_or_strict_buyer_led_first_close":two_close_ok or early_close_ok,
+                "live_spot_above_or_at_first_close_boundary":(indicators.spot>level+buffer or early_close_ok),
                 "rsi_at_least_55":indicators.rsi>=55.0,
                 "one_and_three_minute_momentum_positive":indicators.momentum_1m>0 and indicators.momentum_3m>0,
                 "momentum_expanding_or_follow_through":expanding_up or (last>prev and indicators.momentum_1m>0),
                 "no_confirmed_opposing_divergence_near_trigger":not opposing,
                 "not_overextended_from_boundary":spot_dist<=max(1.5*indicators.atr,45.0)}
     elif setup=="CONFIRMED_BREAKDOWN" and direction=="BEARISH":
-        checks={"fib_support_boundary_confirmed":"TWO_COMPLETED_CLOSES_BELOW_FIB_SUPPORT" in evidence,
-                "two_closes_below_boundary":last<level-buffer and prev<level-buffer,
-                "live_spot_below_boundary":indicators.spot<level-buffer,
+        early_close_ok = bool(early_buyer_breakdown and last<level-buffer and prev>=level-buffer
+                              and indicators.spot<=level+max(0.15*indicators.atr,3.0)
+                              and indicators.rsi<=40.0 and indicators.momentum_1m<-0.00015
+                              and indicators.momentum_3m<=-0.00065)
+        two_close_ok = bool(last<level-buffer and prev<level-buffer)
+        checks={"fib_support_boundary_confirmed":("TWO_COMPLETED_CLOSES_BELOW_FIB_SUPPORT" in evidence
+                                                    or early_buyer_breakdown),
+                "two_closes_or_strict_buyer_led_first_close":two_close_ok or early_close_ok,
+                "live_spot_below_or_at_first_close_boundary":(indicators.spot<level-buffer or early_close_ok),
                 "rsi_at_most_45":indicators.rsi<=45.0,
                 "one_and_three_minute_momentum_negative":indicators.momentum_1m<0 and indicators.momentum_3m<0,
                 "momentum_expanding_or_follow_through":expanding_down or (last<prev and indicators.momentum_1m<0),
@@ -2774,7 +2969,7 @@ def qualify_setup_rules(signal: Signal, frame: pd.DataFrame, indicators: Indicat
             "local_oi_pair_confirmed":bool(oi_gate.get("qualified")),
             "continuation_price_extension_guard":extension_guard if setup in {"CONTINUOUS_BULLISH_TREND","CONTINUOUS_BEARISH_TREND"} else None,
             "extension_is_diagnostic_not_standalone_veto": setup in {"CONTINUOUS_BULLISH_TREND","CONTINUOUS_BEARISH_TREND"}}
-def can_issue_signal_v90(state: Mapping[str, Any], signal: Signal, now: datetime,
+def can_issue_signal_v91(state: Mapping[str, Any], signal: Signal, now: datetime,
                          cooldown_minutes: int, regime: Mapping[str, Any],
                          full_confluence: bool = False,
                          regime_confirmation: Optional[Mapping[str, Any]] = None) -> tuple[bool, str]:
@@ -2951,7 +3146,11 @@ def _candidate_strikes(spot: float, contracts: Mapping[tuple[float, str], Contra
 def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote], spot: float, direction: str,
                     oi: Mapping[str, Any], config: Config, target_delta: float = 0.62,
                     authorized_oi_pair: Optional[Mapping[str, Any]] = None) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
-    """Select only contracts with nearby paired writing/covering flow; rank flow before secondary scores."""
+    """Rank eligible options using the exact authorized paired-flow mode plus safety checks.
+
+    Flow receives 55% of the score and is the primary sort key. Writer-led and buyer-led modes
+    use different, explicit option-side roles; neither mode can be scored using unrelated raw OI.
+    """
     rows: list[dict[str, Any]] = []
     if not candidates:
         return None, rows
@@ -2959,17 +3158,23 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
     step = config.strike_step
     walls = [w for w in oi.get("walls", []) if isinstance(w, Mapping) and finite(w.get("strike"))]
     bullish = str(direction).upper() == "BULLISH"
-    writing_side = "put" if bullish else "call"
     auth = authorized_oi_pair if isinstance(authorized_oi_pair, Mapping) and authorized_oi_pair.get("qualified") else {}
-    auth_writer = auth.get("primary_flow") if isinstance(auth.get("primary_flow"), Mapping) else {}
-    auth_cover = auth.get("secondary_flow") if isinstance(auth.get("secondary_flow"), Mapping) else {}
-    authorized_pair_present = bool(auth_writer and auth_cover and finite(auth_writer.get("strike")) and finite(auth_cover.get("strike"))
-                                   and str(auth_writer.get("option_side", "")).lower() == writing_side
-                                   and str(auth_cover.get("option_side", "")).lower() == ("call" if bullish else "put"))
-    auth_writer_strike = number(auth_writer.get("strike"))
-    auth_cover_strike = number(auth_cover.get("strike"))
+    flow_mode = str(auth.get("flow_mode", "WRITER_COVERING")).upper()
+    buyer_mode = flow_mode == "BUYER_LED_MOMENTUM"
+    if buyer_mode:
+        primary_side, secondary_side = (("call", "put") if bullish else ("put", "call"))
+    else:
+        primary_side, secondary_side = (("put", "call") if bullish else ("call", "put"))
+    auth_primary = auth.get("primary_flow") if isinstance(auth.get("primary_flow"), Mapping) else {}
+    auth_secondary = auth.get("secondary_flow") if isinstance(auth.get("secondary_flow"), Mapping) else {}
+    authorized_pair_present = bool(auth_primary and auth_secondary
+        and finite(auth_primary.get("strike")) and finite(auth_secondary.get("strike"))
+        and str(auth_primary.get("option_side", "")).lower() == primary_side
+        and str(auth_secondary.get("option_side", "")).lower() == secondary_side)
+    auth_primary_strike = number(auth_primary.get("strike"))
+    auth_secondary_strike = number(auth_secondary.get("strike"))
 
-    def valid_leg(row: Mapping[str, Any], side: str, writing: bool) -> Optional[dict[str, Any]]:
+    def valid_leg(row: Mapping[str, Any], side: str, role: str) -> Optional[dict[str, Any]]:
         change = number(row.get(f"{side}_change_pct"))
         premium_change = number(row.get(f"{side}_premium_change_pct"))
         base = number(row.get(f"{side}_prev_oi"))
@@ -2982,10 +3187,16 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
         if base < 10000 or min(old_premium, new_premium) < 5 or current_oi < 0:
             return None
         flow = classify_oi_flow(change, premium_change)
-        if writing:
-            passed = change > 0.025 and premium_change <= -0.002 and flow == "SHORT_BUILDUP_WRITING"
+        if role == "PRIMARY":
+            if buyer_mode:
+                passed = change > 0.025 and premium_change >= 0.002 and flow == "LONG_BUILDUP_BUYING"
+            else:
+                passed = change > 0.025 and premium_change <= -0.002 and flow == "SHORT_BUILDUP_WRITING"
         else:
-            passed = change < -0.005 and premium_change >= 0.002 and flow == "SHORT_COVERING"
+            if buyer_mode:
+                passed = change < -0.005 and premium_change <= -0.002 and flow == "LONG_UNWINDING"
+            else:
+                passed = change < -0.005 and premium_change >= 0.002 and flow == "SHORT_COVERING"
         if not passed:
             return None
         return {"strike": number(row.get("strike")), "flow": flow,
@@ -3023,64 +3234,58 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
             reasons.append("NO_OPTION_VOLUME")
 
         selected_side = "call" if c.side.upper() == "CE" else "put"
-        cover_legs: list[dict[str, Any]] = []
-        write_legs: list[dict[str, Any]] = []
+        expected_contract_side = primary_side if buyer_mode else secondary_side
+        if selected_side != expected_contract_side:
+            reasons.append("CONTRACT_SIDE_DOES_NOT_MATCH_AUTHORIZED_FLOW_MODE")
+        primary_legs: list[dict[str, Any]] = []
+        secondary_legs: list[dict[str, Any]] = []
         for wall in walls:
             distance = abs(number(wall.get("strike")) - c.strike)
             if distance > 2.0 * step + 0.01:
                 continue
-            cover = valid_leg(wall, selected_side, writing=False)
-            if authorized_pair_present and abs(number(wall.get("strike")) - auth_cover_strike) > 0.01:
-                cover = None
-            if cover:
-                cover["distance_to_contract"] = distance
-                cover_legs.append(cover)
-            write = valid_leg(wall, writing_side, writing=True)
-            if authorized_pair_present and abs(number(wall.get("strike")) - auth_writer_strike) > 0.01:
-                write = None
-            if write:
-                write["distance_to_contract"] = distance
-                write_legs.append(write)
-
-        # Pair the selected option's short-covering flow with fresh writing on the
-        # opposite option side, allowing a one/two-strike separation but not unrelated walls.
+            primary = valid_leg(wall, primary_side, "PRIMARY")
+            secondary = valid_leg(wall, secondary_side, "SECONDARY")
+            if authorized_pair_present:
+                if abs(number(wall.get("strike")) - auth_primary_strike) > 0.01:
+                    primary = None
+                if abs(number(wall.get("strike")) - auth_secondary_strike) > 0.01:
+                    secondary = None
+            if primary:
+                primary["distance_to_contract"] = distance
+                primary_legs.append(primary)
+            if secondary:
+                secondary["distance_to_contract"] = distance
+                secondary_legs.append(secondary)
         flow_pairs: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
-        for cover in cover_legs:
-            for write in write_legs:
-                if abs(number(cover.get("strike")) - number(write.get("strike"))) > 2.0 * step + 0.01:
+        for primary in primary_legs:
+            for secondary in secondary_legs:
+                if abs(number(primary.get("strike")) - number(secondary.get("strike"))) > 2.0 * step + 0.01:
                     continue
-                cover_locality = locality(number(cover.get("distance_to_contract"), 0.0))
-                write_locality = locality(number(write.get("distance_to_contract"), 0.0))
-                write_change_pct = number(write.get("oi_change_pct"), 0.0)
-                cover_change_pct = abs(number(cover.get("oi_change_pct"), 0.0))
-                # Weight writing intensity materially so an 8% local writing burst
-                # can outrank a barely-qualified 2.6% one, while preserving locality.
-                writing_intensity = clamp(write_change_pct / 10.0, 0.0, 1.0)
-                covering_intensity = clamp(cover_change_pct / 5.0, 0.0, 1.0)
-                pair_locality = 0.5 * cover_locality + 0.5 * write_locality
-                pair_score = (0.25 * pair_locality + 0.55 * writing_intensity
-                              + 0.20 * covering_intensity)
-                flow_pairs.append((clamp(pair_score, 0.0, 1.0), cover, write))
+                primary_locality = locality(number(primary.get("distance_to_contract"), 0.0))
+                secondary_locality = locality(number(secondary.get("distance_to_contract"), 0.0))
+                primary_intensity = clamp(abs(number(primary.get("oi_change_pct"), 0.0)) / 10.0, 0.0, 1.0)
+                secondary_intensity = clamp(abs(number(secondary.get("oi_change_pct"), 0.0)) / 10.0, 0.0, 1.0)
+                pair_locality = 0.5 * primary_locality + 0.5 * secondary_locality
+                flow_score = clamp(0.25 * pair_locality + 0.55 * primary_intensity + 0.20 * secondary_intensity, 0.0, 1.0)
+                flow_pairs.append((flow_score, primary, secondary))
         flow_pairs.sort(key=lambda item: (-item[0],
                                           number(item[1].get("distance_to_contract"), 1e9)
                                           + number(item[2].get("distance_to_contract"), 1e9),
-                                          -number(item[2].get("oi_change_pct"), 0.0)))
-        supportive_flow_confirmed = bool(flow_pairs)
+                                          -number(item[1].get("oi_change_pct"), 0.0)))
+        supportive_flow_confirmed = bool(flow_pairs) and (authorized_pair_present or not auth)
         if flow_pairs:
-            flow_score, chosen_cover, chosen_write = flow_pairs[0]
-            cover_flow = str(chosen_cover.get("flow"))
-            support_flow = str(chosen_write.get("flow"))
-            write_change = number(chosen_write.get("oi_change_pct"), 0.0)
-            write_premium_change = number(chosen_write.get("premium_change_pct"), 0.0)
-            flow_reference_strikes = sorted({number(chosen_cover.get("strike")), number(chosen_write.get("strike"))})
-            flow_distance = round(number(chosen_cover.get("distance_to_contract"), 0.0)
-                                  + number(chosen_write.get("distance_to_contract"), 0.0), 2)
+            flow_score, chosen_primary, chosen_secondary = flow_pairs[0]
+            primary_flow = str(chosen_primary.get("flow"))
+            secondary_flow = str(chosen_secondary.get("flow"))
+            primary_change = number(chosen_primary.get("oi_change_pct"), 0.0)
+            primary_premium_change = number(chosen_primary.get("premium_change_pct"), 0.0)
+            flow_reference_strikes = sorted({number(chosen_primary.get("strike")), number(chosen_secondary.get("strike"))})
+            flow_distance = round(number(chosen_primary.get("distance_to_contract"), 0.0)
+                                  + number(chosen_secondary.get("distance_to_contract"), 0.0), 2)
         else:
             flow_score = 0.0
-            cover_flow = "UNKNOWN"
-            support_flow = "UNKNOWN"
-            write_change = float("nan")
-            write_premium_change = float("nan")
+            primary_flow = secondary_flow = "UNKNOWN"
+            primary_change = primary_premium_change = float("nan")
             flow_reference_strikes = []
             flow_distance = None
             reasons.append("NO_NEARBY_PAIRED_SUPPORTIVE_LOCAL_OI_FLOW")
@@ -3090,11 +3295,10 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
         depth = q.depth_imbalance if q else 0.0
         liquidity_score = 0.60 * spread_score + 0.25 * volume_score + 0.15 * clamp((depth + 1.0) / 2.0, 0.0, 1.0)
         moneyness_score = clamp(1.0 - abs(spot - c.strike) / (3.0 * step), 0.0, 1.0)
-        # Flow has 55% of total score; it is also the primary sorting key below.
         total = 100.0 * (0.55 * flow_score + 0.15 * delta_score + 0.20 * liquidity_score + 0.10 * moneyness_score)
         hard_ok = (age_ok and finite(ltp) and ltp > 0 and finite(spread) and spread <= config.max_spread
                    and volume > 0 and finite(delta) and 0.45 <= abs(delta) <= 0.90
-                   and supportive_flow_confirmed)
+                   and selected_side == expected_contract_side and supportive_flow_confirmed)
         rows.append({"instrument_key": c.instrument_key, "trading_symbol": c.symbol, "side": c.side,
             "strike": c.strike, "expiry": c.expiry, "ltp": round(ltp, 2) if finite(ltp) else None,
             "delta": round(delta, 4) if finite(delta) else None, "target_abs_delta": round(target_delta, 3),
@@ -3102,9 +3306,10 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
             "quote_age_seconds": round(q.age_seconds, 2) if q and finite(q.age_seconds) else None,
             "quote_timestamp": q.timestamp if q else None,
             "quote_freshness": q.freshness if q else "UNAVAILABLE", "volume": volume, "oi": c.oi,
-            "local_oi_flow": cover_flow, "supporting_oi_flow": support_flow,
-            "supporting_writing_oi_change_pct": round(write_change, 3) if finite(write_change) else None,
-            "supporting_writing_premium_change_pct": round(write_premium_change, 3) if finite(write_premium_change) else None,
+            "local_oi_flow": secondary_flow, "supporting_oi_flow": primary_flow,
+            "flow_mode": flow_mode,
+            "supporting_primary_oi_change_pct": round(primary_change, 3) if finite(primary_change) else None,
+            "supporting_primary_premium_change_pct": round(primary_premium_change, 3) if finite(primary_premium_change) else None,
             "oi_reference_strikes": flow_reference_strikes, "oi_reference_distance_points": flow_distance,
             "flow_score_pct": round(flow_score * 100.0, 2), "delta_score_pct": round(delta_score * 100.0, 2),
             "liquidity_score_pct": round(liquidity_score * 100.0, 2), "score": round(total, 2),
@@ -3113,7 +3318,6 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
             "authorized_oi_pair_enforced": bool(authorized_pair_present),
             "warnings": warnings, "vetoes": reasons})
     eligible = [r for r in rows if r["execution_eligible"]]
-    # Explicitly prioritize the strongest verified supportive OI pair; use total score only as a tie-breaker.
     eligible.sort(key=lambda x: (-number(x.get("flow_score_pct"), 0.0), -number(x.get("score"), 0.0),
                                  abs(spot - number(x.get("strike"), spot)), number(x.get("spread_ratio_pct"), 999.0)))
     rows.sort(key=lambda x: (-number(x.get("flow_score_pct"), 0.0), -number(x.get("score"), 0.0),
@@ -3163,7 +3367,7 @@ def update_active_signal(state: dict[str, Any], frame: pd.DataFrame, now: dateti
 def audit_append(config: Config, report: Mapping[str, Any]) -> None:
     config.audit_dir.mkdir(parents=True, exist_ok=True)
     local_date = parse_date(report.get("timestamp")) or now_ist().date()
-    path = config.audit_dir / f"market_scan_{local_date.isoformat()}_v90.jsonl"
+    path = config.audit_dir / f"market_scan_{local_date.isoformat()}_v91.jsonl"
     record = {"audit_schema_version": 1, "recorded_at": report.get("timestamp"), "scanner_version": VERSION, "scan": safe_json(report)}
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
@@ -3350,9 +3554,9 @@ class PredictiveScanner:
 
             snapshots = state.get("chain_snapshots", []) if isinstance(state.get("chain_snapshots", []), list) else []
             oi = analyze_oi(chain, snapshots, spot, expiry, current, strike_step, self.config.scan_interval)
-            # Price/Fibonacci/divergence analysis is independent of OI confirmation. OI gates entry,
-            # not the scanner's ability to recognise and persist a developing structure.
-            oi_first = qualify_oi_first(oi, spot, strike_step, self.config.min_local_oi_change_pct)
+            # Calculate every available price indicator before OI qualification. This allows the
+            # buyer-led momentum path to require aligned price context without making OI gate the
+            # calculation of price structure, momentum, divergence or Fibonacci.
             indicators = indicator_set(analysis_raw, spot, current, calculate_rsi=True, vwap_frame=futures_frame_raw)
             fib = analyze_fibonacci(analysis_raw, indicators.atr, current)
             # Divergence is an intraday trigger; do not compare pivots across an overnight gap.
@@ -3360,6 +3564,8 @@ class PredictiveScanner:
             levels = make_structure_levels(analysis_raw, indicators, oi, strike_step, current, fib)
             regime = classify_market_regime(frame_raw, indicators, current)
             regime["scan_timestamp"] = current.isoformat()
+            oi_first = qualify_oi_first(oi, spot, strike_step, self.config.min_local_oi_change_pct,
+                                        indicators=indicators, regime=regime)
             directional_watch_diagnostics = update_directional_watch(state, frame_raw, indicators, regime, oi_first, current)
             regime["directional_watch"] = safe_json(state.get("directional_watch")) if isinstance(state.get("directional_watch"), Mapping) else {}
             signal, signal_diagnostics = score_market_signal(frame_raw, indicators, oi, levels, current,
@@ -3405,8 +3611,8 @@ class PredictiveScanner:
                 if not setup_confirmation.get("qualified"):
                     gate_failures.append(str(setup_confirmation.get("reason", "SETUP_RULE_GATE_FAILED")))
                 if gate_failures:
-                    gate_evidence = tuple(dict.fromkeys(list(signal.evidence) + [f"V90_HARD_GATE:{x}" for x in gate_failures]))
-                    signal = Signal("NEUTRAL", "V90_ENTRY_GATES_BLOCKED", signal.score, 0.0,
+                    gate_evidence = tuple(dict.fromkeys(list(signal.evidence) + [f"V91_HARD_GATE:{x}" for x in gate_failures]))
+                    signal = Signal("NEUTRAL", "V91_ENTRY_GATES_BLOCKED", signal.score, 0.0,
                                     "; ".join(gate_evidence[:8]), signal.level, gate_evidence, tuple(gate_failures))
             risk = calculate_risk_plan(signal, levels, indicators, self.config.min_t1_rr)
             events = update_active_signal(state, frame_raw, current)
@@ -3436,7 +3642,7 @@ class PredictiveScanner:
                                     "active": safe_json(state.get("pending_structure_setup")),
                                     "ttl_minutes": STRUCTURE_WATCH_TTL_MINUTES,
                                     "max_extension_atr": STRUCTURE_WATCH_MAX_EXTENSION_ATR},
-                "v90_policy": {"price_analysis_runs_independently_of_oi_gate": True, "persistent_setup_state": True,
+                "v91_policy": {"price_analysis_runs_independently_of_oi_gate": True, "persistent_setup_state": True,
                                "local_writing_oi_change_min_pct_exclusive": self.config.min_local_oi_change_pct,
                                "paired_covering_oi_decline_min_pct_exclusive": 0.5,
                                "expiry_pin": "NO_ENTRY_WHEN_EXPIRY_PIN_CONFIRMED",
@@ -3448,8 +3654,8 @@ class PredictiveScanner:
                                "opposite_signal_lifecycle": "CONFIRMED_BREAK_AND_REGIME_ALIGNMENT_REQUIRED_WHILE_TRACKING_OR_AFTER_T1",
                                "same_direction_reentry_cooldown_minutes": self.config.reentry_cooldown_minutes},
                 "oi_first_gate": oi_first,
-                "candidate_before_v90_gates": _candidate_before_audit(raw_signal, signal_diagnostics),
-                "v90_gate_failures": gate_failures,
+                "candidate_before_v91_gates": _candidate_before_audit(raw_signal, signal_diagnostics),
+                "v91_gate_failures": gate_failures,
                 "active_signal": safe_json(state.get("active_signal")), "expiry": expiry,
                 "state_integrity": {"ok": bool(state.get("state_integrity_ok", True)),
                                      "load_status": state.get("state_load_status"),
@@ -3492,7 +3698,7 @@ class PredictiveScanner:
             elif not risk.valid:
                 report["vetoes"].append(f"STRUCTURAL_RISK_PLAN_INVALID:{risk.reason}")
             else:
-                allowed, allow_reason = can_issue_signal_v90(
+                allowed, allow_reason = can_issue_signal_v91(
                     state, signal, current, self.config.reentry_cooldown_minutes, regime,
                     full_confluence=not gate_failures, regime_confirmation=regime_confirmation)
                 report["active_signal_gate"] = {"allowed": allowed, "reason": allow_reason}
@@ -3582,7 +3788,7 @@ class PredictiveScanner:
             return self._finish(report, state)
         except Exception as exc:
             # The scan boundary is fail-closed: an unforeseen provider/schema error must not create a selection.
-            LOG.exception("V90 scan failed safely")
+            LOG.exception("V91 scan failed safely")
             report.update({"market_state": "DATA_OR_SCAN_ERROR", "scenario": "NO_SELECTION", "direction": "NEUTRAL",
                            "signal_ready": False, "selected_option": None, "confidence_pct": 0.0,
                            "vetoes": [f"SCAN_ERROR:{type(exc).__name__}:{str(exc)[:350]}"]})
@@ -3596,7 +3802,7 @@ class PredictiveScanner:
         if report.get("suppress_signal_email") or pin_diag.get("detected"):
             return None
         event_key=str(tracker.get("event_key",""))
-        subject=f"NIFTY V90 {signal.direction}: {selected['strike']:.0f}{selected['side']}"
+        subject=f"NIFTY V91 {signal.direction}: {selected['strike']:.0f}{selected['side']}"
         spot_value=number(report.get("indicators",{}).get("spot")) if isinstance(report.get("indicators"),Mapping) else float("nan")
         spot_text=f"{spot_value:.2f}" if finite(spot_value) else "Unavailable"
         strike_value=number(selected.get("strike")); strike_text=f"{strike_value:.0f}" if finite(strike_value) else "Unavailable"
@@ -3623,7 +3829,7 @@ class PredictiveScanner:
         timestamp = str(event.get("timestamp", ""))
         event_key = str(tracker.get("event_key", ""))
         key = f"EVENT|{event_key}|{event_type}|{timestamp}"
-        subject = f"NIFTY V90 {event_type}: {tracker.get('strike')}{tracker.get('side')}"
+        subject = f"NIFTY V91 {event_type}: {tracker.get('strike')}{tracker.get('side')}"
         body = (f"Time (IST): {timestamp}\nEvent: {event_type}\nDirection: {tracker.get('direction')}\n"
                 f"Strike: {tracker.get('strike')} {tracker.get('side')}\nLevel: {event.get('level')}\n"
                 f"Original T1/T2/SL: {tracker.get('T1')} / {tracker.get('T2')} / {tracker.get('SL')}\n"
@@ -3696,7 +3902,7 @@ class PredictiveScanner:
                 key = str(item.get("notification_key", ""))
                 if not key or key in emailed_set:
                     continue
-                if send_email(self.config, str(item.get("subject", "NIFTY V90 notification")), str(item.get("body", ""))):
+                if send_email(self.config, str(item.get("subject", "NIFTY V91 notification")), str(item.get("body", ""))):
                     emailed.append(key); emailed_set.add(key); sent_now.add(key)
                     if item.get("kind") == "SIGNAL":
                         state["last_email_key"] = str(item.get("event_key", ""))
@@ -3782,7 +3988,7 @@ def print_report(report: Mapping[str, Any]) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="V90 persistent-structure NIFTY options scanner (signal only)")
+    parser = argparse.ArgumentParser(description="V91 persistent-structure NIFTY options scanner (signal only)")
     parser.add_argument("--loop", action="store_true", help="run continuously at SCAN_INTERVAL_SECONDS")
     parser.add_argument("--interval", type=int, default=None, help="override the loop interval in seconds")
     args = parser.parse_args(argv)
