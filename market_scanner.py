@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""NIFTY 50 intraday options scanner — V91 persistent structure/OI confluence.
+"""NIFTY 50 intraday options scanner — V92 adaptive momentum + paired-flow confluence.
 
-V91 calculates price structure and option-flow independently, persists developing directional
-setups across scans, authorizes entries only after strict same-session paired OI confirmation,
-selects a liquid ATM/ITM option, and derives index targets from opposing OI/price barriers. It is
-signal-only and never places orders. Historical replay is required before performance claims.
+V92 separates movement detection from entry authorization, uses volatility-adaptive impulse detection,
+unifies local OI distance rules, supports short-lived paired-flow memory for continuous setups, audits
+quote/candle alignment, selects a liquid ATM/ITM option, and never places orders. Historical replay
+and paper trading are required before performance claims.
 
 Required environment: UPSTOX_ANALYTICS_TOKEN. Configure NIFTY_FUTURES_INSTRUMENT_KEY with the
 current NIFTY futures contract to enable futures-volume VWAP.
@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-VERSION = "V91-ADAPTIVE-PAIRED-FLOW-EARLY-TRIGGER"
+VERSION = "V92-ADAPTIVE-MOMENTUM-PAIRED-FLOW"
 BASE_URL = "https://api.upstox.com"
 IST = ZoneInfo("Asia/Kolkata")
 NIFTY_KEY_DEFAULT = "NSE_INDEX|Nifty 50"
@@ -49,7 +49,7 @@ MARKET_OPEN = time(9, 15)
 ENTRY_OPEN = time(9, 16)
 ENTRY_CUTOFF = time(15, 15)
 MARKET_CLOSE = time(15, 30)
-LOG = logging.getLogger("market_scanner_v91")
+LOG = logging.getLogger("market_scanner_v92")
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -98,6 +98,8 @@ def clamp(value: float, low: float, high: float) -> float:
 DIVERGENCE_RSI_DELTA = clamp(env_float("DIVERGENCE_RSI_DELTA", 2.0), 1.0, 10.0)
 STRUCTURE_WATCH_TTL_MINUTES = int(clamp(env_int("STRUCTURE_WATCH_TTL_MINUTES", 9), 3, 15))
 STRUCTURE_WATCH_MAX_EXTENSION_ATR = clamp(env_float("STRUCTURE_WATCH_MAX_EXTENSION_ATR", 1.25), 0.75, 2.0)
+# OI memory is a time-limited context aid for continuation setups only, never a stand-alone entry.
+OI_CONFIRMATION_MEMORY_TTL_SECONDS = int(clamp(env_int("OI_CONFIRMATION_MEMORY_TTL_SECONDS", 360), 180, 600))
 
 
 def round_to_grid(value: float, step: float = 50.0) -> float:
@@ -105,6 +107,29 @@ def round_to_grid(value: float, step: float = 50.0) -> float:
     if not finite(value) or not finite(step) or step <= 0:
         return float("nan")
     return float(math.floor(float(value) / float(step) + 0.5) * float(step))
+
+
+def oi_locality_radius(step: float = 50.0) -> float:
+    """One shared maximum locality radius for OI discovery and setup-level confirmation.
+
+    The prior V91 implementation used a 200-point broad OI filter but a 150-point
+    setup-centred filter. A pair could therefore pass discovery and fail revalidation solely
+    because of inconsistent radii. The shared 200-point floor avoids that boundary mismatch;
+    the pair must still match the setup direction, option-flow signature, premium behaviour,
+    OI-change thresholds, and counter-flow checks.
+    """
+    return max(4.0 * float(step), 200.0) if finite(step) and float(step) > 0 else 200.0
+
+
+def adaptive_impulse_threshold(spot: float, atr: float) -> float:
+    """Adaptive NIFTY impulse threshold: volatility-scaled with a spot-relative floor.
+
+    Do not require an arbitrary fixed 30-point move in every volatility regime. The threshold
+    is the greater of 1.25 ATR and the smaller of 30 points or 0.08% of spot.
+    """
+    safe_atr = max(0.0, number(atr, 0.0))
+    safe_spot = abs(number(spot, 0.0))
+    return max(1.25 * safe_atr, min(30.0, 0.0008 * safe_spot))
 
 
 def parse_date(value: Any) -> Optional[date]:
@@ -334,7 +359,7 @@ class Indicators:
 
 class AtomicState:
     """Atomic state store backed by one canonical, unversioned market_state file."""
-    SNAPSHOT_SCHEMAS = {80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91}
+    SNAPSHOT_SCHEMAS = {80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92}
 
     def __init__(self, path: Path):
         self.path = path
@@ -405,7 +430,7 @@ class AtomicState:
         schema = int(number(loaded.get("schema_version"), 0))
         prior_date = parse_date(loaded.get("session_date"))
         same_session = prior_date == today
-        current_schema = same_session and schema == 91 and loaded.get("scanner_version") == VERSION
+        current_schema = same_session and schema == 92 and loaded.get("scanner_version") == VERSION
         known_migration = same_session and schema in self.SNAPSHOT_SCHEMAS
         expected_expiry = str(loaded.get("option_expiry", "")) if same_session else ""
         old_snaps = loaded.get("chain_snapshots", []) if isinstance(loaded.get("chain_snapshots"), list) else []
@@ -436,7 +461,7 @@ class AtomicState:
         sent_keys = loaded.get("emailed_notification_keys", []) if same_session and isinstance(loaded.get("emailed_notification_keys", []), list) else []
         sent_events = loaded.get("emailed_event_keys", []) if same_session and isinstance(loaded.get("emailed_event_keys", []), list) else []
         self.data = {
-            "schema_version": 91,
+            "schema_version": 92,
             "scanner_version": VERSION,
             "session_date": today.isoformat(),
             "option_expiry": expected_expiry,
@@ -447,7 +472,7 @@ class AtomicState:
             "emailed_event_keys": [str(x) for x in sent_events if isinstance(x, str)][-200:],
             "emailed_notification_keys": [str(x) for x in sent_keys if isinstance(x, str)][-300:],
             # Do not import queued messages from a prior scanner generation: their stale
-            # bodies/selection assumptions must not be sent by V91.
+            # bodies/selection assumptions must not be sent by V92.
             "pending_email_notifications": loaded.get("pending_email_notifications", [])[-50:]
                 if current_schema and isinstance(loaded.get("pending_email_notifications", []), list) else [],
             "last_scan_timestamp": loaded.get("last_scan_timestamp") if same_session else None,
@@ -470,6 +495,9 @@ class AtomicState:
                                    else []),
             "historical_context_date": (str(loaded.get("historical_context_date", "")) if same_session and not corrupt else ""),
             "historical_context_instrument_key": (str(loaded.get("historical_context_instrument_key", "")) if same_session and not corrupt else ""),
+            "oi_confirmation_memory": (loaded.get("oi_confirmation_memory")
+                                        if same_session and not corrupt and isinstance(loaded.get("oi_confirmation_memory"), dict)
+                                        else None),
         }
         return self.data
 
@@ -1776,7 +1804,7 @@ def qualify_oi_first(oi: Mapping[str, Any], spot: float, step: float,
              "tactical_available": bool(oi.get("tactical_available")),
              "flow_modes_considered": ["WRITER_COVERING", "BUYER_LED_MOMENTUM"]}
     rows = [r for r in oi.get("walls", []) if isinstance(r, Mapping) and finite(r.get("strike"))
-            and abs(number(r.get("strike")) - spot) <= max(4.0 * step, 200.0)]
+            and abs(number(r.get("strike")) - spot) <= oi_locality_radius(step)]
     empty["rows_considered"] = len(rows)
     atm = round_to_grid(spot, step)
     if not oi.get("tactical_available"):
@@ -2379,6 +2407,69 @@ def score_market_signal(frame: pd.DataFrame, indicators: Indicators, oi: Mapping
     })
     return signal,base_diag
 
+def update_oi_confirmation_memory(state: dict[str, Any], oi_first: Mapping[str, Any], now: datetime,
+                                  ttl_seconds: int = OI_CONFIRMATION_MEMORY_TTL_SECONDS) -> dict[str, Any]:
+    """Store the latest single-direction paired-OI observation with a strict expiry.
+
+    Memory is context for a continuation setup only; it must be revalidated against current
+    tactical data, current price structure, momentum, risk, and a fresh option quote before use.
+    """
+    current = now.astimezone(IST)
+    if bool(oi_first.get("qualified")):
+        directions = [str(x).upper() for x in oi_first.get("qualified_directions", [])]
+        candidates = oi_first.get("direction_candidates", {})
+        if len(directions) == 1 and isinstance(candidates, Mapping) and isinstance(candidates.get(directions[0]), Mapping):
+            state["oi_confirmation_memory"] = {
+                "direction": directions[0],
+                "confirmed_at": current.isoformat(),
+                "expires_at": (current + timedelta(seconds=int(ttl_seconds))).isoformat(),
+                "direction_candidate": safe_json(candidates[directions[0]]),
+                "reference_strikes": list(candidates[directions[0]].get("reference_strikes", [])),
+                "flow_mode": candidates[directions[0]].get("flow_mode", "WRITER_COVERING"),
+                "source": "LATEST_QUALIFYING_SAME_SESSION_OI_PAIR",
+            }
+    memory = state.get("oi_confirmation_memory") if isinstance(state.get("oi_confirmation_memory"), Mapping) else None
+    if not memory:
+        return {"available": False, "reason": "NO_PRIOR_QUALIFYING_OI_PAIR"}
+    stamp = parse_dt(memory.get("confirmed_at"))
+    expires = parse_dt(memory.get("expires_at"))
+    age = (current - stamp.astimezone(IST)).total_seconds() if stamp else float("inf")
+    valid = bool(stamp and expires and stamp.date() == current.date() and 0 <= age <= ttl_seconds
+                 and current <= expires.astimezone(IST)
+                 and str(memory.get("direction", "")).upper() in {"BULLISH", "BEARISH"}
+                 and isinstance(memory.get("direction_candidate"), Mapping))
+    if not valid:
+        state.pop("oi_confirmation_memory", None)
+        return {"available": False, "reason": "PRIOR_OI_PAIR_MEMORY_EXPIRED_OR_INVALID",
+                "age_seconds": round(age, 2) if finite(age) else None}
+    return {**safe_json(memory), "available": True, "age_seconds": round(age, 2),
+            "ttl_seconds": int(ttl_seconds), "reason": "RECENT_OI_PAIR_CONTEXT_WITHIN_TTL_NOT_STANDALONE_AUTHORIZATION"}
+
+
+def effective_oi_first_gate(current_gate: Mapping[str, Any], memory: Mapping[str, Any], oi: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose a recent pair as candidate context only when no fresh contrary pair exists.
+
+    The downstream local OI validator independently permits memory only for continuation setups.
+    """
+    if bool(current_gate.get("qualified")):
+        return dict(current_gate)
+    reason = str(current_gate.get("reason", ""))
+    if reason in {"CONFLICTING_BULLISH_AND_BEARISH_LOCAL_OI_PAIRS", "LOCAL_OI_COUNTERFLOW_CONFLICTS_AT_SETUP_BOUNDARY"}:
+        return dict(current_gate)
+    if not bool(oi.get("tactical_available")) or not bool(memory.get("available")):
+        return dict(current_gate)
+    direction = str(memory.get("direction", "")).upper()
+    candidate = memory.get("direction_candidate")
+    if direction not in {"BULLISH", "BEARISH"} or not isinstance(candidate, Mapping):
+        return dict(current_gate)
+    # Only the continuation branch is permitted to consume this memory; other candidates
+    # will fail qualify_local_oi because it checks the setup name before consulting memory.
+    return {**dict(current_gate), "qualified": True, "reason": "RECENT_PAIRED_OI_MEMORY_FOR_CONTINUATION_ONLY",
+            "qualified_directions": [direction], "direction_candidates": {direction: dict(candidate)},
+            "flow_mode": candidate.get("flow_mode", "WRITER_COVERING"), "memory_backed": True,
+            "memory_age_seconds": memory.get("age_seconds"), "pin_oi_candidate": False}
+
+
 def classify_market_regime(frame: pd.DataFrame, indicators: Indicators, now: datetime) -> dict[str, Any]:
     """Classify the broader intraday context and recent chop independently of setup scoring."""
     session_bars = completed_candles(frame, now)
@@ -2419,7 +2510,7 @@ def classify_market_regime(frame: pd.DataFrame, indicators: Indicators, now: dat
     # A confirmed short-horizon impulse can override the stale flip count, but only when
     # EMA slope, DI dominance, 1m/3m momentum and a meaningful recent price move all align.
     recent_impulse = float(close.iloc[-1] - close.iloc[-4]) if len(close) >= 4 else 0.0
-    impulse_floor = max(1.75 * atr, 30.0)
+    impulse_floor = adaptive_impulse_threshold(indicators.spot, atr)
     impulse_bull = (ema_fast > ema_slow and ema_slope > 0 and di_bull and mom_bull
                     and indicators.momentum_1m > 0 and recent_impulse >= impulse_floor)
     impulse_bear = (ema_fast < ema_slow and ema_slope < 0 and di_bear and mom_bear
@@ -2459,6 +2550,7 @@ def classify_market_regime(frame: pd.DataFrame, indicators: Indicators, now: dat
             "adx": round(adx, 2), "plus_di": round(indicators.plus_di, 2) if finite(indicators.plus_di) else None,
             "minus_di": round(indicators.minus_di, 2) if finite(indicators.minus_di) else None,
             "recent_impulse_points": round(recent_impulse, 2), "impulse_threshold_points": round(impulse_floor, 2),
+            "impulse_threshold_method": "MAX_1_25_ATR_AND_MIN_30_POINTS_OR_0_08_PERCENT_SPOT",
             "impulse_override": bool(impulse_bull or impulse_bear)}
 
 
@@ -2514,10 +2606,10 @@ def qualify_local_oi(oi: Mapping[str, Any], signal: Signal, spot: float, step: f
                          "RESISTANCE_REJECTION", "RESISTANCE_CLUSTER_REJECTION", "EARLY_RESISTANCE_REJECTION"}
     center = ref if reversal else spot
     atm = round_to_grid(spot, step)
-    band = max(3.0 * step, 150.0)
+    band = oi_locality_radius(step)
     rows = [r for r in oi.get("walls", []) if isinstance(r, Mapping) and finite(r.get("strike"))
             and abs(number(r.get("strike")) - center) <= band + 0.01
-            and abs(number(r.get("strike")) - spot) <= max(4.0 * step, 200.0) + 0.01]
+            and abs(number(r.get("strike")) - spot) <= band + 0.01]
 
     def flow_item(row: Mapping[str, Any], side: str, primary_role: bool) -> Optional[dict[str, Any]]:
         change = number(row.get(f"{side}_change_pct"))
@@ -2616,6 +2708,44 @@ def qualify_local_oi(oi: Mapping[str, Any], signal: Signal, spot: float, step: f
     primary_strength = abs(number((best or {}).get("primary", {}).get("oi_change_pct"), 0.0))
     conflict = bool(best and opposing_strength >= primary_strength and opposing_strength > threshold * 100)
     qualified = bool(best and not conflict)
+    # A recent pair may support a continuous-trend candidate for at most the configured TTL,
+    # but only when the current tactical snapshot is available, the direction matches, and
+    # this scan has no qualified current pair or dominant nearby counter-flow. Never apply to reversals.
+    memory = oi.get("recent_confirmation_memory") if isinstance(oi.get("recent_confirmation_memory"), Mapping) else {}
+    memory_direction = str(memory.get("direction", "")).upper()
+    memory_candidate = memory.get("direction_candidate") if isinstance(memory.get("direction_candidate"), Mapping) else {}
+    memory_age = number(memory.get("age_seconds"), float("inf"))
+    memory_refs = memory.get("reference_strikes", memory_candidate.get("reference_strikes", []))
+    memory_refs_local = bool(isinstance(memory_refs, list) and memory_refs
+                             and all(finite(x) and abs(number(x) - spot) <= band + 0.01 for x in memory_refs))
+    continuation_setup = setup in {"CONTINUOUS_BULLISH_TREND", "CONTINUOUS_BEARISH_TREND"}
+    memory_valid = bool(not qualified and not conflict and continuation_setup and memory.get("available")
+                        and memory_direction == direction and finite(memory_age)
+                        and 0 <= memory_age <= OI_CONFIRMATION_MEMORY_TTL_SECONDS
+                        and memory_refs_local and not opposing)
+    if memory_valid:
+        stored_candidate = memory_candidate
+        stored_primary = stored_candidate.get("primary_flow") if isinstance(stored_candidate.get("primary_flow"), Mapping) else {}
+        stored_secondary = stored_candidate.get("secondary_flow") if isinstance(stored_candidate.get("secondary_flow"), Mapping) else {}
+        refs = memory.get("reference_strikes", stored_candidate.get("reference_strikes", []))
+        return {**empty, "qualified": True, "reason": "RECENT_PAIRED_OI_MEMORY_REVALIDATED_FOR_CONTINUATION",
+                "setup": setup, "direction": direction, "flow_mode": memory.get("flow_mode", flow_mode),
+                "reference_level": round(ref, 2), "oi_search_center": round(center, 2),
+                "primary_required": {"option_side": stored_primary.get("option_side", primary_side.upper()),
+                                     "flow": stored_primary.get("flow", "RECENT_CONFIRMED_FLOW")},
+                "secondary_required": {"option_side": stored_secondary.get("option_side", secondary_side.upper()),
+                                       "flow": stored_secondary.get("flow", "RECENT_CONFIRMED_FLOW")},
+                "primary_flow": dict(stored_primary), "secondary_flow": dict(stored_secondary),
+                "supporting_rows": [dict(stored_primary), dict(stored_secondary)], "opposing_rows": opposing[:5],
+                "reference_strikes": list(refs) if isinstance(refs, list) else [],
+                "pair_distance_points": stored_candidate.get("pair_distance_points"),
+                "paired_flow": {"primary_strike": stored_primary.get("strike"),
+                                "secondary_strike": stored_secondary.get("strike"),
+                                "flow_mode": memory.get("flow_mode", flow_mode),
+                                "age_seconds": round(memory_age, 2)},
+                "candidate_pairs_considered": 0, "tactical_age_minutes": oi.get("snapshot_age_minutes"),
+                "tactical_available": bool(oi.get("tactical_available")), "local_rows_considered": len(rows),
+                "memory_backed": True, "memory_age_seconds": round(memory_age, 2)}
     primary = best.get("primary") if best else None
     secondary = best.get("secondary") if best else None
     refs = sorted({number(primary.get("strike")), number(secondary.get("strike"))}) if primary and secondary else []
@@ -2969,7 +3099,7 @@ def qualify_setup_rules(signal: Signal, frame: pd.DataFrame, indicators: Indicat
             "local_oi_pair_confirmed":bool(oi_gate.get("qualified")),
             "continuation_price_extension_guard":extension_guard if setup in {"CONTINUOUS_BULLISH_TREND","CONTINUOUS_BEARISH_TREND"} else None,
             "extension_is_diagnostic_not_standalone_veto": setup in {"CONTINUOUS_BULLISH_TREND","CONTINUOUS_BEARISH_TREND"}}
-def can_issue_signal_v91(state: Mapping[str, Any], signal: Signal, now: datetime,
+def can_issue_signal_v92(state: Mapping[str, Any], signal: Signal, now: datetime,
                          cooldown_minutes: int, regime: Mapping[str, Any],
                          full_confluence: bool = False,
                          regime_confirmation: Optional[Mapping[str, Any]] = None) -> tuple[bool, str]:
@@ -3167,10 +3297,27 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
         primary_side, secondary_side = (("put", "call") if bullish else ("call", "put"))
     auth_primary = auth.get("primary_flow") if isinstance(auth.get("primary_flow"), Mapping) else {}
     auth_secondary = auth.get("secondary_flow") if isinstance(auth.get("secondary_flow"), Mapping) else {}
+    expected_primary_flow = "LONG_BUILDUP_BUYING" if buyer_mode else "SHORT_BUILDUP_WRITING"
+    expected_secondary_flow = "LONG_UNWINDING" if buyer_mode else "SHORT_COVERING"
+    primary_oi_change = number(auth_primary.get("oi_change_pct"))
+    secondary_oi_change = number(auth_secondary.get("oi_change_pct"))
+    primary_premium_change = number(auth_primary.get("premium_change_pct"))
+    secondary_premium_change = number(auth_secondary.get("premium_change_pct"))
+    if buyer_mode:
+        authorized_flow_signature_ok = (primary_oi_change > 2.5 and primary_premium_change >= 0.2
+            and secondary_oi_change < -0.5 and secondary_premium_change <= -0.2
+            and str(auth_primary.get("flow", "")).upper() == expected_primary_flow
+            and str(auth_secondary.get("flow", "")).upper() == expected_secondary_flow)
+    else:
+        authorized_flow_signature_ok = (primary_oi_change > 2.5 and primary_premium_change <= -0.2
+            and secondary_oi_change < -0.5 and secondary_premium_change >= 0.2
+            and str(auth_primary.get("flow", "")).upper() == expected_primary_flow
+            and str(auth_secondary.get("flow", "")).upper() == expected_secondary_flow)
     authorized_pair_present = bool(auth_primary and auth_secondary
         and finite(auth_primary.get("strike")) and finite(auth_secondary.get("strike"))
         and str(auth_primary.get("option_side", "")).lower() == primary_side
-        and str(auth_secondary.get("option_side", "")).lower() == secondary_side)
+        and str(auth_secondary.get("option_side", "")).lower() == secondary_side
+        and authorized_flow_signature_ok)
     auth_primary_strike = number(auth_primary.get("strike"))
     auth_secondary_strike = number(auth_secondary.get("strike"))
 
@@ -3237,37 +3384,70 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
         expected_contract_side = primary_side if buyer_mode else secondary_side
         if selected_side != expected_contract_side:
             reasons.append("CONTRACT_SIDE_DOES_NOT_MATCH_AUTHORIZED_FLOW_MODE")
-        primary_legs: list[dict[str, Any]] = []
-        secondary_legs: list[dict[str, Any]] = []
-        for wall in walls:
-            distance = abs(number(wall.get("strike")) - c.strike)
-            if distance > 2.0 * step + 0.01:
-                continue
-            primary = valid_leg(wall, primary_side, "PRIMARY")
-            secondary = valid_leg(wall, secondary_side, "SECONDARY")
-            if authorized_pair_present:
-                if abs(number(wall.get("strike")) - auth_primary_strike) > 0.01:
-                    primary = None
-                if abs(number(wall.get("strike")) - auth_secondary_strike) > 0.01:
-                    secondary = None
-            if primary:
-                primary["distance_to_contract"] = distance
-                primary_legs.append(primary)
-            if secondary:
-                secondary["distance_to_contract"] = distance
-                secondary_legs.append(secondary)
         flow_pairs: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
-        for primary in primary_legs:
-            for secondary in secondary_legs:
-                if abs(number(primary.get("strike")) - number(secondary.get("strike"))) > 2.0 * step + 0.01:
-                    continue
-                primary_locality = locality(number(primary.get("distance_to_contract"), 0.0))
-                secondary_locality = locality(number(secondary.get("distance_to_contract"), 0.0))
+        # V92 separates underlying-direction confirmation from the execution-contract choice.
+        # An already-qualified pair is measured against spot, not required to sit within two
+        # strikes of each candidate contract. This avoids discarding a valid directional pair
+        # merely because the best liquid ATM/ITM contract is on another strike.
+        if authorized_pair_present:
+            auth_pair_distance = abs(auth_primary_strike - auth_secondary_strike)
+            refs_local_to_spot = (abs(auth_primary_strike - spot) <= oi_locality_radius(step) + 0.01
+                                  and abs(auth_secondary_strike - spot) <= oi_locality_radius(step) + 0.01)
+            memory_backed = bool(auth.get("memory_backed"))
+            memory_age = number(auth.get("memory_age_seconds"), float("inf"))
+            memory_ok = (not memory_backed or
+                         (bool(oi.get("tactical_available")) and finite(memory_age)
+                          and 0.0 <= memory_age <= OI_CONFIRMATION_MEMORY_TTL_SECONDS
+                          and not bool(auth.get("opposing_rows"))))
+            if (auth_pair_distance <= 2.0 * step + 0.01 and refs_local_to_spot and memory_ok):
+                # The saved/current pair retains its own evidence values. Contract locality is
+                # used for diagnostics only; flow locality is relative to the underlying spot.
+                primary = dict(auth_primary)
+                secondary = dict(auth_secondary)
+                primary["distance_to_contract"] = abs(auth_primary_strike - c.strike)
+                secondary["distance_to_contract"] = abs(auth_secondary_strike - c.strike)
+                p_spot_locality = clamp(1.0 - abs(auth_primary_strike - spot) / oi_locality_radius(step), 0.0, 1.0)
+                s_spot_locality = clamp(1.0 - abs(auth_secondary_strike - spot) / oi_locality_radius(step), 0.0, 1.0)
                 primary_intensity = clamp(abs(number(primary.get("oi_change_pct"), 0.0)) / 10.0, 0.0, 1.0)
                 secondary_intensity = clamp(abs(number(secondary.get("oi_change_pct"), 0.0)) / 10.0, 0.0, 1.0)
-                pair_locality = 0.5 * primary_locality + 0.5 * secondary_locality
+                pair_locality = 0.5 * p_spot_locality + 0.5 * s_spot_locality
                 flow_score = clamp(0.25 * pair_locality + 0.55 * primary_intensity + 0.20 * secondary_intensity, 0.0, 1.0)
+                if memory_backed:
+                    # Linear decay gives a recent pair diminishing influence and makes the
+                    # configured TTL operational at contract-selection time as well.
+                    flow_score *= clamp(1.0 - memory_age / OI_CONFIRMATION_MEMORY_TTL_SECONDS, 0.0, 1.0)
+                    warnings.append(f"RECENT_PAIRED_OI_MEMORY_LINEAR_DECAY_{memory_age:.0f}_SECONDS")
                 flow_pairs.append((flow_score, primary, secondary))
+            else:
+                reasons.append("AUTHORIZED_OI_PAIR_FAILED_CONTRACT_STAGE_LOCALITY_OR_MEMORY_RECHECK")
+        elif not auth:
+            # Compatibility fallback for direct callers that don't pass an authorized pair.
+            # The main scanner passes a qualified local pair and therefore uses the branch above.
+            primary_legs: list[dict[str, Any]] = []
+            secondary_legs: list[dict[str, Any]] = []
+            for wall in walls:
+                distance = abs(number(wall.get("strike")) - c.strike)
+                if distance > 2.0 * step + 0.01:
+                    continue
+                primary = valid_leg(wall, primary_side, "PRIMARY")
+                secondary = valid_leg(wall, secondary_side, "SECONDARY")
+                if primary:
+                    primary["distance_to_contract"] = distance
+                    primary_legs.append(primary)
+                if secondary:
+                    secondary["distance_to_contract"] = distance
+                    secondary_legs.append(secondary)
+            for primary in primary_legs:
+                for secondary in secondary_legs:
+                    if abs(number(primary.get("strike")) - number(secondary.get("strike"))) > 2.0 * step + 0.01:
+                        continue
+                    primary_locality = locality(number(primary.get("distance_to_contract"), 0.0))
+                    secondary_locality = locality(number(secondary.get("distance_to_contract"), 0.0))
+                    primary_intensity = clamp(abs(number(primary.get("oi_change_pct"), 0.0)) / 10.0, 0.0, 1.0)
+                    secondary_intensity = clamp(abs(number(secondary.get("oi_change_pct"), 0.0)) / 10.0, 0.0, 1.0)
+                    pair_locality = 0.5 * primary_locality + 0.5 * secondary_locality
+                    flow_score = clamp(0.25 * pair_locality + 0.55 * primary_intensity + 0.20 * secondary_intensity, 0.0, 1.0)
+                    flow_pairs.append((flow_score, primary, secondary))
         flow_pairs.sort(key=lambda item: (-item[0],
                                           number(item[1].get("distance_to_contract"), 1e9)
                                           + number(item[2].get("distance_to_contract"), 1e9),
@@ -3296,9 +3476,14 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
         liquidity_score = 0.60 * spread_score + 0.25 * volume_score + 0.15 * clamp((depth + 1.0) / 2.0, 0.0, 1.0)
         moneyness_score = clamp(1.0 - abs(spot - c.strike) / (3.0 * step), 0.0, 1.0)
         total = 100.0 * (0.55 * flow_score + 0.15 * delta_score + 0.20 * liquidity_score + 0.10 * moneyness_score)
+        memory_backed_flow = bool(auth.get("memory_backed"))
+        memory_flow_score_ok = (not memory_backed_flow) or flow_score >= 0.05
+        if memory_backed_flow and not memory_flow_score_ok:
+            reasons.append("REMEMBERED_OI_FLOW_TOO_WEAK_AFTER_TIME_DECAY")
         hard_ok = (age_ok and finite(ltp) and ltp > 0 and finite(spread) and spread <= config.max_spread
                    and volume > 0 and finite(delta) and 0.45 <= abs(delta) <= 0.90
-                   and selected_side == expected_contract_side and supportive_flow_confirmed)
+                   and selected_side == expected_contract_side and supportive_flow_confirmed
+                   and memory_flow_score_ok)
         rows.append({"instrument_key": c.instrument_key, "trading_symbol": c.symbol, "side": c.side,
             "strike": c.strike, "expiry": c.expiry, "ltp": round(ltp, 2) if finite(ltp) else None,
             "delta": round(delta, 4) if finite(delta) else None, "target_abs_delta": round(target_delta, 3),
@@ -3367,7 +3552,7 @@ def update_active_signal(state: dict[str, Any], frame: pd.DataFrame, now: dateti
 def audit_append(config: Config, report: Mapping[str, Any]) -> None:
     config.audit_dir.mkdir(parents=True, exist_ok=True)
     local_date = parse_date(report.get("timestamp")) or now_ist().date()
-    path = config.audit_dir / f"market_scan_{local_date.isoformat()}_v91.jsonl"
+    path = config.audit_dir / f"market_scan_{local_date.isoformat()}_v92.jsonl"
     record = {"audit_schema_version": 1, "recorded_at": report.get("timestamp"), "scanner_version": VERSION, "scan": safe_json(report)}
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
@@ -3558,6 +3743,10 @@ class PredictiveScanner:
             # buyer-led momentum path to require aligned price context without making OI gate the
             # calculation of price structure, momentum, divergence or Fibonacci.
             indicators = indicator_set(analysis_raw, spot, current, calculate_rsi=True, vwap_frame=futures_frame_raw)
+            quote_candle_gap = abs(spot - indicators.last_close) if finite(spot) and finite(indicators.last_close) else float("nan")
+            quote_candle_gap_limit = max(2.5 * indicators.atr, 0.002 * abs(spot)) if finite(indicators.atr) and finite(spot) else float("nan")
+            quote_candle_alignment_ok = bool(finite(quote_candle_gap) and finite(quote_candle_gap_limit)
+                                             and quote_candle_gap <= quote_candle_gap_limit)
             fib = analyze_fibonacci(analysis_raw, indicators.atr, current)
             # Divergence is an intraday trigger; do not compare pivots across an overnight gap.
             divergence = detect_rsi_divergence(frame_raw, indicators.atr, current)
@@ -3566,11 +3755,14 @@ class PredictiveScanner:
             regime["scan_timestamp"] = current.isoformat()
             oi_first = qualify_oi_first(oi, spot, strike_step, self.config.min_local_oi_change_pct,
                                         indicators=indicators, regime=regime)
+            oi_memory = update_oi_confirmation_memory(state, oi_first, current)
+            oi["recent_confirmation_memory"] = oi_memory
+            effective_oi_first = effective_oi_first_gate(oi_first, oi_memory, oi)
             directional_watch_diagnostics = update_directional_watch(state, frame_raw, indicators, regime, oi_first, current)
             regime["directional_watch"] = safe_json(state.get("directional_watch")) if isinstance(state.get("directional_watch"), Mapping) else {}
             signal, signal_diagnostics = score_market_signal(frame_raw, indicators, oi, levels, current,
                                                               self.config.min_signal_score, strike_step, fib, divergence,
-                                                              regime=regime, oi_first=oi_first, min_rr=self.config.min_t1_rr)
+                                                              regime=regime, oi_first=effective_oi_first, min_rr=self.config.min_t1_rr)
             if oi_first.get("qualified"):
                 signal, structure_watch_resolution = resolve_pending_structure_watch(state, signal, indicators, current)
             else:
@@ -3599,6 +3791,8 @@ class PredictiveScanner:
             gate_failures = []
             if not bool(state.get("state_integrity_ok", True)):
                 gate_failures.append("CANONICAL_STATE_CORRUPT_OR_UNREADABLE_ENTRIES_SUPPRESSED_FOR_RECOVERY_SCAN")
+            if not quote_candle_alignment_ok:
+                gate_failures.append("SPOT_QUOTE_LAST_CLOSED_CANDLE_GAP_EXCEEDS_2_5_ATR_OR_0_20_PERCENT_SPOT")
             if signal.direction in {"BULLISH", "BEARISH"}:
                 if expiry_pin.get("detected"):
                     gate_failures.append("No Entry - Range-Bound / Expiry Pin")
@@ -3611,8 +3805,8 @@ class PredictiveScanner:
                 if not setup_confirmation.get("qualified"):
                     gate_failures.append(str(setup_confirmation.get("reason", "SETUP_RULE_GATE_FAILED")))
                 if gate_failures:
-                    gate_evidence = tuple(dict.fromkeys(list(signal.evidence) + [f"V91_HARD_GATE:{x}" for x in gate_failures]))
-                    signal = Signal("NEUTRAL", "V91_ENTRY_GATES_BLOCKED", signal.score, 0.0,
+                    gate_evidence = tuple(dict.fromkeys(list(signal.evidence) + [f"V92_HARD_GATE:{x}" for x in gate_failures]))
+                    signal = Signal("NEUTRAL", "V92_ENTRY_GATES_BLOCKED", signal.score, 0.0,
                                     "; ".join(gate_evidence[:8]), signal.level, gate_evidence, tuple(gate_failures))
             risk = calculate_risk_plan(signal, levels, indicators, self.config.min_t1_rr)
             events = update_active_signal(state, frame_raw, current)
@@ -3642,7 +3836,15 @@ class PredictiveScanner:
                                     "active": safe_json(state.get("pending_structure_setup")),
                                     "ttl_minutes": STRUCTURE_WATCH_TTL_MINUTES,
                                     "max_extension_atr": STRUCTURE_WATCH_MAX_EXTENSION_ATR},
-                "v91_policy": {"price_analysis_runs_independently_of_oi_gate": True, "persistent_setup_state": True,
+                "v92_policy": {"price_analysis_runs_independently_of_oi_gate": True,
+                               "adaptive_impulse_threshold": "MAX(1.25*ATR, MIN(30 POINTS, 0.08% OF SPOT))",
+                               "shared_oi_locality_radius_points": oi_locality_radius(strike_step),
+                               "recent_oi_memory_ttl_seconds": OI_CONFIRMATION_MEMORY_TTL_SECONDS,
+                               "oi_memory_can_support_continuation_only_with_linear_decay_and_fresh_quotes": True,
+                               "oi_reference_strikes_are_not_contract_selection_filters": True,
+                               "quote_candle_gap_hard_gate": "BLOCK_IF_GAP_EXCEEDS_MAX(2.5*ATR, 0.20% SPOT)",
+                               "output_compatibility_with_v91": True,
+                               "persistent_setup_state": True,
                                "local_writing_oi_change_min_pct_exclusive": self.config.min_local_oi_change_pct,
                                "paired_covering_oi_decline_min_pct_exclusive": 0.5,
                                "expiry_pin": "NO_ENTRY_WHEN_EXPIRY_PIN_CONFIRMED",
@@ -3654,7 +3856,10 @@ class PredictiveScanner:
                                "opposite_signal_lifecycle": "CONFIRMED_BREAK_AND_REGIME_ALIGNMENT_REQUIRED_WHILE_TRACKING_OR_AFTER_T1",
                                "same_direction_reentry_cooldown_minutes": self.config.reentry_cooldown_minutes},
                 "oi_first_gate": oi_first,
-                "candidate_before_v91_gates": _candidate_before_audit(raw_signal, signal_diagnostics),
+                "effective_oi_first_gate": effective_oi_first,
+                "oi_confirmation_memory": oi_memory,
+                "candidate_before_v92_gates": _candidate_before_audit(raw_signal, signal_diagnostics),
+                "v92_gate_failures": gate_failures,
                 "v91_gate_failures": gate_failures,
                 "active_signal": safe_json(state.get("active_signal")), "expiry": expiry,
                 "state_integrity": {"ok": bool(state.get("state_integrity_ok", True)),
@@ -3663,6 +3868,9 @@ class PredictiveScanner:
                                      "state_path": state.get("state_file_path")},
                 "market_data_quality": {"index_quote_freshness": index_quote.freshness if index_quote else "UNAVAILABLE",
                                         "index_quote_age_seconds": index_quote.age_seconds if index_quote else None,
+                                        "spot_quote_vs_last_completed_close_gap_points": round(quote_candle_gap, 2) if finite(quote_candle_gap) else None,
+                                        "spot_quote_candle_gap_limit_points": round(quote_candle_gap_limit, 2) if finite(quote_candle_gap_limit) else None,
+                                        "spot_quote_candle_alignment_ok": quote_candle_alignment_ok,
                                         "completed_1m_candles": len(frame), "historical_context_candles": len(history_frame), "last_completed_candle_timestamp": latest_candle_time.isoformat(),
                                         "last_completed_candle_age_seconds": round(candle_age_seconds, 2),
                                         "volume_source": indicators.volume_source, "futures_instrument_key": self.config.futures_key or None,
@@ -3698,7 +3906,7 @@ class PredictiveScanner:
             elif not risk.valid:
                 report["vetoes"].append(f"STRUCTURAL_RISK_PLAN_INVALID:{risk.reason}")
             else:
-                allowed, allow_reason = can_issue_signal_v91(
+                allowed, allow_reason = can_issue_signal_v92(
                     state, signal, current, self.config.reentry_cooldown_minutes, regime,
                     full_confluence=not gate_failures, regime_confirmation=regime_confirmation)
                 report["active_signal_gate"] = {"allowed": allowed, "reason": allow_reason}
@@ -3706,15 +3914,15 @@ class PredictiveScanner:
                     report["vetoes"].append(allow_reason)
                 else:
                     candidates = _candidate_strikes(spot, contracts, direction, strike_step)
-                    # Keep strike choice near the same local OI cluster that authorized the setup.
+                    # OI reference strikes confirm direction; they must not force the contract
+                    # itself away from ATM/ITM liquidity. V92 ranks the predefined ATM/ITM
+                    # candidates by fresh quote, delta, spread, volume and moneyness.
                     reference_strikes = local_oi_confirmation.get("reference_strikes", [])
-                    if reference_strikes:
-                        matched = [c for c in candidates if any(abs(c.strike - number(x, 1e9)) <= 2.0 * strike_step for x in reference_strikes)]
-                        if matched:
-                            candidates = matched
-                        else:
-                            report["vetoes"].append("NO_CONTRACT_WITHIN_2_STRIKES_OF_QUALIFYING_LOCAL_OI_CLUSTER")
-                            candidates = []
+                    report["option_selection_policy"] = {
+                        "method": "ATM_ITM1_ITM2_INDEPENDENT_OF_OI_REFERENCE_STRIKE",
+                        "oi_reference_strikes": reference_strikes,
+                        "oi_reference_strike_used_as_contract_filter": False,
+                    }
                     candidate_keys = [c.instrument_key for c in candidates]
                     option_quotes = self.client.quotes(candidate_keys) if candidate_keys else {}
                     # Near-ATM reversals may use target delta ~0.55; established continuation
@@ -3727,8 +3935,6 @@ class PredictiveScanner:
                     candidate_diagnostics = [{**row, "route": "ATM_ITM1_ITM2"} for row in ranked]
                     if not selected and signal.setup in reversal_setups:
                         fallback = _candidate_strikes(spot, contracts, direction, strike_step, fallback_otm=True)
-                        if reference_strikes:
-                            fallback = [c for c in fallback if any(abs(c.strike - number(x, 1e9)) <= 2.0 * strike_step for x in reference_strikes)]
                         fallback_keys = [c.instrument_key for c in fallback]
                         fallback_quotes = self.client.quotes(fallback_keys) if fallback_keys else {}
                         fallback_selected, fallback_ranked = score_contracts(fallback, fallback_quotes, spot, direction, oi, self.config, target_delta,
@@ -3788,7 +3994,7 @@ class PredictiveScanner:
             return self._finish(report, state)
         except Exception as exc:
             # The scan boundary is fail-closed: an unforeseen provider/schema error must not create a selection.
-            LOG.exception("V91 scan failed safely")
+            LOG.exception("V92 scan failed safely")
             report.update({"market_state": "DATA_OR_SCAN_ERROR", "scenario": "NO_SELECTION", "direction": "NEUTRAL",
                            "signal_ready": False, "selected_option": None, "confidence_pct": 0.0,
                            "vetoes": [f"SCAN_ERROR:{type(exc).__name__}:{str(exc)[:350]}"]})
@@ -3802,7 +4008,7 @@ class PredictiveScanner:
         if report.get("suppress_signal_email") or pin_diag.get("detected"):
             return None
         event_key=str(tracker.get("event_key",""))
-        subject=f"NIFTY V91 {signal.direction}: {selected['strike']:.0f}{selected['side']}"
+        subject=f"NIFTY V92 {signal.direction}: {selected['strike']:.0f}{selected['side']}"
         spot_value=number(report.get("indicators",{}).get("spot")) if isinstance(report.get("indicators"),Mapping) else float("nan")
         spot_text=f"{spot_value:.2f}" if finite(spot_value) else "Unavailable"
         strike_value=number(selected.get("strike")); strike_text=f"{strike_value:.0f}" if finite(strike_value) else "Unavailable"
@@ -3829,7 +4035,7 @@ class PredictiveScanner:
         timestamp = str(event.get("timestamp", ""))
         event_key = str(tracker.get("event_key", ""))
         key = f"EVENT|{event_key}|{event_type}|{timestamp}"
-        subject = f"NIFTY V91 {event_type}: {tracker.get('strike')}{tracker.get('side')}"
+        subject = f"NIFTY V92 {event_type}: {tracker.get('strike')}{tracker.get('side')}"
         body = (f"Time (IST): {timestamp}\nEvent: {event_type}\nDirection: {tracker.get('direction')}\n"
                 f"Strike: {tracker.get('strike')} {tracker.get('side')}\nLevel: {event.get('level')}\n"
                 f"Original T1/T2/SL: {tracker.get('T1')} / {tracker.get('T2')} / {tracker.get('SL')}\n"
@@ -3902,7 +4108,7 @@ class PredictiveScanner:
                 key = str(item.get("notification_key", ""))
                 if not key or key in emailed_set:
                     continue
-                if send_email(self.config, str(item.get("subject", "NIFTY V91 notification")), str(item.get("body", ""))):
+                if send_email(self.config, str(item.get("subject", "NIFTY V92 notification")), str(item.get("body", ""))):
                     emailed.append(key); emailed_set.add(key); sent_now.add(key)
                     if item.get("kind") == "SIGNAL":
                         state["last_email_key"] = str(item.get("event_key", ""))
@@ -3988,7 +4194,7 @@ def print_report(report: Mapping[str, Any]) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="V91 persistent-structure NIFTY options scanner (signal only)")
+    parser = argparse.ArgumentParser(description="V92 adaptive-momentum NIFTY options scanner (signal only)")
     parser.add_argument("--loop", action="store_true", help="run continuously at SCAN_INTERVAL_SECONDS")
     parser.add_argument("--interval", type=int, default=None, help="override the loop interval in seconds")
     args = parser.parse_args(argv)
@@ -4001,11 +4207,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     scanner = PredictiveScanner(config)
     interval = int(clamp(args.interval if args.interval is not None else config.scan_interval, 60, 900))
     while True:
+        # A long-running loop must not continue polling after the regular NSE cash-market
+        # close. Scheduled one-shot workflow invocations are unaffected.
+        if args.loop and now_ist().time() >= MARKET_CLOSE:
+            LOG.info("NSE market close reached; stopping V92 loop.")
+            return 0
         report = scanner.scan_once()
         print_report(report)
         if not args.loop:
             return 0 if report.get("market_state") != "DATA_OR_SCAN_ERROR" else 1
-        time_module.sleep(interval)
+        if now_ist().time() >= MARKET_CLOSE:
+            LOG.info("NSE market close reached; stopping V92 loop.")
+            return 0 if report.get("market_state") != "DATA_OR_SCAN_ERROR" else 1
+        # When approaching close, sleep only until close; the next iteration exits before
+        # making an unnecessary post-market API request.
+        current = now_ist()
+        close_dt = datetime.combine(current.date(), MARKET_CLOSE, tzinfo=IST)
+        seconds_to_close = max(1.0, (close_dt - current).total_seconds())
+        time_module.sleep(min(interval, seconds_to_close))
 
 
 if __name__ == "__main__":
