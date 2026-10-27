@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""NIFTY 50 intraday scanner — V93 SMC/ICT structure, futures confirmation and execution-quality controls.
+"""NIFTY 50 intraday scanner — V94 fail-closed SMC + current OI + futures confirmation.
 
-V93 extends V93 with measurable SMC/ICT-style structure (liquidity sweeps, confirmed MSS/BOS, FVG and order-block retests, dealing-range premium/discount), automatic NIFTY futures discovery, futures VWAP confirmation, a strict no-chase breakout guard, and structure-aligned stops. It is signal-only; market-pattern labels are hypotheses, not evidence of institutional intent. Historical replay and paper trading are required before performance claims.
+V94 builds on the V93 workflow, but authorizes a candidate only when a completed-candle SMC structure/retest, a current same-session paired-OI confirmation, fresh aligned futures/VWAP confirmation, data-quality checks and the structural risk plan all agree. Same-day-expiry entries are disabled by default. It is signal-only and cannot guarantee prediction or profitability; backtesting/paper trading are required.
 
 Required environment: UPSTOX_ANALYTICS_TOKEN. NIFTY_FUTURES_INSTRUMENT_KEY is optional: if absent, the scanner discovers the nearest valid NSE NIFTY 50 futures contract through Upstox Instrument Search and caches the key for the session.
 Optional: NIFTY_INSTRUMENT_KEY, NIFTY_FUTURES_INSTRUMENT_KEY, STATE_FILE, AUDIT_DIR,
@@ -37,7 +37,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-VERSION = "V93-SMC-ICT-STRUCTURE-FUTURES-CONFLUENCE"
+VERSION = "V94-PRICE-OI-SMC-FUTURES-HARD-GATES"
 BASE_URL = "https://api.upstox.com"
 IST = ZoneInfo("Asia/Kolkata")
 NIFTY_KEY_DEFAULT = "NSE_INDEX|Nifty 50"
@@ -45,7 +45,7 @@ MARKET_OPEN = time(9, 15)
 ENTRY_OPEN = time(9, 16)
 ENTRY_CUTOFF = time(15, 15)
 MARKET_CLOSE = time(15, 30)
-LOG = logging.getLogger("market_scanner_v93")
+LOG = logging.getLogger("market_scanner_v94")
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -70,6 +70,15 @@ def env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = str(os.getenv(name, str(default))).strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return default
 
 
 def number(value: Any, default: float = float("nan")) -> float:
@@ -131,14 +140,14 @@ def adaptive_impulse_threshold(spot: float, atr: float) -> float:
 def assess_quote_candle_alignment(spot: float, last_completed_close: float, atr: float) -> dict[str, Any]:
     """Audit live spot against the last completed close and return a fail-closed quality flag.
 
-    Threshold is max(1.5 ATR, 0.10% of spot). This catches materially inconsistent timestamps
+    Threshold is max(1.5 ATR, 0.05% of spot). This catches materially inconsistent timestamps
     or stale data; a passing result is not proof that both sources are perfectly synchronized.
     """
     if not all(finite(v) for v in (spot, last_completed_close, atr)) or spot <= 0 or atr <= 0:
         return {"available": False, "aligned": False, "gap_points": None, "limit_points": None,
                 "reason": "SPOT_OR_LAST_COMPLETED_CLOSE_UNAVAILABLE"}
     gap = abs(float(spot) - float(last_completed_close))
-    limit = max(1.5 * float(atr), 0.001 * abs(float(spot)))
+    limit = max(1.5 * float(atr), 0.0005 * abs(float(spot)))
     return {"available": True, "aligned": gap <= limit, "gap_points": round(gap, 2),
             "limit_points": round(limit, 2),
             "reason": "QUOTE_CANDLE_GAP_WITHIN_LIMIT" if gap <= limit else "QUOTE_CANDLE_GAP_EXCEEDS_LIMIT"}
@@ -234,6 +243,12 @@ class Config:
     min_t1_rr: float = field(default_factory=lambda: clamp(env_float("MIN_T1_REWARD_RISK_RATIO", 1.25), 1.15, 3.0))
     reentry_cooldown_minutes: int = field(default_factory=lambda: int(clamp(env_int("REENTRY_COOLDOWN_MINUTES", 12), 8, 30)))
     max_spread: float = field(default_factory=lambda: clamp(env_float("MAX_SPREAD_RATIO", 0.0025), 0.0005, 0.01))
+    # V94 defaults to avoiding same-day-expiry options; opt-in requires explicit paper-test validation.
+    allow_0dte: bool = field(default_factory=lambda: env_bool("ALLOW_0DTE", False))
+    min_smc_score: float = field(default_factory=lambda: clamp(env_float("MIN_SMC_SCORE", 70.0), 70.0, 95.0))
+    max_ltp_mid_deviation_pct: float = field(default_factory=lambda: clamp(env_float("MAX_LTP_MID_DEVIATION_PCT", 1.0), 0.25, 5.0))
+    max_stop_atr_multiple: float = field(default_factory=lambda: clamp(env_float("MAX_STOP_ATR_MULTIPLE", 3.0), 1.5, 5.0))
+    max_target_atr_multiple: float = field(default_factory=lambda: clamp(env_float("MAX_TARGET_ATR_MULTIPLE", 5.0), 2.0, 8.0))
     strike_step: float = 50.0
     state_file: Path = field(default_factory=lambda: _resolve_state_path(os.getenv("STATE_FILE", "")))
     audit_dir: Path = field(default_factory=lambda: Path(os.getenv("AUDIT_DIR", "audit")))
@@ -270,6 +285,8 @@ class Quote:
     freshness: str
     bid_qty: float = 0.0
     ask_qty: float = 0.0
+    last_trade_timestamp: Optional[str] = None
+    last_trade_age_seconds: Optional[float] = None
 
     @property
     def mid(self) -> float:
@@ -371,7 +388,7 @@ class Indicators:
 
 class AtomicState:
     """Atomic state store backed by one canonical, unversioned market_state file."""
-    SNAPSHOT_SCHEMAS = {80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93}
+    SNAPSHOT_SCHEMAS = {80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94}
 
     def __init__(self, path: Path):
         self.path = path
@@ -442,7 +459,7 @@ class AtomicState:
         schema = int(number(loaded.get("schema_version"), 0))
         prior_date = parse_date(loaded.get("session_date"))
         same_session = prior_date == today
-        current_schema = same_session and schema == 93 and loaded.get("scanner_version") == VERSION
+        current_schema = same_session and schema == 94 and loaded.get("scanner_version") == VERSION
         known_migration = same_session and schema in self.SNAPSHOT_SCHEMAS
         expected_expiry = str(loaded.get("option_expiry", "")) if same_session else ""
         old_snaps = loaded.get("chain_snapshots", []) if isinstance(loaded.get("chain_snapshots"), list) else []
@@ -473,7 +490,7 @@ class AtomicState:
         sent_keys = loaded.get("emailed_notification_keys", []) if same_session and isinstance(loaded.get("emailed_notification_keys", []), list) else []
         sent_events = loaded.get("emailed_event_keys", []) if same_session and isinstance(loaded.get("emailed_event_keys", []), list) else []
         self.data = {
-            "schema_version": 93,
+            "schema_version": 94,
             "scanner_version": VERSION,
             "session_date": today.isoformat(),
             "option_expiry": expected_expiry,
@@ -484,7 +501,7 @@ class AtomicState:
             "emailed_event_keys": [str(x) for x in sent_events if isinstance(x, str)][-200:],
             "emailed_notification_keys": [str(x) for x in sent_keys if isinstance(x, str)][-300:],
             # Do not import queued messages from a prior scanner generation: their stale
-            # bodies/selection assumptions must not be sent by V93.
+            # bodies/selection assumptions must not be sent by V94.
             "pending_email_notifications": loaded.get("pending_email_notifications", [])[-50:]
                 if current_schema and isinstance(loaded.get("pending_email_notifications", []), list) else [],
             "last_scan_timestamp": loaded.get("last_scan_timestamp") if same_session else None,
@@ -581,7 +598,7 @@ class UpstoxClient:
         raise ScannerError(f"Upstox request failed for {url}: {last_error}")
 
     def resolve_nifty_future(self, today: date) -> dict[str, Any]:
-        """Resolve the nearest non-expired NSE NIFTY 50 FUT contract from Instrument Search.
+        """Resolve the nearest non-expiring-today NSE NIFTY 50 FUT contract from Instrument Search.
 
         Search results are filtered by type and exact underlying identity; a broad NIFTY text
         match alone is never sufficient because it can also return BANKNIFTY and options.
@@ -614,7 +631,7 @@ class UpstoxClient:
             segment = str(row.get("segment", "")).upper().strip()
             exact_underlying = (underlying_key == self.config.nifty_key
                                 or (underlying_symbol == "NIFTY" and "BANK" not in str(row.get("trading_symbol", "")).upper()))
-            if (key and expiry and expiry.isoformat() >= cutoff and instrument_type == "FUT"
+            if (key and expiry and expiry.isoformat() > cutoff and instrument_type == "FUT"
                     and exchange == "NSE" and segment in {"NSE_FO", "FO"} and exact_underlying):
                 valid.append(row)
         if not valid:
@@ -636,17 +653,25 @@ class UpstoxClient:
         return "OPEN" if status in {"OPEN", "NORMAL_OPEN"} else "CLOSED" if status in {"CLOSED", "NORMAL_CLOSE"} else status
 
     def expiry(self, state: dict[str, Any], today: date) -> str:
+        """Choose a valid NIFTY option expiry; same-day expiry is opt-in, not the default."""
+        allow_same_day = bool(self.config.allow_0dte)
         cached = parse_date(state.get("option_expiry"))
-        if cached and cached >= today:
+        cached_eligible = bool(cached and (cached >= today if allow_same_day else cached > today))
+        if cached_eligible:
             return cached.isoformat()
         payload = self.get("/v2/option/contract", {"instrument_key": self.config.nifty_key})
         rows = payload.get("data")
         if not isinstance(rows, list):
             raise ScannerError("Option contracts response has no data array.")
-        expiries = sorted({d for r in rows if isinstance(r, dict) and (d := parse_date(r.get("expiry"))) and d >= today})
+        expiries = sorted({d for r in rows if isinstance(r, dict) and (d := parse_date(r.get("expiry")))
+                           and (d >= today if allow_same_day else d > today)})
         if not expiries:
-            raise ScannerError("No non-expired NIFTY option expiry was returned.")
+            policy = "non-expired" if allow_same_day else "future-dated (ALLOW_0DTE=false)"
+            raise ScannerError(f"No eligible {policy} NIFTY option expiry was returned.")
         state["option_expiry"] = expiries[0].isoformat()
+        # Snapshots for another expiry must not be reused as an OI baseline.
+        state["chain_snapshots"] = [s for s in state.get("chain_snapshots", [])
+                                     if isinstance(s, dict) and str(s.get("expiry", "")) == expiries[0].isoformat()]
         return expiries[0].isoformat()
 
     def chain(self, expiry: str) -> list[dict[str, Any]]:
@@ -722,8 +747,15 @@ def normalise_quote(key: str, raw: Mapping[str, Any], max_age_seconds: float = 3
     sell_rows = [x for x in sells if isinstance(x, dict)]
     bid = number(buy_rows[0].get("price")) if buy_rows else float("nan")
     ask = number(sell_rows[0].get("price")) if sell_rows else float("nan")
-    stamp = parse_dt(raw.get("timestamp")) or parse_dt(raw.get("last_trade_time"))
+    quote_stamp = parse_dt(raw.get("timestamp"))
+    last_trade_stamp = parse_dt(raw.get("last_trade_time"))
+    # Upstox V3 quotes document ``timestamp`` as the quote-response timestamp and
+    # ``last_trade_time`` as the last transaction time. They are not interchangeable:
+    # a recent trade does not prove that the currently displayed BBO is fresh.
+    # Fail closed when quote timestamp is absent; preserve LTT separately for diagnostics.
+    stamp = quote_stamp
     age = (now_ist() - stamp).total_seconds() if stamp else None
+    trade_age = (now_ist() - last_trade_stamp).total_seconds() if last_trade_stamp else None
     freshness = "UNVERIFIED" if age is None else "FRESH" if -5 <= age <= max_age_seconds else "STALE" if age > max_age_seconds else "FUTURE_TIMESTAMP"
     volume = number(raw.get("volume"), number(ohlc.get("volume"), 0.0))
     return Quote(
@@ -737,6 +769,8 @@ def normalise_quote(key: str, raw: Mapping[str, Any], max_age_seconds: float = 3
         age_seconds=age, freshness=freshness,
         bid_qty=sum(max(0.0, number(x.get("quantity"), 0.0)) for x in buy_rows),
         ask_qty=sum(max(0.0, number(x.get("quantity"), 0.0)) for x in sell_rows),
+        last_trade_timestamp=last_trade_stamp.isoformat() if last_trade_stamp else None,
+        last_trade_age_seconds=trade_age,
     )
 
 
@@ -3728,6 +3762,41 @@ def _candidate_strikes(spot: float, contracts: Mapping[tuple[float, str], Contra
     return picked
 
 
+def quote_execution_diagnostics(quote: Optional[Quote], max_age_seconds: float,
+                                max_spread_ratio: float, max_ltp_mid_deviation_pct: float) -> dict[str, Any]:
+    """Fail-closed option quote audit. LTP is informational; a long entry reference is the ask."""
+    if quote is None:
+        return {"eligible": False, "reason": "OPTION_QUOTE_UNAVAILABLE", "entry_price": None}
+    age_ok = bool(quote.freshness == "FRESH" and finite(quote.age_seconds)
+                  and -5 <= number(quote.age_seconds) <= max_age_seconds)
+    bbo_ok = bool(finite(quote.bid) and finite(quote.ask) and 0 < quote.bid <= quote.ask)
+    mid = quote.mid
+    spread = quote.spread_ratio
+    ltp_mid_deviation_pct = (abs(quote.ltp - mid) / mid * 100.0
+                             if finite(quote.ltp) and quote.ltp > 0 and finite(mid) and mid > 0 else float("nan"))
+    reasons = []
+    if not age_ok: reasons.append("OPTION_QUOTE_STALE_OR_UNVERIFIED")
+    if not bbo_ok: reasons.append("OPTION_TWO_SIDED_BBO_UNAVAILABLE")
+    if not finite(spread) or spread > max_spread_ratio: reasons.append("OPTION_SPREAD_EXCEEDS_LIMIT")
+    if not finite(ltp_mid_deviation_pct): reasons.append("OPTION_LTP_MID_DEVIATION_UNAVAILABLE")
+    elif ltp_mid_deviation_pct > max_ltp_mid_deviation_pct:
+        reasons.append("OPTION_LTP_TOO_FAR_FROM_CURRENT_BBO")
+    # If last-trade timestamp exists and is implausibly stale, surface it separately; the live
+    # quote timestamp and BBO remain the primary freshness source for execution.
+    trade_age = quote.last_trade_age_seconds
+    return {"eligible": not reasons, "reasons": reasons, "reason": "OPTION_QUOTE_EXECUTION_CHECKS_PASSED" if not reasons else ";".join(reasons),
+            "quote_age_seconds": round(number(quote.age_seconds), 3) if finite(quote.age_seconds) else None,
+            "quote_timestamp": quote.timestamp, "last_trade_timestamp": quote.last_trade_timestamp,
+            "last_trade_age_seconds": round(number(trade_age), 3) if finite(trade_age) else None,
+            "bid": quote.bid if finite(quote.bid) else None, "ask": quote.ask if finite(quote.ask) else None,
+            "mid": round(mid, 4) if finite(mid) else None,
+            "spread_ratio": round(spread, 6) if finite(spread) else None,
+            "ltp": quote.ltp if finite(quote.ltp) else None,
+            "ltp_mid_deviation_pct": round(ltp_mid_deviation_pct, 4) if finite(ltp_mid_deviation_pct) else None,
+            "entry_price": quote.ask if bbo_ok and age_ok else None,
+            "entry_price_source": "LIVE_ASK" if bbo_ok and age_ok else None}
+
+
 def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote], spot: float, direction: str,
                     oi: Mapping[str, Any], config: Config, target_delta: float = 0.62,
                     authorized_oi_pair: Optional[Mapping[str, Any]] = None,
@@ -3820,6 +3889,9 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
         bid, ask = (q.bid, q.ask) if live_book_ok else (float("nan"), float("nan"))
         volume = max(c.volume, q.volume if q else 0.0)
         spread = (ask - bid) / ((ask + bid) / 2.0) if live_book_ok else float("inf")
+        bbo_mid = (ask + bid) / 2.0 if live_book_ok else float("nan")
+        ltp_mid_deviation_pct = (abs(ltp - bbo_mid) / bbo_mid * 100.0
+                                 if finite(ltp) and ltp > 0 and finite(bbo_mid) and bbo_mid > 0 else float("nan"))
         delta = c.delta
         if not finite(delta) or delta == 0:
             delta_score = 0.0
@@ -3838,6 +3910,10 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
             reasons.append("LIVE_TWO_SIDED_QUOTE_UNAVAILABLE_OR_UNVERIFIED")
         if not finite(spread) or spread > config.max_spread:
             reasons.append("LIVE_QUOTE_SPREAD_LIMIT_EXCEEDED")
+        if not finite(ltp_mid_deviation_pct):
+            reasons.append("OPTION_LTP_MID_DEVIATION_UNAVAILABLE")
+        elif ltp_mid_deviation_pct > config.max_ltp_mid_deviation_pct:
+            reasons.append("OPTION_LTP_TOO_FAR_FROM_CURRENT_BBO")
         if volume <= 0:
             reasons.append("NO_OPTION_VOLUME")
 
@@ -3846,7 +3922,7 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
         if selected_side != expected_contract_side:
             reasons.append("CONTRACT_SIDE_DOES_NOT_MATCH_AUTHORIZED_FLOW_MODE")
         flow_pairs: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
-        # V93 separates underlying-direction confirmation from the execution-contract choice.
+        # V94 separates underlying-direction confirmation from the execution-contract choice.
         # An already-qualified pair is measured against spot, not required to sit within two
         # strikes of each candidate contract. This avoids discarding a valid directional pair
         # merely because the best liquid ATM/ITM contract is on another strike.
@@ -3959,6 +4035,7 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
         if memory_backed_flow and not memory_flow_score_ok:
             reasons.append("REMEMBERED_OI_FLOW_TOO_WEAK_AFTER_TIME_DECAY")
         hard_ok = (age_ok and live_book_ok and finite(ltp) and ltp > 0 and finite(spread) and spread <= config.max_spread
+                   and finite(ltp_mid_deviation_pct) and ltp_mid_deviation_pct <= config.max_ltp_mid_deviation_pct
                    and volume > 0 and finite(delta) and 0.45 <= abs(delta) <= 0.90
                    and selected_side == expected_contract_side and supportive_flow_confirmed
                    and memory_flow_score_ok)
@@ -3969,8 +4046,13 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
             "ask": round(ask, 2) if finite(ask) else None,
             "spread_source": "FRESH_LIVE_QUOTE" if live_book_ok else "UNAVAILABLE",
             "spread_ratio_pct": round(spread * 100.0, 3) if finite(spread) else None,
+            "ltp_mid_deviation_pct": round(ltp_mid_deviation_pct, 4) if finite(ltp_mid_deviation_pct) else None,
+            "executable_entry_price": round(ask, 2) if live_book_ok else None,
+            "executable_entry_price_source": "LIVE_ASK" if live_book_ok else None,
             "quote_age_seconds": round(q.age_seconds, 2) if q and finite(q.age_seconds) else None,
             "quote_timestamp": q.timestamp if q else None,
+            "last_trade_timestamp": q.last_trade_timestamp if q else None,
+            "last_trade_age_seconds": round(q.last_trade_age_seconds, 2) if q and finite(q.last_trade_age_seconds) else None,
             "quote_freshness": q.freshness if q else "UNAVAILABLE", "volume": volume, "oi": c.oi,
             "local_oi_flow": secondary_flow, "supporting_oi_flow": primary_flow,
             "flow_mode": flow_mode,
@@ -3990,6 +4072,242 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
     rows.sort(key=lambda x: (-number(x.get("flow_score_pct"), 0.0), -number(x.get("score"), 0.0),
                              abs(spot - number(x.get("strike"), spot))))
     return (eligible[0] if eligible else None), rows
+
+def evaluate_v94_market_authorization(signal: Signal, smc_context: Mapping[str, Any],
+                                      oi_confirmation: Mapping[str, Any],
+                                      futures_confirmation: Mapping[str, Any],
+                                      regime: Mapping[str, Any], spot: float, atr: float,
+                                      option_expiry: str, now: datetime, allow_0dte: bool = False,
+                                      min_smc_score: float = 70.0,
+                                      quote_candle_alignment: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+    """V94 hard entry gate. Price structure, fresh paired OI and futures must all agree.
+
+    This deliberately prefers abstention over filling missing evidence with a weighted score.
+    SMC labels are mechanical pattern descriptors, not proof of institutional intent.
+    """
+    direction = str(signal.direction).upper()
+    setup = str(signal.setup).upper()
+    smc = smc_context if isinstance(smc_context, Mapping) else {}
+    oi = oi_confirmation if isinstance(oi_confirmation, Mapping) else {}
+    fut = futures_confirmation if isinstance(futures_confirmation, Mapping) else {}
+    rg = regime if isinstance(regime, Mapping) else {}
+    failures: list[str] = []
+    details: dict[str, Any] = {"direction": direction, "setup": setup,
+                               "smc_model": smc.get("model"), "smc_score": smc.get("score"),
+                               "oi_direction": oi.get("direction"), "oi_qualified": bool(oi.get("qualified")),
+                               "futures_direction": fut.get("direction"), "futures_qualified": bool(fut.get("qualified")),
+                               "regime": rg.get("regime"), "session_bias": rg.get("session_bias"),
+                               "option_expiry": str(option_expiry), "allow_0dte": bool(allow_0dte)}
+    if direction not in {"BULLISH", "BEARISH"}:
+        failures.append("NO_DIRECTIONAL_PRICE_CANDIDATE")
+        return {**details, "qualified": False, "status": "FAIL", "failures": failures}
+
+    if setup not in {"SMC_BULLISH_FVG_RETEST", "SMC_BEARISH_FVG_RETEST"}:
+        failures.append("V94_REQUIRES_EXPLICIT_SMC_FVG_OR_OB_RETEST_SETUP")
+    expected_setup = "SMC_BULLISH_FVG_RETEST" if direction == "BULLISH" else "SMC_BEARISH_FVG_RETEST"
+    if setup != expected_setup:
+        failures.append("SIGNAL_SETUP_DIRECTION_MISMATCH")
+
+    smc_direction = str(smc.get("direction", "NEUTRAL")).upper()
+    score = number(smc.get("score"), -1.0)
+    if not smc.get("available") or not smc.get("qualified") or not smc.get("entry_ready"):
+        failures.append("SMC_STRUCTURE_OR_FRESH_RETEST_NOT_QUALIFIED")
+    if smc_direction != direction:
+        failures.append("SMC_DIRECTION_CONFLICTS_WITH_SIGNAL")
+    if not finite(score) or score < min_smc_score:
+        failures.append("SMC_SCORE_BELOW_MINIMUM")
+    model = str(smc.get("model", "")).upper()
+    if not any(token in model for token in ("MSS", "BOS")):
+        failures.append("SMC_MODEL_HAS_NO_CONFIRMED_MSS_OR_BOS")
+
+    zone = smc.get("entry_zone") if isinstance(smc.get("entry_zone"), Mapping) else {}
+    zlow, zhigh = number(zone.get("lower")), number(zone.get("upper"))
+    zmid = number(zone.get("midpoint"))
+    if not (finite(zlow) and finite(zhigh) and zlow > 0 and zhigh >= zlow):
+        failures.append("SMC_ENTRY_ARRAY_INVALID_OR_MISSING")
+    elif not finite(spot) or not finite(atr) or atr <= 0:
+        failures.append("SPOT_OR_ATR_UNAVAILABLE_FOR_ENTRY_ARRAY_CHECK")
+    else:
+        tolerance = max(0.15 * float(atr), 3.0)
+        in_zone_or_edge = (zlow - tolerance <= spot <= zhigh + tolerance)
+        if not in_zone_or_edge:
+            failures.append("PRICE_NOT_AT_FRESH_SMC_RETEST_ZONE")
+        midpoint = zmid if finite(zmid) else (zlow + zhigh) / 2.0
+        max_chase = max(1.25 * float(atr), 15.0)
+        if abs(float(spot) - midpoint) > max_chase:
+            failures.append("ENTRY_TOO_EXTENDED_FROM_SMC_ARRAY")
+
+    if not oi.get("qualified"):
+        failures.append(str(oi.get("reason", "SAME_SESSION_PAIRED_OI_NOT_CONFIRMED")))
+    elif str(oi.get("direction", direction)).upper() not in {direction, "NEUTRAL", ""}:
+        failures.append("OI_CONFIRMATION_DIRECTION_CONFLICT")
+    else:
+        # Some versions express direction with a qualified_directions list. Enforce it if present.
+        qdirs = oi.get("qualified_directions")
+        if isinstance(qdirs, (list, tuple)) and qdirs and direction not in {str(x).upper() for x in qdirs}:
+            failures.append("OI_PAIR_DOES_NOT_QUALIFY_SIGNAL_DIRECTION")
+        # Only current confirmation is permitted in V94; any memory-backed pair is not authorization.
+        if oi.get("memory_backed"):
+            failures.append("MEMORY_BACKED_OI_CANNOT_AUTHORIZE_ENTRY")
+
+    if not fut.get("qualified"):
+        failures.append(str(fut.get("reason", "FUTURES_DIRECTIONAL_CONFIRMATION_UNAVAILABLE")))
+    elif str(fut.get("direction", "NEUTRAL")).upper() != direction:
+        failures.append("FUTURES_CONFIRMATION_CONFLICTS_WITH_SIGNAL")
+
+    session_bias = str(rg.get("session_bias", "UNKNOWN")).upper()
+    regime_name = str(rg.get("regime", "UNKNOWN")).upper()
+    reversal_model = "SWEEP_MSS" in model
+    opposing_regime = ((regime_name == "TREND_BULLISH" and direction == "BEARISH") or
+                       (regime_name == "TREND_BEARISH" and direction == "BULLISH"))
+    opposing_bias = session_bias in {"BULLISH", "BEARISH"} and session_bias != direction
+    if opposing_regime and not reversal_model:
+        failures.append("REGIME_CONFLICT_WITHOUT_SWEEP_MSS_REVERSAL")
+    if opposing_bias and not reversal_model:
+        failures.append("SESSION_BIAS_CONFLICT_WITHOUT_SWEEP_MSS_REVERSAL")
+    # Even a true reversal requires the aligned OI and futures checks above; SMC alone is not enough.
+
+    exp_date = parse_date(option_expiry)
+    local_now = now.astimezone(IST)
+    if exp_date and exp_date < local_now.date():
+        failures.append("OPTION_CONTRACT_EXPIRED")
+    if exp_date and exp_date == local_now.date() and not allow_0dte:
+        failures.append("SAME_DAY_EXPIRY_DISABLED_BY_DEFAULT")
+
+    qca = quote_candle_alignment if isinstance(quote_candle_alignment, Mapping) else {}
+    if not qca.get("aligned", False):
+        failures.append(str(qca.get("reason", "SPOT_QUOTE_CANDLE_ALIGNMENT_NOT_CONFIRMED")))
+
+    unique_failures = list(dict.fromkeys(failures))
+    return {**details, "qualified": not unique_failures, "status": "PASS" if not unique_failures else "FAIL",
+            "failures": unique_failures,
+            "policy": "REQUIRE_SMC_RETEST_AND_CURRENT_PAIRED_OI_AND_ALIGNED_FUTURES_AND_VALID_RISK; FAIL_CLOSED"}
+
+
+def validate_v94_risk_plan(plan: RiskPlan, signal: Signal, levels: Sequence[Level],
+                            indicators: Indicators, smc_context: Mapping[str, Any],
+                            min_rr: float, max_stop_atr_multiple: float = 3.0,
+                            max_target_atr_multiple: float = 5.0) -> dict[str, Any]:
+    """Validate and tighten an index-level plan against SMC invalidation and nearest barriers."""
+    direction = str(signal.direction).upper()
+    smc = smc_context if isinstance(smc_context, Mapping) else {}
+    spot = number(indicators.spot)
+    atr = number(indicators.atr)
+    failures: list[str] = []
+    details: dict[str, Any] = {"input_plan": safe_json(asdict(plan)), "spot": spot, "atr": atr,
+                               "nearest_opposing_barrier": None, "stop_source": None,
+                               "target_source": None, "checks": {}}
+    if direction not in {"BULLISH", "BEARISH"}:
+        failures.append("NO_DIRECTIONAL_SETUP_FOR_RISK_VALIDATION")
+    if not plan.valid:
+        failures.append("BASE_RISK_PLAN_INVALID")
+    if not finite(spot) or spot <= 0 or not finite(atr) or atr <= 0:
+        failures.append("SPOT_OR_ATR_UNAVAILABLE_FOR_RISK_VALIDATION")
+    if failures:
+        invalid = RiskPlan(False, plan.t1, plan.t2, plan.sl, plan.stop_source, plan.target_source,
+                           plan.reward_points, plan.risk_points, plan.reward_risk, ";".join(failures))
+        return {**details, "qualified": False, "failures": failures, "risk_plan": safe_json(asdict(invalid))}
+
+    buffer = max(2.0, 0.10 * atr)
+    invalidation = number(smc.get("invalidation_level"))
+    zone = smc.get("entry_zone") if isinstance(smc.get("entry_zone"), Mapping) else {}
+    zone_bound = number(zone.get("lower" if direction == "BULLISH" else "upper"))
+    stop_anchors = [x for x in (invalidation, zone_bound) if finite(x) and x > 0]
+    if not stop_anchors:
+        failures.append("SMC_STRUCTURAL_INVALIDATION_UNAVAILABLE")
+        structural_stop = number(plan.sl)
+        stop_source = "BASE_PLAN_NO_SMC_ANCHOR"
+    else:
+        # For longs, the most conservative relevant invalidation is the lower anchor; inverse for shorts.
+        anchor = min(stop_anchors) if direction == "BULLISH" else max(stop_anchors)
+        structural_stop = anchor - buffer if direction == "BULLISH" else anchor + buffer
+        stop_source = "SMC_INVALIDATION_PLUS_ATR_BUFFER"
+    stop_side_ok = finite(structural_stop) and (structural_stop < spot if direction == "BULLISH" else structural_stop > spot)
+    if not stop_side_ok:
+        failures.append("STRUCTURAL_STOP_ON_WRONG_SIDE_OF_ENTRY")
+    risk_points = abs(spot - structural_stop) if finite(structural_stop) else float("nan")
+    max_risk = max(max_stop_atr_multiple * atr, 30.0)
+    if not finite(risk_points) or risk_points < 4.0 or risk_points > max_risk:
+        failures.append("STRUCTURAL_STOP_DISTANCE_OUTSIDE_LIMIT")
+
+    original_t1 = number(plan.t1)
+    target_side_ok = finite(original_t1) and (original_t1 > spot if direction == "BULLISH" else original_t1 < spot)
+    if not target_side_ok:
+        failures.append("TARGET_ON_WRONG_SIDE_OR_MISSING")
+    min_target = max(0.75 * atr, 8.0)
+    barriers: list[tuple[float, str]] = []
+    # Only price-based/composite levels or currently corroborated OI-writing barriers are trusted.
+    for level in levels:
+        if not isinstance(level, Level):
+            continue
+        kind_ok = level.kind == ("RESISTANCE" if direction == "BULLISH" else "SUPPORT")
+        if not kind_ok or not finite(level.price):
+            continue
+        if not (level.strength >= 0.50 or level.touches >= 2):
+            continue
+        if "OI_WALL" in str(level.source).upper() and str(level.flow_state).upper() != "SHORT_BUILDUP_WRITING":
+            continue
+        beyond_spot = level.price > spot + min_target if direction == "BULLISH" else level.price < spot - min_target
+        before_original_target = level.price < original_t1 if direction == "BULLISH" else level.price > original_t1
+        if beyond_spot and target_side_ok and before_original_target:
+            barriers.append((float(level.price), str(level.source)))
+    # Add confirmed SMC pivots as opposing barriers so nearby swing structure is not skipped.
+    swings = smc.get("swings", []) if isinstance(smc.get("swings", []), list) else []
+    for swing in swings:
+        if not isinstance(swing, Mapping) or not finite(swing.get("price")):
+            continue
+        expected_kind = "HIGH" if direction == "BULLISH" else "LOW"
+        if str(swing.get("kind", "")).upper() != expected_kind:
+            continue
+        price = number(swing.get("price"))
+        beyond_spot = price > spot + min_target if direction == "BULLISH" else price < spot - min_target
+        before_original_target = price < original_t1 if direction == "BULLISH" else price > original_t1
+        if beyond_spot and target_side_ok and before_original_target:
+            barriers.append((float(price), "SMC_CONFIRMED_SWING"))
+
+    target = original_t1
+    target_source = str(plan.target_source)
+    nearest = None
+    if barriers:
+        barriers.sort(key=lambda item: item[0] if direction == "BULLISH" else -item[0])
+        nearest = barriers[0]
+        target = nearest[0] - buffer if direction == "BULLISH" else nearest[0] + buffer
+        target_source = f"NEAREST_OPPOSING_BARRIER:{nearest[1]}"
+    target_distance = abs(target - spot) if finite(target) else float("nan")
+    max_target = max(max_target_atr_multiple * atr, 60.0)
+    if not finite(target_distance) or target_distance < min_target:
+        failures.append("TARGET_TOO_CLOSE_AFTER_NEAREST_BARRIER_ADJUSTMENT")
+    if not finite(target_distance) or target_distance > max_target:
+        failures.append("TARGET_DISTANCE_EXCEEDS_INTRADAY_LIMIT")
+    reward_risk = target_distance / risk_points if finite(target_distance) and finite(risk_points) and risk_points > 0 else float("nan")
+    if not finite(reward_risk) or reward_risk < min_rr:
+        failures.append("REWARD_RISK_BELOW_MINIMUM_AFTER_BARRIER_ADJUSTMENT")
+
+    t2 = number(plan.t2)
+    if finite(t2):
+        t2_on_side = t2 > target if direction == "BULLISH" else t2 < target
+        if not t2_on_side:
+            t2 = float("nan")
+    checks = {"structural_stop_side_ok": stop_side_ok,
+              "structural_risk_points": round(risk_points, 2) if finite(risk_points) else None,
+              "max_risk_points": round(max_risk, 2),
+              "nearest_barrier": {"price": nearest[0], "source": nearest[1]} if nearest else None,
+              "target_distance_points": round(target_distance, 2) if finite(target_distance) else None,
+              "max_target_distance_points": round(max_target, 2),
+              "reward_risk_after_adjustment": round(reward_risk, 3) if finite(reward_risk) else None}
+    validated = RiskPlan(not failures, round(target, 2) if finite(target) else None,
+                         round(t2, 2) if finite(t2) else None,
+                         round(structural_stop, 2) if finite(structural_stop) else None,
+                         stop_source, target_source,
+                         round(target_distance, 2) if finite(target_distance) else None,
+                         round(risk_points, 2) if finite(risk_points) else None,
+                         round(reward_risk, 3) if finite(reward_risk) else None,
+                         "V94 structural risk checks passed" if not failures else ";".join(dict.fromkeys(failures)))
+    return {**details, "qualified": not failures, "failures": list(dict.fromkeys(failures)),
+            "nearest_opposing_barrier": {"price": nearest[0], "source": nearest[1]} if nearest else None,
+            "stop_source": stop_source, "target_source": target_source, "checks": checks,
+            "risk_plan": safe_json(asdict(validated))}
+
 
 def update_active_signal(state: dict[str, Any], frame: pd.DataFrame, now: datetime) -> list[dict[str, Any]]:
     tracker=state.get("active_signal")
@@ -4034,7 +4352,7 @@ def update_active_signal(state: dict[str, Any], frame: pd.DataFrame, now: dateti
 def audit_append(config: Config, report: Mapping[str, Any]) -> None:
     config.audit_dir.mkdir(parents=True, exist_ok=True)
     local_date = parse_date(report.get("timestamp")) or now_ist().date()
-    path = config.audit_dir / f"market_scan_{local_date.isoformat()}_v93.jsonl"
+    path = config.audit_dir / f"market_scan_{local_date.isoformat()}_v94.jsonl"
     record = {"audit_schema_version": 1, "recorded_at": report.get("timestamp"), "scanner_version": VERSION, "scan": safe_json(report)}
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
@@ -4144,7 +4462,7 @@ class PredictiveScanner:
                 cached_contract = state.get("resolved_futures_contract") if isinstance(state.get("resolved_futures_contract"), Mapping) else {}
                 cached_expiry = parse_date(cached_contract.get("expiry"))
                 if (cached_contract.get("instrument_key") and state.get("resolved_futures_date") == current.date().isoformat()
-                        and cached_expiry and cached_expiry >= current.date()):
+                        and cached_expiry and cached_expiry > current.date()):
                     futures_contract = dict(cached_contract)
                 else:
                     try:
@@ -4276,27 +4594,24 @@ class PredictiveScanner:
             signal, signal_diagnostics = score_market_signal(frame_raw, indicators, oi, levels, current,
                                                               self.config.min_signal_score, strike_step, fib, divergence,
                                                               regime=regime, oi_first=effective_oi_first, min_rr=self.config.min_t1_rr)
-            # SMC/ICT-style alternative: price structure plus a fresh FVG/OB retest, paired OI OR
-            # independently confirmed futures VWAP. This route is continuation/retest-only; it
-            # never authorizes a reversal without same-session paired OI.
+            # V94: use SMC only as an explicit setup candidate, not as a substitute for OI.
+            # The final authorization gate independently requires current same-direction paired OI
+            # AND a fresh, aligned futures/VWAP confirmation.
             smc_dir = str(smc_context.get("direction", "NEUTRAL")).upper()
-            smc_flow = bool((effective_oi_first.get("qualified") and smc_dir in set(effective_oi_first.get("qualified_directions", [])))
-                            or (futures_confirmation.get("qualified") and futures_confirmation.get("direction") == smc_dir))
-            # Never let the SMC fallback override an opposite-direction directional candidate.
-            legacy_breakout_extended = (signal.setup in {"CONFIRMED_BREAKOUT", "CONFIRMED_BREAKDOWN"}
-                and finite(signal.level) and abs(spot - signal.level) > max(1.25 * indicators.atr, 12.0))
             use_smc_fallback = bool(smc_context.get("qualified") and smc_context.get("entry_ready")
                                     and smc_dir in {"BULLISH", "BEARISH"}
-                                    and smc_context.get("score", 0) >= self.config.min_signal_score
-                                    and smc_flow
-                                    and (signal.direction == "NEUTRAL" or
-                                         (legacy_breakout_extended and signal.direction == smc_dir)))
+                                    and number(smc_context.get("score"), 0) >= self.config.min_smc_score
+                                    and (signal.direction == "NEUTRAL" or signal.direction == smc_dir))
             # Select SMC only when price is back at a fresh entry array; never override opposite direction.
             if use_smc_fallback:
                 smc_invalidation = number(smc_context.get("invalidation_level"))
                 smc_evidence = ["SMC_PRICE_MODEL_CONFIRMED", str(smc_context.get("model", "SMC_RETEST")),
                                 "CONFIRMED_SWING_STRUCTURE_BREAK", "FRESH_FVG_OR_ORDER_BLOCK_RETEST",
                                 f"SMC_SCORE_{number(smc_context.get('score'),0):.1f}"]
+                _oi_direction_candidate = (effective_oi_first.get("direction_candidates", {}).get(smc_dir, {})
+                                           if isinstance(effective_oi_first.get("direction_candidates"), Mapping) else {})
+                _oi_flow_mode = str(_oi_direction_candidate.get("flow_mode", effective_oi_first.get("flow_mode", "WRITER_COVERING"))).upper()
+                smc_evidence.append("OI_FLOW_MODE_BUYER_LED" if _oi_flow_mode == "BUYER_LED_MOMENTUM" else "OI_FLOW_MODE_WRITER_COVERING")
                 if smc_context.get("liquidity_sweep"):
                     smc_evidence.append("LIQUIDITY_SWEEP_THEN_STRUCTURE_SHIFT")
                 if smc_context.get("entry_zone_overlaps_ote"):
@@ -4312,15 +4627,22 @@ class PredictiveScanner:
                                 smc_invalidation if finite(smc_invalidation) else number(smc_context.get("entry_zone", {}).get("lower" if smc_dir == "BULLISH" else "upper")),
                                 tuple(smc_evidence), ())
                 signal_diagnostics["smc_fallback_selected"] = True
-                signal_diagnostics["smc_fallback_confirmation_route"] = "PAIRED_OI_OR_FUTURES_VWAP"
+                signal_diagnostics["smc_fallback_confirmation_route"] = "PAIRED_OI_AND_FUTURES_REQUIRED_AT_FINAL_GATE"
             else:
                 signal_diagnostics["smc_fallback_selected"] = False
-                if smc_context.get("qualified") and not smc_flow:
-                    signal_diagnostics["smc_fallback_blocker"] = "SMC_SETUP_REQUIRES_SAME_DIRECTION_PAIRED_OI_OR_FUTURES_VWAP"
-            if oi_first.get("qualified"):
+                _oi_dir_candidate = (effective_oi_first.get("direction_candidates", {}).get(smc_dir, {})
+                                     if isinstance(effective_oi_first.get("direction_candidates"), Mapping) else {})
+                _oi_pair_aligned = bool(effective_oi_first.get("qualified")
+                                        and smc_dir in set(effective_oi_first.get("qualified_directions", [])))
+                _futures_aligned = bool(futures_confirmation.get("qualified")
+                                        and futures_confirmation.get("direction") == smc_dir)
+                if smc_context.get("qualified") and not (_oi_pair_aligned and _futures_aligned):
+                    signal_diagnostics["smc_fallback_blocker"] = "FINAL_ENTRY_REQUIRES_SAME_DIRECTION_PAIRED_OI_AND_FUTURES"
+            if oi_first.get("qualified") and signal.setup not in {"SMC_BULLISH_FVG_RETEST", "SMC_BEARISH_FVG_RETEST"}:
                 signal, structure_watch_resolution = resolve_pending_structure_watch(state, signal, indicators, current)
             else:
-                structure_watch_resolution = {"status": "NOT_EVALUATED_OI_FIRST_GATE", "reason": oi_first.get("reason")}
+                structure_watch_resolution = {"status": "V94_SMC_PRIORITY_OR_OI_NOT_QUALIFIED",
+                                              "reason": oi_first.get("reason")}
             expiry_pin = diagnose_expiry_pin(oi, fib, indicators, expiry, current, strike_step,
                                              self.config.min_local_oi_change_pct)
             if expiry_pin.get("detected"):
@@ -4347,27 +4669,42 @@ class PredictiveScanner:
             if not bool(state.get("state_integrity_ok", True)):
                 gate_failures.append("CANONICAL_STATE_CORRUPT_OR_UNREADABLE_ENTRIES_SUPPRESSED_FOR_RECOVERY_SCAN")
             if not quote_candle_alignment_ok:
-                gate_failures.append("SPOT_QUOTE_LAST_CLOSED_CANDLE_GAP_EXCEEDS_MAX_1_5_ATR_OR_0_10_PERCENT_SPOT")
-            if signal.direction in {"BULLISH", "BEARISH"}:
+                gate_failures.append("SPOT_QUOTE_LAST_CLOSED_CANDLE_GAP_EXCEEDS_V94_LIMIT")
+            candidate_risk_plan = calculate_risk_plan(raw_signal, levels, indicators, self.config.min_t1_rr) if raw_signal.direction in {"BULLISH", "BEARISH"} else calculate_risk_plan(signal, levels, indicators, self.config.min_t1_rr)
+            v94_risk_validation = validate_v94_risk_plan(
+                candidate_risk_plan, raw_signal, levels, indicators, smc_context, self.config.min_t1_rr,
+                self.config.max_stop_atr_multiple, self.config.max_target_atr_multiple
+            ) if raw_signal.direction in {"BULLISH", "BEARISH"} else {
+                "qualified": False, "failures": ["NO_DIRECTIONAL_CANDIDATE_FOR_RISK_VALIDATION"],
+                "risk_plan": safe_json(asdict(candidate_risk_plan))}
+            v94_market_authorization = evaluate_v94_market_authorization(
+                raw_signal, smc_context, local_oi_confirmation, futures_confirmation, regime,
+                spot, indicators.atr, expiry, current, self.config.allow_0dte, self.config.min_smc_score,
+                quote_candle_alignment=quote_candle_alignment
+            ) if raw_signal.direction in {"BULLISH", "BEARISH"} else {
+                "qualified": False, "status": "WAIT", "failures": ["NO_DIRECTIONAL_PRICE_CANDIDATE"]}
+            if raw_signal.direction in {"BULLISH", "BEARISH"}:
                 if expiry_pin.get("detected"):
                     gate_failures.append("No Entry - Range-Bound / Expiry Pin")
-                smc_alt_confirmation = bool(signal.setup in {"SMC_BULLISH_FVG_RETEST", "SMC_BEARISH_FVG_RETEST"}
-                                            and setup_confirmation.get("alternate_flow_confirmation")
-                                            and futures_confirmation.get("qualified")
-                                            and futures_confirmation.get("direction") == signal.direction)
-                if not local_oi_confirmation.get("qualified") and not smc_alt_confirmation:
-                    gate_failures.append(str(local_oi_confirmation.get("reason", "LOCAL_OI_GATE_FAILED")))
+                # No futures-only alternate route and no remembered OI-only authorization in V94.
+                gate_failures.extend(v94_market_authorization.get("failures", []))
+                gate_failures.extend(v94_risk_validation.get("failures", []))
                 if not regime_confirmation.get("qualified"):
                     gate_failures.append(str(regime_confirmation.get("reason", "REGIME_GATE_FAILED")))
                 if not fib_divergence_confirmation.get("qualified"):
                     gate_failures.append(str(fib_divergence_confirmation.get("reason", "FIB_DIVERGENCE_GATE_FAILED")))
                 if not setup_confirmation.get("qualified"):
                     gate_failures.append(str(setup_confirmation.get("reason", "SETUP_RULE_GATE_FAILED")))
+                gate_failures = list(dict.fromkeys(gate_failures))
                 if gate_failures:
-                    gate_evidence = tuple(dict.fromkeys(list(signal.evidence) + [f"V93_HARD_GATE:{x}" for x in gate_failures]))
-                    signal = Signal("NEUTRAL", "V93_ENTRY_GATES_BLOCKED", signal.score, 0.0,
-                                    "; ".join(gate_evidence[:8]), signal.level, gate_evidence, tuple(gate_failures))
-            risk = calculate_risk_plan(signal, levels, indicators, self.config.min_t1_rr)
+                    gate_evidence = tuple(dict.fromkeys(list(raw_signal.evidence) + [f"V94_HARD_GATE:{x}" for x in gate_failures]))
+                    signal = Signal("NEUTRAL", "V94_ENTRY_GATES_BLOCKED", raw_signal.score, 0.0,
+                                    "; ".join(gate_evidence[:10]), raw_signal.level, gate_evidence, tuple(gate_failures))
+                else:
+                    signal = raw_signal
+            risk = (RiskPlan(**{**asdict(candidate_risk_plan), **v94_risk_validation.get("risk_plan", {})})
+                    if signal.direction in {"BULLISH", "BEARISH"} and v94_risk_validation.get("qualified")
+                    else calculate_risk_plan(signal, levels, indicators, self.config.min_t1_rr))
             events = update_active_signal(state, frame_raw, current)
             report["events"].extend(events)
             report["active_option_monitor"] = self._monitor_active_option(state, current)
@@ -4389,6 +4726,9 @@ class PredictiveScanner:
                 "market_regime": regime, "local_oi_confirmation": local_oi_confirmation,
                 "regime_confirmation": regime_confirmation,
                 "setup_rule_confirmation": setup_confirmation,
+                "v94_market_authorization": safe_json(v94_market_authorization),
+                "v94_risk_validation": safe_json(v94_risk_validation),
+                "candidate_risk_plan_before_authorization": safe_json(asdict(candidate_risk_plan)),
                 "fibonacci_analysis": safe_json(fib), "rsi_divergence": safe_json(divergence),
                 "fib_divergence_confirmation": safe_json(fib_divergence_confirmation),
                 "expiry_pin_diagnostics": safe_json(expiry_pin),
@@ -4398,17 +4738,22 @@ class PredictiveScanner:
                                     "active": safe_json(state.get("pending_structure_setup")),
                                     "ttl_minutes": STRUCTURE_WATCH_TTL_MINUTES,
                                     "max_extension_atr": STRUCTURE_WATCH_MAX_EXTENSION_ATR},
-                "v93_policy": {"price_analysis_runs_independently_of_oi_gate": True,
+                "v94_policy": {"price_analysis_runs_independently_of_oi_gate": True,
                                "adaptive_impulse_threshold": "MAX(1.25*ATR, MIN(30 POINTS, 0.08% OF SPOT))",
                                "shared_oi_locality_radius_points": oi_locality_radius(strike_step),
                                "recent_oi_memory_ttl_seconds": OI_CONFIRMATION_MEMORY_TTL_SECONDS,
-                               "oi_memory_can_support_continuation_only_with_linear_decay_and_fresh_quotes": True,
+                               "oi_memory_can_support_continuation_only_with_linear_decay_and_fresh_quotes": False,
+                               "entry_requires_same_direction_smc_and_current_paired_oi_and_futures": True,
+                               "same_day_expiry_disabled_by_default": not self.config.allow_0dte,
+                               "option_entry_reference": "FRESH_LIVE_ASK_NOT_LTP",
+                               "ltt_and_quote_timestamp_recorded_separately": True,
+                               "strict_structural_target_stop_validation": True,
                                "oi_reference_strikes_are_not_contract_selection_filters": True,
                                "smc_ict_setup_model": "CONFIRMED_SWEEP_MSS_OR_BOS_PLUS_FRESH_FVG_OR_OB_RETEST; OI_OR_FUTURES_VWAP; NO_CHASE",
                                "breakout_extension_guard": "MAX(1.25*ATR,12_POINTS); NO_45_POINT_FLOOR",
                                "breakout_stop_source": "BROKEN_BOUNDARY_PLUS_VOLATILITY_BUFFER",
                                "futures_instrument_discovery": "AUTO_UPSTOX_INSTRUMENT_SEARCH_IF_NO_ENV_OVERRIDE",
-                               "quote_candle_gap_hard_gate": "BLOCK_IF_GAP_EXCEEDS_MAX(1.5*ATR, 0.10% SPOT); CANDLE_AGE_USES_INTERVAL_END",
+                               "quote_candle_gap_hard_gate": "BLOCK_IF_GAP_EXCEEDS_MAX(1.5*ATR, 0.05% SPOT); CANDLE_AGE_USES_INTERVAL_END",
                                "output_compatibility_with_v92": True,
                                "legacy_v91_gate_failure_alias_preserved": True,
                                "persistent_setup_state": True,
@@ -4425,8 +4770,8 @@ class PredictiveScanner:
                 "oi_first_gate": oi_first,
                 "effective_oi_first_gate": effective_oi_first,
                 "oi_confirmation_memory": oi_memory,
-                "candidate_before_v93_gates": _candidate_before_audit(raw_signal, signal_diagnostics),
-                "v93_gate_failures": gate_failures,
+                "candidate_before_v94_gates": _candidate_before_audit(raw_signal, signal_diagnostics),
+                "v94_gate_failures": gate_failures,
                 "v91_gate_failures": gate_failures,
                 "active_signal": safe_json(state.get("active_signal")), "expiry": expiry,
                 "state_integrity": {"ok": bool(state.get("state_integrity_ok", True)),
@@ -4482,7 +4827,7 @@ class PredictiveScanner:
                 else:
                     candidates = _candidate_strikes(spot, contracts, direction, strike_step)
                     # OI reference strikes confirm direction; they must not force the contract
-                    # itself away from ATM/ITM liquidity. V93 ranks the predefined ATM/ITM
+                    # itself away from ATM/ITM liquidity. V94 ranks the predefined ATM/ITM
                     # candidates by fresh quote, delta, spread, volume and moneyness.
                     reference_strikes = local_oi_confirmation.get("reference_strikes", [])
                     report["option_selection_policy"] = {
@@ -4497,10 +4842,7 @@ class PredictiveScanner:
                     reversal_setups = {"SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM", "RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION",
                                        "SUPPORT_CLUSTER_RECLAIM", "RESISTANCE_CLUSTER_REJECTION"}
                     target_delta = 0.55 if signal.setup in reversal_setups else 0.62
-                    allow_non_oi = bool(signal.setup in {"SMC_BULLISH_FVG_RETEST", "SMC_BEARISH_FVG_RETEST"}
-                                        and futures_confirmation.get("qualified")
-                                        and futures_confirmation.get("direction") == direction
-                                        and not local_oi_confirmation.get("qualified"))
+                    allow_non_oi = False  # V94 never authorizes a contract via futures-only fallback.
                     selected, ranked = score_contracts(candidates, option_quotes, spot, direction, oi, self.config, target_delta,
                                                       authorized_oi_pair=local_oi_confirmation,
                                                       allow_non_oi_confirmation=allow_non_oi)
@@ -4529,6 +4871,9 @@ class PredictiveScanner:
                             "strike": selected["strike"], "side": selected["side"], "expiry": expiry,
                             "T1": risk.t1, "T2": risk.t2, "SL": risk.sl,
                             "initial_option_ltp": selected.get("ltp"), "last_option_ltp": selected.get("ltp"),
+                            "initial_option_entry_reference_price": selected.get("executable_entry_price", selected.get("ask")),
+                            "initial_option_entry_reference_source": selected.get("executable_entry_price_source", "LIVE_ASK"),
+                            "initial_option_ltp_mid_deviation_pct": selected.get("ltp_mid_deviation_pct"),
                             "last_option_quote_timestamp": selected.get("quote_timestamp"),
                             "last_option_quote_age_seconds": selected.get("quote_age_seconds"),
                             "last_option_bid": selected.get("bid"), "last_option_ask": selected.get("ask"),
@@ -4567,7 +4912,7 @@ class PredictiveScanner:
             return self._finish(report, state)
         except Exception as exc:
             # The scan boundary is fail-closed: an unforeseen provider/schema error must not create a selection.
-            LOG.exception("V93 scan failed safely")
+            LOG.exception("V94 scan failed safely")
             report.update({"market_state": "DATA_OR_SCAN_ERROR", "scenario": "NO_SELECTION", "direction": "NEUTRAL",
                            "signal_ready": False, "selected_option": None, "confidence_pct": 0.0,
                            "vetoes": [f"SCAN_ERROR:{type(exc).__name__}:{str(exc)[:350]}"]})
@@ -4581,7 +4926,7 @@ class PredictiveScanner:
         if report.get("suppress_signal_email") or pin_diag.get("detected"):
             return None
         event_key=str(tracker.get("event_key",""))
-        subject=f"NIFTY V93 {signal.direction}: {selected['strike']:.0f}{selected['side']}"
+        subject=f"NIFTY V94 {signal.direction}: {selected['strike']:.0f}{selected['side']}"
         spot_value=number(report.get("indicators",{}).get("spot")) if isinstance(report.get("indicators"),Mapping) else float("nan")
         spot_text=f"{spot_value:.2f}" if finite(spot_value) else "Unavailable"
         strike_value=number(selected.get("strike")); strike_text=f"{strike_value:.0f}" if finite(strike_value) else "Unavailable"
@@ -4608,7 +4953,7 @@ class PredictiveScanner:
         timestamp = str(event.get("timestamp", ""))
         event_key = str(tracker.get("event_key", ""))
         key = f"EVENT|{event_key}|{event_type}|{timestamp}"
-        subject = f"NIFTY V93 {event_type}: {tracker.get('strike')}{tracker.get('side')}"
+        subject = f"NIFTY V94 {event_type}: {tracker.get('strike')}{tracker.get('side')}"
         body = (f"Time (IST): {timestamp}\nEvent: {event_type}\nDirection: {tracker.get('direction')}\n"
                 f"Strike: {tracker.get('strike')} {tracker.get('side')}\nLevel: {event.get('level')}\n"
                 f"Original T1/T2/SL: {tracker.get('T1')} / {tracker.get('T2')} / {tracker.get('SL')}\n"
@@ -4681,7 +5026,7 @@ class PredictiveScanner:
                 key = str(item.get("notification_key", ""))
                 if not key or key in emailed_set:
                     continue
-                if send_email(self.config, str(item.get("subject", "NIFTY V93 notification")), str(item.get("body", ""))):
+                if send_email(self.config, str(item.get("subject", "NIFTY V94 notification")), str(item.get("body", ""))):
                     emailed.append(key); emailed_set.add(key); sent_now.add(key)
                     if item.get("kind") == "SIGNAL":
                         state["last_email_key"] = str(item.get("event_key", ""))
@@ -4767,7 +5112,7 @@ def print_report(report: Mapping[str, Any]) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="V93 SMC/ICT structure-aware NIFTY options scanner (signal only)")
+    parser = argparse.ArgumentParser(description="V94 fail-closed NIFTY 50 intraday options scanner (signal only)")
     parser.add_argument("--loop", action="store_true", help="run continuously at SCAN_INTERVAL_SECONDS")
     parser.add_argument("--interval", type=int, default=None, help="override the loop interval in seconds")
     args = parser.parse_args(argv)
@@ -4783,14 +5128,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # A long-running loop must not continue polling after the regular NSE cash-market
         # close. Scheduled one-shot workflow invocations are unaffected.
         if args.loop and now_ist().time() >= MARKET_CLOSE:
-            LOG.info("NSE market close reached; stopping V93 loop.")
+            LOG.info("NSE market close reached; stopping V94 loop.")
             return 0
         report = scanner.scan_once()
         print_report(report)
         if not args.loop:
             return 0 if report.get("market_state") != "DATA_OR_SCAN_ERROR" else 1
         if now_ist().time() >= MARKET_CLOSE:
-            LOG.info("NSE market close reached; stopping V93 loop.")
+            LOG.info("NSE market close reached; stopping V94 loop.")
             return 0 if report.get("market_state") != "DATA_OR_SCAN_ERROR" else 1
         # When approaching close, sleep only until close; the next iteration exits before
         # making an unnecessary post-market API request.
