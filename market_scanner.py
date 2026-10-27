@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""NIFTY 50 intraday scanner — V94 fail-closed SMC + current OI + futures confirmation.
+"""NIFTY 50 intraday scanner — B95 balanced SMC + multi-horizon OI context + futures confirmation.
 
-V94 builds on the V93 workflow, but authorizes a candidate only when a completed-candle SMC structure/retest, a current same-session paired-OI confirmation, fresh aligned futures/VWAP confirmation, data-quality checks and the structural risk plan all agree. Same-day-expiry entries are disabled by default. It is signal-only and cannot guarantee prediction or profitability; backtesting/paper trading are required.
+B95 preserves the V94 workflow and state contract while separating opportunity detection from trade authorization. Entry requires a verified SMC event/retest, usable same-session multi-horizon OI context, aligned fresh futures confirmation, aligned quote/candle data, a viable structural risk plan, and an eligible fresh option BBO. A qualified paired OI pattern is strongest; a softer multi-horizon OI context can support only when futures and SMC also align and no material OI conflict exists. Same-day-expiry entries remain disabled by default. Signal-only; historical replay and paper trading are required.
 
 Required environment: UPSTOX_ANALYTICS_TOKEN. NIFTY_FUTURES_INSTRUMENT_KEY is optional: if absent, the scanner discovers the nearest valid NSE NIFTY 50 futures contract through Upstox Instrument Search and caches the key for the session.
 Optional: NIFTY_INSTRUMENT_KEY, NIFTY_FUTURES_INSTRUMENT_KEY, STATE_FILE, AUDIT_DIR,
@@ -37,7 +37,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-VERSION = "V94-PRICE-OI-SMC-FUTURES-HARD-GATES"
+VERSION = "B95-BALANCED-SMC-MULTIHORIZON-OI-FUTURES"
 BASE_URL = "https://api.upstox.com"
 IST = ZoneInfo("Asia/Kolkata")
 NIFTY_KEY_DEFAULT = "NSE_INDEX|Nifty 50"
@@ -45,7 +45,7 @@ MARKET_OPEN = time(9, 15)
 ENTRY_OPEN = time(9, 16)
 ENTRY_CUTOFF = time(15, 15)
 MARKET_CLOSE = time(15, 30)
-LOG = logging.getLogger("market_scanner_v94")
+LOG = logging.getLogger("market_scanner_b95")
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -237,13 +237,13 @@ class Config:
     timeout: float = field(default_factory=lambda: clamp(env_float("REQUEST_TIMEOUT", 12.0), 2.0, 30.0))
     retries: int = field(default_factory=lambda: int(clamp(env_int("API_RETRIES", 3), 1, 5)))
     max_quote_age: float = field(default_factory=lambda: clamp(env_float("MAX_QUOTE_AGE_SECONDS", 30.0), 5.0, 90.0))
-    max_candle_age: float = field(default_factory=lambda: clamp(env_float("MAX_CANDLE_AGE_SECONDS", 180.0), 60.0, 300.0))
+    max_candle_age: float = field(default_factory=lambda: clamp(env_float("MAX_CANDLE_AGE_SECONDS", 120.0), 60.0, 240.0))
     min_signal_score: float = field(default_factory=lambda: clamp(env_float("MIN_SIGNAL_SCORE", 74.0), 70.0, 88.0))
     min_local_oi_change_pct: float = field(default_factory=lambda: max(2.5, clamp(env_float("MIN_LOCAL_OI_CHANGE_PCT", 2.5), 2.5, 10.0)))
     min_t1_rr: float = field(default_factory=lambda: clamp(env_float("MIN_T1_REWARD_RISK_RATIO", 1.25), 1.15, 3.0))
     reentry_cooldown_minutes: int = field(default_factory=lambda: int(clamp(env_int("REENTRY_COOLDOWN_MINUTES", 12), 8, 30)))
     max_spread: float = field(default_factory=lambda: clamp(env_float("MAX_SPREAD_RATIO", 0.0025), 0.0005, 0.01))
-    # V94 defaults to avoiding same-day-expiry options; opt-in requires explicit paper-test validation.
+    # B95 defaults to avoiding same-day-expiry options; opt-in requires explicit paper-test validation.
     allow_0dte: bool = field(default_factory=lambda: env_bool("ALLOW_0DTE", False))
     min_smc_score: float = field(default_factory=lambda: clamp(env_float("MIN_SMC_SCORE", 70.0), 70.0, 95.0))
     max_ltp_mid_deviation_pct: float = field(default_factory=lambda: clamp(env_float("MAX_LTP_MID_DEVIATION_PCT", 1.0), 0.25, 5.0))
@@ -388,7 +388,7 @@ class Indicators:
 
 class AtomicState:
     """Atomic state store backed by one canonical, unversioned market_state file."""
-    SNAPSHOT_SCHEMAS = {80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94}
+    SNAPSHOT_SCHEMAS = {80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95}
 
     def __init__(self, path: Path):
         self.path = path
@@ -459,7 +459,7 @@ class AtomicState:
         schema = int(number(loaded.get("schema_version"), 0))
         prior_date = parse_date(loaded.get("session_date"))
         same_session = prior_date == today
-        current_schema = same_session and schema == 94 and loaded.get("scanner_version") == VERSION
+        current_schema = same_session and schema == 95 and loaded.get("scanner_version") == VERSION
         known_migration = same_session and schema in self.SNAPSHOT_SCHEMAS
         expected_expiry = str(loaded.get("option_expiry", "")) if same_session else ""
         old_snaps = loaded.get("chain_snapshots", []) if isinstance(loaded.get("chain_snapshots"), list) else []
@@ -490,7 +490,7 @@ class AtomicState:
         sent_keys = loaded.get("emailed_notification_keys", []) if same_session and isinstance(loaded.get("emailed_notification_keys", []), list) else []
         sent_events = loaded.get("emailed_event_keys", []) if same_session and isinstance(loaded.get("emailed_event_keys", []), list) else []
         self.data = {
-            "schema_version": 94,
+            "schema_version": 95,
             "scanner_version": VERSION,
             "session_date": today.isoformat(),
             "option_expiry": expected_expiry,
@@ -501,7 +501,7 @@ class AtomicState:
             "emailed_event_keys": [str(x) for x in sent_events if isinstance(x, str)][-200:],
             "emailed_notification_keys": [str(x) for x in sent_keys if isinstance(x, str)][-300:],
             # Do not import queued messages from a prior scanner generation: their stale
-            # bodies/selection assumptions must not be sent by V94.
+            # bodies/selection assumptions must not be sent by B95.
             "pending_email_notifications": loaded.get("pending_email_notifications", [])[-50:]
                 if current_schema and isinstance(loaded.get("pending_email_notifications", []), list) else [],
             "last_scan_timestamp": loaded.get("last_scan_timestamp") if same_session else None,
@@ -516,6 +516,9 @@ class AtomicState:
             "pending_structure_setup": (loaded.get("pending_structure_setup")
                                         if same_session and not corrupt and isinstance(loaded.get("pending_structure_setup"), dict)
                                         else None),
+            "b95_setup_watch": (loaded.get("b95_setup_watch")
+                                 if same_session and not corrupt and isinstance(loaded.get("b95_setup_watch"), dict)
+                                 else None),
             "directional_watch": (loaded.get("directional_watch")
                                   if same_session and not corrupt and isinstance(loaded.get("directional_watch"), dict)
                                   else None),
@@ -1335,6 +1338,302 @@ def analyze_oi(chain: Sequence[dict[str, Any]], snapshots: Sequence[dict[str, An
         "call_resistance_walls": calls_walls[:8], "put_support_walls": puts_walls[:8],
         "source": "SAME_SESSION_OI_AND_PREMIUM_SNAPSHOTS" if tactical_available else "OI_CONCENTRATION_WITHOUT_VALID_TACTICAL_BASELINE",
     }
+
+
+
+def analyze_b95_oi_context(chain: Sequence[dict[str, Any]], snapshots: Sequence[dict[str, Any]], spot: float,
+                           expiry: str, now: datetime, strike_step: float) -> dict[str, Any]:
+    """Build a conservative multi-horizon OI/premium context from same-session snapshots.
+
+    This is a *context* score, not proof of trader intent. The strict paired-OI gate remains
+    independently available. Historical snapshots must match both the current session and expiry.
+    """
+    current = oi_snapshot(chain, expiry, now)
+    current_rows = _snapshot_rows(current)
+    current_date = now.astimezone(IST).date()
+    valid_snaps = []
+    for snap in snapshots or []:
+        if not isinstance(snap, Mapping) or str(snap.get("expiry", "")) != str(expiry):
+            continue
+        stamp = parse_dt(snap.get("timestamp"))
+        if not stamp or stamp.astimezone(IST).date() != current_date:
+            continue
+        age = (now.astimezone(IST) - stamp.astimezone(IST)).total_seconds() / 60.0
+        if age > 0 and math.isfinite(age):
+            valid_snaps.append((age, snap))
+    # nearest snapshot to each horizon, with tolerance wide enough for a 3-minute worker cadence.
+    horizons = [(3.0, 1.25, 5.5, 1.0), (6.0, 3.5, 9.5, 0.70), (12.0, 8.0, 16.0, 0.45)]
+    selected = []
+    used_stamps = set()
+    for target, low, high, weight in horizons:
+        pool = [(age, snap) for age, snap in valid_snaps if low <= age <= high
+                and parse_dt(snap.get("timestamp")).isoformat() not in used_stamps]
+        if not pool:
+            continue
+        age, snap = min(pool, key=lambda item: abs(item[0] - target))
+        stamp = parse_dt(snap.get("timestamp"))
+        used_stamps.add(stamp.isoformat())
+        selected.append((target, age, weight, snap))
+    if not current_rows or not selected or not finite(spot):
+        return {"available": False, "qualified": False, "directional_bias": "UNKNOWN",
+                "reason": "SAME_SESSION_MULTI_HORIZON_OI_BASELINE_UNAVAILABLE",
+                "horizons": [], "bull_score": 0.0, "bear_score": 0.0, "supporting_signals": []}
+    bull_score = 0.0
+    bear_score = 0.0
+    support_bull = 0
+    support_bear = 0
+    signal_records = []
+    horizon_records = []
+    radius = max(250.0, 5.0 * float(strike_step))
+    # OI snapshots store strike -> {call_oi, put_oi, call_ltp, put_ltp, ...}.
+    for target, age, hweight, snap in selected:
+        old_rows = _snapshot_rows(snap)
+        contributions = 0
+        for strike, row in current_rows.items():
+            if abs(float(strike) - spot) > radius:
+                continue
+            old = old_rows.get(strike)
+            if not isinstance(old, Mapping):
+                continue
+            for side, oi_key, ltp_key, vol_key in (
+                ("CE", "call_oi", "call_ltp", "call_volume"),
+                ("PE", "put_oi", "put_ltp", "put_volume"),
+            ):
+                oi_now, oi_old = number(row.get(oi_key)), number(old.get(oi_key))
+                prem_now, prem_old = number(row.get(ltp_key)), number(old.get(ltp_key))
+                if not all(finite(x) for x in (oi_now, oi_old, prem_now, prem_old)) or oi_old <= 0 or prem_old < 5 or prem_now <= 0:
+                    continue
+                oi_delta = oi_now - oi_old
+                prem_delta = prem_now - prem_old
+                oi_pct = 100.0 * oi_delta / oi_old
+                prem_pct = 100.0 * prem_delta / prem_old
+                # Ignore changes too small to be robust against noisy/rounded snapshots.
+                if abs(oi_delta) < 65 or abs(oi_pct) < 0.05 or abs(prem_pct) < 0.15:
+                    continue
+                if oi_pct >= 0.10 and prem_pct >= 0.20:
+                    flow = "LONG_BUILDUP_BUYING"
+                elif oi_pct >= 0.10 and prem_pct <= -0.20:
+                    flow = "SHORT_BUILDUP_WRITING"
+                elif oi_pct <= -0.10 and prem_pct >= 0.20:
+                    flow = "SHORT_COVERING"
+                elif oi_pct <= -0.10 and prem_pct <= -0.20:
+                    flow = "LONG_UNWINDING"
+                else:
+                    flow = "MIXED_LOW_MAGNITUDE"
+                if side == "CE":
+                    direction = "BULLISH" if flow in {"LONG_BUILDUP_BUYING", "SHORT_COVERING"} else "BEARISH" if flow in {"SHORT_BUILDUP_WRITING", "LONG_UNWINDING"} else "NEUTRAL"
+                else:
+                    direction = "BEARISH" if flow in {"LONG_BUILDUP_BUYING", "SHORT_COVERING"} else "BULLISH" if flow in {"SHORT_BUILDUP_WRITING", "LONG_UNWINDING"} else "NEUTRAL"
+                if direction == "NEUTRAL":
+                    continue
+                proximity = clamp(1.0 - abs(float(strike) - spot) / radius, 0.25, 1.0)
+                oi_intensity = clamp(abs(oi_pct) / 0.50, 0.10, 1.5)
+                premium_intensity = clamp(abs(prem_pct) / 1.0, 0.10, 1.5)
+                strength = hweight * proximity * (0.55 * oi_intensity + 0.45 * premium_intensity)
+                if direction == "BULLISH":
+                    bull_score += strength
+                    support_bull += 1
+                else:
+                    bear_score += strength
+                    support_bear += 1
+                contributions += 1
+                signal_records.append({"horizon_minutes": target, "actual_snapshot_age_minutes": round(age, 2),
+                    "strike": float(strike), "side": side, "direction": direction, "flow_proxy": flow,
+                    "oi_change_contracts": round(oi_delta, 2), "oi_change_pct": round(oi_pct, 4),
+                    "premium_change_pct": round(prem_pct, 4), "contribution": round(strength, 4),
+                    "interpretation": "PRICE_OI_PREMIUM_PROXY_NOT_IDENTIFIED_TRADER_INTENT"})
+        horizon_records.append({"target_minutes": target, "snapshot_age_minutes": round(age, 2),
+                               "weight": hweight, "contracts_contributing": contributions,
+                               "snapshot_timestamp": snap.get("timestamp")})
+    # Normalize each horizon before aggregating. Without this, dozens of adjacent strikes and
+    # three overlapping windows can produce enormous unbounded scores. Use the top four distinct
+    # strike/side observations per horizon, then cap each horizon at its weight.
+    raw_bull_score, raw_bear_score = bull_score, bear_score
+    support_bull = len({(x["strike"], x["side"]) for x in signal_records if x["direction"] == "BULLISH"})
+    support_bear = len({(x["strike"], x["side"]) for x in signal_records if x["direction"] == "BEARISH"})
+    norm_bull = 0.0
+    norm_bear = 0.0
+    for horizon in horizon_records:
+        target = horizon["target_minutes"]
+        weight = horizon["weight"]
+        for direction, key in (("BULLISH", "bull"), ("BEARISH", "bear")):
+            contributions = sorted((x["contribution"] for x in signal_records
+                                    if x["horizon_minutes"] == target and x["direction"] == direction), reverse=True)
+            # Dedup is already at strike/side in each horizon; cap contribution per horizon.
+            score_value = min(1.0, sum(contributions[:4]) / 2.5)
+            if direction == "BULLISH": norm_bull += weight * score_value
+            else: norm_bear += weight * score_value
+    bull_score, bear_score = norm_bull, norm_bear
+    total = bull_score + bear_score
+    if total <= 0:
+        bias = "NEUTRAL"
+        qualified = False
+        reason = "NO_MATERIAL_MULTI_HORIZON_OI_PREMIUM_CHANGES"
+    elif bull_score >= 0.65 and bull_score >= bear_score * 1.30 and support_bull >= 2:
+        bias = "BULLISH"
+        qualified = True
+        reason = "MULTI_HORIZON_OI_PREMIUM_CONTEXT_BULLISH"
+    elif bear_score >= 0.65 and bear_score >= bull_score * 1.30 and support_bear >= 2:
+        bias = "BEARISH"
+        qualified = True
+        reason = "MULTI_HORIZON_OI_PREMIUM_CONTEXT_BEARISH"
+    elif min(bull_score, bear_score) >= 0.45 and max(bull_score, bear_score) < 1.30 * min(bull_score, bear_score):
+        bias = "CONFLICTED"
+        qualified = False
+        reason = "MULTI_HORIZON_OI_FLOW_CONFLICT"
+    else:
+        bias = "NEUTRAL"
+        qualified = False
+        reason = "OI_CONTEXT_WEAK_OR_NOT_DIRECTIONALLY_SEPARATED"
+    signal_records.sort(key=lambda x: (x["horizon_minutes"], -x["contribution"]))
+    return {"available": True, "qualified": qualified, "directional_bias": bias, "reason": reason,
+            "bull_score": round(bull_score, 4), "bear_score": round(bear_score, 4),
+            "raw_bull_score_unbounded": round(raw_bull_score, 4), "raw_bear_score_unbounded": round(raw_bear_score, 4),
+            "supporting_bullish_observations": support_bull, "supporting_bearish_observations": support_bear,
+            "horizons": horizon_records, "supporting_signals": signal_records[:60],
+            "radius_points": radius,
+            "thresholds": {"min_abs_oi_change_contracts": 65, "min_oi_pct": 0.05,
+                           "min_premium_pct": 0.15, "directional_separation_ratio": 1.30},
+            "methodology": "Same-expiry same-session 3/6/12m OI+premium changes; weighted descriptive context, not standalone prediction."}
+
+
+def _b95_zone_touch(frame: pd.DataFrame, zone: Mapping[str, Any], now: datetime, max_bars: int = 5) -> dict[str, Any]:
+    low, high = number(zone.get("lower")), number(zone.get("upper"))
+    bars = completed_candles(frame, now.astimezone(IST)) if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    if not finite(low) or not finite(high) or high < low or bars.empty:
+        return {"touched": False, "bars_checked": 0, "reason": "VALID_ZONE_OR_COMPLETED_BARS_UNAVAILABLE"}
+    tail = bars.tail(max(1, int(max_bars)))
+    hits = tail.loc[(tail["low"] <= high) & (tail["high"] >= low)]
+    if hits.empty:
+        return {"touched": False, "bars_checked": int(len(tail)), "reason": "NO_COMPLETED_CANDLE_TOUCHED_ZONE"}
+    last_hit = hits.iloc[-1]
+    ts = parse_dt(last_hit["timestamp"])
+    return {"touched": True, "bars_checked": int(len(tail)),
+            "touch_timestamp": ts.isoformat() if ts else None,
+            "touch_low": number(last_hit["low"]), "touch_high": number(last_hit["high"]),
+            "reason": "COMPLETED_CANDLE_TOUCHED_ZONE"}
+
+
+def update_b95_setup_watch(state: dict[str, Any], smc: Mapping[str, Any], now: datetime,
+                           spot: float, atr: float, ttl_minutes: float = 9.0) -> dict[str, Any]:
+    """Remember a qualified SMC zone across 3-minute scans; watch state never authorizes a trade."""
+    direction = str(smc.get("direction", "NEUTRAL")).upper()
+    zone = smc.get("entry_zone") if isinstance(smc.get("entry_zone"), Mapping) else {}
+    low, high = number(zone.get("lower")), number(zone.get("upper"))
+    structure_ts = None
+    structure = smc.get("mss") or smc.get("bos")
+    if isinstance(structure, Mapping):
+        structure_ts = structure.get("timestamp")
+    existing = state.get("b95_setup_watch") if isinstance(state.get("b95_setup_watch"), Mapping) else None
+    stamp = parse_dt(existing.get("first_seen")) if existing else None
+    old_same = bool(existing and str(existing.get("direction", "")).upper() == direction
+                    and finite(existing.get("zone_lower")) and finite(existing.get("zone_upper"))
+                    and finite(low) and finite(high)
+                    and abs(number(existing.get("zone_lower")) - low) <= max(0.25 * max(atr, 1.0), 5.0)
+                    and abs(number(existing.get("zone_upper")) - high) <= max(0.25 * max(atr, 1.0), 5.0)
+                    and stamp and (now.astimezone(IST) - stamp.astimezone(IST)).total_seconds() <= ttl_minutes * 60)
+    if direction not in {"BULLISH", "BEARISH"} or not smc.get("available") or not smc.get("qualified") or not finite(low) or not finite(high):
+        if existing:
+            created = parse_dt(existing.get("first_seen"))
+            if not created or (now.astimezone(IST) - created.astimezone(IST)).total_seconds() > ttl_minutes * 60:
+                state.pop("b95_setup_watch", None)
+                return {"status": "EXPIRED", "reason": "NO_VALID_CURRENT_SMC_SETUP_OR_TTL_EXPIRED"}
+            return {"status": "RETAINED", "direction": existing.get("direction"), "first_seen": existing.get("first_seen"),
+                    "zone": {"lower": existing.get("zone_lower"), "upper": existing.get("zone_upper")},
+                    "reason": "PERSISTENT_SMC_WATCH_ONLY_NO_ENTRY_AUTHORIZATION"}
+        return {"status": "NONE", "reason": str(smc.get("reason", "NO_SMC_SETUP"))}
+    first_seen = existing.get("first_seen") if old_same else now.isoformat()
+    watch = {"direction": direction, "model": smc.get("model"), "score": number(smc.get("score"), 0.0),
+             "first_seen": first_seen, "last_seen": now.isoformat(), "structure_timestamp": structure_ts,
+             "zone_lower": low, "zone_upper": high, "invalidation_level": number(smc.get("invalidation_level")),
+             "context": safe_json(dict(smc)),
+             "expiry_date": now.astimezone(IST).date().isoformat(), "ttl_minutes": ttl_minutes,
+             "status": "WATCHING_FOR_CONFIRMATION", "source_version": VERSION}
+    state["b95_setup_watch"] = watch
+    return {"status": "UPDATED" if old_same else "CREATED", "direction": direction, "first_seen": first_seen,
+            "zone": {"lower": low, "upper": high}, "reason": "SMC_WATCH_IS_NOT_ENTRY_AUTHORIZATION"}
+
+
+
+def reactivate_b95_smc_watch(current_smc: Mapping[str, Any], watch: Mapping[str, Any], frame: pd.DataFrame,
+                             now: datetime, spot: float, atr: float, max_age_minutes: float = 6.0) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Reuse a recently qualified SMC setup when the 3-minute poll missed its touch scan.
+
+    The stored pattern remains a hypothesis: a new completed candle must have touched the zone,
+    price must remain close, no fresh opposite setup may exist, and all other gates still run.
+    """
+    fresh = dict(current_smc) if isinstance(current_smc, Mapping) else {}
+    existing = dict(watch) if isinstance(watch, Mapping) else {}
+    created = parse_dt(existing.get("first_seen"))
+    direction = str(existing.get("direction", "NEUTRAL")).upper()
+    age_minutes = (now.astimezone(IST) - created.astimezone(IST)).total_seconds() / 60.0 if created else float("inf")
+    context = existing.get("context") if isinstance(existing.get("context"), Mapping) else {}
+    fresh_dir = str(fresh.get("direction", "NEUTRAL")).upper()
+    if not created or age_minutes < 0 or age_minutes > max_age_minutes:
+        return fresh, {"status": "NOT_REACTIVATED", "reason": "WATCH_MISSING_OR_EXPIRED", "age_minutes": round(age_minutes, 2) if finite(age_minutes) else None}
+    if direction not in {"BULLISH", "BEARISH"} or not context.get("qualified") or not context.get("entry_ready"):
+        return fresh, {"status": "NOT_REACTIVATED", "reason": "WATCH_CONTEXT_NOT_ENTRY_READY"}
+    if fresh.get("qualified") and fresh.get("entry_ready") and fresh_dir in {"BULLISH", "BEARISH"} and fresh_dir != direction:
+        return fresh, {"status": "NOT_REACTIVATED", "reason": "FRESH_OPPOSITE_SMC_SETUP_WINS"}
+    zone = {"lower": number(existing.get("zone_lower")), "upper": number(existing.get("zone_upper"))}
+    touch = _b95_zone_touch(frame, zone, now, max_bars=5)
+    if not touch.get("touched"):
+        return fresh, {"status": "NOT_REACTIVATED", "reason": "NO_RECENT_COMPLETED_CANDLE_RETEST", "age_minutes": round(age_minutes, 2)}
+    low, high = number(zone.get("lower")), number(zone.get("upper"))
+    invalidation = number(existing.get("invalidation_level"))
+    invalidation_buffer = max(0.15 * number(atr, 0.0), 3.0)
+    invalidated = bool(finite(invalidation) and (
+        (direction == "BULLISH" and spot < invalidation - invalidation_buffer) or
+        (direction == "BEARISH" and spot > invalidation + invalidation_buffer)))
+    if invalidated:
+        return fresh, {"status": "NOT_REACTIVATED", "reason": "PERSISTED_SMC_INVALIDATION_BREACHED",
+                       "invalidation_level": invalidation, "spot": spot}
+    distance = 0.0 if low <= spot <= high else low - spot if spot < low else spot - high
+    max_distance = max(1.25 * number(atr, 0.0), 10.0)
+    if not finite(distance) or distance > max_distance:
+        return fresh, {"status": "NOT_REACTIVATED", "reason": "PRICE_TOO_EXTENDED_FROM_PERSISTED_ZONE",
+                       "distance_points": round(distance, 2) if finite(distance) else None,
+                       "max_distance_points": round(max_distance, 2)}
+    restored = dict(context)
+    restored.update({"reactivated_from_persistent_watch": True, "watch_age_minutes": round(age_minutes, 2),
+                     "watch_retest_diagnostic": touch, "watch_retest_price_distance_points": round(distance, 2),
+                     "entry_ready": True, "reason": "RECENT_SMC_RETEST_REACTIVATED_AFTER_POLL_GAP"})
+    return restored, {"status": "REACTIVATED", "reason": "RECENT_RETEST_AND_PRICE_DISTANCE_REVALIDATED",
+                      "age_minutes": round(age_minutes, 2), "distance_points": round(distance, 2), "zone_touch": touch}
+
+def b95_opportunity_diagnostic(signal: Signal, smc: Mapping[str, Any], oi_ctx: Mapping[str, Any],
+                               futures: Mapping[str, Any], authorization: Mapping[str, Any],
+                               risk: Mapping[str, Any], setup_gate: Mapping[str, Any],
+                               watch_update: Mapping[str, Any]) -> dict[str, Any]:
+    """Explain an opportunity even when no contract is authorized or selected."""
+    direction = str(signal.direction).upper()
+    smc_dir = str(smc.get("direction", "NEUTRAL")).upper()
+    out = {"candidate_direction": direction if direction in {"BULLISH", "BEARISH"} else smc_dir,
+           "smc_model": smc.get("model"), "smc_score": smc.get("score"),
+           "oi_context_direction": oi_ctx.get("directional_bias"), "oi_context_reason": oi_ctx.get("reason"),
+           "strict_paired_oi_qualified": None, "futures_direction": futures.get("direction"),
+           "futures_reason": futures.get("reason"), "authorization_route": authorization.get("confirmation_route"),
+           "authorization_failures": authorization.get("failures", []),
+           "risk_failures": risk.get("failures", []), "setup_failures": setup_gate.get("reason"),
+           "watch": watch_update.get("status")}
+    if not smc.get("available") or not smc.get("qualified"):
+        status = "NO_QUALIFIED_SMC_SETUP" if not (smc.get("liquidity_sweep") or smc.get("mss") or smc.get("bos")) else "SMC_STRUCTURE_DEVELOPING_WAIT"
+    elif not smc.get("entry_ready"):
+        status = "SMC_SETUP_WATCHING_FOR_RETEST"
+    elif not risk.get("qualified"):
+        # Risk viability is an independent mandatory gate. Show it prominently even when OI or
+        # futures would also have prevented authorization; the details field retains every blocker.
+        status = "SETUP_DETECTED_BLOCKED_BY_RISK"
+    elif not authorization.get("qualified"):
+        failures = authorization.get("failures", [])
+        if any("OI" in str(x) for x in failures): status = "SETUP_DETECTED_WAITING_FOR_OI_CONFIRMATION"
+        elif any("FUTURES" in str(x) for x in failures): status = "SETUP_DETECTED_WAITING_FOR_FUTURES_CONFIRMATION"
+        elif any("RETEST" in str(x) or "EXTENDED" in str(x) for x in failures): status = "SETUP_DETECTED_RETEST_MISSED_OR_TOO_EXTENDED"
+        else: status = "SETUP_DETECTED_AUTHORIZATION_BLOCKED"
+    else:
+        status = "SETUP_AUTHORIZED_AWAITING_OPTION_QUALITY_CHECK"
+    out["status"] = status
+    return safe_json(out)
 
 
 def make_structure_levels(frame: pd.DataFrame, indicators: Indicators, oi: Mapping[str, Any], step: float,
@@ -3479,22 +3778,34 @@ def qualify_setup_rules(signal: Signal, frame: pd.DataFrame, indicators: Indicat
         zone = smc.get("entry_zone") if isinstance(smc.get("entry_zone"), Mapping) else {}
         zone_low, zone_high = number(zone.get("lower")), number(zone.get("upper"))
         zone_mid = number(zone.get("midpoint"))
+        touch_diag = _b95_zone_touch(frame, zone, now, max_bars=5)
+        valid_zone = bool(finite(zone_low) and finite(zone_high) and zone_high >= zone_low)
+        in_zone = bool(valid_zone and zone_low <= indicators.spot <= zone_high)
+        distance_to_zone = (0.0 if in_zone else zone_low - indicators.spot if valid_zone and indicators.spot < zone_low
+                            else indicators.spot - zone_high if valid_zone else float("inf"))
+        # Balanced rule: a recent completed retest remains eligible within a volatility-scaled
+        # extension window; current price still needs follow-through and full risk authorization.
+        max_retest_extension = max(1.25 * indicators.atr, 10.0)
+        recent_retest = bool(touch_diag.get("touched") and finite(distance_to_zone)
+                             and distance_to_zone <= max_retest_extension)
+        price_in_zone = bool(in_zone or (recent_retest and finite(distance_to_zone)))
+        not_chasing = bool(finite(distance_to_zone) and distance_to_zone <= max_retest_extension
+                           and (in_zone or touch_diag.get("touched")))
         aligned_confirmation = bool(oi_gate.get("qualified") or (futures.get("qualified") and futures.get("direction") == direction))
         structure_ok = bool(smc.get("qualified") and smc.get("entry_ready") and str(smc.get("direction", "")).upper() == direction)
-        price_in_zone = bool(finite(zone_low) and finite(zone_high) and zone_low <= indicators.spot <= zone_high
-                             or finite(zone_mid) and abs(indicators.spot - zone_mid) <= max(0.60 * indicators.atr, 6.0))
-        not_chasing = bool(finite(zone_mid) and abs(indicators.spot - zone_mid) <= max(0.85 * indicators.atr, 12.0))
         no_opposing_divergence = not opposing
-        momentum_not_hostile = (indicators.momentum_1m >= -0.00025 and indicators.momentum_3m >= -0.00060) if direction == "BULLISH" else (indicators.momentum_1m <= 0.00025 and indicators.momentum_3m <= 0.00060)
+        momentum_not_hostile = (indicators.momentum_1m >= -0.00035 and indicators.momentum_3m >= -0.00080) if direction == "BULLISH" else (indicators.momentum_1m <= 0.00035 and indicators.momentum_3m <= 0.00080)
         checks = {"confirmed_smc_sweep_mss_or_bos": structure_ok,
-                  "fresh_fvg_or_order_block_retest": bool(smc.get("entry_ready") and zone),
+                  "fresh_fvg_or_order_block_retest": bool(structure_ok and valid_zone and (in_zone or touch_diag.get("touched"))),
                   "same_direction_paired_oi_or_futures_vwap": aligned_confirmation,
-                  "spot_near_entry_array": price_in_zone,
+                  "spot_at_or_near_recently_retested_entry_array": price_in_zone,
                   "not_chasing_away_from_entry_array": not_chasing,
                   "no_confirmed_opposing_divergence": no_opposing_divergence,
                   "short_horizon_momentum_not_hostile": momentum_not_hostile}
-        return {**out, "qualified": all(checks.values()), "reason": "SMC_RETEST_EXECUTION_RULES_PASSED" if all(checks.values()) else "SMC_RETEST_EXECUTION_RULES_FAILED",
+        return {**out, "qualified": all(checks.values()), "reason": "B95_SMC_RETEST_EXECUTION_RULES_PASSED" if all(checks.values()) else "B95_SMC_RETEST_EXECUTION_RULES_FAILED",
                 "checks": checks, "smc_model": smc.get("model"), "entry_zone": safe_json(zone),
+                "zone_touch_diagnostic": touch_diag, "distance_to_zone_points": round(distance_to_zone, 2) if finite(distance_to_zone) else None,
+                "max_retest_extension_points": round(max_retest_extension, 2),
                 "alternate_flow_confirmation": aligned_confirmation, "futures_confirmation_used": bool(not oi_gate.get("qualified") and aligned_confirmation)}
     if setup in {"SUPPORT_BOUNCE", "SUPPORT_CLUSTER_RECLAIM", "EARLY_SUPPORT_RECLAIM"} and direction=="BULLISH":
         checks={"confirmed_bullish_rsi_divergence":bool(fib_gate.get("matching_divergence")),
@@ -3800,7 +4111,9 @@ def quote_execution_diagnostics(quote: Optional[Quote], max_age_seconds: float,
 def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote], spot: float, direction: str,
                     oi: Mapping[str, Any], config: Config, target_delta: float = 0.62,
                     authorized_oi_pair: Optional[Mapping[str, Any]] = None,
-                    allow_non_oi_confirmation: bool = False) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
+                    allow_non_oi_confirmation: bool = False,
+                    b95_oi_context: Optional[Mapping[str, Any]] = None,
+                    confirmation_route: Optional[str] = None) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
     """Rank eligible options using the exact authorized paired-flow mode plus safety checks.
 
     Flow receives 55% of the score and is the primary sort key. Writer-led and buyer-led modes
@@ -3814,7 +4127,12 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
     walls = [w for w in oi.get("walls", []) if isinstance(w, Mapping) and finite(w.get("strike"))]
     bullish = str(direction).upper() == "BULLISH"
     auth = authorized_oi_pair if isinstance(authorized_oi_pair, Mapping) and authorized_oi_pair.get("qualified") else {}
-    flow_mode = str(auth.get("flow_mode", "WRITER_COVERING")).upper()
+    b95_context = b95_oi_context if isinstance(b95_oi_context, Mapping) else {}
+    route_hint = str(confirmation_route or "").upper()
+    context_bias = str(b95_context.get("directional_bias", "UNKNOWN")).upper()
+    context_ok = bool(b95_context.get("available") and not (context_bias == "CONFLICTED" or context_bias in {"BULLISH", "BEARISH"} and context_bias != str(direction).upper())
+                      and (context_bias == str(direction).upper() and b95_context.get("qualified") or route_hint == "STRONG_SMC_FUTURES_WITH_NONCONTRARY_OI" and context_bias == "NEUTRAL"))
+    flow_mode = str(auth.get("flow_mode", "B95_MULTIHORIZON_OI_CONTEXT" if context_ok else "WRITER_COVERING")).upper()
     buyer_mode = flow_mode == "BUYER_LED_MOMENTUM"
     if buyer_mode:
         primary_side, secondary_side = (("call", "put") if bullish else ("put", "call"))
@@ -3957,7 +4275,7 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
                 flow_pairs.append((flow_score, primary, secondary))
             else:
                 reasons.append("AUTHORIZED_OI_PAIR_FAILED_CONTRACT_STAGE_LOCALITY_OR_MEMORY_RECHECK")
-        elif not auth:
+        elif not auth and not allow_non_oi_confirmation:
             # Compatibility fallback for direct callers that don't pass an authorized pair.
             # The main scanner passes a qualified local pair and therefore uses the branch above.
             primary_legs: list[dict[str, Any]] = []
@@ -3990,8 +4308,12 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
                                           + number(item[2].get("distance_to_contract"), 1e9),
                                           -number(item[1].get("oi_change_pct"), 0.0)))
         supportive_flow_confirmed = bool(flow_pairs) and (authorized_pair_present or not auth)
-        if allow_non_oi_confirmation and not auth:
-            supportive_flow_confirmed = True  # Separate futures/VWAP gate must already have passed.
+        if allow_non_oi_confirmation and not auth and context_ok and route_hint in {
+            "MULTI_HORIZON_OI_PLUS_FUTURES", "STRONG_SMC_FUTURES_WITH_NONCONTRARY_OI"
+        }:
+            # This is not a futures-only route: authorization already required an available,
+            # non-conflicting OI baseline and aligned futures. The contract rank retains that context.
+            supportive_flow_confirmed = True
         if flow_pairs:
             flow_score, chosen_primary, chosen_secondary = flow_pairs[0]
             primary_flow = str(chosen_primary.get("flow"))
@@ -4002,30 +4324,47 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
             flow_distance = round(number(chosen_primary.get("distance_to_contract"), 0.0)
                                   + number(chosen_secondary.get("distance_to_contract"), 0.0), 2)
         else:
-            flow_score = 0.0
-            primary_flow = secondary_flow = "UNKNOWN"
-            primary_change = primary_premium_change = float("nan")
-            flow_reference_strikes = []
-            flow_distance = None
-            if allow_non_oi_confirmation and not auth:
-                # OI is genuinely absent on this explicit futures/VWAP route. Do not label the
-                # contract executable as vetoed by a missing OI pair, and do not fabricate an OI score.
-                warnings.append("OI_FLOW_UNAVAILABLE_FUTURES_CONFIRMATION_ROUTE")
+            if context_ok:
+                relevant_score = number(b95_context.get("bull_score" if bullish else "bear_score"), 0.0)
+                flow_score = clamp(relevant_score / 2.0, 0.0, 1.0)
+                primary_flow = "MULTI_HORIZON_OI_PREMIUM_CONTEXT"
+                secondary_flow = str(b95_context.get("reason", "B95_OI_CONTEXT"))
+                primary_change = float("nan")
+                primary_premium_change = float("nan")
+                supporting = [x for x in b95_context.get("supporting_signals", [])
+                              if isinstance(x, Mapping) and str(x.get("direction", "")).upper() == str(direction).upper()]
+                flow_reference_strikes = sorted({number(x.get("strike")) for x in supporting[:8] if finite(x.get("strike"))})
+                flow_distance = round(sum(abs(number(x) - spot) for x in flow_reference_strikes[:2]), 2) if flow_reference_strikes else None
+                warnings.append("B95_MULTI_HORIZON_OI_CONTEXT_USED;NOT_A_PAIRED_OI_CLAIM")
             else:
-                reasons.append("NO_NEARBY_PAIRED_SUPPORTIVE_LOCAL_OI_FLOW")
+                flow_score = 0.0
+                primary_flow = secondary_flow = "UNKNOWN"
+                primary_change = primary_premium_change = float("nan")
+                flow_reference_strikes = []
+                flow_distance = None
+                if allow_non_oi_confirmation and not auth:
+                    warnings.append("B95_NON_PAIRED_OI_ROUTE_HAS_NO_DIRECTIONAL_FLOW_SCORE")
+                else:
+                    reasons.append("NO_NEARBY_PAIRED_SUPPORTIVE_LOCAL_OI_FLOW")
 
         volume_score = clamp(volume / vol_max, 0.0, 1.0) if vol_max > 0 else 0.0
         spread_score = clamp(1.0 - spread / config.max_spread, 0.0, 1.0) if finite(spread) else 0.0
         depth = q.depth_imbalance if q else 0.0
         liquidity_score = 0.60 * spread_score + 0.25 * volume_score + 0.15 * clamp((depth + 1.0) / 2.0, 0.0, 1.0)
         moneyness_score = clamp(1.0 - abs(spot - c.strike) / (3.0 * step), 0.0, 1.0)
-        futures_only_route = bool(allow_non_oi_confirmation and not auth)
-        if futures_only_route:
-            # Route-specific contract quality score: freshness/BBO are hard gates, while delta,
-            # liquidity and moneyness rank contracts when no local OI flow is being claimed.
+        b95_soft_route = bool(allow_non_oi_confirmation and not auth and context_ok and route_hint in {
+            "MULTI_HORIZON_OI_PLUS_FUTURES", "STRONG_SMC_FUTURES_WITH_NONCONTRARY_OI"
+        })
+        futures_only_route = bool(allow_non_oi_confirmation and not auth and not b95_soft_route)
+        if b95_soft_route:
+            total = 100.0 * (0.30 * flow_score + 0.25 * delta_score + 0.35 * liquidity_score + 0.10 * moneyness_score)
+            score_weights = {"multi_horizon_oi_context": 0.30, "delta": 0.25, "liquidity": 0.35,
+                             "moneyness": 0.10, "route": route_hint}
+        elif futures_only_route:
+            # Compatibility behaviour only; B95's main authorization does not permit this route.
             total = 100.0 * (0.40 * delta_score + 0.45 * liquidity_score + 0.15 * moneyness_score)
             score_weights = {"delta": 0.40, "liquidity": 0.45, "moneyness": 0.15,
-                             "paired_oi_flow": 0.0, "route": "FUTURES_VWAP_ONLY"}
+                             "paired_oi_flow": 0.0, "route": "FUTURES_VWAP_ONLY_LEGACY"}
         else:
             total = 100.0 * (0.55 * flow_score + 0.15 * delta_score + 0.20 * liquidity_score + 0.10 * moneyness_score)
             score_weights = {"supportive_local_oi_flow": 0.55, "delta": 0.15, "liquidity": 0.20,
@@ -4063,8 +4402,10 @@ def score_contracts(candidates: Sequence[Contract], quotes: Mapping[str, Quote],
             "liquidity_score_pct": round(liquidity_score * 100.0, 2), "score": round(total, 2),
             "execution_eligible": bool(hard_ok),
             "score_weights": score_weights,
-            "confirmation_route": "FUTURES_VWAP_ONLY" if futures_only_route else "PAIRED_OI",
+            "confirmation_route": route_hint if b95_soft_route else "FUTURES_VWAP_ONLY_LEGACY" if futures_only_route else "STRICT_PAIRED_OI",
             "authorized_oi_pair_enforced": bool(authorized_pair_present),
+            "b95_oi_context_used": bool(b95_soft_route),
+            "b95_oi_context_bias": context_bias if b95_soft_route else None,
             "warnings": warnings, "vetoes": reasons})
     eligible = [r for r in rows if r["execution_eligible"]]
     eligible.sort(key=lambda x: (-number(x.get("flow_score_pct"), 0.0), -number(x.get("score"), 0.0),
@@ -4184,6 +4525,127 @@ def evaluate_v94_market_authorization(signal: Signal, smc_context: Mapping[str, 
             "policy": "REQUIRE_SMC_RETEST_AND_CURRENT_PAIRED_OI_AND_ALIGNED_FUTURES_AND_VALID_RISK; FAIL_CLOSED"}
 
 
+
+def evaluate_b95_market_authorization(signal: Signal, smc_context: Mapping[str, Any],
+                                      strict_oi: Mapping[str, Any], oi_context: Mapping[str, Any],
+                                      futures_confirmation: Mapping[str, Any], regime: Mapping[str, Any],
+                                      spot: float, atr: float, option_expiry: str, now: datetime,
+                                      allow_0dte: bool = False, min_smc_score: float = 70.0,
+                                      quote_candle_alignment: Optional[Mapping[str, Any]] = None,
+                                      frame: Optional[pd.DataFrame] = None) -> dict[str, Any]:
+    """Balanced fail-closed authorization: strict pair OR multi-horizon OI context + futures.
+
+    A strong SMC retest with aligned futures may use valid but directionally neutral OI as context;
+    unavailable OI baselines or conflicting OI never qualify. No remembered OI pair authorizes an
+    entry. Structural risk is validated separately and is always mandatory.
+    """
+    direction = str(signal.direction).upper()
+    setup = str(signal.setup).upper()
+    smc = smc_context if isinstance(smc_context, Mapping) else {}
+    strict = strict_oi if isinstance(strict_oi, Mapping) else {}
+    oi = oi_context if isinstance(oi_context, Mapping) else {}
+    fut = futures_confirmation if isinstance(futures_confirmation, Mapping) else {}
+    rg = regime if isinstance(regime, Mapping) else {}
+    failures: list[str] = []
+    details: dict[str, Any] = {"policy_version": VERSION, "direction": direction, "setup": setup,
+        "smc_model": smc.get("model"), "smc_score": smc.get("score"),
+        "strict_oi_qualified": bool(strict.get("qualified")), "strict_oi_reason": strict.get("reason"),
+        "multi_horizon_oi_available": bool(oi.get("available")), "multi_horizon_oi_bias": oi.get("directional_bias"),
+        "multi_horizon_oi_reason": oi.get("reason"), "futures_direction": fut.get("direction"),
+        "futures_qualified": bool(fut.get("qualified")), "regime": rg.get("regime"),
+        "session_bias": rg.get("session_bias"), "option_expiry": str(option_expiry),
+        "allow_0dte": bool(allow_0dte)}
+    if direction not in {"BULLISH", "BEARISH"}:
+        failures.append("NO_DIRECTIONAL_PRICE_CANDIDATE")
+    expected_setup = "SMC_BULLISH_FVG_RETEST" if direction == "BULLISH" else "SMC_BEARISH_FVG_RETEST"
+    if setup != expected_setup:
+        failures.append("B95_REQUIRES_EXPLICIT_DIRECTIONAL_SMC_RETEST_SETUP")
+    smc_direction = str(smc.get("direction", "NEUTRAL")).upper()
+    score = number(smc.get("score"), -1.0)
+    model = str(smc.get("model", "")).upper()
+    if not smc.get("available") or not smc.get("qualified") or not smc.get("entry_ready"):
+        failures.append("SMC_STRUCTURE_OR_RETEST_NOT_QUALIFIED")
+    if smc_direction != direction:
+        failures.append("SMC_DIRECTION_CONFLICTS_WITH_SIGNAL")
+    if not finite(score) or score < min_smc_score:
+        failures.append("SMC_SCORE_BELOW_MINIMUM")
+    if not any(token in model for token in ("MSS", "BOS")):
+        failures.append("SMC_MODEL_HAS_NO_CONFIRMED_MSS_OR_BOS")
+
+    zone = smc.get("entry_zone") if isinstance(smc.get("entry_zone"), Mapping) else {}
+    zlow, zhigh = number(zone.get("lower")), number(zone.get("upper"))
+    if not (finite(zlow) and finite(zhigh) and zhigh >= zlow and finite(spot) and finite(atr) and atr > 0):
+        failures.append("SMC_ENTRY_ZONE_SPOT_OR_ATR_UNAVAILABLE")
+        distance = float("inf")
+        touch = {"touched": False, "reason": "ZONE_OR_MARKET_DATA_UNAVAILABLE"}
+    else:
+        distance = 0.0 if zlow <= spot <= zhigh else zlow - spot if spot < zlow else spot - zhigh
+        touch = _b95_zone_touch(frame if isinstance(frame, pd.DataFrame) else pd.DataFrame(), zone, now, max_bars=5)
+        max_dist = max(1.25 * atr, 10.0)
+        if distance > max_dist or (not touch.get("touched") and not (zlow <= spot <= zhigh)):
+            failures.append("SMC_RETEST_NOT_RECENT_OR_PRICE_TOO_EXTENDED")
+    details["zone_distance_points"] = round(distance, 2) if finite(distance) else None
+    details["zone_touch_diagnostic"] = touch
+
+    exp_date = parse_date(option_expiry)
+    local_now = now.astimezone(IST)
+    if exp_date and exp_date < local_now.date():
+        failures.append("OPTION_CONTRACT_EXPIRED")
+    if exp_date and exp_date == local_now.date() and not allow_0dte:
+        failures.append("SAME_DAY_EXPIRY_DISABLED_BY_DEFAULT")
+
+    qca = quote_candle_alignment if isinstance(quote_candle_alignment, Mapping) else {}
+    if not qca.get("aligned", False):
+        failures.append(str(qca.get("reason", "SPOT_QUOTE_CANDLE_ALIGNMENT_NOT_CONFIRMED")))
+
+    strict_direction = str(strict.get("direction", "NEUTRAL")).upper()
+    strict_ok = bool(strict.get("qualified") and strict_direction in {direction, "NEUTRAL", ""}
+                      and not strict.get("memory_backed"))
+    # Strict paired OI is the strongest route, but not the only permissible description of a
+    # directionally supportive short-window flow. Multi-horizon context must be available.
+    oi_available = bool(oi.get("available"))
+    oi_bias = str(oi.get("directional_bias", "UNKNOWN")).upper()
+    if not oi_available:
+        failures.append("MULTI_HORIZON_OI_BASELINE_UNAVAILABLE")
+        oi_route = None
+    elif oi_bias == "CONFLICTED" or oi_bias in {"BULLISH", "BEARISH"} and oi_bias != direction:
+        failures.append("MULTI_HORIZON_OI_CONTEXT_CONFLICTS_WITH_SETUP")
+        oi_route = None
+    elif strict_ok:
+        oi_route = "STRICT_PAIRED_OI_AND_FUTURES"
+    elif bool(oi.get("qualified")) and oi_bias == direction:
+        oi_route = "MULTI_HORIZON_OI_PLUS_FUTURES"
+    elif oi_bias == "NEUTRAL" and score >= max(88.0, min_smc_score) and "SWEEP_MSS" in model:
+        oi_route = "STRONG_SMC_FUTURES_WITH_NONCONTRARY_OI"
+    else:
+        failures.append("NO_STRICT_PAIR_OR_SUFFICIENT_NONCONTRARY_MULTI_HORIZON_OI")
+        oi_route = None
+
+    if not fut.get("qualified"):
+        failures.append(str(fut.get("reason", "FUTURES_CONFIRMATION_UNAVAILABLE")))
+    elif str(fut.get("direction", "NEUTRAL")).upper() != direction:
+        failures.append("FUTURES_CONFIRMATION_CONFLICTS_WITH_SETUP")
+
+    # Fresh opposite structure/regime is a veto. A genuine sweep-MSS reversal is allowed only
+    # because it already has aligned futures and acceptable OI evidence above.
+    session_bias = str(rg.get("session_bias", "UNKNOWN")).upper()
+    regime_name = str(rg.get("regime", "UNKNOWN")).upper()
+    reversal_model = "SWEEP_MSS" in model
+    opposing_regime = ((regime_name == "TREND_BULLISH" and direction == "BEARISH") or
+                       (regime_name == "TREND_BEARISH" and direction == "BULLISH"))
+    opposing_bias = session_bias in {"BULLISH", "BEARISH"} and session_bias != direction
+    if opposing_regime and not reversal_model:
+        failures.append("REGIME_CONFLICT_WITHOUT_SWEEP_MSS_REVERSAL")
+    if opposing_bias and not reversal_model:
+        failures.append("SESSION_BIAS_CONFLICT_WITHOUT_SWEEP_MSS_REVERSAL")
+
+    unique = list(dict.fromkeys(failures))
+    return {**details, "qualified": not unique, "status": "PASS" if not unique else "FAIL",
+            "confirmation_route": oi_route, "failures": unique,
+            "hard_gates": {"smc_structure_and_retest": True, "nonconflicting_oi_baseline": True,
+                           "futures_aligned": True, "quote_candle_aligned": True,
+                           "expiry_allowed": True, "risk_plan_required_separately": True}}
+
 def validate_v94_risk_plan(plan: RiskPlan, signal: Signal, levels: Sequence[Level],
                             indicators: Indicators, smc_context: Mapping[str, Any],
                             min_rr: float, max_stop_atr_multiple: float = 3.0,
@@ -4302,7 +4764,7 @@ def validate_v94_risk_plan(plan: RiskPlan, signal: Signal, levels: Sequence[Leve
                          round(target_distance, 2) if finite(target_distance) else None,
                          round(risk_points, 2) if finite(risk_points) else None,
                          round(reward_risk, 3) if finite(reward_risk) else None,
-                         "V94 structural risk checks passed" if not failures else ";".join(dict.fromkeys(failures)))
+                         "Structural risk checks passed" if not failures else ";".join(dict.fromkeys(failures)))
     return {**details, "qualified": not failures, "failures": list(dict.fromkeys(failures)),
             "nearest_opposing_barrier": {"price": nearest[0], "source": nearest[1]} if nearest else None,
             "stop_source": stop_source, "target_source": target_source, "checks": checks,
@@ -4352,7 +4814,7 @@ def update_active_signal(state: dict[str, Any], frame: pd.DataFrame, now: dateti
 def audit_append(config: Config, report: Mapping[str, Any]) -> None:
     config.audit_dir.mkdir(parents=True, exist_ok=True)
     local_date = parse_date(report.get("timestamp")) or now_ist().date()
-    path = config.audit_dir / f"market_scan_{local_date.isoformat()}_v94.jsonl"
+    path = config.audit_dir / f"market_scan_{local_date.isoformat()}_b95.jsonl"
     record = {"audit_schema_version": 1, "recorded_at": report.get("timestamp"), "scanner_version": VERSION, "scan": safe_json(report)}
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
@@ -4568,6 +5030,8 @@ class PredictiveScanner:
 
             snapshots = state.get("chain_snapshots", []) if isinstance(state.get("chain_snapshots", []), list) else []
             oi = analyze_oi(chain, snapshots, spot, expiry, current, strike_step, self.config.scan_interval)
+            b95_oi_context = analyze_b95_oi_context(chain, snapshots, spot, expiry, current, strike_step)
+            oi["b95_multihorizon_context"] = b95_oi_context
             # Calculate every available price indicator before OI qualification. This allows the
             # buyer-led momentum path to require aligned price context without making OI gate the
             # calculation of price structure, momentum, divergence or Fibonacci.
@@ -4583,6 +5047,12 @@ class PredictiveScanner:
             regime = classify_market_regime(frame_raw, indicators, current)
             regime["scan_timestamp"] = current.isoformat()
             smc_context = analyze_smc_context(frame_raw, indicators.atr, spot, current)
+            b95_setup_watch_update = update_b95_setup_watch(state, smc_context, current, spot, indicators.atr)
+            b95_watch_reactivation = {"status": "NOT_NEEDED"}
+            if not (smc_context.get("qualified") and smc_context.get("entry_ready")):
+                smc_context, b95_watch_reactivation = reactivate_b95_smc_watch(
+                    smc_context, state.get("b95_setup_watch") if isinstance(state.get("b95_setup_watch"), Mapping) else {},
+                    frame_raw, current, spot, indicators.atr)
             futures_confirmation = futures_directional_confirmation(futures_quote, indicators, self.config.max_quote_age)
             oi_first = qualify_oi_first(oi, spot, strike_step, self.config.min_local_oi_change_pct,
                                         indicators=indicators, regime=regime)
@@ -4669,7 +5139,7 @@ class PredictiveScanner:
             if not bool(state.get("state_integrity_ok", True)):
                 gate_failures.append("CANONICAL_STATE_CORRUPT_OR_UNREADABLE_ENTRIES_SUPPRESSED_FOR_RECOVERY_SCAN")
             if not quote_candle_alignment_ok:
-                gate_failures.append("SPOT_QUOTE_LAST_CLOSED_CANDLE_GAP_EXCEEDS_V94_LIMIT")
+                gate_failures.append("SPOT_QUOTE_LAST_COMPLETED_CANDLE_GAP_EXCEEDS_LIMIT")
             candidate_risk_plan = calculate_risk_plan(raw_signal, levels, indicators, self.config.min_t1_rr) if raw_signal.direction in {"BULLISH", "BEARISH"} else calculate_risk_plan(signal, levels, indicators, self.config.min_t1_rr)
             v94_risk_validation = validate_v94_risk_plan(
                 candidate_risk_plan, raw_signal, levels, indicators, smc_context, self.config.min_t1_rr,
@@ -4677,17 +5147,19 @@ class PredictiveScanner:
             ) if raw_signal.direction in {"BULLISH", "BEARISH"} else {
                 "qualified": False, "failures": ["NO_DIRECTIONAL_CANDIDATE_FOR_RISK_VALIDATION"],
                 "risk_plan": safe_json(asdict(candidate_risk_plan))}
-            v94_market_authorization = evaluate_v94_market_authorization(
-                raw_signal, smc_context, local_oi_confirmation, futures_confirmation, regime,
+            b95_market_authorization = evaluate_b95_market_authorization(
+                raw_signal, smc_context, local_oi_confirmation, b95_oi_context, futures_confirmation, regime,
                 spot, indicators.atr, expiry, current, self.config.allow_0dte, self.config.min_smc_score,
-                quote_candle_alignment=quote_candle_alignment
+                quote_candle_alignment=quote_candle_alignment, frame=frame_raw
             ) if raw_signal.direction in {"BULLISH", "BEARISH"} else {
-                "qualified": False, "status": "WAIT", "failures": ["NO_DIRECTIONAL_PRICE_CANDIDATE"]}
+                "qualified": False, "status": "WAIT", "confirmation_route": None,
+                "failures": ["NO_DIRECTIONAL_PRICE_CANDIDATE"]}
+            # Keep the legacy alias for dashboards, while new decisions use B95 authorization.
+            v94_market_authorization = b95_market_authorization
             if raw_signal.direction in {"BULLISH", "BEARISH"}:
                 if expiry_pin.get("detected"):
                     gate_failures.append("No Entry - Range-Bound / Expiry Pin")
-                # No futures-only alternate route and no remembered OI-only authorization in V94.
-                gate_failures.extend(v94_market_authorization.get("failures", []))
+                gate_failures.extend(b95_market_authorization.get("failures", []))
                 gate_failures.extend(v94_risk_validation.get("failures", []))
                 if not regime_confirmation.get("qualified"):
                     gate_failures.append(str(regime_confirmation.get("reason", "REGIME_GATE_FAILED")))
@@ -4697,14 +5169,17 @@ class PredictiveScanner:
                     gate_failures.append(str(setup_confirmation.get("reason", "SETUP_RULE_GATE_FAILED")))
                 gate_failures = list(dict.fromkeys(gate_failures))
                 if gate_failures:
-                    gate_evidence = tuple(dict.fromkeys(list(raw_signal.evidence) + [f"V94_HARD_GATE:{x}" for x in gate_failures]))
-                    signal = Signal("NEUTRAL", "V94_ENTRY_GATES_BLOCKED", raw_signal.score, 0.0,
+                    gate_evidence = tuple(dict.fromkeys(list(raw_signal.evidence) + [f"B95_HARD_GATE:{x}" for x in gate_failures]))
+                    signal = Signal("NEUTRAL", "B95_ENTRY_GATES_BLOCKED", raw_signal.score, 0.0,
                                     "; ".join(gate_evidence[:10]), raw_signal.level, gate_evidence, tuple(gate_failures))
                 else:
                     signal = raw_signal
             risk = (RiskPlan(**{**asdict(candidate_risk_plan), **v94_risk_validation.get("risk_plan", {})})
                     if signal.direction in {"BULLISH", "BEARISH"} and v94_risk_validation.get("qualified")
                     else calculate_risk_plan(signal, levels, indicators, self.config.min_t1_rr))
+            b95_opportunity = b95_opportunity_diagnostic(raw_signal, smc_context, b95_oi_context,
+                futures_confirmation, b95_market_authorization, v94_risk_validation,
+                setup_confirmation, b95_setup_watch_update)
             events = update_active_signal(state, frame_raw, current)
             report["events"].extend(events)
             report["active_option_monitor"] = self._monitor_active_option(state, current)
@@ -4726,6 +5201,12 @@ class PredictiveScanner:
                 "market_regime": regime, "local_oi_confirmation": local_oi_confirmation,
                 "regime_confirmation": regime_confirmation,
                 "setup_rule_confirmation": setup_confirmation,
+                "b95_market_authorization": safe_json(b95_market_authorization),
+                "b95_multihorizon_oi_context": safe_json(b95_oi_context),
+                "b95_setup_watch": {"update": safe_json(b95_setup_watch_update),
+                                    "reactivation": safe_json(b95_watch_reactivation),
+                                    "active": safe_json(state.get("b95_setup_watch"))},
+                "b95_opportunity": safe_json(b95_opportunity),
                 "v94_market_authorization": safe_json(v94_market_authorization),
                 "v94_risk_validation": safe_json(v94_risk_validation),
                 "candidate_risk_plan_before_authorization": safe_json(asdict(candidate_risk_plan)),
@@ -4738,6 +5219,15 @@ class PredictiveScanner:
                                     "active": safe_json(state.get("pending_structure_setup")),
                                     "ttl_minutes": STRUCTURE_WATCH_TTL_MINUTES,
                                     "max_extension_atr": STRUCTURE_WATCH_MAX_EXTENSION_ATR},
+                "b95_policy": {"authorization_routes": ["STRICT_PAIRED_OI_AND_FUTURES", "MULTI_HORIZON_OI_PLUS_FUTURES", "STRONG_SMC_FUTURES_WITH_NONCONTRARY_OI"],
+                               "strict_paired_oi_is_strongest_route": True,
+                               "multi_horizon_oi_is_context_not_trader_identity_or_standalone_prediction": True,
+                               "oi_horizons_minutes": [3, 6, 12],
+                               "persistent_smc_watch_ttl_minutes": 9,
+                               "watch_reactivation_requires_recent_completed_candle_retest_and_price_near_zone": True,
+                               "no_trade_if_structural_risk_plan_invalid": True,
+                               "same_day_expiry_disabled_by_default": not self.config.allow_0dte,
+                               "cloudflare_triggered_workflows_need_serialized_state_writes": True},
                 "v94_policy": {"price_analysis_runs_independently_of_oi_gate": True,
                                "adaptive_impulse_threshold": "MAX(1.25*ATR, MIN(30 POINTS, 0.08% OF SPOT))",
                                "shared_oi_locality_radius_points": oi_locality_radius(strike_step),
@@ -4842,10 +5332,14 @@ class PredictiveScanner:
                     reversal_setups = {"SUPPORT_BOUNCE", "EARLY_SUPPORT_RECLAIM", "RESISTANCE_REJECTION", "EARLY_RESISTANCE_REJECTION",
                                        "SUPPORT_CLUSTER_RECLAIM", "RESISTANCE_CLUSTER_REJECTION"}
                     target_delta = 0.55 if signal.setup in reversal_setups else 0.62
-                    allow_non_oi = False  # V94 never authorizes a contract via futures-only fallback.
+                    confirmation_route = str(b95_market_authorization.get("confirmation_route") or "").upper()
+                    allow_non_oi = bool(b95_market_authorization.get("qualified") and confirmation_route in {
+                        "MULTI_HORIZON_OI_PLUS_FUTURES", "STRONG_SMC_FUTURES_WITH_NONCONTRARY_OI"})
                     selected, ranked = score_contracts(candidates, option_quotes, spot, direction, oi, self.config, target_delta,
                                                       authorized_oi_pair=local_oi_confirmation,
-                                                      allow_non_oi_confirmation=allow_non_oi)
+                                                      allow_non_oi_confirmation=allow_non_oi,
+                                                      b95_oi_context=b95_oi_context,
+                                                      confirmation_route=confirmation_route)
                     candidate_diagnostics = [{**row, "route": "ATM_ITM1_ITM2"} for row in ranked]
                     if not selected and signal.setup in reversal_setups:
                         fallback = _candidate_strikes(spot, contracts, direction, strike_step, fallback_otm=True)
@@ -4853,7 +5347,9 @@ class PredictiveScanner:
                         fallback_quotes = self.client.quotes(fallback_keys) if fallback_keys else {}
                         fallback_selected, fallback_ranked = score_contracts(fallback, fallback_quotes, spot, direction, oi, self.config, target_delta,
                                                                     authorized_oi_pair=local_oi_confirmation,
-                                                                    allow_non_oi_confirmation=allow_non_oi)
+                                                                    allow_non_oi_confirmation=allow_non_oi,
+                                                                    b95_oi_context=b95_oi_context,
+                                                                    confirmation_route=confirmation_route)
                         candidate_diagnostics.extend([{**row, "route": "SINGLE_OTM_REVERSAL_FALLBACK"} for row in fallback_ranked])
                         if fallback_selected:
                             selected = fallback_selected
@@ -4912,7 +5408,7 @@ class PredictiveScanner:
             return self._finish(report, state)
         except Exception as exc:
             # The scan boundary is fail-closed: an unforeseen provider/schema error must not create a selection.
-            LOG.exception("V94 scan failed safely")
+            LOG.exception("B95 scan failed safely")
             report.update({"market_state": "DATA_OR_SCAN_ERROR", "scenario": "NO_SELECTION", "direction": "NEUTRAL",
                            "signal_ready": False, "selected_option": None, "confidence_pct": 0.0,
                            "vetoes": [f"SCAN_ERROR:{type(exc).__name__}:{str(exc)[:350]}"]})
@@ -4926,7 +5422,7 @@ class PredictiveScanner:
         if report.get("suppress_signal_email") or pin_diag.get("detected"):
             return None
         event_key=str(tracker.get("event_key",""))
-        subject=f"NIFTY V94 {signal.direction}: {selected['strike']:.0f}{selected['side']}"
+        subject=f"NIFTY B95 {signal.direction}: {selected['strike']:.0f}{selected['side']}"
         spot_value=number(report.get("indicators",{}).get("spot")) if isinstance(report.get("indicators"),Mapping) else float("nan")
         spot_text=f"{spot_value:.2f}" if finite(spot_value) else "Unavailable"
         strike_value=number(selected.get("strike")); strike_text=f"{strike_value:.0f}" if finite(strike_value) else "Unavailable"
@@ -4953,7 +5449,7 @@ class PredictiveScanner:
         timestamp = str(event.get("timestamp", ""))
         event_key = str(tracker.get("event_key", ""))
         key = f"EVENT|{event_key}|{event_type}|{timestamp}"
-        subject = f"NIFTY V94 {event_type}: {tracker.get('strike')}{tracker.get('side')}"
+        subject = f"NIFTY B95 {event_type}: {tracker.get('strike')}{tracker.get('side')}"
         body = (f"Time (IST): {timestamp}\nEvent: {event_type}\nDirection: {tracker.get('direction')}\n"
                 f"Strike: {tracker.get('strike')} {tracker.get('side')}\nLevel: {event.get('level')}\n"
                 f"Original T1/T2/SL: {tracker.get('T1')} / {tracker.get('T2')} / {tracker.get('SL')}\n"
@@ -5026,7 +5522,7 @@ class PredictiveScanner:
                 key = str(item.get("notification_key", ""))
                 if not key or key in emailed_set:
                     continue
-                if send_email(self.config, str(item.get("subject", "NIFTY V94 notification")), str(item.get("body", ""))):
+                if send_email(self.config, str(item.get("subject", "NIFTY B95 notification")), str(item.get("body", ""))):
                     emailed.append(key); emailed_set.add(key); sent_now.add(key)
                     if item.get("kind") == "SIGNAL":
                         state["last_email_key"] = str(item.get("event_key", ""))
@@ -5112,7 +5608,7 @@ def print_report(report: Mapping[str, Any]) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="V94 fail-closed NIFTY 50 intraday options scanner (signal only)")
+    parser = argparse.ArgumentParser(description="B95 balanced NIFTY 50 intraday options scanner (signal only)")
     parser.add_argument("--loop", action="store_true", help="run continuously at SCAN_INTERVAL_SECONDS")
     parser.add_argument("--interval", type=int, default=None, help="override the loop interval in seconds")
     args = parser.parse_args(argv)
@@ -5128,14 +5624,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # A long-running loop must not continue polling after the regular NSE cash-market
         # close. Scheduled one-shot workflow invocations are unaffected.
         if args.loop and now_ist().time() >= MARKET_CLOSE:
-            LOG.info("NSE market close reached; stopping V94 loop.")
+            LOG.info("NSE market close reached; stopping B95 loop.")
             return 0
         report = scanner.scan_once()
         print_report(report)
         if not args.loop:
             return 0 if report.get("market_state") != "DATA_OR_SCAN_ERROR" else 1
         if now_ist().time() >= MARKET_CLOSE:
-            LOG.info("NSE market close reached; stopping V94 loop.")
+            LOG.info("NSE market close reached; stopping B95 loop.")
             return 0 if report.get("market_state") != "DATA_OR_SCAN_ERROR" else 1
         # When approaching close, sleep only until close; the next iteration exits before
         # making an unnecessary post-market API request.
