@@ -196,9 +196,9 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+        token = os.getenv("UPSTOX_ANALYTICS_TOKEN", "").strip()
         if not token:
-            raise ValueError("UPSTOX_ACCESS_TOKEN is required for a live scan")
+            raise ValueError("UPSTOX_ANALYTICS_TOKEN is required for a live scan")
         def f(name: str, default: float) -> float:
             v = as_float(os.getenv(name, str(default)))
             if v is None:
@@ -1799,7 +1799,7 @@ def notify(cfg: Config, signal: Mapping[str, Any]) -> None:
 
 
 def print_environment() -> None:
-    names = ["UPSTOX_ACCESS_TOKEN","NIFTY_INSTRUMENT_KEY (optional; otherwise discovered)","NIFTY_EXPIRY (nearest_weekly or YYYY-MM-DD)",
+    names = ["UPSTOX_ANALYTICS_TOKEN","NIFTY_INSTRUMENT_KEY (optional; otherwise discovered)","NIFTY_EXPIRY (nearest_weekly or YYYY-MM-DD)",
              "STATE_BACKEND","STATE_FILE","GITHUB_STATE_REPOSITORY","GITHUB_STATE_PATH","GITHUB_STATE_BRANCH","GITHUB_STATE_TOKEN",
              "ALERT_WEBHOOK_URL","SMTP_HOST","SMTP_PORT","SMTP_USER","SMTP_PASSWORD","EMAIL_FROM","EMAIL_TO","SCAN_DRY_RUN"]
     print("\n".join(names))
