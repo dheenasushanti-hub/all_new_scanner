@@ -1,4 +1,4 @@
-name: NIFTY Predictive Market Scanner v91
+name: NIFTY Predictive Market Scanner v99.2
 
 on:
   # Scheduling remains controlled by the existing Cloudflare Worker.
@@ -7,7 +7,7 @@ on:
 permissions:
   contents: write
 
-# Serialize scans so appends to market_state.json and the daily audit file do not race.
+# Prevent overlapping runs from racing while updating scanner state and JSONL audit logs.
 concurrency:
   group: nifty-market-scanner
   cancel-in-progress: false
@@ -20,46 +20,80 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        id: checkout
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-          cache: pip
-          cache-dependency-path: requirements.txt
 
-      - name: Install dependencies
+      - name: Prepare directories and India-local date
+        id: prepare
+        shell: bash
         run: |
-          python -m pip install \
-            --disable-pip-version-check \
-            --no-input \
-            --prefer-binary \
-            -r requirements.txt
+          set -euo pipefail
+          mkdir -p .cache state audit
+          # Keep the daily cache/audit boundary aligned with the India trading day,
+          # not the GitHub runner's default UTC date.
+          echo "date=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
+          # Ensure the cache path exists even on the very first run.
+          touch .cache/.keep
+
+      - name: Cache Upstox public NSE instrument master
+        id: instrument-cache
+        uses: actions/cache@v6
+        with:
+          path: .cache
+          key: upstox-nse-instruments-${{ runner.os }}-${{ steps.prepare.outputs.date }}
+          restore-keys: |
+            upstox-nse-instruments-${{ runner.os }}-
+
+      # v99.2 uses Python's standard library only. This intentionally avoids installing
+      # unrelated legacy dependencies from an older requirements.txt.
+      - name: Validate scanner syntax
+        run: python -m py_compile market_scanner.py
 
       - name: Run NIFTY predictive scanner
+        id: run-scanner
+        shell: bash
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-          STATE_FILE: state/market_state.json
-          AUDIT_DIR: audit
-        run: python market_scanner.py
+          # These aliases preserve the secret names used by the previous workflow.
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT || '587' }}
+          SMTP_USER: ${{ secrets.SMTP_USER || secrets.EMAIL_SENDER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD || secrets.EMAIL_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM || secrets.EMAIL_SENDER }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO || secrets.EMAIL_RECEIVER }}
+          STATE_BACKEND: local
+          STATE_FILE: state/market_scanner_v99_2_state.json
+          UPSTOX_INSTRUMENT_MASTER_CACHE_FILE: .cache/upstox_nse_instruments.json.gz
+          UPSTOX_INSTRUMENT_MASTER_TTL_SECONDS: "86400"
+          SCAN_DRY_RUN: "false"
+          TZ: Asia/Kolkata
+        run: |
+          set -euo pipefail
+          AUDIT_FILE="audit/market_scan_${{ steps.prepare.outputs.date }}.jsonl"
+          # Keep the program name used in the GitHub repository: market_scanner.py.
+          # tee preserves the structured JSON output for the durable audit history.
+          python market_scanner.py | tee -a "$AUDIT_FILE"
 
       - name: Persist scanner state and audit logs
-        if: always()
+        if: always() && steps.checkout.outcome == 'success'
         shell: bash
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          if [ -f state/market_state.json ]; then
-            git add -f -- state/market_state.json
+          if [ -f state/market_scanner_v99_2_state.json ]; then
+            git add -f -- state/market_scanner_v99_2_state.json
           fi
 
           if compgen -G "audit/market_scan_*.jsonl" > /dev/null; then
@@ -67,10 +101,10 @@ jobs:
           fi
 
           if git diff --cached --quiet; then
-            echo "No state or audit changes to persist."
+            echo "No scanner state or audit changes to persist."
             exit 0
           fi
 
-          git commit -m "Update NIFTY scanner state and audit logs"
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git commit -m "Persist NIFTY v99.2 scanner state and audit"
+          git pull --rebase origin "${BRANCH_NAME}"
+          git push origin "HEAD:${BRANCH_NAME}"
