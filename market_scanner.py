@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "99.0.0"
+VERSION = "99.1.0"
 IST = ZoneInfo("Asia/Kolkata")
 UTC = dt.timezone.utc
 LOG = logging.getLogger("market_scanner_v99")
@@ -54,7 +54,8 @@ REASON_CODES: dict[str, str] = {
     "OPTION_NET_RR_BELOW_2R": "Option premium scenario net of estimated costs fails the 2.0:1 gate.",
     "OPTION_DELTA_OUT_OF_RANGE": "Candidate option delta is outside configured bounds or unavailable.",
     "NO_ELIGIBLE_STRIKE": "No eligible ATM/near-ITM contract passed all gates.",
-    "API_AUTH_FAILED": "Upstox authentication failed.",
+    "API_AUTH_FAILED": "Upstox rejected the bearer token (HTTP 401).",
+    "API_PERMISSION_DENIED": "Upstox denied access to the requested endpoint (HTTP 403); check token scope or endpoint permissions.",
     "API_RATE_LIMITED": "Upstox rate limit was reached after bounded retries.",
     "API_UNAVAILABLE": "Upstox endpoint failed after bounded retries.",
     "INSTRUMENT_RESOLUTION_FAILED": "NIFTY 50 instrument could not be uniquely and safely resolved.",
@@ -196,9 +197,13 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        token = os.getenv("UPSTOX_ANALYTICS_TOKEN", "").strip()
+        # Upstox Analytics Tokens are still passed as OAuth-style Bearer credentials.
+        # Prefer the explicit analytics variable so a stale daily OAuth token left in
+        # UPSTOX_ACCESS_TOKEN cannot silently override the intended long-lived token.
+        token = (os.getenv("UPSTOX_ANALYTICS_TOKEN", "").strip()
+                 or os.getenv("UPSTOX_ACCESS_TOKEN", "").strip())
         if not token:
-            raise ValueError("UPSTOX_ANALYTICS_TOKEN is required for a live scan")
+            raise ValueError("Set UPSTOX_ANALYTICS_TOKEN (recommended) or UPSTOX_ACCESS_TOKEN")
         def f(name: str, default: float) -> float:
             v = as_float(os.getenv(name, str(default)))
             if v is None:
@@ -453,9 +458,26 @@ def request_json(url: str, token: str, timeout: float, retries: int,
                     raise ScannerError("API_UNAVAILABLE", "Unexpected non-object JSON response")
                 return data, dict(resp.headers.items())
         except urllib.error.HTTPError as exc:
-            body_text = exc.read().decode("utf-8", "replace")[:400]
-            if exc.code in (401, 403):
-                raise ScannerError("API_AUTH_FAILED", f"Upstox returned HTTP {exc.code}") from exc
+            # Report the endpoint and upstream message, but never include request headers
+            # or the bearer token. This distinguishes invalid/revoked credentials (401)
+            # from a permission/scope/endpoint issue (403).
+            body_text = exc.read().decode("utf-8", "replace")[:300]
+            endpoint = urllib.parse.urlsplit(url).path
+            if exc.code == 401:
+                raise ScannerError(
+                    "API_AUTH_FAILED",
+                    f"Upstox returned HTTP 401 for {endpoint}: bearer token rejected. "
+                    f"Check that UPSTOX_ANALYTICS_TOKEN contains the full active Analytics Token; "
+                    f"if both token variables are set, v99.1 prioritises UPSTOX_ANALYTICS_TOKEN. "
+                    f"Upstox response: {body_text}"
+                ) from exc
+            if exc.code == 403:
+                raise ScannerError(
+                    "API_PERMISSION_DENIED",
+                    f"Upstox returned HTTP 403 for {endpoint}: access denied. "
+                    f"The credential may be recognised but this endpoint may not be enabled for it. "
+                    f"Check Analytics Token supported APIs and Upstox response: {body_text}"
+                ) from exc
             if exc.code == 429:
                 last_error = exc
                 if attempt < retries:
@@ -1772,8 +1794,8 @@ def scan_once(cfg: Config, api: UpstoxAPI, store: LocalState | GitHubState, at: 
         return decision
     except ScannerError as exc:
         result = {"timestamp":iso(now),"scanner_version":VERSION,"decision":"NO_TRADE","reason_code":exc.code,
-                  "error_type":type(exc).__name__}
-        LOG.warning("scan blocked: %s", exc.code)
+                  "error_type":type(exc).__name__, "message":str(exc)[:500]}
+        LOG.warning("scan blocked: %s (%s)", exc.code, str(exc)[:240])
         emit(result)
         return result
 
@@ -1799,14 +1821,15 @@ def notify(cfg: Config, signal: Mapping[str, Any]) -> None:
 
 
 def print_environment() -> None:
-    names = ["UPSTOX_ANALYTICS_TOKEN","NIFTY_INSTRUMENT_KEY (optional; otherwise discovered)","NIFTY_EXPIRY (nearest_weekly or YYYY-MM-DD)",
+    names = ["UPSTOX_ANALYTICS_TOKEN (recommended; preferred if set)", "UPSTOX_ACCESS_TOKEN (fallback token variable)",
+             "NIFTY_INSTRUMENT_KEY (optional; otherwise discovered)","NIFTY_EXPIRY (nearest_weekly or YYYY-MM-DD)",
              "STATE_BACKEND","STATE_FILE","GITHUB_STATE_REPOSITORY","GITHUB_STATE_PATH","GITHUB_STATE_BRANCH","GITHUB_STATE_TOKEN",
              "ALERT_WEBHOOK_URL","SMTP_HOST","SMTP_PORT","SMTP_USER","SMTP_PASSWORD","EMAIL_FROM","EMAIL_TO","SCAN_DRY_RUN"]
     print("\n".join(names))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 OI-first regime scanner v99 (alerting only)")
+    parser = argparse.ArgumentParser(description="NIFTY 50 OI-first regime scanner v99.1 (alerting only)")
     parser.add_argument("--print-reason-codes", action="store_true")
     parser.add_argument("--show-env", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Do not send notifications")
