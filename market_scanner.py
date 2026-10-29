@@ -612,16 +612,6 @@ class Settings:
 # ===== Inlined module: state_store.py =====
 
 """Locked, atomic and schema-versioned durable state storage for ephemeral runners."""
-
-
-
-
-
-
-
-
-
-
 try:
     import fcntl
 except ImportError:  # pragma: no cover - target deployment is GitHub's Linux runner
@@ -1296,16 +1286,6 @@ def _first_number(data: dict[str, Any], *keys: str) -> Optional[float]:
 
 """Snapshot-cadence open-interest calculations and probabilistic directional evidence."""
 
-
-
-
-
-
-
-
-
-
-
 def _pct_change(current: float, previous: Optional[float]) -> Optional[float]:
     if previous is None or previous <= 0:
         return None
@@ -1548,19 +1528,6 @@ def derive_oi_wall_levels(snapshot: ChainSnapshot, max_strikes: int = 6):
 # ===== Inlined module: price_engine.py =====
 
 """No-look-ahead candle, regime, swing/level and setup analysis."""
-
-
-
-
-
-
-
-
-
-
-
-
-
 def true_ranges(candles: Sequence[Candle]) -> list[float]:
     out: list[float] = []
     prev_close: Optional[float] = None
@@ -2155,16 +2122,6 @@ def calculate_option_risk(quote: OptionQuote, risk: RiskPlan, settings: Settings
 
 """Deterministic CE/PE selection restricted to the configured ATM offsets."""
 
-
-
-
-
-
-
-
-
-
-
 @dataclass(frozen=True)
 class CandidateEvaluation:
     quote: OptionQuote
@@ -2248,27 +2205,6 @@ def select_contract(snapshot: ChainSnapshot, direction: Direction, risk: RiskPla
 # ===== Inlined module: engine.py =====
 
 """Authoritative single-pass scan pipeline."""
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 IST = ZoneInfo("Asia/Kolkata")
 
 
@@ -2642,22 +2578,6 @@ def _signal_key(session: str, side: str, instrument_key: str, expiry: str, setup
 # ===== Inlined module: cli.py =====
 
 """CLI entry point. Regression tests live only in tests/, never in this module."""
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 IST = ZoneInfo("Asia/Kolkata")
 
 
