@@ -13,6 +13,7 @@ import datetime as dt
 import email.message
 import contextlib
 import hashlib
+import gzip
 import json
 import logging
 import math
@@ -31,7 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "99.1.0"
+VERSION = "99.2.0"
 IST = ZoneInfo("Asia/Kolkata")
 UTC = dt.timezone.utc
 LOG = logging.getLogger("market_scanner_v99")
@@ -55,7 +56,9 @@ REASON_CODES: dict[str, str] = {
     "OPTION_DELTA_OUT_OF_RANGE": "Candidate option delta is outside configured bounds or unavailable.",
     "NO_ELIGIBLE_STRIKE": "No eligible ATM/near-ITM contract passed all gates.",
     "API_AUTH_FAILED": "Upstox rejected the bearer token (HTTP 401).",
-    "API_PERMISSION_DENIED": "Upstox denied access to the requested endpoint (HTTP 403); check token scope or endpoint permissions.",
+    "API_PERMISSION_DENIED": "Upstox API denied access to the endpoint (HTTP 403); inspect its structured error response. This is distinct from Cloudflare edge blocks.",
+    "API_EDGE_BLOCKED": "The request was blocked by an upstream CDN/WAF (for example, Cloudflare Error 1010); this does not prove the Analytics Token is invalid.",
+    "INSTRUMENT_MASTER_UNAVAILABLE": "The official public Upstox instrument master could not be loaded or parsed.",
     "API_RATE_LIMITED": "Upstox rate limit was reached after bounded retries.",
     "API_UNAVAILABLE": "Upstox endpoint failed after bounded retries.",
     "INSTRUMENT_RESOLUTION_FAILED": "NIFTY 50 instrument could not be uniquely and safely resolved.",
@@ -175,9 +178,12 @@ class Config:
     pivot_left: int = 2
     pivot_right: int = 2
     state_backend: str = "auto"
-    state_file: str = "market_scanner_v99_state.json"
+    state_file: str = "market_scanner_v99_2_state.json"
+    instrument_master_url: str = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+    instrument_master_cache_file: str = ".cache/upstox_nse_instruments.json.gz"
+    instrument_master_ttl_seconds: int = 86400
     github_state_repository: str = ""
-    github_state_path: str = "data/market_scanner_v99_state.json"
+    github_state_path: str = "data/market_scanner_v99_2_state.json"
     github_state_branch: str = "main"
     github_state_token: str = ""
     webhook_url: str = ""
@@ -246,9 +252,12 @@ class Config:
             pivot_left=i("PIVOT_LEFT", 2),
             pivot_right=i("PIVOT_RIGHT", 2),
             state_backend=os.getenv("STATE_BACKEND", "auto").strip().lower(),
-            state_file=os.getenv("STATE_FILE", "market_scanner_v99_state.json").strip(),
+            state_file=os.getenv("STATE_FILE", "market_scanner_v99_2_state.json").strip(),
+            instrument_master_url=os.getenv("UPSTOX_INSTRUMENT_MASTER_URL", "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz").strip(),
+            instrument_master_cache_file=os.getenv("UPSTOX_INSTRUMENT_MASTER_CACHE_FILE", ".cache/upstox_nse_instruments.json.gz").strip(),
+            instrument_master_ttl_seconds=i("UPSTOX_INSTRUMENT_MASTER_TTL_SECONDS", 86400),
             github_state_repository=os.getenv("GITHUB_STATE_REPOSITORY", "").strip(),
-            github_state_path=os.getenv("GITHUB_STATE_PATH", "data/market_scanner_v99_state.json").strip(),
+            github_state_path=os.getenv("GITHUB_STATE_PATH", "data/market_scanner_v99_2_state.json").strip(),
             github_state_branch=os.getenv("GITHUB_STATE_BRANCH", "main").strip() or "main",
             github_state_token=os.getenv("GITHUB_STATE_TOKEN", "").strip(),
             webhook_url=os.getenv("ALERT_WEBHOOK_URL", "").strip(),
@@ -278,6 +287,8 @@ class Config:
             raise ValueError("Delta bounds must satisfy 0 <= min < max <= 1")
         if self.max_option_spread_pct <= 0 or self.max_stop_atr <= 0 or self.api_timeout_seconds <= 0:
             raise ValueError("Spread, stop ATR and API timeout values must be positive")
+        if self.instrument_master_ttl_seconds <= 0 or not self.instrument_master_url.startswith("https://"):
+            raise ValueError("Instrument master URL must be HTTPS and cache TTL must be positive")
         if self.max_snapshots < 2 or self.max_candles < max(30, self.atr_period + 2):
             raise ValueError("State history is too short")
         if self.oi_radius_strikes < 2 or self.api_retries < 0:
@@ -468,15 +479,27 @@ def request_json(url: str, token: str, timeout: float, retries: int,
                     "API_AUTH_FAILED",
                     f"Upstox returned HTTP 401 for {endpoint}: bearer token rejected. "
                     f"Check that UPSTOX_ANALYTICS_TOKEN contains the full active Analytics Token; "
-                    f"if both token variables are set, v99.1 prioritises UPSTOX_ANALYTICS_TOKEN. "
+                    f"if both token variables are set, v99.2 prioritises UPSTOX_ANALYTICS_TOKEN. "
                     f"Upstox response: {body_text}"
                 ) from exc
             if exc.code == 403:
+                lower_body = body_text.lower()
+                is_edge_block = (
+                    "error 1010" in lower_body
+                    or "developers.cloudflare.com" in lower_body
+                    or ("cloudflare" in lower_body and ("browser's signature" in lower_body or "browser signature" in lower_body or "site owner has blocked access" in lower_body))
+                )
+                if is_edge_block:
+                    raise ScannerError(
+                        "API_EDGE_BLOCKED",
+                        f"HTTP 403 from an upstream edge/WAF for {endpoint}; response identifies Cloudflare Error 1010. "
+                        f"This is not evidence that the Analytics Token is invalid. Avoid retrying this request or changing tokens; "
+                        f"use the documented Upstox instrument master for instrument discovery. Response: {body_text}"
+                    ) from exc
                 raise ScannerError(
                     "API_PERMISSION_DENIED",
-                    f"Upstox returned HTTP 403 for {endpoint}: access denied. "
-                    f"The credential may be recognised but this endpoint may not be enabled for it. "
-                    f"Check Analytics Token supported APIs and Upstox response: {body_text}"
+                    f"Upstox API returned HTTP 403 for {endpoint}. This differs from a Cloudflare Error 1010 edge block. "
+                    f"Check the endpoint's documented Analytics Token support and structured Upstox error response: {body_text}"
                 ) from exc
             if exc.code == 429:
                 last_error = exc
@@ -498,10 +521,116 @@ def request_json(url: str, token: str, timeout: float, retries: int,
     raise ScannerError("API_UNAVAILABLE", f"Upstox request failed after retries ({type(last_error).__name__})")
 
 
+def _parse_instrument_expiry(value: Any) -> dt.date | None:
+    """Parse BOD-master expiry values (usually Unix milliseconds) without timezone-day shifts."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        # Upstox BOD instrument JSON represents expiry as epoch milliseconds. The
+        # encoded date corresponds to the exchange expiry date; use UTC date here.
+        seconds = number / 1000.0 if number > 10**12 else number
+        try:
+            return dt.datetime.fromtimestamp(seconds, UTC).date()
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        try:
+            return dt.date.fromisoformat(value[:10])
+        except ValueError:
+            try:
+                parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return parsed.date()
+            except ValueError:
+                return None
+    return None
+
+
 class UpstoxAPI:
     BASE = "https://api.upstox.com"
+    MAX_INSTRUMENT_FILE_BYTES = 100 * 1024 * 1024
     def __init__(self, config: Config):
         self.config = config
+        self._instrument_rows: list[dict[str, Any]] | None = None
+
+    @staticmethod
+    def _decode_instrument_master(raw: bytes) -> list[dict[str, Any]]:
+        try:
+            decoded = gzip.decompress(raw)
+        except (OSError, EOFError):
+            decoded = raw
+        try:
+            payload = json.loads(decoded.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ScannerError("INSTRUMENT_MASTER_UNAVAILABLE", "Official Upstox NSE instrument master is not valid JSON/gzip JSON") from exc
+        if isinstance(payload, dict):
+            payload = payload.get("data", payload.get("instruments"))
+        if not isinstance(payload, list) or not payload or not all(isinstance(row, dict) for row in payload):
+            raise ScannerError("INSTRUMENT_MASTER_UNAVAILABLE", "Official Upstox NSE instrument master had an unexpected schema")
+        return payload
+
+    def instrument_master(self) -> list[dict[str, Any]]:
+        """Load public BOD instrument data; cache it to avoid downloading on each scan.
+
+        The file is published by Upstox and does not use the Analytics Token. In a
+        three-minute GitHub Actions deployment, persist/restore the cache path using
+        actions/cache so one large file is not downloaded on every ephemeral run.
+        """
+        if self._instrument_rows is not None:
+            return self._instrument_rows
+        path = Path(self.config.instrument_master_cache_file).expanduser()
+        cached_raw: bytes | None = None
+        if path.exists():
+            try:
+                cached_raw = path.read_bytes()
+                cache_age = max(0.0, time.time() - path.stat().st_mtime)
+                if cache_age <= self.config.instrument_master_ttl_seconds:
+                    self._instrument_rows = self._decode_instrument_master(cached_raw)
+                    return self._instrument_rows
+            except (OSError, ScannerError) as exc:
+                LOG.warning("Instrument master cache is unreadable/invalid (%s); attempting official refresh", type(exc).__name__)
+        last_error: Exception | None = None
+        for attempt in range(self.config.api_retries + 1):
+            req = urllib.request.Request(
+                self.config.instrument_master_url,
+                headers={"Accept": "application/gzip, application/json"},
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.config.api_timeout_seconds) as resp:
+                    raw = resp.read(self.MAX_INSTRUMENT_FILE_BYTES + 1)
+                if len(raw) > self.MAX_INSTRUMENT_FILE_BYTES:
+                    raise ScannerError("INSTRUMENT_MASTER_UNAVAILABLE", "Instrument master download exceeded size limit")
+                rows = self._decode_instrument_master(raw)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+                try:
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+                    os.replace(tmp, path)
+                finally:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                self._instrument_rows = rows
+                LOG.info("Loaded official Upstox NSE instrument master: %d rows", len(rows))
+                return rows
+            except ScannerError:
+                raise
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_error = exc
+                if attempt < self.config.api_retries:
+                    time.sleep(min(0.5 * (2 ** attempt), 4.0))
+        # If an old but parseable cache exists, use it only with an explicit warning.
+        # Expiry filters and live option-contract metadata still validate trade contracts.
+        if cached_raw is not None:
+            try:
+                rows = self._decode_instrument_master(cached_raw)
+                LOG.warning("Official instrument-master download failed; using cached master that may be stale (%s)", type(last_error).__name__)
+                self._instrument_rows = rows
+                return rows
+            except ScannerError:
+                pass
+        raise ScannerError("INSTRUMENT_MASTER_UNAVAILABLE", f"Could not load official Upstox NSE instrument master ({type(last_error).__name__ if last_error else 'download error'}); set NIFTY_INSTRUMENT_KEY only if already verified against official Upstox metadata")
 
     def get(self, path: str, params: Mapping[str, Any] | None = None, v3: bool = False) -> dict[str, Any]:
         query = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v is not None})
@@ -515,16 +644,16 @@ class UpstoxAPI:
 
     def resolve_underlying_key(self) -> str:
         override = self.config.underlying_key_override
-        if override and not override.startswith("NSE_INDEX|"):
-            raise ScannerError("INSTRUMENT_RESOLUTION_FAILED", "NIFTY_INSTRUMENT_KEY must be an NSE_INDEX key and is validated below")
-        data = self.get("/v2/instruments/search", {
-            "query": "NIFTY 50", "exchanges": "NSE", "segments": "INDEX",
-            "instrument_types": "INDEX", "records": 30, "page_number": 1,
-        })
-        rows = data.get("data") or []
+        if override:
+            if not override.startswith("NSE_INDEX|") or len(override.split("|", 1)[1].strip()) == 0:
+                raise ScannerError("INSTRUMENT_RESOLUTION_FAILED", "NIFTY_INSTRUMENT_KEY must be a verified NSE_INDEX instrument key")
+            # An explicit operator-supplied key avoids the beta Instrument Search API.
+            # It is subsequently validated by the live option-contract response and chain.
+            return override
+        rows = self.instrument_master()
         candidates = []
         for row in rows:
-            if not isinstance(row, dict) or row.get("segment") != "NSE_INDEX":
+            if row.get("segment") != "NSE_INDEX" or row.get("instrument_type") != "INDEX":
                 continue
             key = row.get("instrument_key")
             name = str(row.get("name", "")).strip().upper()
@@ -533,12 +662,8 @@ class UpstoxAPI:
             if key and (name == "NIFTY 50" or short == "NIFTY 50" or symbol == "NIFTY"):
                 candidates.append(str(key))
         candidates = sorted(set(candidates))
-        if override:
-            if override not in candidates:
-                raise ScannerError("INSTRUMENT_RESOLUTION_FAILED", "Configured NIFTY_INSTRUMENT_KEY did not match the current official NIFTY 50 instrument search result")
-            return override
         if len(candidates) != 1:
-            raise ScannerError("INSTRUMENT_RESOLUTION_FAILED", f"Expected exactly one NIFTY 50 NSE index instrument; found {len(candidates)}")
+            raise ScannerError("INSTRUMENT_RESOLUTION_FAILED", f"Expected exactly one NIFTY 50 NSE index in official instrument master; found {len(candidates)}")
         return candidates[0]
 
     def resolve_expiry(self, underlying_key: str, today: dt.date) -> tuple[str, list[dict[str, Any]]]:
@@ -692,24 +817,33 @@ class UpstoxAPI:
 
     def resolve_future(self, underlying_key: str, today: dt.date) -> dict[str, Any] | None:
         try:
-            data = self.get("/v2/instruments/search", {
-                "query": "NIFTY", "exchanges": "NSE", "segments": "FO", "instrument_types": "FUT",
-                "expiry": "near_month", "records": 30, "page_number": 1,
-            })
+            rows = self.instrument_master()
         except ScannerError:
+            if self.config.require_futures:
+                raise
+            LOG.warning("Futures metadata unavailable; futures confirmation/VWAP will not be used for this scan")
             return None
-        candidates = []
-        for row in data.get("data", []):
-            if not isinstance(row, dict) or row.get("underlying_key") != underlying_key:
+        candidates: list[tuple[dt.date, dict[str, Any]]] = []
+        for row in rows:
+            if not isinstance(row, dict):
                 continue
-            try:
-                exp = dt.date.fromisoformat(str(row.get("expiry")))
-            except ValueError:
+            if row.get("segment") != "NSE_FO" or row.get("instrument_type") != "FUT":
                 continue
-            if (exp >= today and row.get("instrument_key") and row.get("instrument_type") == "FUT"
-                    and row.get("segment") == "NSE_FO"):
-                candidates.append((exp, row))
-        return min(candidates, key=lambda x: x[0])[1] if candidates else None
+            if row.get("underlying_key") != underlying_key or not row.get("instrument_key"):
+                continue
+            expiry = _parse_instrument_expiry(row.get("expiry"))
+            if expiry is None or expiry < today:
+                continue
+            candidate = dict(row)
+            candidate["expiry"] = expiry.isoformat()
+            candidates.append((expiry, candidate))
+        if not candidates:
+            if self.config.require_futures:
+                raise ScannerError("INSTRUMENT_RESOLUTION_FAILED", "No unexpired NIFTY futures contract was found in official Upstox instrument master")
+            LOG.warning("No unexpired NIFTY futures contract found; futures confirmation/VWAP unavailable")
+            return None
+        # The nearest unexpired listed future is selected by metadata, never by a hard-coded symbol/date.
+        return min(candidates, key=lambda item: item[0])[1]
 
 
 # ------------------------- OI-first feature engine -------------------------
@@ -1412,7 +1546,7 @@ class LocalState:
             raise ScannerError("STATE_SAVE_FAILED", "State root must be JSON object")
         # Clean-slate schema. Do not silently misinterpret older v96/v98 fields as v99 data.
         if state.get("schema_version") != 99:
-            LOG.warning("Existing state schema %r is incompatible; starting a new v99 session state", state.get("schema_version"))
+            LOG.warning("Existing state schema %r is incompatible; starting a fresh v99.2 state. Prior OI/candle history will not be reused; collect a new current-session baseline.", state.get("schema_version"))
             return default_state()
         return state
     def save(self, state: dict[str, Any], revision: Any = None) -> None:
@@ -1460,7 +1594,7 @@ class GitHubState:
     def save(self, state: dict[str, Any], revision: Any = None) -> None:
         state["schema_version"] = 99; state["scanner_version"] = VERSION
         url = self._url().split("?",1)[0]
-        body = {"message":f"Update NIFTY scanner v99 state {now_ist().isoformat()}",
+        body = {"message":f"Update NIFTY scanner v99.2 state {now_ist().isoformat()}",
                 "content":base64.b64encode(json.dumps(jsonable(state), separators=(",", ":"), sort_keys=True).encode()).decode(),
                 "branch":self.config.github_state_branch}
         if self.sha:
@@ -1822,14 +1956,15 @@ def notify(cfg: Config, signal: Mapping[str, Any]) -> None:
 
 def print_environment() -> None:
     names = ["UPSTOX_ANALYTICS_TOKEN (recommended; preferred if set)", "UPSTOX_ACCESS_TOKEN (fallback token variable)",
-             "NIFTY_INSTRUMENT_KEY (optional; otherwise discovered)","NIFTY_EXPIRY (nearest_weekly or YYYY-MM-DD)",
+             "NIFTY_INSTRUMENT_KEY (optional; otherwise resolved from public Upstox NSE instrument master)","NIFTY_EXPIRY (nearest_weekly or YYYY-MM-DD)",
+             "UPSTOX_INSTRUMENT_MASTER_CACHE_FILE","UPSTOX_INSTRUMENT_MASTER_TTL_SECONDS",
              "STATE_BACKEND","STATE_FILE","GITHUB_STATE_REPOSITORY","GITHUB_STATE_PATH","GITHUB_STATE_BRANCH","GITHUB_STATE_TOKEN",
              "ALERT_WEBHOOK_URL","SMTP_HOST","SMTP_PORT","SMTP_USER","SMTP_PASSWORD","EMAIL_FROM","EMAIL_TO","SCAN_DRY_RUN"]
     print("\n".join(names))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 OI-first regime scanner v99.1 (alerting only)")
+    parser = argparse.ArgumentParser(description="NIFTY 50 OI-first regime scanner v99.2 (alerting only)")
     parser.add_argument("--print-reason-codes", action="store_true")
     parser.add_argument("--show-env", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Do not send notifications")
