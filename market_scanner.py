@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 intraday OI + market-structure scanner v103.0.1.
+"""NIFTY 50 OI-first multi-regime intraday options scanner v104.0.0.
 
 Single-file runtime for a GitHub Actions workflow dispatched about every three
 minutes. It never places orders. Tests and documentation are separate files.
@@ -10,7 +10,7 @@ Design contract:
 - one-minute candles are price observations, never a source of fabricated OI;
 - a historical setup must pass a current-price/fresh-quote revalidation;
 - the nearest valid opposing barrier is always T1 and cannot be bypassed;
-- a trade requires both underlying RR and conservative option-net RR >= 2.0;
+- a trade requires spot-only RR >= 2.0; option premium RR is not used;
 - state is written atomically before notification is attempted;
 - failures produce explicit reason codes and never silently reuse stale data.
 
@@ -44,8 +44,8 @@ from statistics import median
 from typing import Any, Iterable, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "103.0.1"
-SCHEMA_VERSION = 103
+VERSION = "104.0.0"
+SCHEMA_VERSION = 104
 IST = ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
 API_BASE = "https://api.upstox.com"
@@ -65,7 +65,7 @@ class ScannerError(RuntimeError):
 @dataclass(frozen=True)
 class Config:
     token: str
-    state_file: Path = Path("state/market_state_v103.json")
+    state_file: Path = Path("state/market_state_v104.json")
     audit_dir: Path = Path("audit")
     instrument_cache: Path = Path(".cache/upstox_nse.json.gz")
     explicit_expiry: Optional[date] = None
@@ -74,7 +74,6 @@ class Config:
     instrument_cache_hours: int = 12
     oi_material_threshold_pct: float = 2.0
     min_underlying_rr: float = 2.0
-    min_option_net_rr: float = 2.0
     max_oi_age_seconds: int = 720
     expected_oi_interval_seconds: int = 180
     max_quote_age_seconds: int = 120
@@ -85,12 +84,12 @@ class Config:
     min_option_volume: float = 1.0
     min_abs_delta: float = 0.30
     max_abs_delta: float = 0.80
-    max_entry_extension_atr: float = 0.80
+    max_entry_extension_atr: float = 1.35
     pivot_left: int = 2
     pivot_right: int = 2
     support_lookback_candles: int = 8
-    setup_max_age_minutes: int = 3
-    setup_state_ttl_minutes: int = 12
+    setup_max_age_minutes: int = 6
+    setup_state_ttl_minutes: int = 20
     strike_offsets_ce: tuple[int, ...] = (0, -1, -2)
     strike_offsets_pe: tuple[int, ...] = (0, 1, 2)
     iv_shock_points: float = 1.0
@@ -103,9 +102,9 @@ class Config:
     stop_buffer_atr_fraction: float = 0.10
     minimum_stop_points: float = 5.0
     max_stop_atr: float = 2.5
-    min_oi_direction_confidence: float = 0.56
+    min_oi_direction_confidence: float = 0.52
     min_oi_score_margin: float = 0.12
-    min_mixed_price_confirmation: float = 0.78
+    min_mixed_price_confirmation: float = 0.65
     email_sender: str = ""
     email_receiver: str = ""
     email_password: str = ""
@@ -122,7 +121,6 @@ class Config:
             "request_timeout": self.request_timeout,
             "oi_material_threshold_pct": self.oi_material_threshold_pct,
             "min_underlying_rr": self.min_underlying_rr,
-            "min_option_net_rr": self.min_option_net_rr,
             "max_oi_age_seconds": self.max_oi_age_seconds,
             "expected_oi_interval_seconds": self.expected_oi_interval_seconds,
             "max_quote_age_seconds": self.max_quote_age_seconds,
@@ -138,8 +136,8 @@ class Config:
         for name, value in positive.items():
             if not math.isfinite(float(value)) or float(value) <= 0:
                 raise ScannerError("CONFIG_INVALID", f"{name} must be a finite number greater than zero")
-        if self.min_underlying_rr < 2.0 or self.min_option_net_rr < 2.0:
-            raise ScannerError("CONFIG_INVALID", "MIN_UNDERLYING_RR and MIN_OPTION_NET_RR cannot be set below the hard 2.0:1 minimum")
+        if self.min_underlying_rr < 2.0:
+            raise ScannerError("CONFIG_INVALID", "MIN_UNDERLYING_RR cannot be set below the hard 2.0:1 spot-based minimum")
         if self.min_abs_delta < 0 or self.max_abs_delta > 1 or self.min_abs_delta >= self.max_abs_delta:
             raise ScannerError("CONFIG_INVALID", "Delta limits must satisfy 0 <= min_abs_delta < max_abs_delta <= 1")
         if self.max_retries < 0 or self.max_retries > 5:
@@ -211,7 +209,7 @@ class Config:
 
         return cls(
             token=token,
-            state_file=Path(os.getenv("STATE_FILE", "state/market_state_v103.json")),
+            state_file=Path(os.getenv("STATE_FILE", "state/market_state_v104.json")),
             audit_dir=Path(os.getenv("AUDIT_DIR", "audit")),
             instrument_cache=Path(os.getenv("INSTRUMENT_CACHE_FILE", ".cache/upstox_nse.json.gz")),
             explicit_expiry=expiry,
@@ -220,7 +218,6 @@ class Config:
             instrument_cache_hours=int_env("INSTRUMENT_CACHE_HOURS", 12),
             oi_material_threshold_pct=float_env("OI_MATERIAL_THRESHOLD_PCT", 2.0) or 2.0,
             min_underlying_rr=float_env("MIN_UNDERLYING_RR", 2.0) or 2.0,
-            min_option_net_rr=float_env("MIN_OPTION_NET_RR", 2.0) or 2.0,
             max_oi_age_seconds=int_env("MAX_OI_AGE_SECONDS", 720),
             expected_oi_interval_seconds=max(30, int_env("EXPECTED_OI_INTERVAL_SECONDS", 180)),
             max_quote_age_seconds=int_env("MAX_QUOTE_AGE_SECONDS", 120),
@@ -231,17 +228,17 @@ class Config:
             min_option_volume=float_env("MIN_OPTION_VOLUME", 1.0),
             min_abs_delta=float_env("MIN_ABS_DELTA", 0.30),
             max_abs_delta=float_env("MAX_ABS_DELTA", 0.80),
-            max_entry_extension_atr=float_env("MAX_ENTRY_EXTENSION_ATR", 0.80),
-            setup_max_age_minutes=int_env("SETUP_MAX_AGE_MINUTES", 3),
-            setup_state_ttl_minutes=int_env("SETUP_STATE_TTL_MINUTES", 12),
+            max_entry_extension_atr=float_env("MAX_ENTRY_EXTENSION_ATR", 1.35),
+            setup_max_age_minutes=int_env("SETUP_MAX_AGE_MINUTES", 6),
+            setup_state_ttl_minutes=int_env("SETUP_STATE_TTL_MINUTES", 20),
             iv_shock_points=float_env("IV_SHOCK_POINTS", 1.0),
             expected_hold_minutes=float_env("EXPECTED_HOLD_MINUTES", 15.0),
             annual_risk_free_rate=float_env("ANNUAL_RISK_FREE_RATE", 0.06),
             option_slippage_points=float_env("OPTION_SLIPPAGE_POINTS", 1.0),
             transaction_cost_rate=float_env("TRANSACTION_COST_RATE", 0.0018),
-            min_oi_direction_confidence=float_env("MIN_OI_DIRECTION_CONFIDENCE", 0.56),
+            min_oi_direction_confidence=float_env("MIN_OI_DIRECTION_CONFIDENCE", 0.52),
             min_oi_score_margin=float_env("MIN_OI_SCORE_MARGIN", 0.12),
-            min_mixed_price_confirmation=float_env("MIN_MIXED_PRICE_CONFIRMATION", 0.78),
+            min_mixed_price_confirmation=float_env("MIN_MIXED_PRICE_CONFIRMATION", 0.65),
             email_sender=(os.getenv("EMAIL_SENDER", "").strip() or os.getenv("EMAIL_FROM", "").strip()),
             email_receiver=(os.getenv("EMAIL_RECEIVER", "").strip() or os.getenv("EMAIL_TO", "").strip()),
             email_password=os.getenv("EMAIL_PASSWORD", "").strip(),
@@ -340,29 +337,73 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
         raise
 
 
+def _migrate_state_payload(state: Mapping[str, Any], source: Path) -> dict[str, Any]:
+    """Migrate compatible v102/v103 durable state without discarding the session baseline.
+
+    Only data structures that already have stable meanings are carried forward.
+    run_scan subsequently validates session date, expiry and instrument identity
+    before using any snapshot for OI deltas.
+    """
+    try:
+        old_schema = int(state.get("schema_version", 0) or 0)
+    except (TypeError, ValueError):
+        old_schema = 0
+    if old_schema not in {102, 103}:
+        raise ScannerError("STATE_SCHEMA_UNSUPPORTED", f"Cannot safely migrate schema {old_schema} from {source}")
+    migrated = dict(state)
+    migrated["schema_version"] = SCHEMA_VERSION
+    migrated["scanner_version"] = VERSION
+    migrated["migration_note"] = f"migrated_schema_{old_schema}_to_{SCHEMA_VERSION}; session/expiry/instrument checks remain mandatory"
+    snapshots = migrated.get("chain_snapshots")
+    migrated["chain_snapshots"] = [x for x in snapshots if isinstance(x, Mapping)][-16:] if isinstance(snapshots, list) else []
+    # Preserve only known durable workflow fields. Unknown schema-specific
+    # structures are not silently interpreted by the new decision engine.
+    allowed = {
+        "schema_version", "scanner_version", "migration_note", "session_date",
+        "chain_snapshots", "session_oi_baseline", "last_successful_snapshot_at",
+        "latest_oi_evidence", "oi_evidence_history", "last_processed_candle",
+        "setup_watch", "seen_signal_keys", "pending_notifications",
+        "delivered_signal_keys", "last_signal", "last_decision", "instrument_cache_version",
+    }
+    return {key: value for key, value in migrated.items() if key in allowed}
+
+
 def read_state(path: Path) -> dict[str, Any]:
-    if not path.exists():
+    """Load v104 state or migrate an existing same-session v103/v102 state file."""
+    source = path if path.exists() else None
+    if source is None:
+        # GitHub Actions previously persisted the state under the v103 filename.
+        # Keep the old file untouched; copy its compatible state into v104 on save.
+        candidates = [path.parent / "market_state_v103.json", path.parent / "market_state_v102.json"]
+        source = next((candidate for candidate in candidates if candidate.exists()), None)
+    if source is None:
         return {"schema_version": SCHEMA_VERSION, "scanner_version": VERSION}
     try:
-        raw = path.read_bytes()
+        raw = source.read_bytes()
         if len(raw) > 2_000_000:
-            raise ScannerError("STATE_TOO_LARGE", f"State file exceeds 2 MB: {path}")
+            raise ScannerError("STATE_TOO_LARGE", f"State file exceeds 2 MB: {source}")
         state = json.loads(raw.decode("utf-8"))
         if not isinstance(state, dict):
             raise ValueError("state root is not an object")
         _reject_non_finite(state)
-        if state.get("schema_version") != SCHEMA_VERSION:
-            old_schema = str(state.get("schema_version", "unknown"))
-            backup = path.with_name(path.name + f".schema-{old_schema}.backup")
-            if backup.exists():
-                backup = path.with_name(path.name + f".schema-{old_schema}.{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.backup")
-            try:
-                shutil.copy2(path, backup)
-            except OSError as exc:
-                raise ScannerError("STATE_BACKUP_FAILED", f"Cannot preserve incompatible state before reset: {exc}") from exc
-            LOG.warning("State schema %r is incompatible with v%s; old state copied to %s; starting clean state.", old_schema, VERSION, backup)
-            return {"schema_version": SCHEMA_VERSION, "scanner_version": VERSION, "migration_note": "incompatible_state_not_reused", "migration_backup": str(backup)}
-        return state
+        schema = state.get("schema_version")
+        if schema == SCHEMA_VERSION:
+            return state
+        if source != path or schema in {102, 103}:
+            migrated = _migrate_state_payload(state, source)
+            LOG.warning("Migrated durable state schema %s to %s from %s", schema, SCHEMA_VERSION, source)
+            return migrated
+        old_schema = str(schema if schema is not None else "unknown")
+        backup = path.with_name(path.name + f".schema-{old_schema}.backup")
+        if backup.exists():
+            backup = path.with_name(path.name + f".schema-{old_schema}.{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.backup")
+        try:
+            shutil.copy2(path, backup)
+        except OSError as exc:
+            raise ScannerError("STATE_BACKUP_FAILED", f"Cannot preserve incompatible state before reset: {exc}") from exc
+        LOG.warning("State schema %r is incompatible with v%s; old state copied to %s; starting clean state.", old_schema, VERSION, backup)
+        return {"schema_version": SCHEMA_VERSION, "scanner_version": VERSION,
+                "migration_note": "incompatible_state_not_reused", "migration_backup": str(backup)}
     except ScannerError:
         raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
@@ -394,7 +435,7 @@ def compact_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "scanner_version", "schema_version", "timestamp", "evaluation_timestamp",
         "session_date", "expiry", "underlying_key", "decision", "reason_code",
         "error_type", "message", "spot", "oi_label", "oi_state", "oi_raw_label",
-        "option_chain_status", "option_chain_error", "regime", "setup_age_seconds",
+        "option_chain_status", "option_chain_error", "regime", "market_scenario", "setup_age_seconds",
         "setup_direction", "setup_kind", "signal_key", "notification_status",
         "notification_error", "candidate_offsets_allowed", "audit_persistence",
     )
@@ -408,7 +449,8 @@ def compact_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "source_refresh_status", "source_refresh_error", "oi_age_seconds",
         "compared_to_previous_successful_snapshot", "contracts_compared",
         "contributing_contract_count", "material_contract_count", "persistence_count",
-        "previous_directional_label",
+        "previous_directional_label", "oi_horizons", "multi_horizon_direction",
+        "multi_horizon_balance", "multi_horizon_alignment", "multi_horizon_vote_count",
         "average_abs_delta_oi_pct", "average_abs_premium_change_pct",
         "aggregate_delta_call_oi_snapshot", "aggregate_delta_put_oi_snapshot",
         "aggregate_delta_call_oi_pct_snapshot", "aggregate_delta_put_oi_pct_snapshot",
@@ -461,6 +503,7 @@ def compact_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "instrument_key", "trading_symbol", "expiry", "price", "quote_timestamp",
         "quote_age_seconds", "quote_status", "basis_points", "basis_points_value",
         "vwap", "vwap_valid", "vwap_status", "latest_candle_age_seconds",
+        "futures_oi_signal", "futures_oi_delta", "futures_oi_delta_pct", "futures_price_delta_points",
     ))
     if futures is not None:
         compact["futures"] = futures
@@ -472,7 +515,7 @@ def compact_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
     if setup is not None:
         compact["setup"] = setup
 
-    # Trade-qualified records retain the selected instrument and full risk plan.
+    # Trade-qualified records retain the selected instrument and full spot risk plan.
     for key in ("risk_plan", "selected_contract"):
         value = record.get(key)
         if isinstance(value, Mapping):
@@ -1120,29 +1163,39 @@ def _lookup_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[s
 
 
 def _weighted_direction(oi_delta: float, oi_pct: Optional[float], premium_pct: Optional[float], side: str, threshold: float) -> tuple[float, str]:
-    """Return signed directional contribution and qualitative positioning heuristic.
+    """Classify the four OI/premium signatures and return a signed hypothesis.
 
-    Positive is bullish, negative is bearish. Interpretation is heuristic, not
-    proof of buyer/seller intent. Actual delta and percent remain untouched.
+    The premium input is the Greek-adjusted residual percentage where possible.
+    This is an inference about positioning, not identification of participants.
+    Positive is bullish; negative is bearish.
     """
-    if oi_pct is None or premium_pct is None or abs(oi_delta) < 0.5 or abs(premium_pct) < 0.05:
+    if oi_pct is None or premium_pct is None or abs(oi_delta) < 0.5 or abs(premium_pct) < 0.025:
         return 0.0, "INSUFFICIENT_CHANGE"
     oi_up = oi_delta > 0
     premium_up = premium_pct > 0
-    magnitude = min(abs(oi_pct) / max(threshold, 1e-9), 1.5) / 1.5
-    magnitude *= min(abs(premium_pct) / 1.5, 1.0)
-    # New-position signatures are weighted somewhat more than unwinds; signed
-    # OI still matters in the contribution magnitude and label.
-    strength = 1.0 if oi_up else 0.65
     if side == "CE":
-        bullish = premium_up
-        label = "CALL_LONG_BUILDUP" if oi_up and premium_up else "CALL_WRITING_LIKELY" if oi_up else "CALL_SHORT_COVERING_LIKELY" if premium_up else "CALL_LONG_UNWINDING_LIKELY"
+        if oi_up and premium_up:
+            label, bullish = "CALL_LONG_BUILDUP_LIKELY", True
+        elif oi_up and not premium_up:
+            label, bullish = "CALL_WRITING_LIKELY", False
+        elif not oi_up and premium_up:
+            label, bullish = "CALL_SHORT_COVERING_LIKELY", True
+        else:
+            label, bullish = "CALL_LONG_UNWINDING_LIKELY", False
     else:
-        bullish = not premium_up
-        label = "PUT_LONG_BUILDUP" if oi_up and premium_up else "PUT_WRITING_LIKELY" if oi_up else "PUT_SHORT_COVERING_LIKELY" if premium_up else "PUT_LONG_UNWINDING_LIKELY"
-    # OI decrease + premium direction is weaker evidence than fresh OI buildup.
-    return (1.0 if bullish else -1.0) * magnitude * strength, label
-
+        if oi_up and premium_up:
+            label, bullish = "PUT_LONG_BUILDUP_LIKELY", False
+        elif oi_up and not premium_up:
+            label, bullish = "PUT_WRITING_LIKELY", True
+        elif not oi_up and premium_up:
+            label, bullish = "PUT_SHORT_COVERING_LIKELY", False
+        else:
+            label, bullish = "PUT_LONG_UNWINDING_LIKELY", True
+    # Keep the observed OI percentage untouched; cap only the score input.
+    oi_strength = min(abs(oi_pct) / max(threshold, 1e-9), 1.5) / 1.5
+    premium_strength = min(abs(premium_pct) / 0.75, 1.0)
+    position_strength = 1.0 if oi_up else 0.78
+    return (1.0 if bullish else -1.0) * oi_strength * premium_strength * position_strength, label
 
 
 def _chain_premium_proxy(ltp: Any, bid: Any, ask: Any) -> tuple[Optional[float], str, float]:
@@ -1165,6 +1218,58 @@ def _chain_premium_proxy(ltp: Any, bid: Any, ask: Any) -> tuple[Optional[float],
         return last, "LTP_FALLBACK_NO_EVENT_TIMESTAMP", 0.60
     return None, "UNAVAILABLE", 0.0
 
+def _greek_adjusted_premium_change(
+    current: OptionRecord, previous: Mapping[str, Any], previous_spot: Optional[float],
+    current_spot: float, elapsed_seconds: float,
+) -> tuple[Optional[float], Optional[float], str, float]:
+    """Return raw and Greek-adjusted premium % changes.
+
+    The adjustment removes estimated delta/gamma exposure to spot, elapsed theta
+    and IV/vega effects where both snapshots contain the required Greeks. Theta
+    is treated as a daily premium change and Vega as premium change per IV point,
+    consistent with the Upstox option-Greek field convention. When a required
+    Greek is missing, raw premium change is returned with sharply lower quality.
+    """
+    cur_premium, cur_source, cur_quality = _chain_premium_proxy(current.ltp, current.chain_bid, current.chain_ask)
+    prev_premium, prev_source, prev_quality = _chain_premium_proxy(
+        previous.get("ltp", 0), previous.get("chain_bid", 0), previous.get("chain_ask", 0)
+    )
+    if cur_premium is None or prev_premium is None or prev_premium <= 0 or cur_source != prev_source:
+        return None, None, "SOURCE_MISMATCH" if cur_source != prev_source else "UNAVAILABLE", 0.0
+    raw_pct = 100.0 * (cur_premium - prev_premium) / prev_premium
+    prev_delta = previous.get("delta")
+    prev_gamma = previous.get("gamma")
+    prev_theta = previous.get("theta")
+    prev_vega = previous.get("vega")
+    prev_iv = previous.get("iv")
+    greek_values = (current.delta, current.gamma, current.theta, current.vega, current.iv,
+                    prev_delta, prev_gamma, prev_theta, prev_vega, prev_iv)
+    try:
+        vals = [float(x) for x in greek_values]
+        if not all(math.isfinite(x) for x in vals) or previous_spot is None or previous_spot <= 0:
+            raise ValueError
+        delta_now, gamma_now, theta_now, vega_now, iv_now, delta_prev, gamma_prev, theta_prev, vega_prev, iv_prev = vals
+        spot_move = current_spot - previous_spot
+        avg_delta = (delta_now + delta_prev) / 2.0
+        avg_gamma = (gamma_now + gamma_prev) / 2.0
+        avg_theta = (theta_now + theta_prev) / 2.0
+        avg_vega = (vega_now + vega_prev) / 2.0
+        iv_move = iv_now - iv_prev
+        elapsed_days = max(0.0, elapsed_seconds) / 86400.0
+        expected_change = avg_delta * spot_move + 0.5 * avg_gamma * spot_move * spot_move
+        expected_change += avg_theta * elapsed_days + avg_vega * iv_move
+        residual = (cur_premium - prev_premium) - expected_change
+        residual_pct = 100.0 * residual / prev_premium
+        if not math.isfinite(residual_pct):
+            raise ValueError
+        quality = min(cur_quality, prev_quality) * 1.0
+        return raw_pct, residual_pct, "GREEK_ADJUSTED_CHAIN_MID" if cur_source == "CHAIN_MID" else "GREEK_ADJUSTED_LTP", quality
+    except (TypeError, ValueError, OverflowError):
+        # LTP/midpoint change without complete Greeks is only a weak proxy.
+        quality = min(cur_quality, prev_quality) * (0.45 if cur_source == "CHAIN_MID" else 0.25)
+        return raw_pct, raw_pct, "RAW_PREMIUM_FALLBACK_LOW_CONFIDENCE", quality
+
+
 def calculate_oi_evidence(
     current_records: Sequence[OptionRecord],
     previous_snapshot: Optional[Mapping[str, Any]],
@@ -1172,18 +1277,23 @@ def calculate_oi_evidence(
     spot: float,
     fetched_at: datetime,
     config: Config,
+    snapshot_history: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> dict[str, Any]:
-    """Compute exact snapshot deltas and a breadth/activity-aware OI hypothesis.
+    """OI-first directional evidence with four-way flow classification.
 
-    The raw per-contract percentage is never clipped. Only the score contribution
-    is capped. The direction is a positioning heuristic based on OI change,
-    premium change, and option side; it is not proof of participant intent.
+    Computes true consecutive-snapshot deltas, session-baseline deltas, and
+    compact strike-level walls. No interpolated OI observations are generated.
     """
     current_session = fetched_at.astimezone(IST).date().isoformat()
     current_expiry = current_records[0].expiry.isoformat() if current_records else None
     previous_rows = _lookup_records(previous_snapshot.get("rows", [])) if previous_snapshot else {}
     baseline_rows = _lookup_records(session_baseline.get("rows", [])) if session_baseline else {}
     previous_time = parse_datetime(previous_snapshot.get("fetched_at")) if previous_snapshot else None
+    previous_spot = None
+    try:
+        previous_spot = float(previous_snapshot.get("spot")) if previous_snapshot else None
+    except (TypeError, ValueError, OverflowError):
+        previous_spot = None
     previous_same = bool(
         current_records and previous_snapshot and previous_time and previous_time < fetched_at
         and previous_snapshot.get("session_date") == current_session
@@ -1207,14 +1317,11 @@ def calculate_oi_evidence(
         current_near = list(current_records)
 
     per_contract: list[dict[str, Any]] = []
-    weighted_sum = 0.0
-    total_direction_weight = 0.0
+    weighted_sum = total_direction_weight = 0.0
     activity_oi_pct: list[tuple[float, float]] = []
     activity_premium_pct: list[tuple[float, float]] = []
-    contributing_contract_count = 0
-    paired_contract_count = 0
-    aggregate_delta_ce = aggregate_prev_ce = 0.0
-    aggregate_delta_pe = aggregate_prev_pe = 0.0
+    contributing_contract_count = paired_contract_count = 0
+    aggregate_delta_ce = aggregate_prev_ce = aggregate_delta_pe = aggregate_prev_pe = 0.0
     session_delta_call = session_delta_put = 0.0
     session_baseline_count = 0
     pcr_rows_call = pcr_rows_put = 0.0
@@ -1222,11 +1329,37 @@ def calculate_oi_evidence(
     put_oi_by_strike: dict[float, float] = defaultdict(float)
     call_delta_by_strike: dict[float, float] = defaultdict(float)
     put_delta_by_strike: dict[float, float] = defaultdict(float)
+    call_prev_by_strike: dict[float, float] = defaultdict(float)
+    put_prev_by_strike: dict[float, float] = defaultdict(float)
+    flow_abs_by_strike: dict[tuple[str, float], float] = defaultdict(float)
+    writer_abs_by_strike: dict[tuple[str, float], float] = defaultdict(float)
+    support_flow_abs_by_strike: dict[tuple[str, float], float] = defaultdict(float)
+    opposing_flow_abs_by_strike: dict[tuple[str, float], float] = defaultdict(float)
+    flow_labels_by_strike: dict[tuple[str, float], Counter[str]] = defaultdict(Counter)
+
+    # Larger absolute OI changes should carry somewhat more influence than tiny
+    # changes with the same percentage. The bounded weight preserves percentage
+    # change as the primary test while respecting material strike-level activity.
+    # CE and PE are normalised independently.
+    max_abs_delta_by_side: dict[str, float] = {"CE": 0.0, "PE": 0.0}
+    for candidate in current_near:
+        old = previous_rows.get(candidate.instrument_key)
+        if not old or not previous_same or old.get("expiry") != candidate.expiry.isoformat() or old.get("side") != candidate.side:
+            continue
+        try:
+            old_oi_value = float(old.get("oi", 0) or 0)
+            old_strike_value = float(old.get("strike", -1))
+            if old_oi_value >= 0 and old_strike_value == candidate.strike and math.isfinite(old_oi_value):
+                max_abs_delta_by_side[candidate.side] = max(
+                    max_abs_delta_by_side[candidate.side], abs(candidate.oi - old_oi_value)
+                )
+        except (TypeError, ValueError, OverflowError):
+            continue
 
     for rec in current_near:
         prev = previous_rows.get(rec.instrument_key)
         base = baseline_rows.get(rec.instrument_key)
-        delta_oi = delta_pct = delta_volume = premium_pct = None
+        delta_oi = delta_pct = delta_volume = raw_premium_pct = residual_premium_pct = None
         premium_change_source = "UNAVAILABLE"
         premium_source_quality = 0.0
         prev_oi_value: Optional[float] = None
@@ -1235,34 +1368,30 @@ def calculate_oi_evidence(
             try:
                 prev_oi_value = float(prev.get("oi", 0) or 0)
                 prev_volume = float(prev.get("volume", 0) or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 prev_oi_value = None
             if prev_oi_value is not None and math.isfinite(prev_oi_value) and prev_oi_value >= 0:
                 delta_oi = rec.oi - prev_oi_value
                 delta_pct = 100.0 * delta_oi / prev_oi_value if prev_oi_value > 0 else None
-                current_premium, current_source, current_quality = _chain_premium_proxy(rec.ltp, rec.chain_bid, rec.chain_ask)
-                previous_premium, previous_source, previous_quality = _chain_premium_proxy(prev.get("ltp", 0), prev.get("chain_bid", 0), prev.get("chain_ask", 0))
-                if current_premium is not None and previous_premium is not None and previous_premium > 0 and current_source == previous_source:
-                    premium_pct = 100.0 * (current_premium - previous_premium) / previous_premium
-                    premium_change_source = current_source
-                    premium_source_quality = min(current_quality, previous_quality)
-                elif current_source != previous_source:
-                    premium_change_source = "SOURCE_MISMATCH"
+                elapsed = (fetched_at - previous_time).total_seconds() if previous_time else 0.0
+                raw_premium_pct, residual_premium_pct, premium_change_source, premium_source_quality = _greek_adjusted_premium_change(
+                    rec, prev, previous_spot, spot, elapsed
+                )
                 if math.isfinite(prev_volume) and prev_volume >= 0:
-                    # Cumulative volume resets are missing data, not negative turnover.
                     delta_volume = rec.volume - prev_volume if rec.volume >= prev_volume else None
                 paired_contract_count += 1
                 if rec.side == "CE":
                     aggregate_delta_ce += delta_oi
                     aggregate_prev_ce += prev_oi_value
                     call_delta_by_strike[rec.strike] += delta_oi
+                    call_prev_by_strike[rec.strike] += prev_oi_value
                 else:
                     aggregate_delta_pe += delta_oi
                     aggregate_prev_pe += prev_oi_value
                     put_delta_by_strike[rec.strike] += delta_oi
+                    put_prev_by_strike[rec.strike] += prev_oi_value
 
-        previous_session_delta = None
-        previous_session_delta_pct = None
+        previous_session_delta = previous_session_delta_pct = None
         if rec.previous_session_oi is not None:
             try:
                 prev_session_oi = float(rec.previous_session_oi)
@@ -1284,25 +1413,49 @@ def calculate_oi_evidence(
                         session_delta_call += session_delta
                     else:
                         session_delta_put += session_delta
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 session_delta = None
 
         contribution = 0.0
         flow_label = "FIRST_SNAPSHOT_OR_NO_PREVIOUS_BASELINE"
-        if delta_oi is not None and delta_pct is not None and premium_pct is not None:
+        if delta_oi is not None and delta_pct is not None and residual_premium_pct is not None:
             contribution, flow_label = _weighted_direction(
-                delta_oi, delta_pct, premium_pct, rec.side, config.oi_material_threshold_pct
+                delta_oi, delta_pct, residual_premium_pct, rec.side, config.oi_material_threshold_pct
             )
             distance_steps = abs(rec.strike - spot) / max(step, 1e-6)
-            proximity_weight = 1.0 / (1.0 + 0.22 * distance_steps)
-            volume_weight = 1.05 if delta_volume is not None and delta_volume > 0 else 0.85
-            effective = contribution * proximity_weight * volume_weight * premium_source_quality
+            proximity_weight = 1.0 / (1.0 + 0.18 * distance_steps)
+            volume_weight = 1.05 if delta_volume is not None and delta_volume > 0 else 0.90
+            max_side_delta = max_abs_delta_by_side.get(rec.side, 0.0)
+            oi_change_weight = 0.55 + 0.45 * math.sqrt(abs(delta_oi) / max_side_delta) if max_side_delta > 0 else 0.55
+            effective = contribution * proximity_weight * volume_weight * premium_source_quality * oi_change_weight
             weighted_sum += effective
             total_direction_weight += abs(effective)
             if abs(effective) > 1e-9:
                 contributing_contract_count += 1
                 activity_oi_pct.append((abs(delta_pct), proximity_weight))
-                activity_premium_pct.append((abs(premium_pct), proximity_weight * premium_source_quality))
+                activity_premium_pct.append((abs(residual_premium_pct), proximity_weight * premium_source_quality))
+                key = (rec.side, rec.strike)
+                flow_abs_by_strike[key] += abs(delta_oi)
+                flow_labels_by_strike[key][flow_label] += abs(delta_oi)
+                if flow_label in {"CALL_WRITING_LIKELY", "PUT_WRITING_LIKELY"}:
+                    writer_abs_by_strike[key] += abs(delta_oi)
+                # A wall is strengthened specifically by writing at that
+                # strike. Long unwinding can be directionally bearish/bullish,
+                # but it reduces the open-interest wall and must not be counted
+                # as fresh resistance/support. Other buyer/covering flows also
+                # reduce confidence that the existing wall will hold.
+                supportive_labels = (
+                    {"CALL_WRITING_LIKELY"} if rec.side == "CE" else {"PUT_WRITING_LIKELY"}
+                )
+                opposing_labels = (
+                    {"CALL_LONG_BUILDUP_LIKELY", "CALL_SHORT_COVERING_LIKELY", "CALL_LONG_UNWINDING_LIKELY"}
+                    if rec.side == "CE" else
+                    {"PUT_LONG_BUILDUP_LIKELY", "PUT_SHORT_COVERING_LIKELY", "PUT_LONG_UNWINDING_LIKELY"}
+                )
+                if flow_label in supportive_labels:
+                    support_flow_abs_by_strike[key] += abs(delta_oi)
+                elif flow_label in opposing_labels:
+                    opposing_flow_abs_by_strike[key] += abs(delta_oi)
 
         per_contract.append({
             "instrument_key": rec.instrument_key, "expiry": rec.expiry.isoformat(), "strike": rec.strike,
@@ -1310,8 +1463,10 @@ def calculate_oi_evidence(
             "delta_oi_pct_snapshot": delta_pct, "delta_oi_session": session_delta,
             "delta_oi_vs_prev_session": previous_session_delta,
             "delta_oi_vs_prev_session_pct": previous_session_delta_pct,
-            "delta_volume_snapshot": delta_volume, "premium_change_pct_snapshot": premium_pct,
+            "delta_volume_snapshot": delta_volume, "premium_change_pct_snapshot": raw_premium_pct,
+            "premium_residual_change_pct_snapshot": residual_premium_pct,
             "premium_change_source": premium_change_source,
+            "oi_change_weight": oi_change_weight if delta_oi is not None else 0.0,
             "material_oi_change": delta_pct is not None and abs(delta_pct) >= config.oi_material_threshold_pct,
             "flow_interpretation": flow_label, "directional_contribution": contribution,
             "distance_from_spot_points": rec.strike - spot,
@@ -1334,23 +1489,19 @@ def calculate_oi_evidence(
     average_abs_oi_pct = weighted_average(activity_oi_pct)
     average_abs_premium_pct = weighted_average(activity_premium_pct)
     oi_activity_factor = min(1.0, (average_abs_oi_pct or 0.0) / max(config.oi_material_threshold_pct, 1e-9))
-    # Premium movement reference is an engineering calibration (1.5%); it does
-    # not replace or alter the single configurable 2.0% OI materiality threshold.
-    premium_activity_factor = min(1.0, (average_abs_premium_pct or 0.0) / 1.5)
-    breadth_factor = min(1.0, contributing_contract_count / 4.0)
+    premium_activity_factor = min(1.0, (average_abs_premium_pct or 0.0) / 0.75)
+    breadth_factor = min(1.0, contributing_contract_count / 5.0)
     interval_seconds = (fetched_at - previous_time).total_seconds() if previous_same and previous_time else None
     expected_interval = max(30, config.expected_oi_interval_seconds)
     interval_factor = min(1.0, expected_interval / max(interval_seconds, float(expected_interval))) if interval_seconds and interval_seconds > 0 else 0.0
     activity_factor = math.sqrt(max(0.0, oi_activity_factor * premium_activity_factor)) * breadth_factor * interval_factor
     confidence = abs(directional_balance) * activity_factor
     score = directional_balance * activity_factor
-    bull_score = max(0.0, score)
-    bear_score = max(0.0, -score)
+    bull_score, bear_score = max(0.0, score), max(0.0, -score)
     margin = abs(directional_balance)
     if not previous_same:
         label = "MISSING"
-    elif (contributing_contract_count < 3 or confidence < config.min_oi_direction_confidence
-          or margin < config.min_oi_score_margin):
+    elif contributing_contract_count < 3 or confidence < config.min_oi_direction_confidence or margin < config.min_oi_score_margin:
         label = "MIXED"
     else:
         label = "BULLISH" if directional_balance > 0 else "BEARISH"
@@ -1360,65 +1511,207 @@ def calculate_oi_evidence(
 
     def walls(source: Mapping[float, float], side: str) -> list[dict[str, Any]]:
         ordered = sorted(source.items(), key=lambda pair: pair[1], reverse=True)
-        out: list[dict[str, Any]] = []
         max_oi = ordered[0][1] if ordered else 0.0
-        for strike, oi_value in ordered[:3]:
-            if oi_value <= 0 or max_oi <= 0:
-                continue
-            out.append({"strike": strike, "oi": oi_value, "relative_strength": oi_value / max_oi, "side": side})
-        return out
+        return [{"strike": strike, "oi": value, "relative_strength": value / max_oi if max_oi else 0.0, "side": side}
+                for strike, value in ordered[:5] if value > 0 and max_oi > 0]
 
-    def positional_zones(source: Mapping[float, float], deltas: Mapping[float, float], side: str, position: str, metric: str) -> list[dict[str, Any]]:
-        if position == "ABOVE":
-            candidates = [(strike, value) for strike, value in source.items() if strike > spot]
-        else:
-            candidates = [(strike, value) for strike, value in source.items() if strike < spot]
-        if metric == "FASTEST_CHANGE":
-            candidates.sort(key=lambda pair: abs(deltas.get(pair[0], 0.0)), reverse=True)
-        else:
-            candidates.sort(key=lambda pair: pair[1], reverse=True)
-        max_metric = max((abs(deltas.get(k, 0.0)) if metric == "FASTEST_CHANGE" else v for k, v in candidates), default=0.0)
-        result: list[dict[str, Any]] = []
-        for strike, oi_value in candidates[:3]:
-            delta_value = deltas.get(strike)
-            measure = abs(delta_value or 0.0) if metric == "FASTEST_CHANGE" else oi_value
-            if measure <= 0 or max_metric <= 0:
-                continue
-            result.append({"strike": strike, "oi": oi_value, "delta_oi_snapshot": delta_value,
-                           "relative_strength": measure / max_metric, "option_side": side,
-                           "position_vs_spot": position, "zone_metric": metric, "distance_points": strike - spot})
-        return result
+    max_call = max(call_oi_by_strike.values(), default=0.0)
+    max_put = max(put_oi_by_strike.values(), default=0.0)
+    oi_levels: list[dict[str, Any]] = []
+    for strike in strikes:
+        call_oi = call_oi_by_strike.get(strike, 0.0)
+        put_oi = put_oi_by_strike.get(strike, 0.0)
+        call_key, put_key = ("CE", strike), ("PE", strike)
+        call_flow_count = flow_abs_by_strike.get(call_key, 0.0)
+        put_flow_count = flow_abs_by_strike.get(put_key, 0.0)
+        call_writer = writer_abs_by_strike.get(call_key, 0.0) / call_flow_count if call_flow_count > 0 else 0.0
+        put_writer = writer_abs_by_strike.get(put_key, 0.0) / put_flow_count if put_flow_count > 0 else 0.0
+        call_support_flow = support_flow_abs_by_strike.get(call_key, 0.0) / call_flow_count if call_flow_count > 0 else 0.0
+        put_support_flow = support_flow_abs_by_strike.get(put_key, 0.0) / put_flow_count if put_flow_count > 0 else 0.0
+        call_opposing_flow = opposing_flow_abs_by_strike.get(call_key, 0.0) / call_flow_count if call_flow_count > 0 else 0.0
+        put_opposing_flow = opposing_flow_abs_by_strike.get(put_key, 0.0) / put_flow_count if put_flow_count > 0 else 0.0
+        call_labels = flow_labels_by_strike.get(call_key, Counter())
+        put_labels = flow_labels_by_strike.get(put_key, Counter())
+        call_flow = call_labels.most_common(1)[0][0] if call_labels else "NO_FLOW_EVIDENCE"
+        put_flow = put_labels.most_common(1)[0][0] if put_labels else "NO_FLOW_EVIDENCE"
+        call_delta = call_delta_by_strike.get(strike, 0.0)
+        put_delta = put_delta_by_strike.get(strike, 0.0)
+        oi_levels.append({
+            "strike": strike, "call_oi": call_oi, "put_oi": put_oi,
+            "call_relative_oi": call_oi / max_call if max_call > 0 else 0.0,
+            "put_relative_oi": put_oi / max_put if max_put > 0 else 0.0,
+            "call_delta_oi_snapshot": call_delta, "put_delta_oi_snapshot": put_delta,
+            "call_delta_oi_pct_snapshot": aggregate_pct(call_delta, call_prev_by_strike.get(strike, 0.0)),
+            "put_delta_oi_pct_snapshot": aggregate_pct(put_delta, put_prev_by_strike.get(strike, 0.0)),
+            "oi_material_threshold_pct": config.oi_material_threshold_pct,
+            "call_writer_strength": call_writer, "put_writer_strength": put_writer,
+            "call_resistance_flow_strength": call_support_flow,
+            "put_support_flow_strength": put_support_flow,
+            "call_bullish_flow_strength": call_opposing_flow,
+            "put_bearish_flow_strength": put_opposing_flow,
+            "call_flow": call_flow, "put_flow": put_flow,
+        })
 
-    oi_zones = {
-        "highest_call_oi_above_spot": positional_zones(call_oi_by_strike, call_delta_by_strike, "CE", "ABOVE", "HIGHEST_OI"),
-        "highest_call_oi_below_spot": positional_zones(call_oi_by_strike, call_delta_by_strike, "CE", "BELOW", "HIGHEST_OI"),
-        "highest_put_oi_above_spot": positional_zones(put_oi_by_strike, put_delta_by_strike, "PE", "ABOVE", "HIGHEST_OI"),
-        "highest_put_oi_below_spot": positional_zones(put_oi_by_strike, put_delta_by_strike, "PE", "BELOW", "HIGHEST_OI"),
-        "fastest_call_oi_change_above_spot": positional_zones(call_oi_by_strike, call_delta_by_strike, "CE", "ABOVE", "FASTEST_CHANGE"),
-        "fastest_call_oi_change_below_spot": positional_zones(call_oi_by_strike, call_delta_by_strike, "CE", "BELOW", "FASTEST_CHANGE"),
-        "fastest_put_oi_change_above_spot": positional_zones(put_oi_by_strike, put_delta_by_strike, "PE", "ABOVE", "FASTEST_CHANGE"),
-        "fastest_put_oi_change_below_spot": positional_zones(put_oi_by_strike, put_delta_by_strike, "PE", "BELOW", "FASTEST_CHANGE"),
-    }
+    oi_zones = {}
+    for option_side, source, deltas in (("CE", call_oi_by_strike, call_delta_by_strike), ("PE", put_oi_by_strike, put_delta_by_strike)):
+        for position in ("ABOVE", "BELOW"):
+            candidates = [(k, v) for k, v in source.items() if (k > spot if position == "ABOVE" else k < spot)]
+            oi_zones[f"highest_{'call' if option_side == 'CE' else 'put'}_oi_{position.casefold()}_spot"] = [
+                {"strike": k, "oi": v, "delta_oi_snapshot": deltas.get(k), "option_side": option_side,
+                 "position_vs_spot": position, "relative_strength": v / max(source.values(), default=1.0)}
+                for k, v in sorted(candidates, key=lambda x: x[1], reverse=True)[:3]
+            ]
+            oi_zones[f"fastest_{'call' if option_side == 'CE' else 'put'}_oi_change_{position.casefold()}_spot"] = [
+                {"strike": k, "oi": source.get(k), "delta_oi_snapshot": deltas.get(k), "option_side": option_side,
+                 "position_vs_spot": position, "relative_strength": abs(deltas.get(k, 0.0)) / max((abs(x) for x in deltas.values()), default=1.0)}
+                for k, _ in sorted(candidates, key=lambda x: abs(deltas.get(x[0], 0.0)), reverse=True)[:3]
+            ]
+
+    horizons: dict[str, Any] = {}
+    history = [x for x in (snapshot_history or []) if isinstance(x, Mapping)
+               and x.get("session_date") == current_session and x.get("expiry") == current_expiry]
+    history.sort(key=lambda x: parse_datetime(x.get("fetched_at")) or datetime.min.replace(tzinfo=IST))
+    current_by_id = {r.instrument_key: r for r in current_near}
+    for horizon in (5, 15, 30):
+        target_time = fetched_at - timedelta(minutes=horizon)
+        candidates = [x for x in history if (parse_datetime(x.get("fetched_at")) or fetched_at) <= target_time]
+        base_snapshot = candidates[-1] if candidates else None
+        base_time = parse_datetime(base_snapshot.get("fetched_at")) if base_snapshot else None
+        if not base_snapshot or not base_time:
+            horizons[f"{horizon}m"] = {"available": False, "raw_label": "MISSING", "reason": "INSUFFICIENT_SNAPSHOT_HISTORY"}
+            continue
+        base_rows = _lookup_records(base_snapshot.get("rows", []))
+        try:
+            base_spot = float(base_snapshot.get("spot"))
+        except (TypeError, ValueError, OverflowError):
+            base_spot = 0.0
+        call_delta_h = put_delta_h = call_base_h = put_base_h = 0.0
+        matched_h = contributing_h = 0
+        horizon_weighted = horizon_total_weight = 0.0
+        max_abs_delta_h_by_side: dict[str, float] = {"CE": 0.0, "PE": 0.0}
+        for candidate_key, candidate in current_by_id.items():
+            old = base_rows.get(candidate_key)
+            if not old or old.get("expiry") != current_expiry or old.get("side") != candidate.side:
+                continue
+            try:
+                old_oi = float(old.get("oi", 0) or 0)
+                old_strike = float(old.get("strike", -1))
+                if old_oi >= 0 and old_strike == candidate.strike and math.isfinite(old_oi):
+                    max_abs_delta_h_by_side[candidate.side] = max(
+                        max_abs_delta_h_by_side[candidate.side], abs(candidate.oi - old_oi)
+                    )
+            except (TypeError, ValueError, OverflowError):
+                continue
+        horizon_oi_activity: list[tuple[float, float]] = []
+        horizon_premium_activity: list[tuple[float, float]] = []
+        for instrument_key, rec in current_by_id.items():
+            old = base_rows.get(instrument_key)
+            if not old or old.get("expiry") != current_expiry or old.get("side") != rec.side:
+                continue
+            try:
+                old_strike = float(old.get("strike", -1))
+                old_oi = float(old.get("oi", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if old_strike != rec.strike or not math.isfinite(old_oi) or old_oi < 0:
+                continue
+            matched_h += 1
+            delta_h = rec.oi - old_oi
+            pct_h = 100.0 * delta_h / old_oi if old_oi > 0 else None
+            if rec.side == "CE":
+                call_delta_h += delta_h
+                call_base_h += old_oi
+            else:
+                put_delta_h += delta_h
+                put_base_h += old_oi
+            raw_h, residual_h, _, quality_h = _greek_adjusted_premium_change(
+                rec, old, base_spot if base_spot > 0 else None, spot,
+                max(0.0, (fetched_at - base_time).total_seconds()),
+            )
+            if pct_h is None or residual_h is None:
+                continue
+            contribution_h, _ = _weighted_direction(delta_h, pct_h, residual_h, rec.side, config.oi_material_threshold_pct)
+            if abs(contribution_h) <= 1e-9:
+                continue
+            proximity_h = 1.0 / (1.0 + 0.18 * abs(rec.strike - spot) / max(step, 1e-6))
+            volume_h = 1.0
+            max_side_delta_h = max_abs_delta_h_by_side.get(rec.side, 0.0)
+            oi_change_weight_h = 0.55 + 0.45 * math.sqrt(abs(delta_h) / max_side_delta_h) if max_side_delta_h > 0 else 0.55
+            effective_h = contribution_h * proximity_h * volume_h * quality_h * oi_change_weight_h
+            horizon_weighted += effective_h
+            horizon_total_weight += abs(effective_h)
+            contributing_h += 1
+            horizon_oi_activity.append((abs(pct_h), proximity_h))
+            horizon_premium_activity.append((abs(residual_h), proximity_h * quality_h))
+        balance_h = horizon_weighted / horizon_total_weight if horizon_total_weight > 1e-9 else 0.0
+        def horizon_average(items: Sequence[tuple[float, float]]) -> Optional[float]:
+            denom = sum(weight for _, weight in items)
+            return sum(value * weight for value, weight in items) / denom if denom > 0 else None
+        oi_factor_h = min(1.0, (horizon_average(horizon_oi_activity) or 0.0) / max(config.oi_material_threshold_pct, 1e-9))
+        premium_factor_h = min(1.0, (horizon_average(horizon_premium_activity) or 0.0) / 0.75)
+        breadth_h = min(1.0, contributing_h / 5.0)
+        elapsed_h = max(0.0, (fetched_at - base_time).total_seconds())
+        interval_h = min(1.0, (horizon * 60.0) / max(elapsed_h, horizon * 60.0))
+        activity_h = math.sqrt(max(0.0, oi_factor_h * premium_factor_h)) * breadth_h * interval_h
+        confidence_h = abs(balance_h) * activity_h
+        margin_h = abs(balance_h)
+        if matched_h < 10 or contributing_h < 3 or confidence_h < config.min_oi_direction_confidence or margin_h < config.min_oi_score_margin:
+            label_h = "MIXED"
+        else:
+            label_h = "BULLISH" if balance_h > 0 else "BEARISH"
+        horizons[f"{horizon}m"] = {
+            "available": matched_h >= 10,
+            "matched_contracts": matched_h,
+            "contributing_contracts": contributing_h,
+            "actual_elapsed_seconds": elapsed_h,
+            "call_delta_oi": call_delta_h if matched_h >= 10 else None,
+            "put_delta_oi": put_delta_h if matched_h >= 10 else None,
+            "call_delta_oi_pct": aggregate_pct(call_delta_h, call_base_h) if matched_h >= 10 else None,
+            "put_delta_oi_pct": aggregate_pct(put_delta_h, put_base_h) if matched_h >= 10 else None,
+            "directional_balance": balance_h if matched_h >= 10 else None,
+            "confidence": confidence_h if matched_h >= 10 else None,
+            "raw_label": label_h if matched_h >= 10 else "MISSING",
+            "reason": None if matched_h >= 10 else "INSUFFICIENT_MATCHED_CONTRACTS",
+        }
+
+    # Multi-horizon direction is a separately reported context vote. The latest
+    # snapshot remains the immediate signal; longer horizons never overwrite it.
+    horizon_weights = {5: 0.45, 15: 0.35, 30: 0.20}
+    horizon_votes = []
+    for horizon, weight in horizon_weights.items():
+        item = horizons.get(f"{horizon}m", {})
+        label_h = item.get("raw_label")
+        conf_h = float(item.get("confidence") or 0.0)
+        if item.get("available") and label_h in {"BULLISH", "BEARISH"} and conf_h > 0:
+            horizon_votes.append((1.0 if label_h == "BULLISH" else -1.0, weight * min(1.0, conf_h / 0.65), label_h))
+    if len(horizon_votes) >= 2:
+        vote_weight = sum(weight for _, weight, _ in horizon_votes)
+        horizon_balance = sum(direction * weight for direction, weight, _ in horizon_votes) / vote_weight if vote_weight else 0.0
+        multi_horizon_direction = "BULLISH" if horizon_balance > 0.10 else "BEARISH" if horizon_balance < -0.10 else "MIXED"
+        current_direction = "BULLISH" if directional_balance > 0 else "BEARISH" if directional_balance < 0 else "MIXED"
+        horizon_alignment = sum(weight for direction, weight, _ in horizon_votes if (direction > 0 and current_direction == "BULLISH") or (direction < 0 and current_direction == "BEARISH")) / vote_weight if vote_weight and current_direction != "MIXED" else 0.0
+    else:
+        horizon_balance = None
+        multi_horizon_direction = "INSUFFICIENT_HORIZONS" if horizon_votes else "UNAVAILABLE"
+        horizon_alignment = None
 
     return {
         "label": label, "score": score, "directional_balance": directional_balance,
         "bull_score": bull_score, "bear_score": bear_score, "confidence": confidence,
         "score_margin": margin, "snapshot_time": fetched_at.isoformat(),
         "snapshot_interval_seconds": interval_seconds,
-        "snapshot_status": "FRESH_FETCHED_SOURCE_EVENT_TIME_NOT_PROVIDED_BY_CHAIN_RESPONSE",
+        "snapshot_status": "FETCH_TIME_USED_SOURCE_EVENT_TIME_NOT_PROVIDED_BY_CHAIN_RESPONSE",
         "compared_to_previous_successful_snapshot": previous_same,
         "contracts_compared": paired_contract_count,
         "contributing_contract_count": contributing_contract_count,
         "material_contract_count": sum(1 for r in per_contract if r["material_oi_change"]),
         "average_abs_delta_oi_pct": average_abs_oi_pct,
         "average_abs_premium_change_pct": average_abs_premium_pct,
-        "premium_mid_comparison_count": sum(1 for r in per_contract if r["premium_change_source"] == "CHAIN_MID"),
-        "premium_ltp_fallback_count": sum(1 for r in per_contract if r["premium_change_source"] == "LTP_FALLBACK_NO_EVENT_TIMESTAMP"),
-        "premium_source_mismatch_count": sum(1 for r in per_contract if r["premium_change_source"] == "SOURCE_MISMATCH"),
-        "oi_activity_factor": oi_activity_factor,
-        "premium_activity_factor": premium_activity_factor,
-        "breadth_factor": breadth_factor,
-        "interval_factor": interval_factor,
+        "premium_mid_comparison_count": sum(1 for r in per_contract if "CHAIN_MID" in r["premium_change_source"]),
+        "premium_ltp_fallback_count": sum(1 for r in per_contract if "LTP" in r["premium_change_source"]),
+        "premium_source_mismatch_count": sum(1 for r in per_contract if r["premium_change_source"] in {"SOURCE_MISMATCH", "UNAVAILABLE"}),
+        "oi_activity_factor": oi_activity_factor, "premium_activity_factor": premium_activity_factor,
+        "breadth_factor": breadth_factor, "interval_factor": interval_factor,
         "aggregate_delta_call_oi_snapshot": aggregate_delta_ce if previous_same else None,
         "aggregate_delta_put_oi_snapshot": aggregate_delta_pe if previous_same else None,
         "aggregate_delta_call_oi_pct_snapshot": aggregate_pct(aggregate_delta_ce, aggregate_prev_ce) if previous_same else None,
@@ -1430,8 +1723,12 @@ def calculate_oi_evidence(
         "nearby_pcr": pcr_rows_put / pcr_rows_call if pcr_rows_call > 0 else None,
         "call_oi_walls": walls(call_oi_by_strike, "CALL_OI_POTENTIAL_RESISTANCE"),
         "put_oi_walls": walls(put_oi_by_strike, "PUT_OI_POTENTIAL_SUPPORT"),
-        "oi_zones_above_below_spot": oi_zones,
-        "features": per_contract,
+        "oi_levels": oi_levels, "oi_horizons": horizons,
+        "multi_horizon_direction": multi_horizon_direction,
+        "multi_horizon_balance": horizon_balance,
+        "multi_horizon_alignment": horizon_alignment,
+        "multi_horizon_vote_count": len(horizon_votes),
+        "oi_zones_above_below_spot": oi_zones, "features": per_contract,
     }
 
 
@@ -1726,12 +2023,30 @@ def build_levels(
         levels.append(PriceLevel(value, "RESISTANCE", f"CONFIRMED_SWING_HIGH_{candles[idx].start.astimezone(IST).strftime('%H%M')}", 1.5))
     if futures_vwap is not None and math.isfinite(futures_vwap):
         levels.append(PriceLevel(futures_vwap, "SUPPORT" if futures_vwap <= latest.close else "RESISTANCE", "FUTURES_VWAP_CONTEXT_ONLY", 0.8))
-    for wall in oi_evidence.get("put_oi_walls", [])[:3]:
-        if float(wall.get("relative_strength", 0)) >= 0.7:
-            levels.append(PriceLevel(float(wall["strike"]), "SUPPORT", "OI_PUT_WALL_POTENTIAL_ONLY", 0.8 + float(wall.get("relative_strength", 0)) * 0.3))
-    for wall in oi_evidence.get("call_oi_walls", [])[:3]:
-        if float(wall.get("relative_strength", 0)) >= 0.7:
-            levels.append(PriceLevel(float(wall["strike"]), "RESISTANCE", "OI_CALL_WALL_POTENTIAL_ONLY", 0.8 + float(wall.get("relative_strength", 0)) * 0.3))
+    # OI walls are directional levels only in their relevant market location:
+    # put OI below spot is a potential support/target zone; call OI above spot
+    # is a potential resistance/stop zone. A writer-flow score strengthens the
+    # level, but total OI remains visible when the current snapshot has no flow
+    # baseline yet. These are zones, never guarantees.
+    for wall in oi_evidence.get("oi_levels", []):
+        try:
+            strike = float(wall.get("strike"))
+            put_rel = float(wall.get("put_relative_oi") or 0.0)
+            call_rel = float(wall.get("call_relative_oi") or 0.0)
+            put_writer = float(wall.get("put_writer_strength") or 0.0)
+            call_writer = float(wall.get("call_writer_strength") or 0.0)
+            put_support_flow = float(wall.get("put_support_flow_strength") or put_writer)
+            call_resistance_flow = float(wall.get("call_resistance_flow_strength") or call_writer)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if strike < latest.close and put_rel >= 0.18:
+            strength = min(3.8, 1.0 + 1.20 * put_rel + 0.75 * put_support_flow)
+            source = "OI_PUT_ACTIVE_SUPPORT" if put_support_flow >= 0.25 else "OI_PUT_CONCENTRATION_SUPPORT"
+            levels.append(PriceLevel(strike, "SUPPORT", source, strength))
+        elif strike > latest.close and call_rel >= 0.18:
+            strength = min(3.8, 1.0 + 1.20 * call_rel + 0.75 * call_resistance_flow)
+            source = "OI_CALL_ACTIVE_RESISTANCE" if call_resistance_flow >= 0.25 else "OI_CALL_CONCENTRATION_RESISTANCE"
+            levels.append(PriceLevel(strike, "RESISTANCE", source, strength))
     # Cluster nearby levels while preserving each level's provenance in source text.
     out: list[PriceLevel] = []
     for side in ("SUPPORT", "RESISTANCE"):
@@ -1778,7 +2093,7 @@ def _nearest_level(levels: Sequence[PriceLevel], side: str, price: float, minimu
     return min(candidates, key=lambda x: x.price) if side == "RESISTANCE" else max(candidates, key=lambda x: x.price)
 
 
-def detect_setup(candles: Sequence[Candle], levels: Sequence[PriceLevel], structure: Mapping[str, Any], config: Config) -> Optional[Setup]:
+def detect_setup(candles: Sequence[Candle], levels: Sequence[PriceLevel], structure: Mapping[str, Any], config: Config, oi_evidence: Optional[Mapping[str, Any]] = None) -> Optional[Setup]:
     if len(candles) < 3:
         return None
     current = candles[-1]
@@ -1793,23 +2108,33 @@ def detect_setup(candles: Sequence[Candle], levels: Sequence[PriceLevel], struct
     resistances = [x for x in levels if x.side == "RESISTANCE" and x.strength >= 1.0]
     setups: list[Setup] = []
     for level in supports:
-        touched = [(i, c) for i, c in enumerate(recent[:-1]) if c.low <= level.price + max(buffer, atr1 * 0.12) and c.low >= level.price - max(atr1 * 0.7, buffer)]
-        swept = [(i, c) for i, c in enumerate(recent[:-1]) if c.low < level.price - buffer and c.close > level.price]
+        test_band = max(buffer, atr1 * 0.12)
+        historical_touches = [(i, c) for i, c in enumerate(recent[:-1]) if c.low <= level.price + test_band and c.low >= level.price - max(atr1 * 0.7, buffer)]
+        historical_sweeps = [(i, c) for i, c in enumerate(recent[:-1]) if c.low < level.price - buffer and c.close > level.price]
+        current_touch = current.low <= level.price + test_band and current.low >= level.price - max(atr1 * 0.7, buffer)
+        current_sweep = current.low < level.price - buffer and current.close > level.price
         reclaimed = current.close >= level.price + buffer and current.close > current.open and current.close > previous.close
-        if reclaimed and (touched or swept):
-            touched_candles = [c for _, c in (swept if swept else touched)]
-            invalidation = min(c.low for c in touched_candles + [current])
-            kind = "LIQUIDITY_SWEEP_RECLAIM" if swept else "RANGE_EDGE_REVERSAL" if structure.get("regime") == "SIDEWAYS" else "TREND_CONTINUATION_PULLBACK" if structure.get("higher_timeframe_bias") == "BULLISH" else "SUPPORT_BOUNCE"
+        if reclaimed and (historical_touches or historical_sweeps or current_touch or current_sweep):
+            evidence_candles = [c for _, c in (historical_sweeps if historical_sweeps else historical_touches)]
+            if current_touch or current_sweep:
+                evidence_candles.append(current)
+            invalidation = min(c.low for c in evidence_candles + [current])
+            kind = "LIQUIDITY_SWEEP_RECLAIM" if (historical_sweeps or current_sweep) else "RANGE_EDGE_REVERSAL" if structure.get("regime") == "SIDEWAYS" else "TREND_CONTINUATION_PULLBACK" if structure.get("higher_timeframe_bias") == "BULLISH" else "SUPPORT_BOUNCE"
             confidence = min(0.95, 0.58 + 0.08 * (current.close > previous.high) + 0.08 * (current.close > level.price + 2 * buffer) + 0.05 * (structure.get("higher_timeframe_bias") == "BULLISH"))
             setups.append(Setup(kind, "BULLISH", current.close, invalidation, current.close_time, level.price, level.source, confidence))
     for level in resistances:
-        touched = [(i, c) for i, c in enumerate(recent[:-1]) if c.high >= level.price - max(buffer, atr1 * 0.12) and c.high <= level.price + max(atr1 * 0.7, buffer)]
-        swept = [(i, c) for i, c in enumerate(recent[:-1]) if c.high > level.price + buffer and c.close < level.price]
+        test_band = max(buffer, atr1 * 0.12)
+        historical_touches = [(i, c) for i, c in enumerate(recent[:-1]) if c.high >= level.price - test_band and c.high <= level.price + max(atr1 * 0.7, buffer)]
+        historical_sweeps = [(i, c) for i, c in enumerate(recent[:-1]) if c.high > level.price + buffer and c.close < level.price]
+        current_touch = current.high >= level.price - test_band and current.high <= level.price + max(atr1 * 0.7, buffer)
+        current_sweep = current.high > level.price + buffer and current.close < level.price
         rejected = current.close <= level.price - buffer and current.close < current.open and current.close < previous.close
-        if rejected and (touched or swept):
-            touched_candles = [c for _, c in (swept if swept else touched)]
-            invalidation = max(c.high for c in touched_candles + [current])
-            kind = "LIQUIDITY_SWEEP_RECLAIM" if swept else "RANGE_EDGE_REVERSAL" if structure.get("regime") == "SIDEWAYS" else "TREND_CONTINUATION_PULLBACK" if structure.get("higher_timeframe_bias") == "BEARISH" else "RESISTANCE_REJECTION"
+        if rejected and (historical_touches or historical_sweeps or current_touch or current_sweep):
+            evidence_candles = [c for _, c in (historical_sweeps if historical_sweeps else historical_touches)]
+            if current_touch or current_sweep:
+                evidence_candles.append(current)
+            invalidation = max(c.high for c in evidence_candles + [current])
+            kind = "LIQUIDITY_SWEEP_RECLAIM" if (historical_sweeps or current_sweep) else "RANGE_EDGE_REVERSAL" if structure.get("regime") == "SIDEWAYS" else "TREND_CONTINUATION_PULLBACK" if structure.get("higher_timeframe_bias") == "BEARISH" else "RESISTANCE_REJECTION"
             confidence = min(0.95, 0.58 + 0.08 * (current.close < previous.low) + 0.08 * (current.close < level.price - 2 * buffer) + 0.05 * (structure.get("higher_timeframe_bias") == "BEARISH"))
             setups.append(Setup(kind, "BEARISH", current.close, invalidation, current.close_time, level.price, level.source, confidence))
     # Breakout/retest requires a prior close through a level, a retest and a
@@ -1824,11 +2149,42 @@ def detect_setup(candles: Sequence[Candle], levels: Sequence[PriceLevel], struct
         retested = current.high >= level.price - max(buffer, atr1 * 0.12) and current.high <= level.price + max(atr1 * 0.6, buffer)
         if crossed and retested and current.close < level.price - buffer and current.close < current.open:
             setups.append(Setup("BREAKDOWN_RETEST", "BEARISH", current.close, max(current.high, level.price + buffer), current.close_time, level.price, level.source, 0.78))
+    # Continuous-trend continuation: require a completed pullback candle and
+    # a fresh resumed break, not merely an EMA touch. This supplements the
+    # level-based sweep/retest patterns for persistent directional sessions.
+    if len(recent) >= 4:
+        last_three = recent[-3:]
+        if structure.get("execution_direction") == "BEARISH" and structure.get("higher_timeframe_bias") in {"BEARISH", "TRANSITION", "UNKNOWN"}:
+            had_pullback = any(c.close > c.open for c in last_three[:-1])
+            resumed = current.close < current.open and current.close < previous.low
+            if had_pullback and resumed:
+                invalidation = max(c.high for c in last_three)
+                setups.append(Setup("TREND_CONTINUATION_PULLBACK", "BEARISH", current.close, invalidation,
+                                    current.close_time, previous.low, "BEARISH_PULLBACK_RESUMPTION", 0.76))
+        if structure.get("execution_direction") == "BULLISH" and structure.get("higher_timeframe_bias") in {"BULLISH", "TRANSITION", "UNKNOWN"}:
+            had_pullback = any(c.close < c.open for c in last_three[:-1])
+            resumed = current.close > current.open and current.close > previous.high
+            if had_pullback and resumed:
+                invalidation = min(c.low for c in last_three)
+                setups.append(Setup("TREND_CONTINUATION_PULLBACK", "BULLISH", current.close, invalidation,
+                                    current.close_time, previous.high, "BULLISH_PULLBACK_RESUMPTION", 0.76))
+
     if not setups:
         return None
-    # Prefer confirmed sweep/reclaim, then retest, then bounce/rejection.
-    priority = {"LIQUIDITY_SWEEP_RECLAIM": 0, "BREAKOUT_RETEST": 1, "BREAKDOWN_RETEST": 1, "SUPPORT_BOUNCE": 2, "RESISTANCE_REJECTION": 2, "TREND_CONTINUATION_PULLBACK": 3}
-    return sorted(setups, key=lambda s: (priority.get(s.kind, 9), -s.price_confidence))[0]
+    # Prefer a pattern aligned with both OI's current raw direction and the
+    # one-minute execution tape. This prevents countertrend bounce patterns
+    # from constantly replacing a valid continuation watch.
+    priority = {"BREAKDOWN_RETEST": 0, "BREAKOUT_RETEST": 0, "LIQUIDITY_SWEEP_RECLAIM": 1,
+                "TREND_CONTINUATION_PULLBACK": 2, "RESISTANCE_REJECTION": 3,
+                "SUPPORT_BOUNCE": 3, "RANGE_EDGE_REVERSAL": 3}
+    raw_oi = str((oi_evidence or {}).get("raw_label", (oi_evidence or {}).get("label", "MISSING")))
+    execution = str(structure.get("execution_direction", "UNKNOWN"))
+    def setup_rank(candidate: Setup) -> tuple[float, float, float, float]:
+        alignment = 1.0 if candidate.direction == raw_oi else 0.0
+        price_alignment = 1.0 if candidate.direction == execution else 0.0
+        return (alignment + price_alignment, -priority.get(candidate.kind, 9), candidate.price_confidence,
+                candidate.trigger if candidate.direction == "BULLISH" else -candidate.trigger)
+    return sorted(setups, key=setup_rank, reverse=True)[0]
 
 
 # ---------- Risk planning and option pricing ----------
@@ -1958,20 +2314,30 @@ def select_option_and_risk(
     direction: str, spot: float, spot_quote_time: Optional[datetime], chain_records: Sequence[OptionRecord], full_quotes: Mapping[str, Mapping[str, Any]],
     expiry: date, now: datetime, plan: Mapping[str, Any], structure: Mapping[str, Any], config: Config,
 ) -> dict[str, Any]:
+    """Select the best liquid permitted strike; never calculate option-premium RR.
+
+    Underlying spot levels alone determine 2:1 risk/reward. Option data is used
+    for instrument eligibility, executable quote quality, delta suitability and
+    time-decay-aware ranking only.
+    """
     if direction not in {"BULLISH", "BEARISH"}:
         raise ScannerError("DIRECTION_INVALID", "Option selector requires a directional setup")
-    strike_grid = sorted({r.strike for r in chain_records})
-    step_values = sorted({b - a for a, b in zip(strike_grid, strike_grid[1:]) if b > a})
+    strikes = sorted({r.strike for r in chain_records})
+    step_values = [b - a for a, b in zip(strikes, strikes[1:]) if b > a]
     if not step_values:
         raise ScannerError("STRIKE_GRID_INVALID", "Cannot infer strike interval from option-chain data")
     strike_step = median(step_values)
-    strikes = sorted({r.strike for r in chain_records})
-    atm = min(strikes, key=lambda s: abs(s - spot))
+    atm = min(strikes, key=lambda value: abs(value - spot))
     side = "CE" if direction == "BULLISH" else "PE"
     offsets = config.strike_offsets_ce if side == "CE" else config.strike_offsets_pe
-    by_id = {r.instrument_key: r for r in chain_records}
     candidates: list[dict[str, Any]] = []
     rejections: Counter[str] = Counter()
+    local_now = now.astimezone(IST)
+    expiry_close = datetime.combine(expiry, dtime(15, 30), tzinfo=IST)
+    minutes_to_expiry = max(0.0, (expiry_close - local_now).total_seconds() / 60.0)
+    if minutes_to_expiry <= config.expected_hold_minutes:
+        raise ScannerError("EXPIRY_TOO_NEAR_FOR_HOLD", f"Only {minutes_to_expiry:.1f} minutes remain to selected expiry; expected hold is {config.expected_hold_minutes:.1f} minutes")
+
     for offset in offsets:
         target_strike = atm + offset * strike_step
         record = min((r for r in chain_records if r.side == side), key=lambda r: abs(r.strike - target_strike), default=None)
@@ -1988,7 +2354,7 @@ def select_option_and_risk(
             continue
         try:
             quote_age, quote_clock_skew, quote_timestamp_status = quote_timing(
-                quote.timestamp, now.astimezone(IST), error_code="OPTION_QUOTE_CLOCK_SKEW"
+                quote.timestamp, local_now, error_code="OPTION_QUOTE_CLOCK_SKEW"
             )
         except ScannerError as timestamp_exc:
             rejections[timestamp_exc.code] += 1
@@ -2011,58 +2377,46 @@ def select_option_and_risk(
         if quote.delta is None or not (config.min_abs_delta <= abs(quote.delta) <= config.max_abs_delta):
             rejections["DELTA_OUT_OF_RANGE"] += 1
             continue
-        if quote.iv is None or not (1 <= quote.iv <= 100):
+        if quote.iv is None or not math.isfinite(float(quote.iv)) or not (0.1 <= quote.iv <= 500.0):
             rejections["INVALID_IV"] += 1
             continue
-        entry = quote.ask + config.option_slippage_points
-        stop_model = price_option_scenario(quote, spot, float(plan["stop_underlying"]), now, config, adverse_iv_points=config.iv_shock_points)
-        t1_model = price_option_scenario(quote, spot, float(plan["t1_underlying"]), now, config, adverse_iv_points=config.iv_shock_points)
-        t2_model = price_option_scenario(quote, spot, float(plan["t2_underlying"]), now, config, adverse_iv_points=config.iv_shock_points)
-        if stop_model is None or t1_model is None or t2_model is None:
-            rejections["PREMIUM_SCENARIO_UNAVAILABLE"] += 1
-            continue
-        half_spread = (quote.ask - quote.bid) / 2.0
-        stop_exit = max(0.0, stop_model - half_spread - config.option_slippage_points)
-        t1_exit = max(0.0, t1_model - half_spread - config.option_slippage_points)
-        t2_exit = max(0.0, t2_model - half_spread - config.option_slippage_points)
-        entry_cost = entry * config.transaction_cost_rate
-        stop_cost = stop_exit * config.transaction_cost_rate
-        t1_cost = t1_exit * config.transaction_cost_rate
-        t2_cost = t2_exit * config.transaction_cost_rate
-        premium_risk = (entry - stop_exit) + entry_cost + stop_cost
-        net_reward1 = (t1_exit - entry) - entry_cost - t1_cost
-        net_reward2 = (t2_exit - entry) - entry_cost - t2_cost
-        net_rr1 = net_reward1 / premium_risk if premium_risk > 0 and net_reward1 > 0 else 0.0
-        net_rr2 = net_reward2 / premium_risk if premium_risk > 0 and net_reward2 > 0 else 0.0
-        if premium_risk <= 0 or net_reward1 <= 0:
-            rejections["OPTION_NET_REWARD_NONPOSITIVE"] += 1
-            continue
-        if net_rr1 < config.min_option_net_rr:
-            rejections["OPTION_NET_RR_BELOW_2R"] += 1
-            continue
-        # Rank valid contracts by net RR first, then prefer a delta closer to 0.55 and tighter spread.
-        rank = (net_rr1, -abs(abs(quote.delta) - 0.55), -quote.spread_pct, -abs(offset))
+
+        mid = quote.mid
+        theta_estimate = abs(quote.theta or 0.0) * config.expected_hold_minutes / 1440.0
+        theta_fraction = theta_estimate / mid if mid > 0 else 1.0
+        # Higher score favours executable depth, tight spreads, a useful delta,
+        # and less decay relative to premium. No option RR is calculated.
+        delta_score = max(0.0, 1.0 - abs(abs(quote.delta) - 0.55) / 0.35)
+        spread_score = max(0.0, 1.0 - quote.spread_pct / max(config.max_spread_pct, 1e-9))
+        depth_score = min(1.0, math.log1p(quote.bid_qty + quote.ask_qty) / math.log1p(5000.0))
+        volume_score = min(1.0, math.log1p(quote.volume) / math.log1p(50000.0))
+        decay_score = max(0.0, 1.0 - min(theta_fraction, 1.0))
+        score = 0.34 * delta_score + 0.27 * spread_score + 0.16 * depth_score + 0.13 * volume_score + 0.10 * decay_score
         candidates.append({
-            "instrument_key": quote.instrument_key, "strike": quote.strike, "side": quote.side, "expiry": quote.expiry.isoformat(),
+            "instrument_key": quote.instrument_key, "strike": quote.strike,
+            "side": quote.side, "expiry": quote.expiry.isoformat(),
             "trading_offset_from_atm": offset, "atm_strike": atm, "strike_interval": strike_step,
-            "entry_option_ask_plus_slippage": entry, "option_stop_estimate": stop_exit,
-            "option_t1_estimate": t1_exit, "option_t2_estimate": t2_exit,
-            "net_option_rr_t1": net_rr1, "net_option_rr_t2": net_rr2,
-            "spread_points": quote.ask - quote.bid, "spread_pct": quote.spread_pct, "bid_qty": quote.bid_qty, "ask_qty": quote.ask_qty,
-            "quote_timestamp": quote.timestamp.isoformat(), "quote_age_seconds": quote_age,
-            "quote_clock_skew_seconds": quote_clock_skew, "quote_timestamp_status": quote_timestamp_status,
-            "ltp": quote.ltp, "bid": quote.bid, "ask": quote.ask, "volume": quote.volume, "oi": quote.oi,
-            "delta": quote.delta, "gamma": quote.gamma, "theta": quote.theta, "vega": quote.vega, "iv_percent": quote.iv,
-            "pricing_method": "BLACK_SCHOLES_REPRICE_CALIBRATED_TO_LIVE_MID_WITH_IV_SHOCK_AND_SPREAD_SLIPPAGE_COSTS",
-            "estimated_round_trip_cost_rate_each_side": config.transaction_cost_rate,
-            "entry_slippage_points_per_side": config.option_slippage_points,
-            "_rank": rank,
+            "reference_entry_ask": quote.ask, "reference_bid": quote.bid,
+            "reference_mid": mid, "spread_points": quote.ask - quote.bid,
+            "spread_pct": quote.spread_pct, "bid_qty": quote.bid_qty,
+            "ask_qty": quote.ask_qty, "quote_timestamp": quote.timestamp.isoformat(),
+            "quote_age_seconds": quote_age, "quote_clock_skew_seconds": quote_clock_skew,
+            "quote_timestamp_status": quote_timestamp_status, "ltp": quote.ltp,
+            "volume": quote.volume, "oi": quote.oi, "delta": quote.delta,
+            "gamma": quote.gamma, "theta": quote.theta, "vega": quote.vega,
+            "iv_percent": quote.iv, "estimated_theta_decay_points_for_hold": theta_estimate,
+            "estimated_theta_decay_fraction_of_mid": theta_fraction,
+            "minutes_to_expiry": minutes_to_expiry,
+            "selection_score": round(score, 5),
+            "selection_method": "LIQUIDITY_SPREAD_DELTA_AND_TIME_DECAY_SCORE_SPOT_RR_ONLY",
+            "spot_risk_reward": plan.get("underlying_rr"),
+            "_rank": (score, -quote.spread_pct, delta_score, volume_score, -abs(offset)),
         })
     if not candidates:
         reason = rejections.most_common(1)[0][0] if rejections else "NO_VALID_OPTION_QUOTES"
-        details = ", ".join(f"{k}:{v}" for k, v in rejections.most_common(4))
+        details = ", ".join(f"{key}:{value}" for key, value in rejections.most_common(5))
         raise ScannerError(reason, f"No eligible {side} contract among allowed ATM offsets. {details}")
-    candidates.sort(key=lambda c: c["_rank"], reverse=True)
+    candidates.sort(key=lambda candidate: candidate["_rank"], reverse=True)
     selected = candidates[0]
     selected.pop("_rank", None)
     selected["candidate_count_passed"] = len(candidates)
@@ -2107,7 +2461,7 @@ def stabilize_oi_evidence(evidence: dict[str, Any], state: dict[str, Any], sessi
 
 def advance_setup_watch(
     candles: Sequence[Candle], previous_processed: Optional[datetime], previous_daily: Sequence[Candle],
-    state: dict[str, Any], config: Config,
+    state: dict[str, Any], config: Config, oi_evidence: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Setup]:
     """Walk newly completed candles chronologically and persist the most recent setup.
 
@@ -2126,53 +2480,131 @@ def advance_setup_watch(
                 state["setup_watch"] = None
         prefix = candles[:i + 1]
         atr_value = atr(prefix)
-        prefix_levels = build_levels(prefix, previous_daily, _empty_oi(), None, atr_value, config)
+        # Current OI walls are the latest available positioning context for
+        # this scan. Any reconstructed candidate is still revalidated against
+        # the current live quote and is never treated as a historical fill.
+        prefix_levels = build_levels(prefix, previous_daily, oi_evidence or _empty_oi(), None, atr_value, config)
         prefix_structure = price_regime(prefix, aggregate_candles(prefix, 5, candle.close_time))
-        candidate = detect_setup(prefix, prefix_levels, prefix_structure, config)
+        candidate = detect_setup(prefix, prefix_levels, prefix_structure, config, oi_evidence)
         if candidate is not None:
-            pending = candidate
-            state["setup_watch"] = {"direction": candidate.direction, "kind": candidate.kind,
-                                    "confirmed_at": candidate.confirmed_at.isoformat(), "trigger": candidate.trigger,
-                                    "invalidation": candidate.invalidation, "source_level": candidate.source_level,
-                                    "source": candidate.source, "price_confidence": candidate.price_confidence}
+            replace_pending = pending is None
+            if pending is not None and candidate.direction == pending.direction:
+                # For bearish entries, a higher trigger is more favourable; for
+                # bullish entries, a lower trigger is more favourable. Do not
+                # chase a market by walking the trigger in the adverse direction.
+                better_trigger = (candidate.trigger > pending.trigger + 0.25) if candidate.direction == "BEARISH" else (candidate.trigger < pending.trigger - 0.25)
+                no_worse_entry = (candidate.trigger >= pending.trigger - 0.25) if candidate.direction == "BEARISH" else (candidate.trigger <= pending.trigger + 0.25)
+                replace_pending = better_trigger or (no_worse_entry and candidate.price_confidence >= pending.price_confidence + 0.12)
+            if replace_pending:
+                pending = candidate
+                state["setup_watch"] = {"direction": candidate.direction, "kind": candidate.kind,
+                                        "confirmed_at": candidate.confirmed_at.isoformat(), "trigger": candidate.trigger,
+                                        "invalidation": candidate.invalidation, "source_level": candidate.source_level,
+                                        "source": candidate.source, "price_confidence": candidate.price_confidence}
     return pending
 
 
+
+def select_active_setup(
+    current: Optional[Setup], tracked: Optional[Setup], spot: float,
+    oi: Mapping[str, Any], structure: Mapping[str, Any], now: datetime,
+    config: Config,
+) -> Optional[Setup]:
+    """Preserve a valid watch; switch direction only on a confirmed OI/price reversal."""
+    def valid(candidate: Optional[Setup]) -> bool:
+        if candidate is None:
+            return False
+        age = (now - candidate.confirmed_at).total_seconds()
+        if age < -1 or age > config.setup_max_age_minutes * 60:
+            return False
+        if candidate.direction == "BEARISH" and spot >= candidate.invalidation:
+            return False
+        if candidate.direction == "BULLISH" and spot <= candidate.invalidation:
+            return False
+        return True
+
+    cur_valid, tracked_valid = valid(current), valid(tracked)
+    if not tracked_valid:
+        return current if cur_valid else None
+    if not cur_valid:
+        return tracked
+    assert current is not None and tracked is not None
+    if current.direction == tracked.direction:
+        better = (current.trigger > tracked.trigger + 0.25) if current.direction == "BEARISH" else (current.trigger < tracked.trigger - 0.25)
+        no_worse_entry = (current.trigger >= tracked.trigger - 0.25) if current.direction == "BEARISH" else (current.trigger <= tracked.trigger + 0.25)
+        fresher = current.confirmed_at > tracked.confirmed_at
+        if better or (no_worse_entry and fresher and current.price_confidence >= tracked.price_confidence + 0.10):
+            return current
+        return tracked
+    raw = str(oi.get("raw_label", oi.get("label", "MISSING")))
+    execution = str(structure.get("execution_direction", "UNKNOWN"))
+    htf = str(structure.get("higher_timeframe_bias", "UNKNOWN"))
+    reversal_confirmed = raw == current.direction and (execution == current.direction or htf == current.direction)
+    strong_candidate = current.price_confidence >= max(0.72, config.min_mixed_price_confirmation)
+    tracked_age = (now - tracked.confirmed_at).total_seconds()
+    if reversal_confirmed and strong_candidate and tracked_age >= 60:
+        return current
+    return tracked
+
 def authorize_direction(oi: Mapping[str, Any], setup: Setup, structure: Mapping[str, Any], config: Config) -> None:
-    label = oi.get("label", "MISSING")
+    """OI-first authorization with explicit reversal and sideways-wall handling."""
+    stable = str(oi.get("label", "MISSING"))
+    raw = str(oi.get("raw_label", stable))
+    if not oi.get("compared_to_previous_successful_snapshot"):
+        raise ScannerError("OI_BASELINE_MISSING", "Two valid same-session snapshots are required before OI direction can be evaluated")
     age = oi.get("oi_age_seconds")
-    if label in {"MISSING", "UNKNOWN"} or not oi.get("compared_to_previous_successful_snapshot"):
-        raise ScannerError("OI_BASELINE_MISSING", "At least two successful, same-session OI snapshots are required before directional qualification")
-    if age is not None and age > config.max_oi_age_seconds:
-        raise ScannerError("OI_STALE", f"Last successful OI snapshot is {age:.0f}s old")
-    expected = "BULLISH" if setup.direction == "BULLISH" else "BEARISH"
-    if label == expected:
-        if float(oi.get("confidence") or 0) < config.min_oi_direction_confidence:
-            raise ScannerError("OI_LOW_CONFIDENCE", f"OI directional confidence is below {config.min_oi_direction_confidence:.2f}")
-        return
-    if label == "MIXED":
-        raw_label = oi.get("raw_label", "MIXED")
-        transition = oi.get("transition_status")
-        # During a genuine OI direction flip, price cannot authorize a trade
-        # against the newly observed raw OI direction. It may only confirm in
-        # the same direction while persistence is being established.
-        if raw_label in {"BULLISH", "BEARISH"} and raw_label != expected:
-            code = "OI_REVERSAL_CONFLICT" if transition == "REVERSAL_WATCH" else "OI_RAW_DIRECTION_CONFLICT"
-            raise ScannerError(code, f"Latest raw OI evidence points {raw_label}, while the price setup points {setup.direction}. OI has not confirmed the opposite direction; wait for alignment.")
+    if age is not None and float(age) > config.max_oi_age_seconds:
+        raise ScannerError("OI_STALE", f"Latest OI snapshot is {float(age):.0f}s old")
+    expected = setup.direction
+    execution = str(structure.get("execution_direction", "UNKNOWN"))
+    htf = str(structure.get("higher_timeframe_bias", "UNKNOWN"))
+    confidence = float(oi.get("confidence") or 0.0)
+    balance = abs(float(oi.get("directional_balance") or 0.0))
+
+    # Strong first-snapshot reversal evidence is not forced to wait for a
+    # second 3-minute cycle when current OI, price execution and setup agree.
+    if raw == expected and confidence >= config.min_oi_direction_confidence:
+        if execution == expected:
+            return
+        if htf == expected and setup.price_confidence >= config.min_mixed_price_confirmation:
+            return
+        if setup.price_confidence >= max(0.82, config.min_mixed_price_confirmation):
+            return
+        raise ScannerError("OI_WAIT_PRICE_ALIGNMENT", f"Raw OI is {raw}, but one-minute execution is {execution}; wait for price alignment")
+
+    if stable == expected:
+        if raw in {expected, "MIXED", "MISSING"}:
+            if execution in {expected, "MIXED", "UNKNOWN"} or htf == expected:
+                return
+        raise ScannerError("OI_PRICE_DIRECTION_CONFLICT", f"Stable OI is {stable}, but market structure does not support {expected}")
+
+    # Sideways markets are locally directional at a well-defined range edge.
+    # Allow put-writing support bounces or call-writing resistance rejections
+    # when the wall's own OI flow agrees and the candle setup is confirmed.
+    if "SIDEWAYS" in str(structure.get("regime", "")) or htf == "SIDEWAYS":
+        rows = [x for x in oi.get("oi_levels", []) if isinstance(x, Mapping)]
+        source_level = setup.source_level if setup.source_level is not None else setup.trigger
+        nearest = min(rows, key=lambda row: abs(float(row.get("strike", source_level)) - source_level), default=None)
+        if nearest is not None and abs(float(nearest.get("strike", source_level)) - source_level) <= 0.55 * 50:
+            local_strength = float(nearest.get("put_support_flow_strength" if expected == "BULLISH" else "call_resistance_flow_strength") or nearest.get("put_writer_strength" if expected == "BULLISH" else "call_writer_strength") or 0.0)
+            if local_strength >= 0.20 and setup.price_confidence >= config.min_mixed_price_confirmation:
+                return
+
+    if raw in {"BULLISH", "BEARISH"} and raw != expected:
+        code = "OI_REVERSAL_CONFLICT" if oi.get("transition_status") == "REVERSAL_WATCH" else "OI_RAW_DIRECTION_CONFLICT"
+        raise ScannerError(code, f"Latest OI positioning points {raw}, while the setup points {expected}")
+    if stable == "MIXED" or raw == "MIXED":
         if setup.price_confidence < config.min_mixed_price_confirmation:
-            raise ScannerError("OI_MIXED_WAIT_PRICE_CONFIRMATION", f"Price setup confidence {setup.price_confidence:.2f} is below {config.min_mixed_price_confirmation:.2f} while OI is not persistent")
-        if structure.get("execution_direction") != setup.direction:
-            raise ScannerError("OI_MIXED_WAIT_PRICE_CONFIRMATION", "OI is not persistent and the latest completed one-minute execution direction does not align with the setup")
-        execution_confidence = float(structure.get("execution_confidence", 1.0) or 0.0)
-        if execution_confidence < 0.50:
-            raise ScannerError("OI_MIXED_WAIT_PRICE_CONFIRMATION", f"One-minute execution confidence {execution_confidence:.2f} is too low to resolve mixed OI")
+            raise ScannerError("OI_MIXED_WAIT_PRICE_CONFIRMATION", f"Setup confidence {setup.price_confidence:.2f} is below {config.min_mixed_price_confirmation:.2f}")
+        if execution != expected and htf != expected:
+            raise ScannerError("OI_MIXED_WAIT_PRICE_CONFIRMATION", "OI is mixed and neither one-minute execution nor five-minute context aligns with the setup")
+        if confidence < 0.25 and balance < 0.15:
+            raise ScannerError("OI_MIXED_WAIT_PRICE_CONFIRMATION", "OI directional evidence is too weak to support the setup")
         return
-    if label == "MISSING":
-        raise ScannerError("OI_BASELINE_MISSING", "No usable current-session OI evidence")
-    raise ScannerError("OI_PRICE_DIRECTION_CONFLICT", f"Confirmed price setup is {setup.direction}, but OI evidence is {label}")
+    raise ScannerError("OI_BASELINE_MISSING", "No usable OI directional evidence is available")
 
 
-def validate_live_setup_trigger(setup: Setup, spot: float) -> None:
+def validate_live_setup_trigger(setup: Setup, spot: float, tolerance_points: float = 0.0) -> None:
     """Require the live underlying quote to remain on the trigger side.
 
     A closed candle that confirmed a pattern is not an executable entry if the
@@ -2182,9 +2614,9 @@ def validate_live_setup_trigger(setup: Setup, spot: float) -> None:
         raise ScannerError("SETUP_INVALIDATED", f"Bullish setup invalidation is {setup.invalidation:.2f}; live NIFTY {spot:.2f} is at/below invalidation.")
     if setup.direction == "BEARISH" and spot >= setup.invalidation:
         raise ScannerError("SETUP_INVALIDATED", f"Bearish setup invalidation is {setup.invalidation:.2f}; live NIFTY {spot:.2f} is at/above invalidation.")
-    if setup.direction == "BULLISH" and spot < setup.trigger:
+    if setup.direction == "BULLISH" and spot < setup.trigger - max(0.0, tolerance_points):
         raise ScannerError("LIVE_TRIGGER_NOT_CONFIRMED", f"Bullish trigger is {setup.trigger:.2f}; live NIFTY {spot:.2f} is below it. Wait for price to reclaim the trigger.")
-    if setup.direction == "BEARISH" and spot > setup.trigger:
+    if setup.direction == "BEARISH" and spot > setup.trigger + max(0.0, tolerance_points):
         raise ScannerError("LIVE_TRIGGER_NOT_CONFIRMED", f"Bearish trigger is {setup.trigger:.2f}; live NIFTY {spot:.2f} is above it. Wait for price to trade at or below the trigger.")
 
 
@@ -2330,6 +2762,30 @@ def build_futures_context(
             futures_vwap = valid_futures_vwap(futures_candles)
             vwap_status = "FRESH_WITH_POSITIVE_VOLUME" if futures_vwap is not None else "NO_POSITIVE_VOLUME"
 
+    # Futures OI provides an independent participant-positioning cross-check.
+    # It is not mixed into option OI deltas and is never fabricated from candles
+    # whose OI field is zero or unchanged.
+    futures_oi_signal = "UNAVAILABLE"
+    futures_oi_delta = None
+    futures_price_delta = None
+    futures_oi_pct = None
+    recent_futures = _contiguous_tail(futures_candles, 1) if futures_candles else []
+    if len(recent_futures) >= 2:
+        prev_bar, last_bar = recent_futures[-2], recent_futures[-1]
+        futures_oi_delta = last_bar.oi - prev_bar.oi
+        futures_price_delta = last_bar.close - prev_bar.close
+        futures_oi_pct = 100.0 * futures_oi_delta / prev_bar.oi if prev_bar.oi > 0 else None
+        if prev_bar.oi > 0 and last_bar.oi > 0 and futures_oi_delta != 0 and futures_price_delta != 0:
+            if futures_price_delta > 0 and futures_oi_delta > 0:
+                futures_oi_signal = "LONG_BUILDUP_BULLISH"
+            elif futures_price_delta < 0 and futures_oi_delta > 0:
+                futures_oi_signal = "SHORT_BUILDUP_BEARISH"
+            elif futures_price_delta > 0 and futures_oi_delta < 0:
+                futures_oi_signal = "SHORT_COVERING_BULLISH"
+            elif futures_price_delta < 0 and futures_oi_delta < 0:
+                futures_oi_signal = "LONG_UNWINDING_BEARISH"
+        elif futures_oi_delta == 0:
+            futures_oi_signal = "OI_UNCHANGED"
     basis = futures_basis_metrics(price, spot_price)
     return {
         "instrument_key": instrument_key,
@@ -2345,8 +2801,202 @@ def build_futures_context(
         "vwap_valid": futures_vwap is not None,
         "vwap_status": vwap_status,
         "latest_candle_age_seconds": candle_age,
+        "futures_oi_signal": futures_oi_signal,
+        "futures_oi_delta": futures_oi_delta,
+        "futures_oi_delta_pct": futures_oi_pct,
+        "futures_price_delta_points": futures_price_delta,
     }
 
+
+
+def classify_market_scenario(oi: Mapping[str, Any], structure: Mapping[str, Any], futures: Mapping[str, Any]) -> dict[str, Any]:
+    """Combine OI-first direction with independent price and futures context."""
+    raw = str(oi.get("raw_label", oi.get("label", "MISSING")))
+    stable = str(oi.get("label", "MISSING"))
+    execution = str(structure.get("execution_direction", "UNKNOWN"))
+    htf = str(structure.get("higher_timeframe_bias", "UNKNOWN"))
+    previous = str(oi.get("previous_directional_label") or "")
+    horizon_direction = str(oi.get("multi_horizon_direction") or "UNAVAILABLE")
+    regime = "TRANSITION"
+    if "SIDEWAYS" in str(structure.get("regime", "")) or htf == "SIDEWAYS":
+        regime = "SIDEWAYS"
+    elif raw == "BEARISH" and execution == "BEARISH":
+        regime = "CONTINUOUS_BEARISH" if htf in {"BEARISH", "TRANSITION", "UNKNOWN"} else "BULLISH_TO_BEARISH_REVERSAL"
+        if previous == "BULLISH" or horizon_direction == "BULLISH":
+            regime = "BULLISH_TO_BEARISH_REVERSAL"
+    elif raw == "BULLISH" and execution == "BULLISH":
+        regime = "CONTINUOUS_BULLISH" if htf in {"BULLISH", "TRANSITION", "UNKNOWN"} else "BEARISH_TO_BULLISH_REVERSAL"
+        if previous == "BEARISH" or horizon_direction == "BEARISH":
+            regime = "BEARISH_TO_BULLISH_REVERSAL"
+    elif htf == "BEARISH" and execution == "BULLISH":
+        regime = "BEARISH_TO_BULLISH_REVERSAL_WATCH"
+    elif htf == "BULLISH" and execution == "BEARISH":
+        regime = "BULLISH_TO_BEARISH_REVERSAL_WATCH"
+    elif execution in {"BULLISH", "BEARISH"} and raw == execution:
+        regime = f"EARLY_SESSION_{'BULLISH' if execution == 'BULLISH' else 'BEARISH'}"
+    elif execution == "MIXED" and raw in {"BULLISH", "BEARISH"}:
+        regime = f"OI_LEADING_{raw}_WAIT_PRICE"
+    elif htf == "SIDEWAYS":
+        regime = "SIDEWAYS"
+    maturity = str(structure.get("higher_timeframe_status") or "")
+    if maturity == "PROVISIONAL_EARLY_SESSION" and not regime.startswith(("EARLY_SESSION_", "SIDEWAYS")):
+        regime = f"EARLY_SESSION_{regime}"
+    elif maturity == "DEVELOPING_CONTEXT" and not regime.startswith(("DEVELOPING_", "SIDEWAYS")):
+        regime = f"DEVELOPING_{regime}"
+    confidence = float(oi.get("confidence") or 0.0)
+    futures_signal = str(futures.get("futures_oi_signal") or "UNAVAILABLE")
+    # Futures OI is a corroborating vote, never a substitute for option OI.
+    futures_bias = "BULLISH" if futures_signal in {"LONG_BUILDUP_BULLISH", "SHORT_COVERING_BULLISH"} else "BEARISH" if futures_signal in {"SHORT_BUILDUP_BEARISH", "LONG_UNWINDING_BEARISH"} else "UNKNOWN"
+    return {
+        "scenario": regime, "oi_raw_direction": raw, "oi_stable_direction": stable,
+        "price_execution_direction": execution, "higher_timeframe_bias": htf,
+        "futures_positioning": futures_signal, "futures_bias": futures_bias,
+        "oi_confidence": confidence,
+        "multi_horizon_direction": horizon_direction,
+        "multi_horizon_balance": oi.get("multi_horizon_balance"),
+        "alignment": "ALIGNED" if raw == execution and raw in {"BULLISH", "BEARISH"} else "PARTIAL_OR_CONFLICTING",
+    }
+
+
+def _oi_wall_score(level: Mapping[str, Any], side: str) -> float:
+    """Score an OI target wall using concentration and the direction of its flow.
+
+    Put support is strengthened by put writing/put-long unwinding and weakened
+    by put buying/short covering. Call resistance is strengthened by call
+    writing/call-long unwinding and weakened by call buying/short covering.
+    """
+    try:
+        if side == "PE":
+            relative = float(level.get("put_relative_oi") or 0.0)
+            supportive = float(level.get("put_support_flow_strength", level.get("put_writer_strength", 0.0)) or 0.0)
+            opposing = float(level.get("put_bearish_flow_strength") or 0.0)
+            delta_pct = float(level.get("put_delta_oi_pct_snapshot") or 0.0)
+            threshold = float(level.get("oi_material_threshold_pct") or 2.0)
+        else:
+            relative = float(level.get("call_relative_oi") or 0.0)
+            supportive = float(level.get("call_resistance_flow_strength", level.get("call_writer_strength", 0.0)) or 0.0)
+            opposing = float(level.get("call_bullish_flow_strength") or 0.0)
+            delta_pct = float(level.get("call_delta_oi_pct_snapshot") or 0.0)
+            threshold = float(level.get("oi_material_threshold_pct") or 2.0)
+        values = (relative, supportive, opposing, delta_pct, threshold)
+        if not all(math.isfinite(v) for v in values):
+            return 0.0
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    fresh_build = min(1.0, abs(delta_pct) / max(threshold, 1e-9)) if delta_pct > 0 and supportive > opposing else 0.0
+    score = 0.48 * relative + 0.37 * supportive + 0.15 * fresh_build - 0.22 * opposing
+    return max(0.0, min(1.0, score))
+
+
+def choose_oi_targets_and_stop(
+    entry: float, setup: Setup, oi: Mapping[str, Any], structure: Mapping[str, Any],
+    config: Config, now: datetime,
+) -> dict[str, Any]:
+    """Build stop/targets exclusively from OI walls; validate R:R on NIFTY spot.
+
+    Bearish: stop beyond the dominant relevant Call-OI wall; T1/T2 are the
+    nearest and next Put-OI support walls. Bullish is the exact mirror image.
+    The nearest significant target is never skipped to manufacture 2R.
+    """
+    rows = [x for x in oi.get("oi_levels", []) if isinstance(x, Mapping)]
+    if not rows:
+        raise ScannerError("OI_LEVELS_UNAVAILABLE", "No same-expiry OI strike profile is available for risk planning")
+    strikes = sorted({float(x.get("strike")) for x in rows if x.get("strike") is not None})
+    step_values = [b - a for a, b in zip(strikes, strikes[1:]) if b > a]
+    step = median(step_values) if step_values else 50.0
+    atr1 = float(structure.get("atr_1m") or 0.0)
+    atr5 = float(structure.get("atr_5m") or atr1 or 0.0)
+    if atr1 <= 0:
+        raise ScannerError("ATR_UNAVAILABLE", "One-minute ATR is unavailable for OI wall buffers")
+    buffer = max(config.minimum_stop_points, atr1 * max(config.stop_buffer_atr_fraction, 0.12), 2.0)
+    max_relevant_distance = max(6.0 * step, 5.0 * atr5, 250.0)
+
+    if setup.direction == "BEARISH":
+        stop_side, target_side = "CE", "PE"
+        stop_pool = [x for x in rows if entry < float(x.get("strike", 0)) <= entry + max_relevant_distance
+                     and float(x.get("call_oi", 0) or 0) > 0]
+        target_pool = [x for x in rows if float(x.get("strike", 0)) < entry
+                       and float(x.get("put_oi", 0) or 0) > 0]
+        stop_field, target_field = "call_oi", "put_oi"
+    elif setup.direction == "BULLISH":
+        stop_side, target_side = "PE", "CE"
+        stop_pool = [x for x in rows if entry - max_relevant_distance <= float(x.get("strike", 0)) < entry
+                     and float(x.get("put_oi", 0) or 0) > 0]
+        target_pool = [x for x in rows if float(x.get("strike", 0)) > entry
+                       and float(x.get("call_oi", 0) or 0) > 0]
+        stop_field, target_field = "put_oi", "call_oi"
+    else:
+        raise ScannerError("DIRECTION_INVALID", "OI risk planner needs BULLISH or BEARISH")
+
+    if not stop_pool:
+        raise ScannerError("OI_STOP_WALL_UNAVAILABLE", f"No relevant {stop_side} OI wall exists on the stop side of spot")
+    # Stop specifically uses the largest relevant opposite-side OI wall, not an
+    # unrelated old pivot. The pattern's invalidation is a secondary protection.
+    stop_wall = max(stop_pool, key=lambda x: (float(x.get(stop_field, 0) or 0), _oi_wall_score(x, stop_side)))
+    wall_price = float(stop_wall["strike"])
+    if setup.direction == "BEARISH":
+        stop = max(wall_price, setup.invalidation) + buffer
+        risk = stop - entry
+    else:
+        stop = min(wall_price, setup.invalidation) - buffer
+        risk = entry - stop
+    if not math.isfinite(risk) or risk <= 0:
+        raise ScannerError("INVALID_OI_STOP", "OI-derived stop is not on the risk side of the current NIFTY entry")
+
+    eligible_targets = []
+    for row in target_pool:
+        score = _oi_wall_score(row, target_side)
+        relative = float(row.get("put_relative_oi" if target_side == "PE" else "call_relative_oi") or 0.0)
+        supportive = float(row.get("put_support_flow_strength" if target_side == "PE" else "call_resistance_flow_strength") or 0.0)
+        opposing = float(row.get("put_bearish_flow_strength" if target_side == "PE" else "call_bullish_flow_strength") or 0.0)
+        # Retain a large existing wall in early-session conditions, but avoid
+        # treating a wall with strongly opposing option flow as a reliable target.
+        materially_opposed = opposing >= supportive + 0.25 and relative < 0.75
+        if not materially_opposed and (score >= 0.20 or relative >= 0.38 or supportive >= 0.25):
+            eligible_targets.append((row, score))
+    if not eligible_targets:
+        raise ScannerError("OI_TARGET_WALL_UNAVAILABLE", f"No significant {target_side} OI target zone is available")
+    eligible_targets.sort(key=lambda item: float(item[0]["strike"]), reverse=(setup.direction == "BEARISH"))
+    # For bearish, highest strike below spot is nearest support. For bullish,
+    # lowest strike above spot is nearest resistance.
+    t1_row, t1_strength = eligible_targets[0]
+    t1 = float(t1_row["strike"])
+    t2_row = eligible_targets[1][0] if len(eligible_targets) > 1 else None
+    t2 = float(t2_row["strike"]) if t2_row is not None else None
+    reward = (entry - t1) if setup.direction == "BEARISH" else (t1 - entry)
+    rr = reward / risk if reward > 0 else 0.0
+    if rr + 1e-9 < config.min_underlying_rr:
+        raise ScannerError(
+            "RR_BELOW_2R_OI_LEVELS",
+            f"Nearest significant OI target {t1:.2f} gives {rr:.2f}R using spot entry {entry:.2f} and OI stop {stop:.2f}; minimum is {config.min_underlying_rr:.2f}R",
+        )
+
+    local_now = now.astimezone(IST)
+    close_time = datetime.combine(local_now.date(), dtime(15, 30), tzinfo=IST)
+    minutes_left = max(0.0, (close_time - local_now).total_seconds() / 60.0)
+    usable_minutes = max(1.0, min(minutes_left, 180.0))
+    expected_move = max(atr1 * math.sqrt(usable_minutes) * 1.15, atr5 * math.sqrt(usable_minutes / 5.0) * 0.85)
+    t1_distance = abs(entry - t1)
+    time_feasibility = expected_move / max(t1_distance, 1e-9)
+    if minutes_left < 1.0 or time_feasibility < 0.45:
+        raise ScannerError("OI_T1_TIME_FEASIBILITY_LOW", f"Nearest OI target is {t1_distance:.1f} points away with estimated remaining-session move {expected_move:.1f} points")
+
+    return {
+        "entry_underlying": entry, "stop_underlying": stop,
+        "stop_source": f"MAX_RELEVANT_{stop_side}_OI_WALL",
+        "stop_oi_strike": wall_price, "stop_oi": float(stop_wall.get(stop_field, 0) or 0),
+        "stop_oi_writer_strength": float(stop_wall.get("call_resistance_flow_strength" if stop_side == "CE" else "put_support_flow_strength") or 0.0),
+        "t1_underlying": t1, "t1_source": f"NEAREST_SIGNIFICANT_{target_side}_OI_WALL",
+        "t1_oi": float(t1_row.get(target_field, 0) or 0), "t1_oi_strength": t1_strength,
+        "t1_flow": t1_row.get("put_flow" if target_side == "PE" else "call_flow"),
+        "t2_underlying": t2, "t2_source": f"NEXT_{target_side}_OI_WALL" if t2 is not None else None,
+        "t2_oi": float(t2_row.get(target_field, 0) or 0) if t2_row is not None else None,
+        "risk_points": risk, "reward_t1_points": reward, "underlying_rr": rr,
+        "stop_buffer_points": buffer, "atr_1m": atr1, "atr_5m": atr5,
+        "estimated_remaining_session_move": expected_move,
+        "t1_time_feasibility_ratio": time_feasibility,
+        "minutes_to_market_close": minutes_left,
+    }
 
 def _nearest_quote_key(full_quotes: Mapping[str, Mapping[str, Any]], instrument_key: str) -> Optional[Mapping[str, Any]]:
     return full_quotes.get(instrument_key)
@@ -2433,7 +3083,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
             chain_payload = client.get_json(chain_url)
             chain_time = now_ist()
             spot_chain, chain_records = parse_option_chain(chain_payload, expiry, chain_time)
-            oi = calculate_oi_evidence(chain_records, prior_snapshot, baseline, spot_chain, chain_time, config)
+            oi = calculate_oi_evidence(chain_records, prior_snapshot, baseline, spot_chain, chain_time, config, state.get("chain_snapshots", []))
             stabilize_oi_evidence(oi, state, session_date, expiry)
             # Fetch/receive time is distinct from the actual interval between snapshots.
             oi["oi_age_seconds"] = max(0.0, (now_ist() - chain_time).total_seconds())
@@ -2448,7 +3098,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
             existing_snapshots = state.get("chain_snapshots", [])
             if not existing_snapshots or existing_snapshots[-1].get("fetched_at") != chain_snapshot["fetched_at"]:
                 existing_snapshots.append(chain_snapshot)
-            state["chain_snapshots"] = existing_snapshots[-5:]
+            state["chain_snapshots"] = existing_snapshots[-16:]
             state["last_successful_snapshot_at"] = chain_time.isoformat()
             state["latest_oi_evidence"] = persisted_oi_evidence(oi)
             # Persist the successful observation before later market-data calls.
@@ -2551,10 +3201,10 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         level_summary = _levels_summary(levels, spot)
         # Reconstruct setup state chronologically from every candle not yet
         # processed by the prior workflow run. This is not historical execution.
-        tracked_setup = advance_setup_watch(index_candles, previous_processed, daily_candles, state, config)
-        current_setup = detect_setup(index_candles, levels, structure, config)
-        setup = current_setup or tracked_setup
-        detected_new_setup = current_setup is not None
+        tracked_setup = advance_setup_watch(index_candles, previous_processed, daily_candles, state, config, oi)
+        current_setup = detect_setup(index_candles, levels, structure, config, oi)
+        setup = select_active_setup(current_setup, tracked_setup, spot, oi, structure, quote_received_at, config)
+        detected_new_setup = setup is not None and (tracked_setup is None or setup.confirmed_at != tracked_setup.confirmed_at or setup.direction != tracked_setup.direction)
         state["last_processed_candle"] = index_candles[-1].start.isoformat()
         # Freshness-validated futures quote/VWAP context was built before levels.
         if oi.get("raw_label") in {"BULLISH", "BEARISH"} and oi.get("label") == "MIXED":
@@ -2562,7 +3212,8 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
             oi_state = f"{transition}_{oi.get('raw_label')}"
         else:
             oi_state = oi.get("label", "MISSING")
-        base_result.update({"expiry": expiry.isoformat(), "underlying_key": index_key, "spot": spot, "spot_context": spot_context, "oi": {k: v for k, v in oi.items() if k != "features"}, "oi_label": oi.get("label", "MISSING"), "oi_state": oi_state, "oi_raw_label": oi.get("raw_label", oi.get("label", "MISSING")), "option_chain_status": oi.get("source_refresh_status", "SUCCESS" if chain_refresh_ok else "UNKNOWN"), "option_chain_error": chain_refresh_error.code if chain_refresh_error else None, "structure": structure, "regime": structure.get("regime"), "levels": level_summary, "futures": future_context, "setup": json_safe(setup) if setup else None, "decision": "NO_TRADE", "reason_code": "NO_CONFIRMED_SETUP"})
+        market_scenario = classify_market_scenario(oi, structure, future_context)
+        base_result.update({"expiry": expiry.isoformat(), "underlying_key": index_key, "spot": spot, "spot_context": spot_context, "oi": {k: v for k, v in oi.items() if k != "features"}, "oi_label": oi.get("label", "MISSING"), "oi_state": oi_state, "oi_raw_label": oi.get("raw_label", oi.get("label", "MISSING")), "option_chain_status": oi.get("source_refresh_status", "SUCCESS" if chain_refresh_ok else "UNKNOWN"), "option_chain_error": chain_refresh_error.code if chain_refresh_error else None, "structure": structure, "regime": structure.get("regime"), "market_scenario": market_scenario, "levels": level_summary, "futures": future_context, "setup": json_safe(setup) if setup else None, "decision": "NO_TRADE", "reason_code": "NO_CONFIRMED_SETUP"})
         if not setup:
             base_result["reason_code"] = "OI_BASELINE_MISSING" if not oi.get("compared_to_previous_successful_snapshot") else "NO_CONFIRMED_SETUP"
             # Keep an existing watch until TTL or explicit invalidation; it is
@@ -2578,13 +3229,13 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
             base_result["setup_age_seconds"] = setup_age
             base_result["setup_direction"] = setup.direction
             base_result["setup_kind"] = setup.kind
-            if detected_new_setup or not state.get("setup_watch"):
+            if detected_new_setup or not state.get("setup_watch") or _setup_from_state(state.get("setup_watch")) != setup:
                 state["setup_watch"] = {"direction": setup.direction, "kind": setup.kind, "confirmed_at": setup.confirmed_at.isoformat(), "trigger": setup.trigger, "invalidation": setup.invalidation, "source_level": setup.source_level, "source": setup.source, "price_confidence": setup.price_confidence}
             if setup_age < -1 or setup_age > config.setup_max_age_minutes * 60:
                 raise ScannerError("MISSED_OR_STALE_SETUP", f"Setup confirmation is {setup_age:.0f}s old; no backdated entry allowed")
             # First test the directional trigger/invalidation. Distance alone
             # must never mask the fact that the live quote is on the wrong side.
-            validate_live_setup_trigger(setup, spot)
+            validate_live_setup_trigger(setup, spot, max(0.5, float(structure.get("atr_1m") or 0.0) * 0.15))
             extension = abs(spot - setup.trigger)
             if structure.get("atr_1m") and extension > float(structure["atr_1m"]) * config.max_entry_extension_atr:
                 raise ScannerError("ENTRY_TOO_EXTENDED", f"Current spot is {extension:.2f} points from setup trigger")
@@ -2592,7 +3243,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                 detail = chain_refresh_error.code if chain_refresh_error else "UNKNOWN_REFRESH_FAILURE"
                 raise ScannerError("OPTION_CHAIN_REFRESH_FAILED", f"Price structure was evaluated, but a fresh option chain/Greeks snapshot is required before entry; latest refresh failed with {detail}")
             authorize_direction(oi, setup, structure, config)
-            plan = choose_targets_and_stop(spot, setup, levels, structure, config)
+            plan = choose_oi_targets_and_stop(spot, setup, oi, structure, config, quote_received_at)
             base_result["risk_plan"] = plan
             selected = select_option_and_risk(setup.direction, spot, spot_quote_time, chain_records, full_quotes, expiry, quote_received_at, plan, structure, config)
             signal_key_raw = f"{session_date}|{expiry}|{setup.direction}|{selected['instrument_key']}|{setup.kind}|{setup.confirmed_at.isoformat()}"
