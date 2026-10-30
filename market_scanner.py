@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 intraday OI + market-structure scanner v102.0.1.
+"""NIFTY 50 intraday OI + market-structure scanner v103.0.0.
 
 Single-file runtime for a GitHub Actions workflow dispatched about every three
 minutes. It never places orders. Tests and documentation are separate files.
@@ -14,7 +14,7 @@ Design contract:
 - state is written atomically before notification is attempted;
 - failures produce explicit reason codes and never silently reuse stale data.
 
-Sources of truth for the API adapter are documented in RESEARCH_NOTES_v102.md.
+Sources of truth for the API adapter are documented in RESEARCH_NOTES.md.
 """
 from __future__ import annotations
 
@@ -44,8 +44,8 @@ from statistics import median
 from typing import Any, Iterable, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "102.0.1"
-SCHEMA_VERSION = 102
+VERSION = "103.0.0"
+SCHEMA_VERSION = 103
 IST = ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
 API_BASE = "https://api.upstox.com"
@@ -65,7 +65,7 @@ class ScannerError(RuntimeError):
 @dataclass(frozen=True)
 class Config:
     token: str
-    state_file: Path = Path("state/market_state_v102.json")
+    state_file: Path = Path("state/market_state_v103.json")
     audit_dir: Path = Path("audit")
     instrument_cache: Path = Path(".cache/upstox_nse.json.gz")
     explicit_expiry: Optional[date] = None
@@ -197,7 +197,7 @@ class Config:
 
         return cls(
             token=token,
-            state_file=Path(os.getenv("STATE_FILE", "state/market_state_v102.json")),
+            state_file=Path(os.getenv("STATE_FILE", "state/market_state_v103.json")),
             audit_dir=Path(os.getenv("AUDIT_DIR", "audit")),
             instrument_cache=Path(os.getenv("INSTRUMENT_CACHE_FILE", ".cache/upstox_nse.json.gz")),
             explicit_expiry=expiry,
@@ -1302,51 +1302,179 @@ def aggregate_candles(candles: Sequence[Candle], size_minutes: int, now: datetim
     return bars
 
 
+def _contiguous_tail(candles: Sequence[Candle], interval_minutes: int) -> list[Candle]:
+    """Return the chronologically ordered, duplicate-free contiguous tail.
+
+    Gaps are not forward-filled. A gap shortens the usable lookback so an
+    indicator cannot accidentally bridge missing market observations.
+    """
+    if not candles:
+        return []
+    ordered = sorted(candles, key=lambda c: c.start)
+    unique: list[Candle] = []
+    for candle in ordered:
+        if unique and candle.start == unique[-1].start:
+            # Keep the last provider record for a duplicate timestamp; count is
+            # reported separately by price_regime so this is never invisible.
+            unique[-1] = candle
+        else:
+            unique.append(candle)
+    tail = [unique[-1]]
+    expected = timedelta(minutes=interval_minutes)
+    for candle in reversed(unique[:-1]):
+        if tail[0].start - candle.start != expected:
+            break
+        tail.insert(0, candle)
+    return tail
+
+
 def price_regime(candles_1m: Sequence[Candle], candles_5m: Sequence[Candle]) -> dict[str, Any]:
-    if len(candles_1m) < 20 or len(candles_5m) < 5:
-        return {"regime": "UNKNOWN", "higher_timeframe_bias": "UNKNOWN", "execution_direction": "UNKNOWN", "efficiency_ratio": None, "atr_1m": atr(candles_1m), "atr_5m": atr(candles_5m), "reason": "INSUFFICIENT_COMPLETED_CANDLES"}
-    c5 = list(candles_5m)
-    closes5 = [c.close for c in c5]
-    recent = closes5[-6:]
-    net = recent[-1] - recent[0]
-    path = sum(abs(b - a) for a, b in zip(recent, recent[1:]))
-    efficiency = abs(net) / path if path > 0 else 0.0
-    atr5 = atr(c5, 14) or median([c.high - c.low for c in c5[-5:]])
-    e8, e21 = ema(closes5[-30:], 8), ema(closes5[-50:], 21)
-    up_count = sum(1 for a, b in zip(recent, recent[1:]) if b > a)
-    down_count = sum(1 for a, b in zip(recent, recent[1:]) if b < a)
-    if e8 is not None and e21 is not None and closes5[-1] > e8 > e21 and net > max(atr5 * 0.55, 1.0) and up_count >= 3:
-        htf = "BULLISH"
-    elif e8 is not None and e21 is not None and closes5[-1] < e8 < e21 and net < -max(atr5 * 0.55, 1.0) and down_count >= 3:
-        htf = "BEARISH"
-    elif efficiency < 0.22:
-        htf = "SIDEWAYS"
-    else:
-        htf = "TRANSITION"
-    c1 = list(candles_1m)
-    closes1 = [c.close for c in c1]
-    e8_1 = ema(closes1[-25:], 8)
-    momentum = closes1[-1] - closes1[-4]
-    atr1 = atr(c1, 14)
-    if e8_1 is not None and closes1[-1] > e8_1 and momentum > 0:
-        exec_dir = "BULLISH"
-    elif e8_1 is not None and closes1[-1] < e8_1 and momentum < 0:
-        exec_dir = "BEARISH"
-    else:
-        exec_dir = "MIXED"
-    if htf == "BULLISH" and exec_dir == "BULLISH":
+    """Classify execution and higher-timeframe context independently.
+
+    Eight contiguous one-minute closes are sufficient for an EMA(8) execution
+    read. Three contiguous completed five-minute bars support only a provisional
+    context; 21 bars are required before the EMA(21) slow-stack context is marked mature.
+    ATR uses the available true ranges and never fabricates missing candles.
+    """
+    one = _contiguous_tail(candles_1m, 1)
+    five = _contiguous_tail(candles_5m, 5)
+    duplicate_1m = max(0, len(candles_1m) - len({c.start for c in candles_1m}))
+    duplicate_5m = max(0, len(candles_5m) - len({c.start for c in candles_5m}))
+    atr1 = atr(one, 14)
+    atr5 = atr(five, 14)
+
+    # One-minute execution structure is not gated by the number of five-minute
+    # bars. This was the primary early-session coupling defect in v102.0.1.
+    execution_direction = "UNKNOWN"
+    execution_confidence = 0.0
+    momentum = None
+    ema8_1 = None
+    execution_status = "INSUFFICIENT_CONTIGUOUS_1M_HISTORY"
+    if len(one) >= 8:
+        closes1 = [c.close for c in one]
+        ema8_1 = ema(closes1[-16:], 8)
+        ema8_1_previous = ema(closes1[-17:-1], 8) if len(closes1) >= 9 else None
+        momentum = closes1[-1] - closes1[-4]
+        recent_diffs = [b - a for a, b in zip(closes1[-5:], closes1[-4:])]
+        up_count = sum(x > 0 for x in recent_diffs)
+        down_count = sum(x < 0 for x in recent_diffs)
+        vol_scale = max(0.25 * (atr1 or 0.0), 0.5)
+        momentum_ok_up = momentum > vol_scale * 0.15
+        momentum_ok_down = momentum < -vol_scale * 0.15
+        ema_slope_up = ema8_1_previous is None or ema8_1 >= ema8_1_previous
+        ema_slope_down = ema8_1_previous is None or ema8_1 <= ema8_1_previous
+        if closes1[-1] > float(ema8_1) and momentum_ok_up and ema_slope_up and up_count >= 2:
+            execution_direction = "BULLISH"
+        elif closes1[-1] < float(ema8_1) and momentum_ok_down and ema_slope_down and down_count >= 2:
+            execution_direction = "BEARISH"
+        else:
+            execution_direction = "MIXED"
+        momentum_strength = min(1.0, abs(momentum) / max((atr1 or 1.0) * 0.75, 1.0))
+        consistency = max(up_count, down_count) / max(1, len(recent_diffs))
+        ema_distance = min(1.0, abs(closes1[-1] - float(ema8_1)) / max((atr1 or 1.0) * 0.5, 1.0))
+        execution_confidence = round(0.45 * consistency + 0.35 * momentum_strength + 0.20 * ema_distance, 4)
+        execution_status = "READY" if execution_direction in {"BULLISH", "BEARISH"} else "MIXED_PRICE_ACTION"
+
+    # Five-minute context has its own readiness. During the first 15-35 minutes,
+    # a transparent provisional read is preferable to hiding a usable 1m signal.
+    htf = "UNKNOWN"
+    htf_status = "INSUFFICIENT_COMPLETED_5M_BARS"
+    htf_confidence = 0.0
+    efficiency = None
+    ema8_5 = None
+    ema21_5 = None
+    if len(five) >= 3:
+        closes5 = [c.close for c in five]
+        recent5 = closes5[-6:]
+        net = recent5[-1] - recent5[0]
+        path = sum(abs(b - a) for a, b in zip(recent5, recent5[1:]))
+        efficiency = abs(net) / path if path > 0 else 0.0
+        atr5 = atr5 or median([c.high - c.low for c in five[-min(5, len(five)):]]) or 0.0
+        diffs5 = [b - a for a, b in zip(recent5, recent5[1:])]
+        up5 = sum(x > 0 for x in diffs5)
+        down5 = sum(x < 0 for x in diffs5)
+        share = max(up5, down5) / max(1, len(diffs5))
+        fast_period = 3 if len(five) < 8 else 8
+        ema8_5 = ema(closes5[-max(fast_period, min(24, len(closes5))):], fast_period)
+        # Do not call an 8- or 12-bar estimate a mature EMA(21). Wait for 21
+        # completed five-minute observations before applying the slow-stack gate.
+        ema21_5 = ema(closes5[-40:], 21) if len(five) >= 21 else None
+        directional_threshold = max(0.30 * atr5, 1.0)
+        if net > directional_threshold and up5 >= max(2, math.ceil(0.60 * len(diffs5))) and closes5[-1] > float(ema8_5):
+            htf = "BULLISH"
+            htf_confidence = min(0.90, 0.45 + 0.25 * min(1.0, abs(net) / max(atr5, 1.0)) + 0.20 * share)
+        elif net < -directional_threshold and down5 >= max(2, math.ceil(0.60 * len(diffs5))) and closes5[-1] < float(ema8_5):
+            htf = "BEARISH"
+            htf_confidence = min(0.90, 0.45 + 0.25 * min(1.0, abs(net) / max(atr5, 1.0)) + 0.20 * share)
+        elif efficiency < 0.22 and abs(net) <= max(0.50 * atr5, 1.0):
+            htf = "SIDEWAYS"
+            htf_confidence = max(0.40, 1.0 - efficiency)
+        else:
+            htf = "TRANSITION"
+            htf_confidence = max(0.0, min(0.65, 0.35 + 0.25 * efficiency))
+        htf_status = ("PROVISIONAL_EARLY_SESSION" if len(five) < 8
+                      else "DEVELOPING_CONTEXT" if len(five) < 21
+                      else "MATURE_CONTEXT")
+        # At mature depth, require both the fast/slow EMA stack and momentum
+        # before assigning a confirmed directional bias. Until EMA(21) has 21
+        # completed observations, retain the early hypothesis as provisional.
+        if len(five) >= 21:
+            if closes5[-1] > float(ema8_5) > float(ema21_5) and net > max(0.45 * atr5, 1.0) and up5 >= 3:
+                htf = "BULLISH"
+                htf_confidence = min(1.0, 0.55 + 0.25 * min(1.0, abs(net) / max(atr5, 1.0)) + 0.20 * share)
+            elif closes5[-1] < float(ema8_5) < float(ema21_5) and net < -max(0.45 * atr5, 1.0) and down5 >= 3:
+                htf = "BEARISH"
+                htf_confidence = min(1.0, 0.55 + 0.25 * min(1.0, abs(net) / max(atr5, 1.0)) + 0.20 * share)
+            elif htf in {"BULLISH", "BEARISH"}:
+                htf = "TRANSITION"
+                htf_confidence = min(htf_confidence, 0.60)
+            htf_status = "MATURE_CONTEXT"
+
+    if execution_direction == "UNKNOWN":
+        regime = "INSUFFICIENT_EXECUTION_HISTORY"
+    elif htf == "UNKNOWN":
+        regime = f"EARLY_SESSION_{execution_direction}_EXECUTION" if execution_direction in {"BULLISH", "BEARISH"} else "EARLY_SESSION_MIXED_EXECUTION"
+    elif htf == "BULLISH" and execution_direction == "BULLISH":
         regime = "CONTINUOUS_BULLISH"
-    elif htf == "BEARISH" and exec_dir == "BEARISH":
+    elif htf == "BEARISH" and execution_direction == "BEARISH":
         regime = "CONTINUOUS_BEARISH"
-    elif htf == "BEARISH" and exec_dir == "BULLISH":
+    elif htf == "BEARISH" and execution_direction == "BULLISH":
         regime = "REVERSAL_BEAR_TO_BULL_WATCH"
-    elif htf == "BULLISH" and exec_dir == "BEARISH":
+    elif htf == "BULLISH" and execution_direction == "BEARISH":
         regime = "REVERSAL_BULL_TO_BEAR_WATCH"
     elif htf == "SIDEWAYS":
         regime = "SIDEWAYS"
     else:
         regime = "TRANSITION"
-    return {"regime": regime, "higher_timeframe_bias": htf, "execution_direction": exec_dir, "efficiency_ratio": efficiency, "atr_1m": atr1, "atr_5m": atr5, "momentum_3m_points": momentum, "ema8_1m": e8_1, "ema8_5m": e8, "ema21_5m": e21, "reason": "COMPLETED_CANDLE_STRUCTURE"}
+    # Make the maturity of the 5m context visible in the regime label itself.
+    # A provisional first-hour read is never presented as a fully confirmed
+    # continuous trend.
+    if htf_status == "PROVISIONAL_EARLY_SESSION" and not regime.startswith(("EARLY_SESSION_", "INSUFFICIENT_")):
+        regime = f"EARLY_SESSION_{regime}"
+    elif htf_status == "DEVELOPING_CONTEXT" and not regime.startswith(("EARLY_SESSION_", "INSUFFICIENT_")):
+        regime = f"DEVELOPING_{regime}"
+
+    return {
+        "regime": regime,
+        "higher_timeframe_bias": htf,
+        "higher_timeframe_status": htf_status,
+        "higher_timeframe_confidence": round(htf_confidence, 4),
+        "execution_direction": execution_direction,
+        "execution_status": execution_status,
+        "execution_confidence": execution_confidence,
+        "efficiency_ratio": efficiency,
+        "atr_1m": atr1,
+        "atr_5m": atr5,
+        "momentum_3m_points": momentum,
+        "ema8_1m": ema8_1,
+        "ema8_5m": ema8_5,
+        "ema21_5m": ema21_5,
+        "completed_1m_contiguous_count": len(one),
+        "completed_5m_contiguous_count": len(five),
+        "duplicate_1m_candle_count": duplicate_1m,
+        "duplicate_5m_candle_count": duplicate_5m,
+        "reason": "INDEPENDENT_1M_EXECUTION_AND_5M_CONTEXT",
+    }
 
 
 def confirmed_pivots(candles: Sequence[Candle], left: int = 2, right: int = 2) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
@@ -1671,8 +1799,14 @@ def select_option_and_risk(
         if quote.timestamp is None:
             rejections["QUOTE_TIMESTAMP_MISSING"] += 1
             continue
-        quote_age = (now.astimezone(IST) - quote.timestamp).total_seconds()
-        if quote_age < -5 or quote_age > config.max_quote_age_seconds:
+        try:
+            quote_age, quote_clock_skew, quote_timestamp_status = quote_timing(
+                quote.timestamp, now.astimezone(IST), error_code="OPTION_QUOTE_CLOCK_SKEW"
+            )
+        except ScannerError as timestamp_exc:
+            rejections[timestamp_exc.code] += 1
+            continue
+        if quote_age > config.max_quote_age_seconds:
             rejections["QUOTE_STALE"] += 1
             continue
         if quote.bid <= 0 or quote.ask <= 0 or quote.ask < quote.bid:
@@ -1729,6 +1863,7 @@ def select_option_and_risk(
             "net_option_rr_t1": net_rr1, "net_option_rr_t2": net_rr2,
             "spread_points": quote.ask - quote.bid, "spread_pct": quote.spread_pct, "bid_qty": quote.bid_qty, "ask_qty": quote.ask_qty,
             "quote_timestamp": quote.timestamp.isoformat(), "quote_age_seconds": quote_age,
+            "quote_clock_skew_seconds": quote_clock_skew, "quote_timestamp_status": quote_timestamp_status,
             "ltp": quote.ltp, "bid": quote.bid, "ask": quote.ask, "volume": quote.volume, "oi": quote.oi,
             "delta": quote.delta, "gamma": quote.gamma, "theta": quote.theta, "vega": quote.vega, "iv_percent": quote.iv,
             "pricing_method": "BLACK_SCHOLES_REPRICE_CALIBRATED_TO_LIVE_MID_WITH_IV_SHOCK_AND_SPREAD_SLIPPAGE_COSTS",
@@ -1829,12 +1964,54 @@ def authorize_direction(oi: Mapping[str, Any], setup: Setup, structure: Mapping[
             raise ScannerError("OI_LOW_CONFIDENCE", f"OI directional confidence is below {config.min_oi_direction_confidence:.2f}")
         return
     if label == "MIXED":
-        if setup.price_confidence < config.min_mixed_price_confirmation or structure.get("execution_direction") != setup.direction:
-            raise ScannerError("OI_MIXED_WAIT_PRICE_CONFIRMATION", "OI is mixed; a strong completed-candle trigger aligned with execution direction is required")
+        raw_label = oi.get("raw_label", "MIXED")
+        transition = oi.get("transition_status")
+        # During a genuine OI direction flip, price cannot authorize a trade
+        # against the newly observed raw OI direction. It may only confirm in
+        # the same direction while persistence is being established.
+        if raw_label in {"BULLISH", "BEARISH"} and raw_label != expected:
+            code = "OI_REVERSAL_CONFLICT" if transition == "REVERSAL_WATCH" else "OI_RAW_DIRECTION_CONFLICT"
+            raise ScannerError(code, f"Latest raw OI evidence points {raw_label}, while the price setup points {setup.direction}. OI has not confirmed the opposite direction; wait for alignment.")
+        if setup.price_confidence < config.min_mixed_price_confirmation:
+            raise ScannerError("OI_MIXED_WAIT_PRICE_CONFIRMATION", f"Price setup confidence {setup.price_confidence:.2f} is below {config.min_mixed_price_confirmation:.2f} while OI is not persistent")
+        if structure.get("execution_direction") != setup.direction:
+            raise ScannerError("OI_MIXED_WAIT_PRICE_CONFIRMATION", "OI is not persistent and the latest completed one-minute execution direction does not align with the setup")
+        execution_confidence = float(structure.get("execution_confidence", 1.0) or 0.0)
+        if execution_confidence < 0.50:
+            raise ScannerError("OI_MIXED_WAIT_PRICE_CONFIRMATION", f"One-minute execution confidence {execution_confidence:.2f} is too low to resolve mixed OI")
         return
     if label == "MISSING":
         raise ScannerError("OI_BASELINE_MISSING", "No usable current-session OI evidence")
     raise ScannerError("OI_PRICE_DIRECTION_CONFLICT", f"Confirmed price setup is {setup.direction}, but OI evidence is {label}")
+
+
+def validate_live_setup_trigger(setup: Setup, spot: float) -> None:
+    """Require the live underlying quote to remain on the trigger side.
+
+    A closed candle that confirmed a pattern is not an executable entry if the
+    live quote has already moved back through the trigger.
+    """
+    if setup.direction == "BULLISH" and spot <= setup.invalidation:
+        raise ScannerError("SETUP_INVALIDATED", f"Bullish setup invalidation is {setup.invalidation:.2f}; live NIFTY {spot:.2f} is at/below invalidation.")
+    if setup.direction == "BEARISH" and spot >= setup.invalidation:
+        raise ScannerError("SETUP_INVALIDATED", f"Bearish setup invalidation is {setup.invalidation:.2f}; live NIFTY {spot:.2f} is at/above invalidation.")
+    if setup.direction == "BULLISH" and spot < setup.trigger:
+        raise ScannerError("LIVE_TRIGGER_NOT_CONFIRMED", f"Bullish trigger is {setup.trigger:.2f}; live NIFTY {spot:.2f} is below it. Wait for price to reclaim the trigger.")
+    if setup.direction == "BEARISH" and spot > setup.trigger:
+        raise ScannerError("LIVE_TRIGGER_NOT_CONFIRMED", f"Bearish trigger is {setup.trigger:.2f}; live NIFTY {spot:.2f} is above it. Wait for price to trade at or below the trigger.")
+
+
+def quote_timing(source_timestamp: datetime, received_at: datetime, *, future_tolerance_seconds: float = 5.0, error_code: str = "SPOT_QUOTE_CLOCK_SKEW") -> tuple[float, float, str]:
+    """Return nonnegative quote age, future clock skew and a transparent status."""
+    if source_timestamp.tzinfo is None or received_at.tzinfo is None:
+        raise ScannerError("QUOTE_TIMESTAMP_INVALID", "Quote source and receipt timestamps must be timezone-aware")
+    delta = (received_at - source_timestamp).total_seconds()
+    if delta >= 0:
+        return delta, 0.0, "SOURCE_TIMESTAMP_NOT_AFTER_RECEIPT"
+    skew = -delta
+    if skew > future_tolerance_seconds:
+        raise ScannerError(error_code, f"Quote source timestamp is {skew:.2f}s ahead of local receipt time")
+    return 0.0, skew, "SOURCE_TIMESTAMP_AHEAD_OF_RECEIPT_WITHIN_TOLERANCE"
 
 
 def _option_record_from_state(row: Mapping[str, Any]) -> OptionRecord:
@@ -1899,6 +2076,91 @@ def _setup_from_state(raw: Optional[Mapping[str, Any]]) -> Optional[Setup]:
         return None
 
 
+def futures_basis_metrics(futures_price: Optional[float], spot_price: float) -> dict[str, Optional[float]]:
+    """Return futures-spot spread in index points and true basis points."""
+    if futures_price is None or not math.isfinite(float(futures_price)) or not math.isfinite(float(spot_price)) or spot_price <= 0:
+        return {"basis_points_value": None, "basis_points": None}
+    spread = float(futures_price) - float(spot_price)
+    return {"basis_points_value": spread, "basis_points": spread / float(spot_price) * 10000.0}
+
+
+def build_futures_context(
+    futures_quote: Optional[Mapping[str, Any]],
+    futures_candles: Sequence[Candle],
+    spot_price: float,
+    received_at: datetime,
+    *,
+    max_quote_age_seconds: int,
+    max_candle_age_seconds: int,
+    instrument_key: Optional[str] = None,
+    trading_symbol: Optional[str] = None,
+    expiry: Optional[date] = None,
+) -> dict[str, Any]:
+    """Build futures context only from fresh, timestamped futures data.
+
+    Futures context is informational. A stale/malformed futures feed is
+    excluded rather than allowed to contaminate basis or VWAP levels.
+    """
+    price: Optional[float] = None
+    quote_time: Optional[datetime] = None
+    quote_age: Optional[float] = None
+    quote_status = "FUTURES_QUOTE_UNAVAILABLE"
+    if futures_quote is not None:
+        try:
+            candidate = float(futures_quote.get("last_price"))
+            if math.isfinite(candidate) and candidate > 0:
+                quote_time = parse_datetime(futures_quote.get("timestamp"))
+                if quote_time is None:
+                    quote_status = "FUTURES_QUOTE_TIMESTAMP_MISSING"
+                else:
+                    try:
+                        quote_age, _skew, timing_status = quote_timing(
+                            quote_time, received_at, error_code="FUTURES_QUOTE_CLOCK_SKEW"
+                        )
+                    except ScannerError:
+                        quote_status = "FUTURES_QUOTE_CLOCK_SKEW"
+                    else:
+                        if quote_age > max_quote_age_seconds:
+                            quote_status = "FUTURES_QUOTE_STALE"
+                        else:
+                            price = candidate
+                            quote_status = timing_status
+            else:
+                quote_status = "FUTURES_QUOTE_INVALID"
+        except (TypeError, ValueError, OverflowError):
+            quote_status = "FUTURES_QUOTE_INVALID"
+
+    futures_vwap: Optional[float] = None
+    candle_age: Optional[float] = None
+    vwap_status = "FUTURES_CANDLES_UNAVAILABLE"
+    if futures_candles:
+        candle_age = (received_at - futures_candles[-1].close_time).total_seconds()
+        if candle_age < -1.0:
+            vwap_status = "FUTURES_CANDLE_TIMESTAMP_AHEAD"
+        elif candle_age > max_candle_age_seconds:
+            vwap_status = "FUTURES_CANDLES_STALE"
+        else:
+            futures_vwap = valid_futures_vwap(futures_candles)
+            vwap_status = "FRESH_WITH_POSITIVE_VOLUME" if futures_vwap is not None else "NO_POSITIVE_VOLUME"
+
+    basis = futures_basis_metrics(price, spot_price)
+    return {
+        "instrument_key": instrument_key,
+        "trading_symbol": trading_symbol,
+        "expiry": expiry.isoformat() if expiry else None,
+        "price": price,
+        "quote_timestamp": quote_time.isoformat() if quote_time else None,
+        "quote_age_seconds": quote_age,
+        "quote_status": quote_status,
+        "basis_points": basis["basis_points"],
+        "basis_points_value": basis["basis_points_value"],
+        "vwap": futures_vwap,
+        "vwap_valid": futures_vwap is not None,
+        "vwap_status": vwap_status,
+        "latest_candle_age_seconds": candle_age,
+    }
+
+
 def _nearest_quote_key(full_quotes: Mapping[str, Mapping[str, Any]], instrument_key: str) -> Optional[Mapping[str, Any]]:
     return full_quotes.get(instrument_key)
 
@@ -1945,6 +2207,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
     if now.tzinfo is None or now.utcoffset() is None:
         raise ScannerError("TIMEZONE_INVALID", "Scan evaluation time must be timezone-aware")
     now = now.astimezone(IST)
+    scan_monotonic_start = time.monotonic()
     session_date = now.date()
     base_result: dict[str, Any] = {"scanner_version": VERSION, "schema_version": SCHEMA_VERSION, "timestamp": now.isoformat(), "session_date": session_date.isoformat(), "decision": "NO_TRADE", "reason_code": "UNINITIALIZED"}
     if not _market_open(now):
@@ -2066,11 +2329,37 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         spot, spot_quote_time, _ = _spot_from_full_quote(raw_spot_quote)
         if spot_quote_time is None:
             raise ScannerError("SPOT_QUOTE_TIMESTAMP_MISSING", "NIFTY 50 live quote has no source timestamp")
-        spot_age = (now - spot_quote_time).total_seconds()
-        if spot_age < -5 or spot_age > config.max_quote_age_seconds:
+        # `now` is captured at scan start. Compare quote time with the actual
+        # local receipt instant, reconstructed from monotonic elapsed time.
+        quote_received_at = now + timedelta(seconds=max(0.0, time.monotonic() - scan_monotonic_start))
+        spot_age, quote_clock_skew, quote_timestamp_status = quote_timing(spot_quote_time, quote_received_at)
+        if spot_age > config.max_quote_age_seconds:
             raise ScannerError("SPOT_QUOTE_STALE", f"NIFTY spot quote age is {spot_age:.0f}s")
-        divergence = abs(spot - index_candles[-1].close)
-        spot_context = {"spot": spot, "spot_quote_timestamp": spot_quote_time.isoformat(), "spot_quote_age_seconds": spot_age, "latest_completed_candle_time": index_candles[-1].start.isoformat(), "latest_candle_close": index_candles[-1].close, "spot_vs_last_close_points": divergence}
+        divergence_signed = spot - index_candles[-1].close
+        spot_context = {
+            "spot": spot,
+            "spot_quote_timestamp": spot_quote_time.isoformat(),
+            "spot_quote_received_at": quote_received_at.isoformat(),
+            "spot_quote_age_seconds": spot_age,
+            "spot_quote_clock_skew_seconds": quote_clock_skew,
+            "spot_quote_timestamp_status": quote_timestamp_status,
+            "latest_completed_candle_time": index_candles[-1].start.isoformat(),
+            "latest_candle_close": index_candles[-1].close,
+            "spot_vs_last_close_points": abs(divergence_signed),
+            "spot_minus_last_close_points": divergence_signed,
+        }
+        futures_quote = full_quotes.get(future_key) if future_key else None
+        future_expiry = parse_expiry(future_row.get("expiry")) if future_row else None
+        future_context = build_futures_context(
+            futures_quote, futures_candles, spot, quote_received_at,
+            max_quote_age_seconds=config.max_quote_age_seconds,
+            max_candle_age_seconds=config.max_candle_age_seconds,
+            instrument_key=future_key or None,
+            trading_symbol=future_row.get("trading_symbol") if future_row else None,
+            expiry=future_expiry,
+        )
+        # Only a fresh futures VWAP with positive volume may become a level.
+        futures_vwap = future_context["vwap"]
         levels = build_levels(index_candles, daily_candles, oi, futures_vwap, structure.get("atr_1m"), config)
         level_summary = _levels_summary(levels, spot)
         # Reconstruct setup state chronologically from every candle not yet
@@ -2080,16 +2369,13 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         setup = current_setup or tracked_setup
         detected_new_setup = current_setup is not None
         state["last_processed_candle"] = index_candles[-1].start.isoformat()
-        # Quote-derived current market context, not a fabricated index VWAP.
-        futures_quote = full_quotes.get(future_key) if future_key else None
-        futures_price = float(futures_quote.get("last_price")) if futures_quote and futures_quote.get("last_price") is not None else None
-        basis = futures_price - spot if futures_price is not None else None
-        if futures_quote and futures_quote.get("timestamp"):
-            futures_quote_time = parse_datetime(futures_quote.get("timestamp"))
+        # Freshness-validated futures quote/VWAP context was built before levels.
+        if oi.get("raw_label") in {"BULLISH", "BEARISH"} and oi.get("label") == "MIXED":
+            transition = oi.get("transition_status") or "PENDING_PERSISTENCE"
+            oi_state = f"{transition}_{oi.get('raw_label')}"
         else:
-            futures_quote_time = None
-        future_context = {"instrument_key": future_key or None, "trading_symbol": future_row.get("trading_symbol") if future_row else None, "expiry": parse_expiry(future_row.get("expiry")).isoformat() if future_row and parse_expiry(future_row.get("expiry")) else None, "price": futures_price, "quote_timestamp": futures_quote_time.isoformat() if futures_quote_time else None, "basis_points": basis, "vwap": futures_vwap, "vwap_valid": futures_vwap is not None and any(c.volume > 0 for c in futures_candles)}
-        base_result.update({"expiry": expiry.isoformat(), "underlying_key": index_key, "spot": spot, "spot_context": spot_context, "oi": {k: v for k, v in oi.items() if k != "features"}, "oi_label": oi.get("label", "MISSING"), "option_chain_status": oi.get("source_refresh_status", "SUCCESS" if chain_refresh_ok else "UNKNOWN"), "option_chain_error": chain_refresh_error.code if chain_refresh_error else None, "structure": structure, "regime": structure.get("regime"), "levels": level_summary, "futures": future_context, "setup": json_safe(setup) if setup else None, "decision": "NO_TRADE", "reason_code": "NO_CONFIRMED_SETUP"})
+            oi_state = oi.get("label", "MISSING")
+        base_result.update({"expiry": expiry.isoformat(), "underlying_key": index_key, "spot": spot, "spot_context": spot_context, "oi": {k: v for k, v in oi.items() if k != "features"}, "oi_label": oi.get("label", "MISSING"), "oi_state": oi_state, "oi_raw_label": oi.get("raw_label", oi.get("label", "MISSING")), "option_chain_status": oi.get("source_refresh_status", "SUCCESS" if chain_refresh_ok else "UNKNOWN"), "option_chain_error": chain_refresh_error.code if chain_refresh_error else None, "structure": structure, "regime": structure.get("regime"), "levels": level_summary, "futures": future_context, "setup": json_safe(setup) if setup else None, "decision": "NO_TRADE", "reason_code": "NO_CONFIRMED_SETUP"})
         if not setup:
             base_result["reason_code"] = "OI_BASELINE_MISSING" if not oi.get("compared_to_previous_successful_snapshot") else "NO_CONFIRMED_SETUP"
             # Keep an existing watch until TTL or explicit invalidation; it is
@@ -2101,7 +2387,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                 if age > config.setup_state_ttl_minutes * 60 or invalidated:
                     state["setup_watch"] = None
         else:
-            setup_age = (now - setup.confirmed_at).total_seconds()
+            setup_age = (quote_received_at - setup.confirmed_at).total_seconds()
             base_result["setup_age_seconds"] = setup_age
             base_result["setup_direction"] = setup.direction
             base_result["setup_kind"] = setup.kind
@@ -2109,6 +2395,9 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                 state["setup_watch"] = {"direction": setup.direction, "kind": setup.kind, "confirmed_at": setup.confirmed_at.isoformat(), "trigger": setup.trigger, "invalidation": setup.invalidation, "source_level": setup.source_level, "source": setup.source, "price_confidence": setup.price_confidence}
             if setup_age < -1 or setup_age > config.setup_max_age_minutes * 60:
                 raise ScannerError("MISSED_OR_STALE_SETUP", f"Setup confirmation is {setup_age:.0f}s old; no backdated entry allowed")
+            # First test the directional trigger/invalidation. Distance alone
+            # must never mask the fact that the live quote is on the wrong side.
+            validate_live_setup_trigger(setup, spot)
             extension = abs(spot - setup.trigger)
             if structure.get("atr_1m") and extension > float(structure["atr_1m"]) * config.max_entry_extension_atr:
                 raise ScannerError("ENTRY_TOO_EXTENDED", f"Current spot is {extension:.2f} points from setup trigger")
@@ -2118,7 +2407,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
             authorize_direction(oi, setup, structure, config)
             plan = choose_targets_and_stop(spot, setup, levels, structure, config)
             base_result["risk_plan"] = plan
-            selected = select_option_and_risk(setup.direction, spot, spot_quote_time, chain_records, full_quotes, expiry, now, plan, structure, config)
+            selected = select_option_and_risk(setup.direction, spot, spot_quote_time, chain_records, full_quotes, expiry, quote_received_at, plan, structure, config)
             signal_key_raw = f"{session_date}|{expiry}|{setup.direction}|{selected['instrument_key']}|{setup.kind}|{setup.confirmed_at.isoformat()}"
             signal_key = hashlib.sha256(signal_key_raw.encode()).hexdigest()[:24]
             if signal_key in state.get("seen_signal_keys", []):
@@ -2131,7 +2420,8 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                 state["last_signal"] = {"signal_key": signal_key, "timestamp": now.isoformat(), "decision": base_result["decision"], "contract": selected, "risk_plan": plan}
                 state.setdefault("pending_notifications", []).append({"signal_key": signal_key, "payload": base_result.copy(), "attempts": 0, "created_at": now.isoformat()})
                 state["pending_notifications"] = state["pending_notifications"][-20:]
-        state["last_decision"] = {k: base_result.get(k) for k in ("timestamp", "decision", "reason_code", "signal_key", "spot", "oi_label", "regime")}
+        base_result["evaluation_timestamp"] = quote_received_at.isoformat()
+        state["last_decision"] = {k: base_result.get(k) for k in ("timestamp", "evaluation_timestamp", "decision", "reason_code", "signal_key", "spot", "oi_label", "regime")}
         state["schema_version"] = SCHEMA_VERSION
         state["scanner_version"] = VERSION
         state["session_date"] = session_date.isoformat()
