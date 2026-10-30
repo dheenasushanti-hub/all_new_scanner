@@ -1,13 +1,12 @@
-name: NIFTY 50 Market Scanner v102
+name: NIFTY 50 OI-First Market Scanner v104.0.0
 
 on:
-  # Scheduling remains controlled by the existing Cloudflare Worker.
+  # The existing Cloudflare Worker controls dispatch cadence.
   workflow_dispatch:
 
 permissions:
   contents: write
 
-# Only one writer may update the durable state/audit at a time.
 concurrency:
   group: nifty-market-scanner
   cancel-in-progress: false
@@ -46,6 +45,16 @@ jobs:
           restore-keys: |
             upstox-nse-instrument-master-${{ runner.os }}-
 
+      - name: Validate scanner configuration
+        env:
+          UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+          STATE_FILE: state/market_state_v104.json
+          AUDIT_DIR: audit
+          INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
+        shell: bash
+        run: python market_scanner.py --config-check
+
       - name: Execute NIFTY scanner
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
@@ -57,12 +66,14 @@ jobs:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ vars.SMTP_PORT || '465' }}
           ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
-          STATE_FILE: state/market_state_v102.json
+          STATE_FILE: state/market_state_v104.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           OI_MATERIAL_THRESHOLD_PCT: "2.0"
+          MIN_UNDERLYING_RR: "2.0"
           EXPECTED_OI_INTERVAL_SECONDS: "180"
           LOG_LEVEL: INFO
+          SCANNER_DEBUG_AUDIT: "false"
         shell: bash
         run: |
           set -o pipefail
@@ -79,10 +90,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          if [[ -f state/market_state_v102.json ]]; then
-            git add -f -- state/market_state_v102.json
+          if [[ -f state/market_state_v104.json ]]; then
+            git add -f -- state/market_state_v104.json
           fi
-          state_backups=(state/market_state_v102.json.schema-*.backup)
+          state_backups=(state/market_state_v104.json.schema-*.backup)
           if (( ${#state_backups[@]} > 0 )); then
             git add -f -- "${state_backups[@]}"
           fi
@@ -97,6 +108,6 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Update NIFTY v102 scanner state and audit"
+          git commit -m "Update NIFTY v104.0.0 scanner state and audit"
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
