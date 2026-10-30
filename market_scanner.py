@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 intraday OI + market-structure scanner v103.0.0.
+"""NIFTY 50 intraday OI + market-structure scanner v103.0.1.
 
 Single-file runtime for a GitHub Actions workflow dispatched about every three
 minutes. It never places orders. Tests and documentation are separate files.
@@ -44,7 +44,7 @@ from statistics import median
 from typing import Any, Iterable, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "103.0.0"
+VERSION = "103.0.1"
 SCHEMA_VERSION = 103
 IST = ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
@@ -113,6 +113,7 @@ class Config:
     smtp_host: str = ""
     smtp_port: int = 465
     webhook_url: str = ""
+    debug_audit: bool = False
 
     def __post_init__(self) -> None:
         if not self.token or not self.token.strip():
@@ -143,6 +144,8 @@ class Config:
             raise ScannerError("CONFIG_INVALID", "Delta limits must satisfy 0 <= min_abs_delta < max_abs_delta <= 1")
         if self.max_retries < 0 or self.max_retries > 5:
             raise ScannerError("CONFIG_INVALID", "max_retries must be between 0 and 5")
+        if not isinstance(self.debug_audit, bool):
+            raise ScannerError("CONFIG_INVALID", "debug_audit must be a boolean")
         if self.setup_state_ttl_minutes < self.setup_max_age_minutes:
             raise ScannerError("CONFIG_INVALID", "setup_state_ttl_minutes must be at least setup_max_age_minutes")
         if self.smtp_port < 1 or self.smtp_port > 65535:
@@ -188,6 +191,17 @@ class Config:
                 return value
             except ValueError as exc:
                 raise ScannerError("CONFIG_INVALID", f"{name} must be a finite nonnegative number") from exc
+
+        def bool_env(name: str, default: bool = False) -> bool:
+            raw = os.getenv(name)
+            if raw is None or not raw.strip():
+                return default
+            normalized = raw.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+            raise ScannerError("CONFIG_INVALID", f"{name} must be one of true/false, 1/0, yes/no, or on/off")
 
         expiry_raw = os.getenv("OPTION_EXPIRY", "").strip()
         try:
@@ -235,6 +249,7 @@ class Config:
             smtp_host=os.getenv("SMTP_HOST", "").strip(),
             smtp_port=int_env("SMTP_PORT", 465),
             webhook_url=os.getenv("ALERT_WEBHOOK_URL", "").strip(),
+            debug_audit=bool_env("SCANNER_DEBUG_AUDIT", False),
         )
 
 
@@ -362,6 +377,178 @@ def append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
         stream.write(line)
         stream.flush()
         os.fsync(stream.fileno())
+
+# Routine logs deliberately retain decision-critical information while omitting
+# repeated strike-zone permutations and per-contract feature rows. Full evidence
+# is written to a separate diagnostics JSONL only for exceptions, qualified
+# signals, OI reversal watches, or explicitly enabled debug sessions.
+def _picked_fields(value: Any, fields: Sequence[str]) -> Optional[dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    return {key: value[key] for key in fields if key in value}
+
+
+def compact_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a bounded, decision-complete audit/CLI representation."""
+    root_fields = (
+        "scanner_version", "schema_version", "timestamp", "evaluation_timestamp",
+        "session_date", "expiry", "underlying_key", "decision", "reason_code",
+        "error_type", "message", "spot", "oi_label", "oi_state", "oi_raw_label",
+        "option_chain_status", "option_chain_error", "regime", "setup_age_seconds",
+        "setup_direction", "setup_kind", "signal_key", "notification_status",
+        "notification_error", "candidate_offsets_allowed", "audit_persistence",
+    )
+    compact = {key: record[key] for key in root_fields if key in record}
+
+    oi = record.get("oi") if isinstance(record.get("oi"), Mapping) else {}
+    oi_fields = (
+        "label", "raw_label", "transition_status", "score", "directional_balance",
+        "bull_score", "bear_score", "confidence", "score_margin",
+        "snapshot_time", "snapshot_interval_seconds", "snapshot_status",
+        "source_refresh_status", "source_refresh_error", "oi_age_seconds",
+        "compared_to_previous_successful_snapshot", "contracts_compared",
+        "contributing_contract_count", "material_contract_count", "persistence_count",
+        "previous_directional_label",
+        "average_abs_delta_oi_pct", "average_abs_premium_change_pct",
+        "aggregate_delta_call_oi_snapshot", "aggregate_delta_put_oi_snapshot",
+        "aggregate_delta_call_oi_pct_snapshot", "aggregate_delta_put_oi_pct_snapshot",
+        "aggregate_pe_minus_ce_delta_oi", "session_baseline_contracts_matched",
+        "session_delta_call_oi_nearby", "session_delta_put_oi_nearby", "nearby_pcr",
+        "oi_activity_factor", "premium_activity_factor", "breadth_factor", "interval_factor",
+        "premium_mid_comparison_count", "premium_ltp_fallback_count",
+        "premium_source_mismatch_count", "current_snapshot_delta_available",
+    )
+    oi_compact = _picked_fields(oi, oi_fields) or {}
+    oi_compact.setdefault("label", record.get("oi_label", "MISSING"))
+    oi_compact.setdefault("raw_label", record.get("oi_raw_label", oi_compact.get("label")))
+    # Two largest walls per side are enough for the routine summary; the full
+    # three-wall list and all eight positional/metric zones stay in diagnostics.
+    for key in ("call_oi_walls", "put_oi_walls"):
+        walls = oi.get(key, [])
+        if isinstance(walls, list):
+            oi_compact[key] = [
+                _picked_fields(wall, ("strike", "oi", "relative_strength", "side"))
+                for wall in walls[:2] if isinstance(wall, Mapping)
+            ]
+    compact["oi"] = oi_compact
+
+    structure = _picked_fields(record.get("structure"), (
+        "regime", "higher_timeframe_bias", "higher_timeframe_confidence",
+        "higher_timeframe_status", "execution_direction", "execution_confidence",
+        "execution_status", "reason", "atr_1m", "atr_5m", "efficiency_ratio",
+        "momentum_3m_points", "completed_1m_contiguous_count",
+        "completed_5m_contiguous_count", "duplicate_1m_candle_count",
+        "duplicate_5m_candle_count", "ema8_1m", "ema8_5m", "ema21_5m",
+    ))
+    if structure is not None:
+        compact["structure"] = structure
+
+    spot_context = _picked_fields(record.get("spot_context"), (
+        "spot", "spot_quote_timestamp", "spot_quote_received_at", "spot_quote_age_seconds",
+        "spot_quote_clock_skew_seconds", "spot_quote_timestamp_status",
+        "latest_completed_candle_time", "latest_candle_close", "spot_minus_last_close_points",
+    ))
+    if spot_context is not None:
+        compact["spot_context"] = spot_context
+
+    levels = _picked_fields(record.get("levels"), (
+        "nearest_resistance", "nearest_support", "resistance_count", "support_count",
+    ))
+    if levels is not None:
+        compact["levels"] = levels
+
+    futures = _picked_fields(record.get("futures"), (
+        "instrument_key", "trading_symbol", "expiry", "price", "quote_timestamp",
+        "quote_age_seconds", "quote_status", "basis_points", "basis_points_value",
+        "vwap", "vwap_valid", "vwap_status", "latest_candle_age_seconds",
+    ))
+    if futures is not None:
+        compact["futures"] = futures
+
+    setup = _picked_fields(record.get("setup"), (
+        "direction", "kind", "confirmed_at", "trigger", "invalidation",
+        "source_level", "source", "price_confidence",
+    ))
+    if setup is not None:
+        compact["setup"] = setup
+
+    # Trade-qualified records retain the selected instrument and full risk plan.
+    for key in ("risk_plan", "selected_contract"):
+        value = record.get(key)
+        if isinstance(value, Mapping):
+            compact[key] = dict(value)
+    return json_safe(compact)
+
+
+def detailed_audit_triggers(record: Mapping[str, Any], debug_enabled: bool = False) -> list[str]:
+    triggers: list[str] = []
+    if debug_enabled:
+        triggers.append("DEBUG_ENABLED")
+    if record.get("decision") == "QUALIFIED":
+        triggers.append("QUALIFIED_SIGNAL")
+    if record.get("error_type") or record.get("reason_code") in {
+        "UNEXPECTED_ERROR", "STATE_SAVE_FAILED", "API_AUTH_FAILED", "API_PERMISSION_DENIED",
+        "API_HTTP_ERROR", "API_HTTP_403", "API_HTTP_401",
+    }:
+        triggers.append("SCANNER_ERROR")
+    oi = record.get("oi") if isinstance(record.get("oi"), Mapping) else {}
+    state = str(record.get("oi_state") or "")
+    if oi.get("transition_status") == "REVERSAL_WATCH" or state.startswith("REVERSAL_WATCH"):
+        triggers.append("OI_REVERSAL_WATCH")
+    return list(dict.fromkeys(triggers))
+
+
+def persist_audit_records(
+    config: Config,
+    session_date: date,
+    record: Mapping[str, Any],
+    *,
+    oi_diagnostics: Optional[Mapping[str, Any]] = None,
+) -> dict[str, str]:
+    """Write compact routine audit and conditional detailed diagnostics.
+
+    Audit failures are reported to the workflow log but never rewrite a
+    completed trading decision or turn an already-delivered signal into NO_TRADE.
+    """
+    routine_path = config.audit_dir / f"market_scan_{session_date.isoformat()}.jsonl"
+    result = {"routine": "FAILED", "diagnostics": "NOT_REQUIRED"}
+    compact = compact_audit_record(record)
+    try:
+        append_jsonl(routine_path, compact)
+        result["routine"] = "WRITTEN"
+    except Exception as exc:
+        LOG.error("Routine audit write failed (%s): %s", type(exc).__name__, routine_path)
+
+    triggers = detailed_audit_triggers(record, config.debug_audit)
+    if not triggers:
+        return result
+
+    detail_path = config.audit_dir / f"market_scan_diagnostics_{session_date.isoformat()}.jsonl"
+    oi_full = dict(oi_diagnostics) if isinstance(oi_diagnostics, Mapping) else {}
+    if not oi_full and isinstance(record.get("oi"), Mapping):
+        oi_full = dict(record["oi"])
+    oi_without_features = {key: value for key, value in oi_full.items() if key != "features"}
+    diagnostic_record = {
+        "diagnostic_schema_version": 1,
+        "scanner_version": VERSION,
+        "timestamp": record.get("timestamp"),
+        "triggers": triggers,
+        "decision_summary": compact_audit_record(record),
+        "oi_diagnostics": json_safe(oi_without_features),
+        "per_contract_features": json_safe(oi_full.get("features", [])),
+    }
+    try:
+        append_jsonl(detail_path, diagnostic_record)
+        result["diagnostics"] = "WRITTEN"
+    except Exception as exc:
+        result["diagnostics"] = "FAILED"
+        LOG.error("Detailed diagnostics write failed (%s): %s", type(exc).__name__, detail_path)
+    return result
+
+
+def persisted_oi_evidence(oi: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep only fields needed to reuse the last OI context after refresh failure."""
+    return {key: value for key, value in oi.items() if key not in {"features", "oi_zones_above_below_spot"}}
 
 
 # ---------- HTTP client: bounded retry, no hidden auth behaviour ----------
@@ -2201,7 +2388,7 @@ def _empty_oi(status: str = "MISSING") -> dict[str, Any]:
 
 
 def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional[UpstoxClient] = None, master: Optional[InstrumentMaster] = None, dry_run: bool = False) -> dict[str, Any]:
-    """Run one idempotent scan and return a compact structured decision."""
+    """Run one idempotent scan and return full structured evidence."""
     if now is None:
         now = now_ist()
     if now.tzinfo is None or now.utcoffset() is None:
@@ -2263,7 +2450,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                 existing_snapshots.append(chain_snapshot)
             state["chain_snapshots"] = existing_snapshots[-5:]
             state["last_successful_snapshot_at"] = chain_time.isoformat()
-            state["latest_oi_evidence"] = {k: v for k, v in oi.items() if k != "features"}
+            state["latest_oi_evidence"] = persisted_oi_evidence(oi)
             # Persist the successful observation before later market-data calls.
             # This survives a subsequent quote/candle failure or interrupted job.
             atomic_write_json(config.state_file, state)
@@ -2418,7 +2605,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                 state.setdefault("seen_signal_keys", []).append(signal_key)
                 state["seen_signal_keys"] = state["seen_signal_keys"][-500:]
                 state["last_signal"] = {"signal_key": signal_key, "timestamp": now.isoformat(), "decision": base_result["decision"], "contract": selected, "risk_plan": plan}
-                state.setdefault("pending_notifications", []).append({"signal_key": signal_key, "payload": base_result.copy(), "attempts": 0, "created_at": now.isoformat()})
+                state.setdefault("pending_notifications", []).append({"signal_key": signal_key, "payload": compact_audit_record(base_result), "attempts": 0, "created_at": now.isoformat()})
                 state["pending_notifications"] = state["pending_notifications"][-20:]
         base_result["evaluation_timestamp"] = quote_received_at.isoformat()
         state["last_decision"] = {k: base_result.get(k) for k in ("timestamp", "evaluation_timestamp", "decision", "reason_code", "signal_key", "spot", "oi_label", "regime")}
@@ -2427,7 +2614,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         state["session_date"] = session_date.isoformat()
         state["expiry"] = expiry.isoformat()
         if chain_refresh_ok:
-            state["latest_oi_evidence"] = {k: v for k, v in oi.items() if k != "features"}
+            state["latest_oi_evidence"] = persisted_oi_evidence(oi)
             if chain_time is not None:
                 state["last_successful_snapshot_at"] = chain_time.isoformat()
         state["last_processed_candle"] = index_candles[-1].start.isoformat()
@@ -2445,8 +2632,9 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                     base_result["notification_error"] = pending_match["last_error"]
         # Persist delivery status before adding the final audit record.
         atomic_write_json(config.state_file, state)
-        audit_file = config.audit_dir / f"market_scan_{session_date.isoformat()}.jsonl"
-        append_jsonl(audit_file, base_result)
+        base_result["audit_persistence"] = persist_audit_records(
+            config, session_date, base_result, oi_diagnostics=oi
+        )
         return json_safe(base_result)
     except ScannerError as exc:
         base_result.update({"decision": "NO_TRADE", "error_type": "ScannerError", "reason_code": exc.code, "message": str(exc), "expiry": expiry.isoformat() if expiry else None, "underlying_key": index_row.get("instrument_key") if index_row else None, "oi_label": oi.get("label", "MISSING"), "regime": base_result.get("regime", "UNKNOWN"), "spot": base_result.get("spot", spot_chain or None)})
@@ -2457,11 +2645,13 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
             state["session_date"] = session_date.isoformat()
             state["last_decision"] = {k: base_result.get(k) for k in ("timestamp", "decision", "reason_code", "signal_key", "spot", "oi_label", "regime")}
             atomic_write_json(config.state_file, state)
-            append_jsonl(config.audit_dir / f"market_scan_{session_date.isoformat()}.jsonl", base_result)
         except Exception as persistence_error:
-            LOG.error("Could not persist blocked scan (%s); alerts suppressed", persistence_error)
+            LOG.error("Could not persist blocked scan state (%s); alerts suppressed", persistence_error)
             base_result["reason_code"] = "STATE_SAVE_FAILED"
-            base_result["message"] = f"{exc}; state/audit persistence also failed"
+            base_result["message"] = f"{exc}; state persistence failed"
+        base_result["audit_persistence"] = persist_audit_records(
+            config, session_date, base_result, oi_diagnostics=oi
+        )
         return json_safe(base_result)
     except Exception as exc:
         LOG.exception("Unexpected scanner failure")
@@ -2472,9 +2662,11 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
             state["session_date"] = session_date.isoformat()
             state["last_decision"] = {k: base_result.get(k) for k in ("timestamp", "decision", "reason_code", "signal_key", "spot", "oi_label", "regime")}
             atomic_write_json(config.state_file, state)
-            append_jsonl(config.audit_dir / f"market_scan_{session_date.isoformat()}.jsonl", base_result)
         except Exception:
             base_result["reason_code"] = "STATE_SAVE_FAILED"
+        base_result["audit_persistence"] = persist_audit_records(
+            config, session_date, base_result, oi_diagnostics=oi
+        )
         return json_safe(base_result)
 
 
@@ -2488,7 +2680,10 @@ def _deliver_pending_notifications(config: Config, state: dict[str, Any], *, dry
             item["status"] = "FAILED_MAX_ATTEMPTS"
             remaining.append(item)
             continue
-        payload = item.get("payload") or {}
+        payload = compact_audit_record(item.get("payload") or {})
+        # Also migrate legacy queued payloads so state remains compact even if
+        # notification delivery is not configured yet.
+        item["payload"] = payload
         if dry_run:
             item["status"] = "DRY_RUN_NOT_SENT"
             remaining.append(item)
@@ -2554,7 +2749,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps({"version": VERSION, "config": "valid", "state_file": str(config.state_file), "audit_dir": str(config.audit_dir), "notification_configured": bool(config.webhook_url or (config.smtp_host and config.email_sender and config.email_receiver and config.email_password))}))
             return 0
         result = run_scan(config, dry_run=args.dry_run)
-        print(json.dumps(json_safe(result), separators=(",", ":"), sort_keys=True))
+        print(json.dumps(compact_audit_record(result), separators=(",", ":"), sort_keys=True))
         return 0 if result.get("reason_code") not in {"UNEXPECTED_ERROR", "STATE_SAVE_FAILED", "API_AUTH_FAILED", "API_PERMISSION_DENIED", "API_HTTP_ERROR", "API_HTTP_403", "API_HTTP_401"} else 1
     except ScannerError as exc:
         result = {"scanner_version": VERSION, "timestamp": now_ist().isoformat(), "decision": "NO_TRADE", "reason_code": exc.code, "error_type": "ScannerError", "message": str(exc)}
