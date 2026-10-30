@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 OI-first multi-regime intraday options scanner v105.0.0.
+"""NIFTY 50 OI-first multi-regime intraday options scanner v106.0.0.
 
 Single-file runtime for a GitHub Actions workflow dispatched about every three
 minutes. It never places orders. Tests and documentation are separate files.
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import html
 import hashlib
 import json
 import logging
@@ -29,23 +30,22 @@ import random
 import shutil
 import smtplib
 import ssl
-import sys
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from statistics import median
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "105.0.0"
-SCHEMA_VERSION = 105
+VERSION = "106.0.0"
+SCHEMA_VERSION = 106
 IST = ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
 API_BASE = "https://api.upstox.com"
@@ -65,7 +65,7 @@ class ScannerError(RuntimeError):
 @dataclass(frozen=True)
 class Config:
     token: str
-    state_file: Path = Path("state/market_state_v104.json")
+    state_file: Path = Path("state/market_state_v106.json")
     audit_dir: Path = Path("audit")
     instrument_cache: Path = Path(".cache/upstox_nse.json.gz")
     explicit_expiry: Optional[date] = None
@@ -109,9 +109,8 @@ class Config:
     email_receiver: str = ""
     email_password: str = ""
     email_username: str = ""
-    smtp_host: str = ""
+    smtp_host: str = "smtp.gmail.com"
     smtp_port: int = 465
-    webhook_url: str = ""
     debug_audit: bool = False
 
     def __post_init__(self) -> None:
@@ -146,8 +145,8 @@ class Config:
             raise ScannerError("CONFIG_INVALID", "debug_audit must be a boolean")
         if self.setup_state_ttl_minutes < self.setup_max_age_minutes:
             raise ScannerError("CONFIG_INVALID", "setup_state_ttl_minutes must be at least setup_max_age_minutes")
-        if self.smtp_port < 1 or self.smtp_port > 65535:
-            raise ScannerError("CONFIG_INVALID", "SMTP_PORT must be between 1 and 65535")
+        if self.smtp_port not in {465, 587}:
+            raise ScannerError("CONFIG_INVALID", "SMTP_PORT must be 465 (SSL) or 587 (STARTTLS)")
         for name, value in {
             "min_oi_direction_confidence": self.min_oi_direction_confidence,
             "min_oi_score_margin": self.min_oi_score_margin,
@@ -165,6 +164,10 @@ class Config:
         for name, value in nonnegative.items():
             if not math.isfinite(float(value)) or float(value) < 0:
                 raise ScannerError("CONFIG_INVALID", f"{name} must be a finite nonnegative number")
+
+    @property
+    def email_configured(self) -> bool:
+        return all((self.smtp_host, self.email_sender, self.email_receiver, self.email_password))
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -209,7 +212,7 @@ class Config:
 
         return cls(
             token=token,
-            state_file=Path(os.getenv("STATE_FILE", "state/market_state_v104.json")),
+            state_file=Path(os.getenv("STATE_FILE", "state/market_state_v106.json")),
             audit_dir=Path(os.getenv("AUDIT_DIR", "audit")),
             instrument_cache=Path(os.getenv("INSTRUMENT_CACHE_FILE", ".cache/upstox_nse.json.gz")),
             explicit_expiry=expiry,
@@ -243,9 +246,8 @@ class Config:
             email_receiver=(os.getenv("EMAIL_RECEIVER", "").strip() or os.getenv("EMAIL_TO", "").strip()),
             email_password=os.getenv("EMAIL_PASSWORD", "").strip(),
             email_username=os.getenv("EMAIL_USERNAME", "").strip(),
-            smtp_host=os.getenv("SMTP_HOST", "").strip(),
+            smtp_host=os.getenv("SMTP_HOST", "smtp.gmail.com").strip() or "smtp.gmail.com",
             smtp_port=int_env("SMTP_PORT", 465),
-            webhook_url=os.getenv("ALERT_WEBHOOK_URL", "").strip(),
             debug_audit=bool_env("SCANNER_DEBUG_AUDIT", False),
         )
 
@@ -338,7 +340,7 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _migrate_state_payload(state: Mapping[str, Any], source: Path) -> dict[str, Any]:
-    """Migrate compatible v102/v103/v104 durable state without discarding the session baseline.
+    """Migrate compatible v102-v105 durable state without discarding the session baseline.
 
     Only data structures that already have stable meanings are carried forward.
     run_scan subsequently validates session date, expiry and instrument identity
@@ -348,14 +350,22 @@ def _migrate_state_payload(state: Mapping[str, Any], source: Path) -> dict[str, 
         old_schema = int(state.get("schema_version", 0) or 0)
     except (TypeError, ValueError):
         old_schema = 0
-    if old_schema not in {102, 103, 104}:
+    if old_schema not in {102, 103, 104, 105}:
         raise ScannerError("STATE_SCHEMA_UNSUPPORTED", f"Cannot safely migrate schema {old_schema} from {source}")
     migrated = dict(state)
     migrated["schema_version"] = SCHEMA_VERSION
     migrated["scanner_version"] = VERSION
-    migrated["migration_note"] = f"migrated_schema_{old_schema}_to_{SCHEMA_VERSION}; session/expiry/instrument checks remain mandatory"
+    migrated["migration_note"] = (f"migrated_schema_{old_schema}_to_{SCHEMA_VERSION}; "
+                                  "legacy pending notifications held as LEGACY_UNCERTAIN to prevent duplicate sends")
     snapshots = migrated.get("chain_snapshots")
     migrated["chain_snapshots"] = [x for x in snapshots if isinstance(x, Mapping)][-16:] if isinstance(snapshots, list) else []
+    legacy_pending = migrated.get("pending_notifications")
+    if isinstance(legacy_pending, list):
+        migrated["pending_notifications"] = [
+            {**dict(item), "status": "LEGACY_UNCERTAIN", "claim_token": None,
+             "migration_note": "Not automatically resent; delivery may already have occurred"}
+            for item in legacy_pending if isinstance(item, Mapping)
+        ]
     # Preserve only known durable workflow fields. Unknown schema-specific
     # structures are not silently interpreted by the new decision engine.
     allowed = {
@@ -363,18 +373,19 @@ def _migrate_state_payload(state: Mapping[str, Any], source: Path) -> dict[str, 
         "chain_snapshots", "session_oi_baseline", "last_successful_snapshot_at",
         "latest_oi_evidence", "oi_evidence_history", "last_processed_candle",
         "setup_watch", "seen_signal_keys", "pending_notifications",
-        "delivered_signal_keys", "last_signal", "last_decision", "instrument_cache_version",
+        "delivered_signal_keys", "notification_history", "last_signal", "last_decision", "instrument_cache_version",
     }
     return {key: value for key, value in migrated.items() if key in allowed}
 
 
 def read_state(path: Path) -> dict[str, Any]:
-    """Load v105 state or migrate an existing same-session v104/v103/v102 state file."""
+    """Load v106 state or migrate a compatible v102-v105 state file."""
     source = path if path.exists() else None
     if source is None:
         # GitHub Actions may still persist state under an earlier versioned filename.
         # Keep the old file untouched; migrate its compatible state into v105 on save.
-        candidates = [path.parent / "market_state_v104.json", path.parent / "market_state_v103.json", path.parent / "market_state_v102.json"]
+        candidates = [path.parent / "market_state_v105.json", path.parent / "market_state_v104.json",
+                      path.parent / "market_state_v103.json", path.parent / "market_state_v102.json"]
         source = next((candidate for candidate in candidates if candidate.exists()), None)
     if source is None:
         return {"schema_version": SCHEMA_VERSION, "scanner_version": VERSION}
@@ -389,7 +400,7 @@ def read_state(path: Path) -> dict[str, Any]:
         schema = state.get("schema_version")
         if schema == SCHEMA_VERSION:
             return state
-        if source != path or schema in {102, 103, 104}:
+        if source != path or schema in {102, 103, 104, 105}:
             migrated = _migrate_state_payload(state, source)
             LOG.warning("Migrated durable state schema %s to %s from %s", schema, SCHEMA_VERSION, source)
             return migrated
@@ -3058,7 +3069,7 @@ def _empty_oi(status: str = "MISSING") -> dict[str, Any]:
     return {"label": status, "score": 0.0, "bull_score": 0.0, "bear_score": 0.0, "confidence": 0.0, "score_margin": 0.0, "snapshot_status": "MISSING", "compared_to_previous_successful_snapshot": False, "features": [], "call_oi_walls": [], "put_oi_walls": []}
 
 
-def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional[UpstoxClient] = None, master: Optional[InstrumentMaster] = None, dry_run: bool = False) -> dict[str, Any]:
+def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional[UpstoxClient] = None, master: Optional[InstrumentMaster] = None) -> dict[str, Any]:
     """Run one idempotent scan and return full structured evidence."""
     if now is None:
         now = now_ist()
@@ -3071,14 +3082,29 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
     if not _market_open(now):
         return {**base_result, "regime": "UNKNOWN", "oi_label": "MISSING", "reason_code": "MARKET_CLOSED", "decision": "NO_TRADE"}
     state = read_state(config.state_file)
-    previous_processed = parse_datetime(state.get("last_processed_candle")) if state.get("session_date") == session_date.isoformat() else None
-    if state.get("session_date") != session_date.isoformat():
-        # Never use yesterday's OI as the previous intraday snapshot.
-        state = {"schema_version": SCHEMA_VERSION, "scanner_version": VERSION, "session_date": session_date.isoformat(), "chain_snapshots": [], "session_oi_baseline": None, "seen_signal_keys": [], "pending_notifications": [], "last_processed_candle": None, "setup_watch": None}
-    else:
-        state.setdefault("chain_snapshots", [])
-        state.setdefault("seen_signal_keys", [])
-        state.setdefault("pending_notifications", [])
+    same_session = state.get("session_date") == session_date.isoformat()
+    previous_processed = parse_datetime(state.get("last_processed_candle")) if same_session else None
+    if not same_session:
+        # Reset session market baselines, but never discard the durable email outbox.
+        state = {
+            "schema_version": SCHEMA_VERSION,
+            "scanner_version": VERSION,
+            "session_date": session_date.isoformat(),
+            "chain_snapshots": [],
+            "session_oi_baseline": None,
+            "seen_signal_keys": [],
+            "pending_notifications": state.get("pending_notifications", []),
+            "delivered_signal_keys": state.get("delivered_signal_keys", []),
+            "notification_history": state.get("notification_history", []),
+            "last_processed_candle": None,
+            "setup_watch": None,
+        }
+    for collection in (
+        "chain_snapshots", "seen_signal_keys", "pending_notifications",
+        "delivered_signal_keys", "notification_history", "oi_evidence_history",
+    ):
+        _ensure_state_list(state, collection)
+    normalize_notification_queue(state)
     client = client or UpstoxClient(config.token, config.request_timeout, config.max_retries)
     master = master or InstrumentMaster(client, config.instrument_cache, config.instrument_cache_hours)
     index_row: Optional[dict[str, Any]] = None
@@ -3273,12 +3299,30 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                 base_result["reason_code"] = "DUPLICATE_SIGNAL_SUPPRESSED"
                 base_result["decision"] = "NO_TRADE"
             else:
-                base_result.update({"decision": "QUALIFIED", "reason_code": "QUALIFIED_CE" if setup.direction == "BULLISH" else "QUALIFIED_PE", "signal_key": signal_key, "selected_contract": selected, "risk_plan": plan, "setup": json_safe(setup), "candidate_offsets_allowed": list(config.strike_offsets_ce if setup.direction == "BULLISH" else config.strike_offsets_pe), "notification_status": "PENDING" if (config.webhook_url or (config.smtp_host and config.email_sender and config.email_receiver and config.email_password)) else "NOT_CONFIGURED"})
+                base_result.update({
+                    "decision": "QUALIFIED",
+                    "reason_code": "QUALIFIED_CE" if setup.direction == "BULLISH" else "QUALIFIED_PE",
+                    "signal_key": signal_key,
+                    "selected_contract": selected,
+                    "risk_plan": plan,
+                    "setup": json_safe(setup),
+                    "candidate_offsets_allowed": list(config.strike_offsets_ce if setup.direction == "BULLISH" else config.strike_offsets_pe),
+                    "notification_status": "QUEUED" if config.email_configured else "NOT_CONFIGURED",
+                })
                 state.setdefault("seen_signal_keys", []).append(signal_key)
-                state["seen_signal_keys"] = state["seen_signal_keys"][-500:]
-                state["last_signal"] = {"signal_key": signal_key, "timestamp": now.isoformat(), "decision": base_result["decision"], "contract": selected, "risk_plan": plan}
-                state.setdefault("pending_notifications", []).append({"signal_key": signal_key, "payload": compact_audit_record(base_result), "attempts": 0, "created_at": now.isoformat()})
-                state["pending_notifications"] = state["pending_notifications"][-20:]
+                state["seen_signal_keys"] = state["seen_signal_keys"][-1000:]
+                state["last_signal"] = {
+                    "signal_key": signal_key, "timestamp": now.isoformat(),
+                    "decision": base_result["decision"], "contract": selected, "risk_plan": plan,
+                }
+                if signal_key not in {_notification_key(x) for x in state["pending_notifications"]} and signal_key not in set(state["delivered_signal_keys"]):
+                    queue_payload = compact_audit_record(base_result)
+                    queue_payload["notification_status"] = "QUEUED"
+                    state["pending_notifications"].append({
+                        "signal_key": signal_key, "payload": queue_payload, "attempts": 0,
+                        "status": "QUEUED", "created_at": now.isoformat(),
+                    })
+                    normalize_notification_queue(state)
         base_result["evaluation_timestamp"] = quote_received_at.isoformat()
         state["last_decision"] = {k: base_result.get(k) for k in ("timestamp", "evaluation_timestamp", "decision", "reason_code", "signal_key", "spot", "oi_label", "regime")}
         state["schema_version"] = SCHEMA_VERSION
@@ -3290,20 +3334,18 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
             if chain_time is not None:
                 state["last_successful_snapshot_at"] = chain_time.isoformat()
         state["last_processed_candle"] = index_candles[-1].start.isoformat()
-        # Save state before writing audit/sending alert. On save failure, no alert is sent.
+        # Scanning only enqueues alerts. GitHub persists a durable claim before
+        # a separate delivery phase is allowed to contact Gmail.
+        normalize_notification_queue(state)
         atomic_write_json(config.state_file, state)
-        # Notification is attempted only after the signal/dedup key is durable.
-        _deliver_pending_notifications(config, state, dry_run=dry_run)
         if base_result.get("signal_key"):
+            pending = next((x for x in state["pending_notifications"] if x.get("signal_key") == base_result["signal_key"]), None)
             if base_result["signal_key"] in state.get("delivered_signal_keys", []):
                 base_result["notification_status"] = "SENT"
-            else:
-                pending_match = next((x for x in state.get("pending_notifications", []) if x.get("signal_key") == base_result["signal_key"]), None)
-                base_result["notification_status"] = (pending_match or {}).get("status", "NOT_CONFIGURED")
-                if pending_match and pending_match.get("last_error"):
-                    base_result["notification_error"] = pending_match["last_error"]
-        # Persist delivery status before adding the final audit record.
-        atomic_write_json(config.state_file, state)
+            elif pending:
+                base_result["notification_status"] = pending.get("status", "QUEUED")
+            elif base_result.get("notification_status") != "NOT_CONFIGURED":
+                base_result["notification_status"] = "HELD_OR_ALREADY_PROCESSED"
         base_result["audit_persistence"] = persist_audit_records(
             config, session_date, base_result, oi_diagnostics=oi
         )
@@ -3342,96 +3384,405 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         return json_safe(base_result)
 
 
-def _deliver_pending_notifications(config: Config, state: dict[str, Any], *, dry_run: bool = False) -> None:
-    pending = state.get("pending_notifications", [])
-    if not pending:
-        return
-    remaining = []
-    for item in pending:
-        if item.get("attempts", 0) >= 3:
-            item["status"] = "FAILED_MAX_ATTEMPTS"
-            remaining.append(item)
-            continue
-        payload = compact_audit_record(item.get("payload") or {})
-        # Also migrate legacy queued payloads so state remains compact even if
-        # notification delivery is not configured yet.
-        item["payload"] = payload
-        if dry_run:
-            item["status"] = "DRY_RUN_NOT_SENT"
-            remaining.append(item)
-            continue
-        errors = []
-        sent = False
-        if config.webhook_url:
-            try:
-                body = json.dumps(json_safe(payload), separators=(",", ":")).encode("utf-8")
-                request = urllib.request.Request(config.webhook_url, data=body, headers={"Content-Type": "application/json", "User-Agent": f"NiftyMarketScanner/{VERSION}"}, method="POST")
-                with urllib.request.urlopen(request, timeout=10) as response:
-                    if 200 <= getattr(response, "status", 200) < 300:
-                        sent = True
-                    else:
-                        errors.append(f"webhook HTTP {response.status}")
-            except Exception as exc:
-                errors.append(f"webhook {type(exc).__name__}")
-        if not sent and config.smtp_host and config.email_sender and config.email_receiver and config.email_password:
-            try:
-                message = EmailMessage()
-                message["Subject"] = f"NIFTY v{VERSION} {payload.get('reason_code')} — {payload.get('selected_contract', {}).get('side')} {payload.get('selected_contract', {}).get('strike')}"
-                message["From"] = config.email_sender
-                message["To"] = config.email_receiver
-                message.set_content(json.dumps(json_safe(payload), indent=2))
-                username = config.email_username or config.email_sender
-                if config.smtp_port == 465:
-                    with smtplib.SMTP_SSL(config.smtp_host, config.smtp_port, timeout=15, context=ssl.create_default_context()) as smtp:
-                        smtp.login(username, config.email_password)
-                        smtp.send_message(message)
-                else:
-                    with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=15) as smtp:
-                        smtp.starttls(context=ssl.create_default_context())
-                        smtp.login(username, config.email_password)
-                        smtp.send_message(message)
-                sent = True
-            except Exception as exc:
-                errors.append(f"email {type(exc).__name__}: {str(exc)[:180]}")
-        item["attempts"] = int(item.get("attempts", 0)) + 1
-        item["last_attempt_at"] = now_ist().isoformat()
-        if sent:
-            item["status"] = "SENT"
-            state.setdefault("delivered_signal_keys", []).append(item.get("signal_key"))
-            state["delivered_signal_keys"] = state["delivered_signal_keys"][-500:]
-        else:
-            item["status"] = "FAILED" if errors else "NOT_CONFIGURED"
-            item["last_error"] = "; ".join(errors) if errors else "No webhook or complete SMTP configuration"
-            remaining.append(item)
-    state["pending_notifications"] = remaining[-20:]
+# ---------- Notification queue and Gmail delivery ----------
 
+def _ensure_state_list(state: dict[str, Any], key: str) -> list[Any]:
+    value = state.get(key)
+    if value is None:
+        value = []
+        state[key] = value
+    if not isinstance(value, list):
+        raise ScannerError("STATE_COLLECTION_INVALID", f"State field {key!r} must be a JSON list")
+    return value
+
+
+def _notification_key(item: Mapping[str, Any]) -> str:
+    key = item.get("signal_key")
+    if not key and isinstance(item.get("payload"), Mapping):
+        key = item["payload"].get("signal_key")
+    return str(key or "").strip()
+
+
+def normalize_notification_queue(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Remove duplicate, delivered, and malformed queue entries conservatively."""
+    delivered = {str(x) for x in _ensure_state_list(state, "delivered_signal_keys") if x}
+    raw_pending = _ensure_state_list(state, "pending_notifications")
+    unique: dict[str, dict[str, Any]] = {}
+    priority = {"QUEUED": 0, "CLAIMED": 1, "LEGACY_UNCERTAIN": 2, "DELIVERY_UNKNOWN": 3, "EXPIRED": 4}
+
+    for raw in raw_pending:
+        if not isinstance(raw, Mapping):
+            continue
+        item = dict(raw)
+        key = _notification_key(item)
+        if not key or key in delivered:
+            continue
+        item["signal_key"] = key
+        status = str(item.get("status") or "").upper()
+        if not status:
+            status = "QUEUED" if int(item.get("attempts", 0) or 0) == 0 else "LEGACY_UNCERTAIN"
+        if status in {"PENDING", "NOT_CONFIGURED", "FAILED", "DRY_RUN_NOT_SENT"}:
+            status = "QUEUED" if int(item.get("attempts", 0) or 0) == 0 else "LEGACY_UNCERTAIN"
+        item["status"] = status
+        previous = unique.get(key)
+        if previous is None or priority.get(status, 4) > priority.get(str(previous.get("status")), 4):
+            unique[key] = item
+
+    state["pending_notifications"] = list(unique.values())
+    return state["pending_notifications"]
+
+
+def _record_notification_history(state: dict[str, Any], item: Mapping[str, Any], status: str) -> None:
+    history = _ensure_state_list(state, "notification_history")
+    history.append({
+        "signal_key": _notification_key(item),
+        "status": status,
+        "timestamp": now_ist().isoformat(),
+        "attempts": int(item.get("attempts", 0) or 0),
+        "error": str(item.get("last_error") or "")[:240] or None,
+    })
+    state["notification_history"] = history[-500:]
+
+
+def _format_value(value: Any, decimals: int = 2) -> str:
+    try:
+        number = float(value)
+        if not math.isfinite(number):
+            return "—"
+        return f"{number:,.{decimals}f}"
+    except (TypeError, ValueError):
+        return "—" if value is None else str(value)
+
+
+def build_trade_email(payload: Mapping[str, Any]) -> EmailMessage:
+    """Build a concise multipart trade alert with its full audit JSON attached."""
+    data = compact_audit_record(payload)
+    selected = data.get("selected_contract") or {}
+    risk = data.get("risk_plan") or {}
+    setup = data.get("setup") or {}
+    oi = data.get("oi") or {}
+    structure = data.get("structure") or {}
+    timestamp = parse_datetime(data.get("timestamp")) or now_ist()
+    side = str(selected.get("side") or "OPTION")
+    strike = _format_value(selected.get("strike"), 0)
+    expiry = str(selected.get("expiry") or data.get("expiry") or "—")
+    reason = str(data.get("reason_code") or data.get("decision") or "QUALIFIED")
+    direction = str(data.get("setup_direction") or setup.get("direction") or ("BULLISH" if side == "CE" else "BEARISH"))
+    spot = data.get("spot", risk.get("entry_underlying"))
+    signal_key = _notification_key({"signal_key": data.get("signal_key")})
+    signal_short = signal_key[:12] if signal_key else "UNKEYED"
+
+    trade_rows = [
+        ("Signal", reason), ("Direction", direction), ("Option", f"{side} {strike}"),
+        ("Expiry", expiry), ("NIFTY spot", _format_value(spot)),
+        ("Entry premium (ask ref.)", _format_value(selected.get("reference_entry_ask"))),
+        ("Bid / Ask", f"{_format_value(selected.get('reference_bid'))} / {_format_value(selected.get('reference_entry_ask'))}"),
+        ("Delta", _format_value(selected.get("delta"), 4)),
+        ("IV", _format_value(selected.get("iv_percent"))),
+        ("Spread", f"{_format_value(selected.get('spread_pct'), 3)}%"),
+        ("Selection score", _format_value(selected.get("selection_score"), 4)),
+    ]
+    risk_rows = [
+        ("Underlying entry ref.", _format_value(risk.get("entry_underlying", spot))),
+        ("Underlying stop", _format_value(risk.get("stop_underlying"))),
+        ("Target 1", _format_value(risk.get("t1_underlying"))),
+        ("Target 2", _format_value(risk.get("t2_underlying"))),
+        ("Spot-based RR", f"{_format_value(risk.get('underlying_rr'))}:1"),
+    ]
+    oi_direction = str(oi.get("raw_label") or oi.get("label") or data.get("oi_raw_label") or "—")
+    oi_stable = str(oi.get("label") or data.get("oi_label") or "—")
+    oi_confidence = _format_value(oi.get("confidence"), 3)
+    setup_kind = str(setup.get("kind") or data.get("setup_kind") or "—")
+    setup_confirmed = str(setup.get("confirmed_at") or "—")
+
+    def plain_table(rows: Sequence[tuple[str, str]]) -> str:
+        return "\n".join(f"{label}: {value}" for label, value in rows)
+
+    text_body = "\n".join([
+        f"NIFTY 50 — {reason}", f"{side} {strike} | Expiry {expiry}",
+        f"Generated: {timestamp.strftime('%d %b %Y, %I:%M:%S %p IST')}",
+        f"Signal ID: {signal_key or '—'}", "", "TRADE DETAILS", plain_table(trade_rows),
+        "", "UNDERLYING RISK PLAN", plain_table(risk_rows), "", "MARKET CONFIRMATION",
+        f"Setup: {setup_kind}", f"Setup confirmed: {setup_confirmed}",
+        f"OI raw / stable: {oi_direction} / {oi_stable}", f"OI confidence: {oi_confidence}",
+        f"Price execution: {structure.get('execution_direction', '—')}",
+        f"Market regime: {data.get('regime', structure.get('regime', '—'))}",
+        "", "The JSON attachment contains the compact technical audit record.",
+        "This is an analytical alert, not an order placed by the scanner.",
+    ])
+
+    def html_table(rows: Sequence[tuple[str, str]]) -> str:
+        cells = "".join(
+            f'<tr><th style="text-align:left;padding:7px 10px;color:#586174;font-weight:500">{html.escape(label)}</th>'
+            f'<td style="text-align:right;padding:7px 10px;font-weight:600">{html.escape(value)}</td></tr>'
+            for label, value in rows
+        )
+        return f'<table role="presentation" style="width:100%;border-collapse:collapse">{cells}</table>'
+
+    accent = "#b42318" if direction.upper() == "BEARISH" else "#067647"
+    html_body = f'''<!doctype html>
+<html><body style="margin:0;padding:24px;background:#f4f6f8;font-family:Arial,Helvetica,sans-serif;color:#172033">
+<div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e2e6ea;border-radius:12px;overflow:hidden">
+  <div style="padding:22px 24px;border-bottom:1px solid #e8ebef">
+    <div style="font-size:12px;letter-spacing:1px;color:#667085">NIFTY 50 MARKET SCANNER · v{VERSION}</div>
+    <div style="margin-top:8px;font-size:25px;font-weight:700;color:{accent}">{html.escape(reason)}</div>
+    <div style="margin-top:5px;font-size:19px;font-weight:600">{html.escape(side)} {html.escape(strike)} <span style="font-size:14px;color:#667085">· Expiry {html.escape(expiry)}</span></div>
+    <div style="margin-top:8px;font-size:12px;color:#667085">{html.escape(timestamp.strftime('%d %b %Y, %I:%M:%S %p IST'))} · Signal {html.escape(signal_short)}</div>
+  </div>
+  <div style="padding:18px 24px"><h3 style="margin:0 0 8px;font-size:15px">Trade details</h3>{html_table(trade_rows)}</div>
+  <div style="padding:0 24px 18px"><h3 style="margin:0 0 8px;font-size:15px">Underlying risk plan</h3>{html_table(risk_rows)}</div>
+  <div style="padding:0 24px 22px"><h3 style="margin:0 0 8px;font-size:15px">Market confirmation</h3>{html_table([
+      ('Setup', setup_kind), ('Setup confirmed', setup_confirmed),
+      ('OI raw / stable', f'{oi_direction} / {oi_stable}'), ('OI confidence', oi_confidence),
+      ('Price execution', str(structure.get('execution_direction') or '—')),
+      ('Market regime', str(data.get('regime') or structure.get('regime') or '—')),
+  ])}</div>
+  <div style="padding:14px 24px;background:#f8fafc;border-top:1px solid #e8ebef;font-size:12px;color:#667085">
+    Full compact technical evidence is attached as JSON. This is an analytical alert; the scanner does not place orders.
+  </div>
+</div></body></html>'''
+
+    message = EmailMessage()
+    message["Subject"] = f"NIFTY v{VERSION} | {reason} | {side} {strike} | {timestamp.strftime('%d-%b %I:%M %p IST')}"
+    message["X-Scanner-Version"] = VERSION
+    if signal_key:
+        message["Message-ID"] = f"<nifty-v106-{signal_key}@market-scanner.local>"
+    message.set_content(text_body)
+    message.add_alternative(html_body, subtype="html")
+    attachment = dict(data)
+    attachment["notification_status"] = "SENT"
+    message.add_attachment(
+        json.dumps(json_safe(attachment), indent=2, allow_nan=False).encode("utf-8"),
+        maintype="application", subtype="json",
+        filename=f"nifty_v106_signal_{signal_short}.json",
+    )
+    return message
+
+
+def send_gmail(config: Config, payload: Mapping[str, Any]) -> None:
+    """Send one message over Gmail SMTP; never retries an uncertain send."""
+    if not config.email_configured:
+        raise ScannerError("SMTP_CONFIG_MISSING", "Gmail sender, receiver, App Password, and SMTP host are required")
+    message = build_trade_email(payload)
+    message["From"] = config.email_sender
+    message["To"] = config.email_receiver
+    username = config.email_username or config.email_sender
+    if config.smtp_port == 465:
+        with smtplib.SMTP_SSL(config.smtp_host, config.smtp_port, timeout=20, context=ssl.create_default_context()) as smtp:
+            smtp.login(username, config.email_password)
+            refused = smtp.send_message(message)
+    elif config.smtp_port == 587:
+        with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=20) as smtp:
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.login(username, config.email_password)
+            refused = smtp.send_message(message)
+    else:
+        raise ScannerError("SMTP_PORT_INVALID", "Gmail SMTP port must be 465 (SSL) or 587 (STARTTLS)")
+    if refused:
+        raise ScannerError("SMTP_RECIPIENT_REFUSED", f"SMTP refused recipient(s): {', '.join(refused)}")
+
+
+def claim_pending_notifications(config: Config, claim_token: str) -> dict[str, int]:
+    """Durably claim queued alerts before the workflow attempts SMTP delivery."""
+    if not config.email_configured:
+        raise ScannerError("SMTP_CONFIG_MISSING", "Gmail settings are incomplete; refusing to claim notifications")
+    if not claim_token.strip():
+        raise ScannerError("NOTIFICATION_CLAIM_TOKEN_MISSING", "Set NOTIFICATION_CLAIM_TOKEN from the GitHub run ID and attempt")
+    state = read_state(config.state_file)
+    normalize_notification_queue(state)
+    claimed = 0
+    uncertain = 0
+    expired = 0
+    claim_time = now_ist()
+    for item in state["pending_notifications"]:
+        status = str(item.get("status", "QUEUED"))
+        if status == "QUEUED":
+            created_at = parse_datetime(item.get("created_at"))
+            age_seconds = (claim_time - created_at).total_seconds() if created_at else float("inf")
+            if age_seconds < -30 or age_seconds > config.setup_max_age_minutes * 60:
+                item.update({
+                    "status": "EXPIRED",
+                    "last_error": "Alert exceeded the live setup freshness window before delivery; stale trade alerts are not sent.",
+                    "expired_at": claim_time.isoformat(),
+                })
+                _record_notification_history(state, item, "EXPIRED")
+                expired += 1
+                continue
+            item.update({"status": "CLAIMED", "claim_token": claim_token,
+                         "claimed_at": claim_time.isoformat()})
+            claimed += 1
+        elif status == "CLAIMED" and item.get("claim_token") != claim_token:
+            item.update({"status": "DELIVERY_UNKNOWN", "last_error":
+                         "A previous workflow attempt claimed this signal but did not persist a final delivery result; automatic resend is disabled."})
+            _record_notification_history(state, item, "DELIVERY_UNKNOWN")
+            uncertain += 1
+    state["schema_version"] = SCHEMA_VERSION
+    state["scanner_version"] = VERSION
+    atomic_write_json(config.state_file, state)
+    return {"claimed": claimed, "uncertain_previous_claims": uncertain,
+            "expired": expired,
+            "queued_or_held": len(state["pending_notifications"]) - claimed - uncertain - expired}
+
+
+def requeue_uncertain_notification(config: Config, signal_key: str) -> None:
+    """Manually requeue one uncertain alert after an operator checks the inbox."""
+    key = signal_key.strip()
+    if not key:
+        raise ScannerError("SIGNAL_KEY_REQUIRED", "Supply the exact signal key to requeue")
+    state = read_state(config.state_file)
+    normalize_notification_queue(state)
+    if key in {str(x) for x in state.get("delivered_signal_keys", [])}:
+        raise ScannerError("SIGNAL_ALREADY_DELIVERED", "This signal is recorded as delivered and will not be requeued")
+    item = next((x for x in state["pending_notifications"] if x.get("signal_key") == key), None)
+    if item is None or item.get("status") not in {"DELIVERY_UNKNOWN", "LEGACY_UNCERTAIN"}:
+        raise ScannerError("SIGNAL_NOT_REQUEUEABLE", "Only DELIVERY_UNKNOWN or LEGACY_UNCERTAIN signals can be manually requeued")
+    item.update({
+        "status": "QUEUED",
+        "attempts": 0,
+        "claim_token": None,
+        "last_error": None,
+        "operator_requeued_at": now_ist().isoformat(),
+    })
+    state["pending_notifications"] = [x for x in state["pending_notifications"] if x.get("signal_key") != key]
+    state["pending_notifications"].append(item)
+    atomic_write_json(config.state_file, state)
+
+
+def deliver_claimed_notifications(config: Config, claim_token: str) -> dict[str, int]:
+    """Send only alerts claimed by this exact GitHub run attempt; no automatic retry."""
+    if not config.email_configured:
+        raise ScannerError("SMTP_CONFIG_MISSING", "Gmail settings are incomplete; refusing notification delivery")
+    if not claim_token.strip():
+        raise ScannerError("NOTIFICATION_CLAIM_TOKEN_MISSING", "Notification claim token is missing")
+    state = read_state(config.state_file)
+    normalize_notification_queue(state)
+    sent = 0
+    unknown = 0
+    skipped = 0
+
+    for item in list(state["pending_notifications"]):
+        if item.get("status") != "CLAIMED" or item.get("claim_token") != claim_token:
+            skipped += 1
+            continue
+
+        # Persist the one-shot attempt before contacting SMTP. A failure is not
+        # automatically retried because SMTP acceptance can be ambiguous.
+        item["status"] = "DELIVERY_UNKNOWN"
+        item["attempts"] = int(item.get("attempts", 0) or 0) + 1
+        item["last_attempt_at"] = now_ist().isoformat()
+        item["last_error"] = "Delivery attempt started; automatic resend is disabled unless delivery is manually verified."
+        atomic_write_json(config.state_file, state)
+
+        try:
+            payload = item.get("payload") if isinstance(item.get("payload"), Mapping) else {}
+            send_gmail(config, payload)
+        except Exception as exc:
+            item["last_error"] = f"{type(exc).__name__}: {str(exc)[:220]}"
+            _record_notification_history(state, item, "DELIVERY_UNKNOWN")
+            unknown += 1
+            LOG.error("Notification delivery uncertain for signal %s: %s", item.get("signal_key"), item["last_error"])
+        else:
+            item["status"] = "SENT"
+            item["sent_at"] = now_ist().isoformat()
+            item.pop("last_error", None)
+            state.setdefault("delivered_signal_keys", []).append(item["signal_key"])
+            state["delivered_signal_keys"] = list(dict.fromkeys(state["delivered_signal_keys"]))[-1000:]
+            _record_notification_history(state, item, "SENT")
+            sent += 1
+
+        atomic_write_json(config.state_file, state)
+
+    state["pending_notifications"] = [
+        item for item in state["pending_notifications"]
+        if item.get("status") != "SENT"
+    ]
+    atomic_write_json(config.state_file, state)
+    return {"sent": sent, "delivery_unknown": unknown, "skipped": skipped}
 
 # ---------- CLI ----------
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY 50 intraday OI + price-structure scanner (no order execution)")
+    parser = argparse.ArgumentParser(
+        description="NIFTY 50 intraday OI + price-structure scanner (no order execution)"
+    )
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--config-check", action="store_true", help="Validate Upstox and Gmail configuration")
+    modes.add_argument("--prepare-only", action="store_true", help="Run scan and queue alerts without sending")
+    modes.add_argument("--claim-notifications", action="store_true", help="Claim queued alerts for this GitHub run attempt")
+    modes.add_argument("--deliver-claimed", action="store_true", help="Send only alerts claimed by this GitHub run attempt")
+    modes.add_argument("--requeue-notification", metavar="SIGNAL_KEY", help="Manually requeue one uncertain alert after checking Gmail")
     parser.add_argument("--version", action="version", version=VERSION)
-    parser.add_argument("--dry-run", action="store_true", help="Evaluate a scan but do not send queued notifications")
-    parser.add_argument("--config-check", action="store_true", help="Validate required configuration without calling APIs")
     args = parser.parse_args(argv)
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
     try:
         config = Config.from_env()
         if args.config_check:
-            print(json.dumps({"version": VERSION, "config": "valid", "state_file": str(config.state_file), "audit_dir": str(config.audit_dir), "notification_configured": bool(config.webhook_url or (config.smtp_host and config.email_sender and config.email_receiver and config.email_password))}))
+            if not config.email_configured:
+                raise ScannerError(
+                    "SMTP_CONFIG_MISSING",
+                    "Set EMAIL_SENDER, EMAIL_RECEIVER, EMAIL_PASSWORD and SMTP_HOST (smtp.gmail.com by default).",
+                )
+            print(json.dumps({
+                "version": VERSION,
+                "config": "valid",
+                "state_file": str(config.state_file),
+                "audit_dir": str(config.audit_dir),
+                "notification_configured": config.email_configured,
+                "smtp_host": config.smtp_host,
+                "smtp_port": config.smtp_port,
+            }, sort_keys=True))
             return 0
-        result = run_scan(config, dry_run=args.dry_run)
+
+        if args.claim_notifications:
+            claim_token = os.getenv("NOTIFICATION_CLAIM_TOKEN", "").strip()
+            result = claim_pending_notifications(config, claim_token)
+            print(json.dumps(result, sort_keys=True))
+            return 0
+
+        if args.requeue_notification:
+            requeue_uncertain_notification(config, args.requeue_notification)
+            print(json.dumps({"requeued_signal_key": args.requeue_notification, "status": "QUEUED"}, sort_keys=True))
+            return 0
+
+        if args.deliver_claimed:
+            claim_token = os.getenv("NOTIFICATION_CLAIM_TOKEN", "").strip()
+            result = deliver_claimed_notifications(config, claim_token)
+            print(json.dumps(result, sort_keys=True))
+            return 1 if result["delivery_unknown"] else 0
+
+        result = run_scan(config)
         print(json.dumps(compact_audit_record(result), separators=(",", ":"), sort_keys=True))
-        return 0 if result.get("reason_code") not in {"UNEXPECTED_ERROR", "STATE_SAVE_FAILED", "API_AUTH_FAILED", "API_PERMISSION_DENIED", "API_HTTP_ERROR", "API_HTTP_403", "API_HTTP_401"} else 1
+        failure_codes = {
+            "UNEXPECTED_ERROR", "STATE_SAVE_FAILED", "API_AUTH_FAILED",
+            "API_PERMISSION_DENIED", "API_HTTP_ERROR", "API_HTTP_403", "API_HTTP_401",
+        }
+        return 0 if result.get("reason_code") not in failure_codes else 1
     except ScannerError as exc:
-        result = {"scanner_version": VERSION, "timestamp": now_ist().isoformat(), "decision": "NO_TRADE", "reason_code": exc.code, "error_type": "ScannerError", "message": str(exc)}
+        result = {
+            "scanner_version": VERSION,
+            "timestamp": now_ist().isoformat(),
+            "decision": "NO_TRADE",
+            "reason_code": exc.code,
+            "error_type": "ScannerError",
+            "message": str(exc),
+        }
         print(json.dumps(result, separators=(",", ":"), sort_keys=True))
         return 1
     except Exception as exc:
         LOG.exception("Fatal configuration/CLI failure")
-        print(json.dumps({"scanner_version": VERSION, "timestamp": now_ist().isoformat(), "decision": "NO_TRADE", "reason_code": "UNEXPECTED_ERROR", "error_type": type(exc).__name__, "message": str(exc)[:500]}, separators=(",", ":"), sort_keys=True))
+        print(json.dumps({
+            "scanner_version": VERSION,
+            "timestamp": now_ist().isoformat(),
+            "decision": "NO_TRADE",
+            "reason_code": "UNEXPECTED_ERROR",
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:500],
+        }, separators=(",", ":"), sort_keys=True))
         return 1
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
