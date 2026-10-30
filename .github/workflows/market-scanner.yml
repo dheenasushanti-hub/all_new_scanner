@@ -1,12 +1,20 @@
-name: NIFTY 50 OI-First Market Scanner v106.0.0
+name: NIFTY 50 OI-First Position Manager v107.0.0
 
 on:
-  # The Cloudflare Worker controls dispatch cadence. A manual operator may
-  # provide a signal key only after checking that an uncertain email was not received.
+  # The existing Cloudflare Worker controls dispatch cadence.
   workflow_dispatch:
     inputs:
+      reconcile_position:
+        description: >-
+          First v107 deployment only. Enter 'flat' if no v106 advisory position
+          is being tracked, or the exact v106 signal key you explicitly wish to
+          recover. Never infer an actual brokerage holding from last_signal.
+        required: false
+        type: string
       requeue_signal_key:
-        description: "Optional signal key to requeue after verifying Gmail"
+        description: >-
+          Optional notification key to requeue only after manually checking
+          Gmail and confirming that the message was not received.
         required: false
         type: string
 
@@ -21,7 +29,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     environment: Production
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: Checkout repository
@@ -60,11 +68,28 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v106.json
+          STATE_FILE: state/market_state_v107.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
         shell: bash
         run: python market_scanner.py --config-check
+
+      - name: Reconcile v106 advisory position (first deployment only)
+        if: ${{ inputs.reconcile_position != '' }}
+        env:
+          UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+          EMAIL_USERNAME: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: "465"
+          STATE_FILE: state/market_state_v107.json
+          AUDIT_DIR: audit
+          INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
+          RECONCILE_POSITION: ${{ inputs.reconcile_position }}
+        shell: bash
+        run: python market_scanner.py --reconcile-position "$RECONCILE_POSITION"
 
       - name: Requeue one manually verified uncertain alert (optional)
         if: ${{ inputs.requeue_signal_key != '' }}
@@ -76,14 +101,14 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v106.json
+          STATE_FILE: state/market_state_v107.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           REQUEUE_SIGNAL_KEY: ${{ inputs.requeue_signal_key }}
         shell: bash
-        run: python market_scanner.py_ --requeue-notification "$REQUEUE_SIGNAL_KEY"
+        run: python market_scanner.py --requeue-notification "$REQUEUE_SIGNAL_KEY"
 
-      - name: Run NIFTY scan and queue qualified signals
+      - name: Run v107 market scan and position manager
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
@@ -92,12 +117,18 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v106.json
+          STATE_FILE: state/market_state_v107.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           OI_MATERIAL_THRESHOLD_PCT: "2.0"
           MIN_UNDERLYING_RR: "2.0"
           EXPECTED_OI_INTERVAL_SECONDS: "180"
+          T1_PARTIAL_EXIT_PCT: "50"
+          MAX_PREMIUM_LOSS_PCT: "20"
+          PREMIUM_TRAILING_DRAWDOWN_PCT: "25"
+          PREMIUM_DECAY_REVIEW_MINUTES: "15"
+          PREMIUM_DECAY_MIN_LOSS_PCT: "12"
+          NO_PROGRESS_MIN_SPOT_MOVE_ATR: "0.25"
           LOG_LEVEL: INFO
           SCANNER_DEBUG_AUDIT: "false"
         shell: bash
@@ -115,16 +146,16 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v106.json
+          STATE_FILE: state/market_state_v107.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           NOTIFICATION_CLAIM_TOKEN: ${{ github.run_id }}:${{ github.run_attempt }}
         shell: bash
         run: python market_scanner.py --claim-notifications
 
-      # This commit is deliberately before SMTP: a later workflow attempt will
-      # see the durable CLAIMED state and will not automatically resend it.
-      - name: Persist scanner state and notification claims before email delivery
+      # Commit the durable claim before contacting SMTP. A later run must not
+      # resend a message whose delivery may already have been accepted.
+      - name: Persist position state and notification claims before email
         if: success()
         shell: bash
         run: |
@@ -132,14 +163,14 @@ jobs:
           shopt -s nullglob
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          [[ ! -f state/market_state_v106.json ]] || git add -f -- state/market_state_v106.json
+          [[ ! -f state/market_state_v107.json ]] || git add -f -- state/market_state_v107.json
           audit_files=(audit/market_scan_*.jsonl audit/market_scan_diagnostics_*.jsonl audit/worker_*.log)
           if (( ${#audit_files[@]} > 0 )); then git add -f -- "${audit_files[@]}"; fi
           if git diff --cached --quiet; then
             echo "No pre-delivery state changes to persist."
             exit 0
           fi
-          git commit -m "Persist NIFTY v106 state and email claims"
+          git commit -m "Persist NIFTY v107 position state and email claims"
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
 
@@ -152,14 +183,14 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v106.json
+          STATE_FILE: state/market_state_v107.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           NOTIFICATION_CLAIM_TOKEN: ${{ github.run_id }}:${{ github.run_attempt }}
         shell: bash
         run: python market_scanner.py --deliver-claimed
 
-      - name: Persist final scanner and notification status
+      - name: Persist final position and notification status
         if: always()
         shell: bash
         run: |
@@ -167,13 +198,13 @@ jobs:
           shopt -s nullglob
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          [[ ! -f state/market_state_v106.json ]] || git add -f -- state/market_state_v106.json
+          [[ ! -f state/market_state_v107.json ]] || git add -f -- state/market_state_v107.json
           audit_files=(audit/market_scan_*.jsonl audit/market_scan_diagnostics_*.jsonl audit/worker_*.log)
           if (( ${#audit_files[@]} > 0 )); then git add -f -- "${audit_files[@]}"; fi
           if git diff --cached --quiet; then
             echo "No final state changes to persist."
             exit 0
           fi
-          git commit -m "Update NIFTY v106 scanner delivery status"
+          git commit -m "Update NIFTY v107 position and notification status"
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
