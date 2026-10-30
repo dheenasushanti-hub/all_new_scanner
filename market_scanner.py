@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 OI-first multi-regime intraday options scanner v104.0.0.
+"""NIFTY 50 OI-first multi-regime intraday options scanner v105.0.0.
 
 Single-file runtime for a GitHub Actions workflow dispatched about every three
 minutes. It never places orders. Tests and documentation are separate files.
@@ -44,8 +44,8 @@ from statistics import median
 from typing import Any, Iterable, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "104.0.0"
-SCHEMA_VERSION = 104
+VERSION = "105.0.0"
+SCHEMA_VERSION = 105
 IST = ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
 API_BASE = "https://api.upstox.com"
@@ -338,7 +338,7 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _migrate_state_payload(state: Mapping[str, Any], source: Path) -> dict[str, Any]:
-    """Migrate compatible v102/v103 durable state without discarding the session baseline.
+    """Migrate compatible v102/v103/v104 durable state without discarding the session baseline.
 
     Only data structures that already have stable meanings are carried forward.
     run_scan subsequently validates session date, expiry and instrument identity
@@ -348,7 +348,7 @@ def _migrate_state_payload(state: Mapping[str, Any], source: Path) -> dict[str, 
         old_schema = int(state.get("schema_version", 0) or 0)
     except (TypeError, ValueError):
         old_schema = 0
-    if old_schema not in {102, 103}:
+    if old_schema not in {102, 103, 104}:
         raise ScannerError("STATE_SCHEMA_UNSUPPORTED", f"Cannot safely migrate schema {old_schema} from {source}")
     migrated = dict(state)
     migrated["schema_version"] = SCHEMA_VERSION
@@ -359,7 +359,7 @@ def _migrate_state_payload(state: Mapping[str, Any], source: Path) -> dict[str, 
     # Preserve only known durable workflow fields. Unknown schema-specific
     # structures are not silently interpreted by the new decision engine.
     allowed = {
-        "schema_version", "scanner_version", "migration_note", "session_date",
+        "schema_version", "scanner_version", "migration_note", "session_date", "expiry",
         "chain_snapshots", "session_oi_baseline", "last_successful_snapshot_at",
         "latest_oi_evidence", "oi_evidence_history", "last_processed_candle",
         "setup_watch", "seen_signal_keys", "pending_notifications",
@@ -369,12 +369,12 @@ def _migrate_state_payload(state: Mapping[str, Any], source: Path) -> dict[str, 
 
 
 def read_state(path: Path) -> dict[str, Any]:
-    """Load v104 state or migrate an existing same-session v103/v102 state file."""
+    """Load v105 state or migrate an existing same-session v104/v103/v102 state file."""
     source = path if path.exists() else None
     if source is None:
-        # GitHub Actions previously persisted the state under the v103 filename.
-        # Keep the old file untouched; copy its compatible state into v104 on save.
-        candidates = [path.parent / "market_state_v103.json", path.parent / "market_state_v102.json"]
+        # GitHub Actions may still persist state under an earlier versioned filename.
+        # Keep the old file untouched; migrate its compatible state into v105 on save.
+        candidates = [path.parent / "market_state_v104.json", path.parent / "market_state_v103.json", path.parent / "market_state_v102.json"]
         source = next((candidate for candidate in candidates if candidate.exists()), None)
     if source is None:
         return {"schema_version": SCHEMA_VERSION, "scanner_version": VERSION}
@@ -389,7 +389,7 @@ def read_state(path: Path) -> dict[str, Any]:
         schema = state.get("schema_version")
         if schema == SCHEMA_VERSION:
             return state
-        if source != path or schema in {102, 103}:
+        if source != path or schema in {102, 103, 104}:
             migrated = _migrate_state_payload(state, source)
             LOG.warning("Migrated durable state schema %s to %s from %s", schema, SCHEMA_VERSION, source)
             return migrated
@@ -2930,18 +2930,37 @@ def choose_oi_targets_and_stop(
 
     if not stop_pool:
         raise ScannerError("OI_STOP_WALL_UNAVAILABLE", f"No relevant {stop_side} OI wall exists on the stop side of spot")
-    # Stop specifically uses the largest relevant opposite-side OI wall, not an
-    # unrelated old pivot. The pattern's invalidation is a secondary protection.
+    # Choose the nearer valid protective reference, not the farther one.
+    # For a long, the stop belongs below entry and the higher (closer) of the
+    # OI support wall / setup invalidation is the first level that disproves the
+    # trade. For a short, the stop belongs above entry and the lower (closer)
+    # of the OI resistance wall / setup invalidation is the first invalidation.
+    # v104 used min() for bullish and max() for bearish, systematically widening
+    # risk and falsely failing otherwise valid 2R plans.
     stop_wall = max(stop_pool, key=lambda x: (float(x.get(stop_field, 0) or 0), _oi_wall_score(x, stop_side)))
     wall_price = float(stop_wall["strike"])
+    try:
+        invalidation = float(setup.invalidation)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ScannerError("INVALID_OI_STOP", "Setup invalidation is not a valid numeric price") from exc
+    if not math.isfinite(invalidation) or invalidation <= 0:
+        raise ScannerError("INVALID_OI_STOP", "Setup invalidation must be a finite positive price")
     if setup.direction == "BEARISH":
-        stop = max(wall_price, setup.invalidation) + buffer
+        if wall_price <= entry or invalidation <= entry:
+            raise ScannerError("INVALID_OI_STOP", "Bearish stop references must both be above the live NIFTY entry")
+        stop_reference = min(wall_price, invalidation)
+        stop_reference_source = "SETUP_INVALIDATION" if invalidation <= wall_price else "OI_WALL"
+        stop = stop_reference + buffer
         risk = stop - entry
     else:
-        stop = min(wall_price, setup.invalidation) - buffer
+        if wall_price >= entry or invalidation >= entry:
+            raise ScannerError("INVALID_OI_STOP", "Bullish stop references must both be below the live NIFTY entry")
+        stop_reference = max(wall_price, invalidation)
+        stop_reference_source = "SETUP_INVALIDATION" if invalidation >= wall_price else "OI_WALL"
+        stop = stop_reference - buffer
         risk = entry - stop
     if not math.isfinite(risk) or risk <= 0:
-        raise ScannerError("INVALID_OI_STOP", "OI-derived stop is not on the risk side of the current NIFTY entry")
+        raise ScannerError("INVALID_OI_STOP", "Protective stop is not on the risk side of the current NIFTY entry")
 
     eligible_targets = []
     for row in target_pool:
@@ -2983,7 +3002,9 @@ def choose_oi_targets_and_stop(
 
     return {
         "entry_underlying": entry, "stop_underlying": stop,
-        "stop_source": f"MAX_RELEVANT_{stop_side}_OI_WALL",
+        "stop_source": "NEAREST_VALID_OI_WALL_OR_SETUP_INVALIDATION",
+        "stop_reference_price": stop_reference,
+        "stop_reference_source": stop_reference_source,
         "stop_oi_strike": wall_price, "stop_oi": float(stop_wall.get(stop_field, 0) or 0),
         "stop_oi_writer_strength": float(stop_wall.get("call_resistance_flow_strength" if stop_side == "CE" else "put_support_flow_strength") or 0.0),
         "t1_underlying": t1, "t1_source": f"NEAREST_SIGNIFICANT_{target_side}_OI_WALL",
