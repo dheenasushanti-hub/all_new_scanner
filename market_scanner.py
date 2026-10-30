@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 intraday OI + market-structure scanner v102.0.0.
+"""NIFTY 50 intraday OI + market-structure scanner v102.0.1.
 
 Single-file runtime for a GitHub Actions workflow dispatched about every three
 minutes. It never places orders. Tests and documentation are separate files.
@@ -44,7 +44,7 @@ from statistics import median
 from typing import Any, Iterable, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "102.0.0"
+VERSION = "102.0.1"
 SCHEMA_VERSION = 102
 IST = ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
@@ -507,22 +507,92 @@ class InstrumentMaster:
         return [item for item in rows if isinstance(item, dict)]
 
     def resolve_index(self) -> dict[str, Any]:
-        candidates = []
+        """Resolve the NSE NIFTY 50 index by exact instrument-master identity.
+
+        The previous implementation concatenated several display fields and
+        searched for the substring ``nifty 50``. That also matched related
+        indices (for example NIFTY 50 Equal Weight / Value 20) and produced a
+        false ambiguity. Upstox documents separate ``name``,
+        ``trading_symbol`` and unique ``instrument_key`` fields for index rows.
+
+        Ranking is deterministic and based only on exact source metadata:
+        exact display name plus exact key suffix, then exact display name,
+        then exact key suffix, then exact full trading symbol. Duplicate rows
+        for the same instrument_key are collapsed. Two distinct
+        keys at the same best rank still fail closed with diagnostic candidates.
+        """
+        def norm(value: Any) -> str:
+            return " ".join(str(value or "").strip().casefold().split())
+
+        eligible: list[tuple[int, dict[str, Any]]] = []
         for row in self.rows:
-            if str(row.get("segment", "")).upper() != "NSE_INDEX" or str(row.get("instrument_type", "")).upper() != "INDEX":
+            if norm(row.get("segment")) != "nse_index":
                 continue
-            names = " ".join(str(row.get(k, "")) for k in ("name", "trading_symbol", "short_name")).casefold()
-            compact = " ".join(names.split())
-            if compact.strip() in {"nifty 50", "nifty fifty"} or "nifty 50" in compact:
-                if row.get("instrument_key"):
-                    candidates.append(row)
-        # Multiple rows can exist; prefer exact trading symbol, then exact name. Never guess a literal key.
-        if not candidates:
-            raise ScannerError("NIFTY_INSTRUMENT_NOT_FOUND", "NIFTY 50 index was not found in the official NSE instrument master")
-        candidates.sort(key=lambda r: (str(r.get("trading_symbol", "")).casefold() != "nifty 50", str(r.get("name", "")).casefold() != "nifty 50"))
-        if len({str(x.get("instrument_key")) for x in candidates}) > 1 and candidates[0].get("trading_symbol", "").casefold() != "nifty 50":
-            raise ScannerError("NIFTY_INSTRUMENT_AMBIGUOUS", "Multiple NIFTY 50 index instruments found; cannot safely choose")
-        return candidates[0]
+            if norm(row.get("instrument_type")) != "index":
+                continue
+            exchange = norm(row.get("exchange"))
+            if exchange and exchange != "nse":
+                continue
+
+            key = str(row.get("instrument_key") or "").strip()
+            if not key or not key.upper().startswith("NSE_INDEX|"):
+                continue
+
+            name = norm(row.get("name"))
+            trading_symbol = norm(row.get("trading_symbol"))
+            key_suffix = norm(key.split("|", 1)[1] if "|" in key else "")
+
+            # Exact identity only. Do not substring-match related NIFTY indices.
+            exact_name = name in {"nifty 50", "nifty fifty"}
+            exact_key = key_suffix in {"nifty 50", "nifty fifty"}
+            if exact_name and exact_key:
+                rank = 0
+            elif exact_name:
+                rank = 1
+            elif exact_key:
+                rank = 2
+            elif trading_symbol in {"nifty 50", "nifty fifty"}:
+                rank = 3
+            else:
+                continue
+            eligible.append((rank, row))
+
+        if not eligible:
+            raise ScannerError(
+                "NIFTY_INSTRUMENT_NOT_FOUND",
+                "No exact NSE NIFTY 50 index identity was found in the official instrument master; related indices were intentionally excluded.",
+            )
+
+        best_rank = min(rank for rank, _ in eligible)
+        best_rows = [row for rank, row in eligible if rank == best_rank]
+        by_key: dict[str, dict[str, Any]] = {}
+        for row in best_rows:
+            key = str(row["instrument_key"]).strip()
+            existing = by_key.get(key)
+            if existing is None:
+                by_key[key] = row
+            else:
+                # Same key means same Upstox instrument. Prefer the row with
+                # more populated documented identity fields, without changing key.
+                quality = lambda item: sum(bool(str(item.get(field) or "").strip()) for field in ("name", "exchange", "trading_symbol", "exchange_token"))
+                if quality(row) > quality(existing):
+                    by_key[key] = row
+
+        if len(by_key) != 1:
+            details = [
+                {
+                    "instrument_key": key,
+                    "name": str(row.get("name", ""))[:80],
+                    "trading_symbol": str(row.get("trading_symbol", ""))[:40],
+                    "exchange": str(row.get("exchange", ""))[:12],
+                }
+                for key, row in sorted(by_key.items())
+            ]
+            raise ScannerError(
+                "NIFTY_INSTRUMENT_AMBIGUOUS",
+                "Multiple distinct exact NSE NIFTY 50 instrument identities remain at the same priority; refusing to guess. Candidates=" + json.dumps(details, separators=(",", ":")),
+            )
+        return next(iter(by_key.values()))
 
     def _options_for_index(self, index_key: str, asof: date) -> list[dict[str, Any]]:
         result = []
