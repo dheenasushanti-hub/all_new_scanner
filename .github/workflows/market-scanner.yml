@@ -59,21 +59,6 @@ jobs:
           restore-keys: |
             upstox-nse-instrument-master-${{ runner.os }}-
 
-      - name: Validate scanner and Gmail configuration
-        env:
-          UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
-          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-          EMAIL_USERNAME: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          SMTP_HOST: smtp.gmail.com
-          SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v107.json
-          AUDIT_DIR: audit
-          INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
-        shell: bash
-        run: python market_scanner.py --config-check
-
       - name: Reconcile v106 advisory position (first deployment only)
         if: ${{ inputs.reconcile_position != '' }}
         env:
@@ -108,7 +93,7 @@ jobs:
         shell: bash
         run: python market_scanner.py --requeue-notification "$REQUEUE_SIGNAL_KEY"
 
-      - name: Run v107 market scan and position manager
+      - name: Run v107 market scan and claim queued notifications
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
@@ -120,6 +105,7 @@ jobs:
           STATE_FILE: state/market_state_v107.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
+          NOTIFICATION_CLAIM_TOKEN: ${{ github.run_id }}:${{ github.run_attempt }}
           OI_MATERIAL_THRESHOLD_PCT: "2.0"
           MIN_UNDERLYING_RR: "2.0"
           EXPECTED_OI_INTERVAL_SECONDS: "180"
@@ -133,25 +119,9 @@ jobs:
           SCANNER_DEBUG_AUDIT: "false"
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           session_date="$(TZ=Asia/Kolkata date +%F)"
-          python market_scanner.py --prepare-only 2>&1 | tee -a "audit/worker_${session_date}.log"
-
-      - name: Claim queued notifications for this workflow attempt
-        env:
-          UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
-          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-          EMAIL_USERNAME: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          SMTP_HOST: smtp.gmail.com
-          SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v107.json
-          AUDIT_DIR: audit
-          INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
-          NOTIFICATION_CLAIM_TOKEN: ${{ github.run_id }}:${{ github.run_attempt }}
-        shell: bash
-        run: python market_scanner.py --claim-notifications
+          python market_scanner.py --scan-and-claim 2>&1 | tee -a "audit/worker_${session_date}.log"
 
       # Commit the durable claim before contacting SMTP. A later run must not
       # resend a message whose delivery may already have been accepted.
