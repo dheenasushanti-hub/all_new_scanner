@@ -63,9 +63,8 @@ jobs:
           EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ vars.SMTP_PORT || '465' }}
-          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: '465'
           STATE_FILE: state/market_state_v104.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
