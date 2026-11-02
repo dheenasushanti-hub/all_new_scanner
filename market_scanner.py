@@ -44,7 +44,7 @@ from statistics import median
 from typing import Any, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "107.0.1"
+VERSION = "107.1.0"
 SCHEMA_VERSION = 107
 IST = ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
@@ -135,6 +135,17 @@ class Config:
     premium_decay_review_minutes: float = 15.0
     premium_decay_min_loss_pct: float = 12.0
     no_progress_min_spot_move_atr: float = 0.25
+    direction_entry_score_min: float = 0.42
+    direction_reversal_score_min: float = 0.52
+    direction_extreme_reversal_score: float = 0.72
+    consensus_setup_max_age_minutes: int = 12
+    consensus_pullback_max_atr: float = 0.90
+    min_target_barrier_strength: float = 1.80
+    preferred_abs_delta: float = 0.58
+    sideways_exit_minutes: float = 12.0
+    sideways_max_progress_atr: float = 0.30
+    sideways_consensus_abs_max: float = 0.20
+    reversal_confirmation_runs: int = 2
     email_sender: str = ""
     email_receiver: str = ""
     email_password: str = ""
@@ -198,16 +209,39 @@ class Config:
             raise ScannerError("CONFIG_INVALID", "T1_PARTIAL_EXIT_PCT must be greater than 0 and less than 100")
         if not math.isfinite(float(self.no_progress_min_spot_move_atr)) or self.no_progress_min_spot_move_atr < 0:
             raise ScannerError("CONFIG_INVALID", "NO_PROGRESS_MIN_SPOT_MOVE_ATR must be finite and nonnegative")
+        for name, value in {
+            "direction_entry_score_min": self.direction_entry_score_min,
+            "direction_reversal_score_min": self.direction_reversal_score_min,
+            "direction_extreme_reversal_score": self.direction_extreme_reversal_score,
+            "sideways_consensus_abs_max": self.sideways_consensus_abs_max,
+        }.items():
+            if not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0:
+                raise ScannerError("CONFIG_INVALID", f"{name} must be between 0 and 1")
+        if self.direction_reversal_score_min < self.direction_entry_score_min:
+            raise ScannerError("CONFIG_INVALID", "direction_reversal_score_min must be >= direction_entry_score_min")
+        if self.direction_extreme_reversal_score < self.direction_reversal_score_min:
+            raise ScannerError("CONFIG_INVALID", "direction_extreme_reversal_score must be >= direction_reversal_score_min")
+        if self.consensus_setup_max_age_minutes < self.setup_max_age_minutes:
+            raise ScannerError("CONFIG_INVALID", "consensus_setup_max_age_minutes must be >= setup_max_age_minutes")
+        if self.reversal_confirmation_runs < 1 or self.reversal_confirmation_runs > 5:
+            raise ScannerError("CONFIG_INVALID", "reversal_confirmation_runs must be between 1 and 5")
         nonnegative = {
             "min_bid_qty": self.min_bid_qty, "min_ask_qty": self.min_ask_qty,
             "min_option_volume": self.min_option_volume, "option_slippage_points": self.option_slippage_points,
             "transaction_cost_rate": self.transaction_cost_rate, "iv_shock_points": self.iv_shock_points,
             "annual_risk_free_rate": self.annual_risk_free_rate, "stop_buffer_atr_fraction": self.stop_buffer_atr_fraction,
             "level_cluster_atr_fraction": self.level_cluster_atr_fraction,
+            "consensus_pullback_max_atr": self.consensus_pullback_max_atr,
+            "min_target_barrier_strength": self.min_target_barrier_strength,
+            "preferred_abs_delta": self.preferred_abs_delta,
+            "sideways_exit_minutes": self.sideways_exit_minutes,
+            "sideways_max_progress_atr": self.sideways_max_progress_atr,
         }
         for name, value in nonnegative.items():
             if not math.isfinite(float(value)) or float(value) < 0:
                 raise ScannerError("CONFIG_INVALID", f"{name} must be a finite nonnegative number")
+        if not self.min_abs_delta <= self.preferred_abs_delta <= self.max_abs_delta:
+            raise ScannerError("CONFIG_INVALID", "preferred_abs_delta must lie within the configured delta range")
 
     @property
     def email_configured(self) -> bool:
@@ -292,6 +326,17 @@ class Config:
             premium_decay_review_minutes=float_env("PREMIUM_DECAY_REVIEW_MINUTES", 15.0),
             premium_decay_min_loss_pct=float_env("PREMIUM_DECAY_MIN_LOSS_PCT", 12.0),
             no_progress_min_spot_move_atr=float_env("NO_PROGRESS_MIN_SPOT_MOVE_ATR", 0.25),
+            direction_entry_score_min=float_env("DIRECTION_ENTRY_SCORE_MIN", 0.42),
+            direction_reversal_score_min=float_env("DIRECTION_REVERSAL_SCORE_MIN", 0.52),
+            direction_extreme_reversal_score=float_env("DIRECTION_EXTREME_REVERSAL_SCORE", 0.72),
+            consensus_setup_max_age_minutes=int_env("CONSENSUS_SETUP_MAX_AGE_MINUTES", 12),
+            consensus_pullback_max_atr=float_env("CONSENSUS_PULLBACK_MAX_ATR", 0.90),
+            min_target_barrier_strength=float_env("MIN_TARGET_BARRIER_STRENGTH", 1.80),
+            preferred_abs_delta=float_env("PREFERRED_ABS_DELTA", 0.58),
+            sideways_exit_minutes=float_env("SIDEWAYS_EXIT_MINUTES", 12.0),
+            sideways_max_progress_atr=float_env("SIDEWAYS_MAX_PROGRESS_ATR", 0.30),
+            sideways_consensus_abs_max=float_env("SIDEWAYS_CONSENSUS_ABS_MAX", 0.20),
+            reversal_confirmation_runs=max(1, int_env("REVERSAL_CONFIRMATION_RUNS", 2)),
             email_sender=(os.getenv("EMAIL_SENDER", "").strip() or os.getenv("EMAIL_FROM", "").strip()),
             email_receiver=(os.getenv("EMAIL_RECEIVER", "").strip() or os.getenv("EMAIL_TO", "").strip()),
             email_password=os.getenv("EMAIL_PASSWORD", "").strip(),
@@ -547,6 +592,7 @@ def compact_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "event_type", "position_id", "original_signal_key", "position_status",
         "remaining_pct", "t1_hit", "premium_bid", "exit_spot", "exit_reason",
         "position_event_details", "active_position_summary", "position_reconciliation_required",
+        "direction_consensus", "shadow_option_selection", "entry_timing_status",
     )
     compact = {key: record[key] for key in root_fields if key in record}
 
@@ -2490,14 +2536,18 @@ def select_option_and_risk(
         mid = quote.mid
         theta_estimate = abs(quote.theta or 0.0) * config.expected_hold_minutes / 1440.0
         theta_fraction = theta_estimate / mid if mid > 0 else 1.0
-        # Higher score favours executable depth, tight spreads, a useful delta,
-        # and less decay relative to premium. No option RR is calculated.
-        delta_score = max(0.0, 1.0 - abs(abs(quote.delta) - 0.55) / 0.35)
+        # Rank one executable contract, with a small preference for roughly
+        # one-step ITM contracts when liquidity is otherwise comparable.
+        # This improves directional participation without hard-coding a strike.
+        delta_score = max(0.0, 1.0 - abs(abs(quote.delta) - config.preferred_abs_delta) / 0.30)
         spread_score = max(0.0, 1.0 - quote.spread_pct / max(config.max_spread_pct, 1e-9))
         depth_score = min(1.0, math.log1p(quote.bid_qty + quote.ask_qty) / math.log1p(5000.0))
         volume_score = min(1.0, math.log1p(quote.volume) / math.log1p(50000.0))
         decay_score = max(0.0, 1.0 - min(theta_fraction, 1.0))
-        score = 0.34 * delta_score + 0.27 * spread_score + 0.16 * depth_score + 0.13 * volume_score + 0.10 * decay_score
+        itm_steps = (-offset) if side == "CE" else offset
+        moneyness_score = 1.0 if itm_steps == 1 else 0.94 if itm_steps == 0 else 0.78 if itm_steps == 2 else 0.55
+        score = (0.30 * delta_score + 0.22 * spread_score + 0.14 * depth_score
+                 + 0.12 * volume_score + 0.10 * decay_score + 0.12 * moneyness_score)
         candidates.append({
             "instrument_key": quote.instrument_key, "strike": quote.strike,
             "side": quote.side, "expiry": quote.expiry.isoformat(),
@@ -2514,21 +2564,31 @@ def select_option_and_risk(
             "estimated_theta_decay_fraction_of_mid": theta_fraction,
             "minutes_to_expiry": minutes_to_expiry,
             "selection_score": round(score, 5),
-            "selection_method": "LIQUIDITY_SPREAD_DELTA_AND_TIME_DECAY_SCORE_SPOT_RR_ONLY",
+            "delta_score": round(delta_score, 5),
+            "moneyness_score": round(moneyness_score, 5),
+            "selection_method": "CONSENSUS_LIQUIDITY_DELTA_MONEYNESS_AND_DECAY_SCORE",
             "spot_risk_reward": plan.get("underlying_rr"),
-            "_rank": (score, -quote.spread_pct, delta_score, volume_score, -abs(offset)),
+            "_rank": (score, -quote.spread_pct, delta_score, moneyness_score, volume_score),
         })
     if not candidates:
         reason = rejections.most_common(1)[0][0] if rejections else "NO_VALID_OPTION_QUOTES"
         details = ", ".join(f"{key}:{value}" for key, value in rejections.most_common(5))
         raise ScannerError(reason, f"No eligible {side} contract among allowed ATM offsets. {details}")
     candidates.sort(key=lambda candidate: candidate["_rank"], reverse=True)
-    selected = candidates[0]
+    ranking = []
+    for rank, candidate in enumerate(candidates[:5], 1):
+        ranking.append({k: v for k, v in candidate.items() if k not in {"_rank"}} | {"rank": rank})
+    selected = dict(candidates[0])
     selected.pop("_rank", None)
     selected["candidate_count_passed"] = len(candidates)
     selected["candidate_count_rejected"] = sum(rejections.values())
     selected["rejection_counts"] = dict(rejections)
     selected["spot_quote_timestamp"] = spot_quote_time.isoformat() if spot_quote_time else None
+    selected["candidate_ranking"] = ranking
+    selected["selection_margin_vs_second"] = (
+        round(float(candidates[0]["selection_score"]) - float(candidates[1]["selection_score"]), 5)
+        if len(candidates) > 1 else None
+    )
     return selected
 
 
@@ -2651,6 +2711,243 @@ def select_active_setup(
     if reversal_confirmed and strong_candidate and tracked_age >= 60:
         return current
     return tracked
+
+
+def _direction_sign(value: Any) -> float:
+    label = str(value or "").upper()
+    if label == "BULLISH":
+        return 1.0
+    if label == "BEARISH":
+        return -1.0
+    return 0.0
+
+
+def _clamp(value: float, low: float = -1.0, high: float = 1.0) -> float:
+    return max(low, min(high, float(value)))
+
+
+def build_direction_consensus(
+    oi: Mapping[str, Any],
+    structure: Mapping[str, Any],
+    futures: Mapping[str, Any],
+    setup: Optional[Setup],
+    config: Config,
+) -> dict[str, Any]:
+    """Fuse independent directional evidence into one bounded score.
+
+    Positive values are bullish and negative values are bearish.  The setup is
+    intentionally a small input: a transient pattern may confirm a thesis, but
+    it cannot overturn strong OI/price/futures alignment by itself.
+    """
+    components: dict[str, dict[str, Any]] = {}
+    weighted = 0.0
+    used_weight = 0.0
+
+    def add(name: str, signal: float, weight: float, detail: Any = None) -> None:
+        nonlocal weighted, used_weight
+        if not math.isfinite(float(signal)):
+            return
+        signal = _clamp(float(signal))
+        weighted += signal * weight
+        used_weight += weight
+        components[name] = {"signal": round(signal, 5), "weight": weight, "detail": detail}
+
+    if oi.get("compared_to_previous_successful_snapshot"):
+        balance = _clamp(float(oi.get("directional_balance") or 0.0))
+        confidence = _clamp(float(oi.get("confidence") or 0.0), 0.0, 1.0)
+        # Preserve directional information even while the stable label is MIXED,
+        # but scale it by measured confidence.
+        add("oi_current", balance * max(0.35, confidence), 0.30,
+            {"raw": oi.get("raw_label"), "stable": oi.get("label"), "confidence": confidence})
+        mh_balance = oi.get("multi_horizon_balance")
+        mh_direction = str(oi.get("multi_horizon_direction") or "")
+        if mh_balance is not None and mh_direction not in {"UNAVAILABLE", "INSUFFICIENT_HORIZONS", ""}:
+            add("oi_multi_horizon", _clamp(float(mh_balance)), 0.18,
+                {"direction": mh_direction, "votes": oi.get("multi_horizon_vote_count")})
+
+    execution = str(structure.get("execution_direction") or "UNKNOWN").upper()
+    execution_conf = _clamp(float(structure.get("execution_confidence") or 0.0), 0.0, 1.0)
+    if execution in {"BULLISH", "BEARISH"}:
+        add("price_execution", _direction_sign(execution) * execution_conf, 0.22,
+            {"direction": execution, "confidence": execution_conf})
+
+    htf = str(structure.get("higher_timeframe_bias") or "UNKNOWN").upper()
+    htf_conf = _clamp(float(structure.get("higher_timeframe_confidence") or 0.0), 0.0, 1.0)
+    if htf in {"BULLISH", "BEARISH"}:
+        add("higher_timeframe", _direction_sign(htf) * htf_conf, 0.10,
+            {"direction": htf, "confidence": htf_conf})
+
+    futures_signal = str(futures.get("futures_oi_signal") or "").upper()
+    futures_map = {
+        "LONG_BUILDUP_BULLISH": 1.0,
+        "SHORT_COVERING_BULLISH": 0.75,
+        "SHORT_BUILDUP_BEARISH": -1.0,
+        "LONG_UNWINDING_BEARISH": -0.80,
+    }
+    if futures_signal in futures_map:
+        add("futures_positioning", futures_map[futures_signal], 0.10, futures_signal)
+
+    atr1 = float(structure.get("atr_1m") or 0.0)
+    momentum = structure.get("momentum_3m_points")
+    if atr1 > 0 and momentum is not None:
+        try:
+            momentum_signal = _clamp(float(momentum) / max(atr1 * 1.25, 1.0))
+            add("short_momentum", momentum_signal, 0.05,
+                {"points": float(momentum), "atr_1m": atr1})
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    if setup is not None:
+        add("setup", _direction_sign(setup.direction) * _clamp(setup.price_confidence, 0.0, 1.0),
+            0.05, {"direction": setup.direction, "kind": setup.kind})
+
+    score = weighted / used_weight if used_weight > 0 else 0.0
+    direction = "MIXED"
+    if score >= config.direction_entry_score_min:
+        direction = "BULLISH"
+    elif score <= -config.direction_entry_score_min:
+        direction = "BEARISH"
+
+    aligned = sum(1 for item in components.values() if item["signal"] * score > 0.02)
+    opposed = sum(1 for item in components.values() if item["signal"] * score < -0.02)
+    return {
+        "direction": direction,
+        "score": round(score, 5),
+        "confidence": round(abs(score), 5),
+        "entry_threshold": config.direction_entry_score_min,
+        "reversal_threshold": config.direction_reversal_score_min,
+        "aligned_components": aligned,
+        "opposed_components": opposed,
+        "components": components,
+    }
+
+
+def derive_consensus_continuation_setup(
+    candles: Sequence[Candle],
+    levels: Sequence[PriceLevel],
+    structure: Mapping[str, Any],
+    consensus: Mapping[str, Any],
+    spot: float,
+    now: datetime,
+    config: Config,
+) -> Optional[Setup]:
+    """Create a fresh continuation entry only on a controlled pullback.
+
+    This is deliberately stricter than a generic momentum entry.  It requires a
+    strong consensus, matching 1-minute execution, and price still close to the
+    EMA/nearby risk structure so the scanner does not chase an already extended
+    move.  The live quote is the trigger, making this a current decision rather
+    than a reconstructed historical fill.
+    """
+    direction = str(consensus.get("direction") or "MIXED").upper()
+    score = abs(float(consensus.get("score") or 0.0))
+    execution = str(structure.get("execution_direction") or "UNKNOWN").upper()
+    execution_conf = float(structure.get("execution_confidence") or 0.0)
+    atr1 = float(structure.get("atr_1m") or 0.0)
+    ema8 = structure.get("ema8_1m")
+    if (direction not in {"BULLISH", "BEARISH"} or score < config.direction_entry_score_min
+            or execution != direction or execution_conf < 0.35 or atr1 <= 0 or ema8 is None):
+        return None
+    try:
+        ema8 = float(ema8)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if abs(spot - ema8) > config.consensus_pullback_max_atr * atr1:
+        return None
+
+    risk_side = "SUPPORT" if direction == "BULLISH" else "RESISTANCE"
+    risk_levels = [
+        level for level in levels
+        if level.side == risk_side
+        and ((level.price < spot) if direction == "BULLISH" else (level.price > spot))
+        and level.strength >= config.min_level_strength
+        and "FUTURES_VWAP_CONTEXT_ONLY" not in level.source
+    ]
+    nearest = min(risk_levels, key=lambda level: abs(level.price - spot), default=None)
+    buffer = max(1.5, atr1 * 0.20)
+    if nearest is not None:
+        invalidation = nearest.price - buffer if direction == "BULLISH" else nearest.price + buffer
+        source_level = nearest.price
+        source = f"CONSENSUS_PULLBACK+{nearest.source}"
+    else:
+        invalidation = ema8 - max(config.minimum_stop_points, buffer) if direction == "BULLISH" else ema8 + max(config.minimum_stop_points, buffer)
+        source_level = ema8
+        source = "CONSENSUS_PULLBACK+EMA8_1M"
+
+    if direction == "BULLISH" and invalidation >= spot:
+        invalidation = spot - max(config.minimum_stop_points, buffer)
+    if direction == "BEARISH" and invalidation <= spot:
+        invalidation = spot + max(config.minimum_stop_points, buffer)
+
+    price_confidence = min(0.95, 0.55 + 0.30 * score + 0.15 * execution_conf)
+    return Setup(
+        kind="CONSENSUS_PULLBACK_CONTINUATION",
+        direction=direction,
+        trigger=float(spot),
+        invalidation=float(invalidation),
+        confirmed_at=now.astimezone(IST),
+        source_level=float(source_level),
+        source=source,
+        price_confidence=price_confidence,
+    )
+
+
+def choose_setup_with_consensus(
+    existing: Optional[Setup],
+    candles: Sequence[Candle],
+    levels: Sequence[PriceLevel],
+    structure: Mapping[str, Any],
+    consensus: Mapping[str, Any],
+    spot: float,
+    now: datetime,
+    config: Config,
+) -> Optional[Setup]:
+    direction = str(consensus.get("direction") or "MIXED").upper()
+    if direction not in {"BULLISH", "BEARISH"}:
+        return existing
+    atr1 = float(structure.get("atr_1m") or 0.0)
+    if existing is not None:
+        age = (now - existing.confirmed_at).total_seconds()
+        invalid = ((existing.direction == "BULLISH" and spot <= existing.invalidation)
+                   or (existing.direction == "BEARISH" and spot >= existing.invalidation))
+        extension = abs(spot - existing.trigger)
+        if (existing.direction == direction and not invalid
+                and age <= config.consensus_setup_max_age_minutes * 60
+                and (atr1 <= 0 or extension <= config.max_entry_extension_atr * atr1)):
+            return existing
+    synthetic = derive_consensus_continuation_setup(candles, levels, structure, consensus, spot, now, config)
+    if synthetic is not None:
+        return synthetic
+    if existing is not None and existing.direction == direction:
+        age = (now - existing.confirmed_at).total_seconds()
+        invalid = ((existing.direction == "BULLISH" and spot <= existing.invalidation)
+                   or (existing.direction == "BEARISH" and spot >= existing.invalidation))
+        if not invalid and age <= config.consensus_setup_max_age_minutes * 60:
+            return existing
+    return None
+
+
+def authorize_consensus_entry(
+    consensus: Mapping[str, Any],
+    setup: Setup,
+    oi: Mapping[str, Any],
+    structure: Mapping[str, Any],
+    config: Config,
+) -> None:
+    if not oi.get("compared_to_previous_successful_snapshot"):
+        raise ScannerError("OI_BASELINE_MISSING", "Two valid same-session snapshots are required before directional entry")
+    direction = str(consensus.get("direction") or "MIXED").upper()
+    score = abs(float(consensus.get("score") or 0.0))
+    if direction not in {"BULLISH", "BEARISH"} or score < config.direction_entry_score_min:
+        raise ScannerError("DIRECTION_CONSENSUS_WEAK", f"Weighted direction score {float(consensus.get('score') or 0.0):.2f} is below the entry threshold")
+    if setup.direction != direction:
+        raise ScannerError("SETUP_DIRECTION_CONFLICT", f"Setup points {setup.direction}, while weighted consensus points {direction}")
+    execution = str(structure.get("execution_direction") or "UNKNOWN").upper()
+    if execution != direction and score < config.direction_reversal_score_min:
+        raise ScannerError("PRICE_EXECUTION_NOT_ALIGNED", f"Weighted consensus is {direction}, but one-minute execution is {execution}")
+    if int(consensus.get("aligned_components") or 0) < 2:
+        raise ScannerError("DIRECTION_CONSENSUS_THIN", "Too few independent components support the proposed direction")
+
 
 def authorize_direction(oi: Mapping[str, Any], setup: Setup, structure: Mapping[str, Any], config: Config) -> None:
     """OI-first authorization with explicit reversal and sideways-wall handling."""
@@ -3040,6 +3337,8 @@ def _combined_directional_levels(
                 "structural_strength": float(level.strength), "oi_score": 0.0,
                 "oi_value": 0.0, "flow": None, "has_structure": True,
                 "has_oi": any(src.startswith("OI_") for src in sources),
+                "supportive_flow_strength": 0.0, "opposing_flow_strength": 0.0,
+                "oi_delta_pct": None,
             })
 
     oi_side = ("CE" if direction == "BULLISH" else "PE") if target else ("PE" if direction == "BULLISH" else "CE")
@@ -3057,6 +3356,13 @@ def _combined_directional_levels(
         material, score = _oi_wall_is_material(row, oi_side)
         if not material:
             continue
+        supportive_strength = float(row.get("put_support_flow_strength" if oi_side == "PE" else "call_resistance_flow_strength") or 0.0)
+        opposing_strength = float(row.get("put_bearish_flow_strength" if oi_side == "PE" else "call_bullish_flow_strength") or 0.0)
+        delta_pct = row.get("put_delta_oi_pct_snapshot" if oi_side == "PE" else "call_delta_oi_pct_snapshot")
+        try:
+            delta_pct = float(delta_pct) if delta_pct is not None else None
+        except (TypeError, ValueError, OverflowError):
+            delta_pct = None
         candidates.append({
             "price": price,
             "source": f"OI_{oi_side}_WALL",
@@ -3066,6 +3372,9 @@ def _combined_directional_levels(
             "flow": row.get("put_flow" if oi_side == "PE" else "call_flow"),
             "has_structure": False,
             "has_oi": True,
+            "supportive_flow_strength": supportive_strength,
+            "opposing_flow_strength": opposing_strength,
+            "oi_delta_pct": delta_pct,
         })
 
     if not candidates:
@@ -3086,17 +3395,40 @@ def _combined_directional_levels(
         sources = list(dict.fromkeys(src for x in cluster for src in x["source"].split("+") if src))
         has_structure = any(x["has_structure"] for x in cluster)
         has_oi = any(x["has_oi"] for x in cluster)
+        structural_strength = max((x["structural_strength"] for x in cluster), default=0.0)
+        oi_score = max((x["oi_score"] for x in cluster), default=0.0)
+        supportive_flow = max((x.get("supportive_flow_strength", 0.0) for x in cluster), default=0.0)
+        opposing_flow = max((x.get("opposing_flow_strength", 0.0) for x in cluster), default=0.0)
+        oi_delta_pct = next((x.get("oi_delta_pct") for x in cluster if x.get("oi_delta_pct") is not None), None)
+        confluence = "OI_AND_PRICE_STRUCTURE" if has_structure and has_oi else "OI_ONLY" if has_oi else "PRICE_STRUCTURE_ONLY"
+        strength = min(5.0, structural_strength + oi_score * 2.0)
+        # A nearby level is a hard barrier only when it has independent
+        # structure, confluence, or reinforcing OI flow.  Unwinding/weak walls
+        # remain visible as soft intermediate barriers instead of automatically
+        # vetoing an otherwise high-quality directional trade.
+        hard_barrier = bool(
+            confluence == "OI_AND_PRICE_STRUCTURE"
+            or structural_strength >= 2.0
+            or (has_oi and oi_score >= 0.24 and supportive_flow + 0.05 >= opposing_flow
+                and (oi_delta_pct is None or oi_delta_pct >= -0.25))
+        )
+        barrier_quality = strength + (0.75 if confluence == "OI_AND_PRICE_STRUCTURE" else 0.0) + supportive_flow - opposing_flow
         combined.append({
             "price": price,
             "source": "+".join(sources),
-            "structural_strength": max((x["structural_strength"] for x in cluster), default=0.0),
-            "oi_score": max((x["oi_score"] for x in cluster), default=0.0),
+            "structural_strength": structural_strength,
+            "oi_score": oi_score,
             "oi_value": max((x["oi_value"] for x in cluster), default=0.0),
             "flow": next((x["flow"] for x in cluster if x.get("flow")), None),
             "has_structure": has_structure,
             "has_oi": has_oi,
-            "confluence": "OI_AND_PRICE_STRUCTURE" if has_structure and has_oi else "OI_ONLY" if has_oi else "PRICE_STRUCTURE_ONLY",
-            "strength": min(5.0, max((x["structural_strength"] for x in cluster), default=0.0) + max((x["oi_score"] for x in cluster), default=0.0) * 2.0),
+            "confluence": confluence,
+            "strength": strength,
+            "supportive_flow_strength": supportive_flow,
+            "opposing_flow_strength": opposing_flow,
+            "oi_delta_pct": oi_delta_pct,
+            "hard_barrier": hard_barrier,
+            "barrier_quality": barrier_quality,
         })
     # Sort by distance from entry in the direction of travel, nearest barrier first.
     combined.sort(key=lambda item: abs(item["price"] - entry))
@@ -3163,8 +3495,35 @@ def choose_oi_targets_and_stop(
     targets = [x for x in targets if abs(float(x["price"]) - entry) >= min_target_distance]
     if not targets:
         raise ScannerError("OI_STRUCTURE_TARGET_UNAVAILABLE", "No qualified opposing OI/price-structure barrier is available")
-    t1_row = targets[0]
-    t2_row = targets[1] if len(targets) > 1 else None
+
+    # Do not let a weak nearby swing or an actively unwinding OI wall veto the
+    # complete trade.  Such levels remain visible as intermediate soft barriers.
+    # T1 is the nearest hard barrier, or the nearest sufficiently strong level
+    # that independently offers the configured minimum reward/risk.
+    soft_barriers = []
+    tradable_targets = []
+    for row in targets:
+        distance = abs(float(row["price"]) - entry)
+        row_rr = distance / max(risk, 1e-9)
+        hard = bool(row.get("hard_barrier"))
+        strong = float(row.get("strength") or 0.0) >= config.min_target_barrier_strength
+        if hard or (strong and row_rr + 1e-9 >= config.min_underlying_rr):
+            tradable_targets.append(row)
+        else:
+            soft_barriers.append({
+                "price": row.get("price"), "source": row.get("source"),
+                "strength": row.get("strength"), "rr_from_entry": row_rr,
+                "barrier_quality": row.get("barrier_quality"), "flow": row.get("flow"),
+            })
+    if not tradable_targets:
+        nearest = targets[0]
+        nearest_rr = abs(float(nearest["price"]) - entry) / max(risk, 1e-9)
+        raise ScannerError(
+            "RR_BELOW_2R_OI_STRUCTURE",
+            f"No hard/strong opposing barrier offers {config.min_underlying_rr:.2f}R; nearest visible barrier {float(nearest['price']):.2f} is {nearest_rr:.2f}R",
+        )
+    t1_row = tradable_targets[0]
+    t2_row = tradable_targets[1] if len(tradable_targets) > 1 else None
     t1 = float(t1_row["price"])
     t2 = float(t2_row["price"]) if t2_row else None
     reward = abs(t1 - entry)
@@ -3172,7 +3531,7 @@ def choose_oi_targets_and_stop(
     if rr + 1e-9 < config.min_underlying_rr:
         raise ScannerError(
             "RR_BELOW_2R_OI_STRUCTURE",
-            f"Nearest opposing barrier {t1:.2f} gives {rr:.2f}R using entry {entry:.2f} and stop {stop:.2f}; minimum is {config.min_underlying_rr:.2f}R",
+            f"Nearest qualified hard barrier {t1:.2f} gives {rr:.2f}R using entry {entry:.2f} and stop {stop:.2f}; minimum is {config.min_underlying_rr:.2f}R",
         )
 
     local_now = now.astimezone(IST)
@@ -3214,7 +3573,10 @@ def choose_oi_targets_and_stop(
         "estimated_remaining_session_move": expected_move,
         "t1_time_feasibility_ratio": time_feasibility,
         "minutes_to_market_close": minutes_left,
-        "target_method": "NEAREST_OI_AND_PRICE_STRUCTURE_BARRIERS",
+        "target_method": "NEAREST_HARD_OR_STRONG_OI_PRICE_STRUCTURE_BARRIERS",
+        "intermediate_soft_barriers": soft_barriers[:5],
+        "t1_hard_barrier": bool(t1_row.get("hard_barrier")),
+        "t1_barrier_quality": t1_row.get("barrier_quality"),
     }
 
 
@@ -3613,6 +3975,7 @@ def manage_active_position(
     chain_refresh_ok: bool,
     option_quote: Optional[OptionQuote],
     levels: Sequence[PriceLevel] = (),
+    direction_consensus: Optional[Mapping[str, Any]] = None,
 ) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]], str, dict[str, Any]]:
     """Advance the one active signal position; no new strike can replace it while open."""
     active = dict(active)
@@ -3805,12 +4168,68 @@ def manage_active_position(
                 spot, premium_bid=latest_bid, details=stop_revision,
             ))
 
+    consensus_now = direction_consensus if isinstance(direction_consensus, Mapping) else {}
+    consensus_direction = str(consensus_now.get("direction") or "MIXED").upper()
+    consensus_score = abs(float(consensus_now.get("score") or 0.0))
+    opposite = "BEARISH" if direction == "BULLISH" else "BULLISH"
+    execution_now = str(structure.get("execution_direction") or "UNKNOWN").upper()
+    if (consensus_direction == opposite and execution_now == opposite
+            and consensus_score >= config.direction_reversal_score_min):
+        opposite_count = int(active.get("opposite_consensus_count") or 0) + 1
+    else:
+        opposite_count = 0
+    active["opposite_consensus_count"] = opposite_count
+    stable_oi_now = str(oi.get("label") or "MISSING").upper()
+    htf_for_reversal = str(structure.get("higher_timeframe_bias") or "UNKNOWN").upper()
+    extreme_reversal_confirmed = (
+        consensus_direction == opposite and execution_now == opposite
+        and consensus_score >= config.direction_extreme_reversal_score
+        and (stable_oi_now == opposite or htf_for_reversal == opposite)
+    )
+    if opposite_count >= config.reversal_confirmation_runs or extreme_reversal_confirmed:
+        return close("REVERSAL_CONFIRMED", quote_received_at, spot, {
+            "reversal_source": "WEIGHTED_DIRECTION_CONSENSUS",
+            "reversal_direction": opposite,
+            "consensus_score": consensus_now.get("score"),
+            "confirmation_runs": opposite_count,
+            "price_execution_direction": execution_now,
+        })
+
     reversed_now, reversal_evidence = confirmed_opposite_reversal(
         active, setup, oi, structure, spot, quote_received_at, config,
         chain_refresh_ok=chain_refresh_ok,
     )
     if reversed_now:
         return close("REVERSAL_CONFIRMED", quote_received_at, spot, reversal_evidence)
+
+    elapsed_minutes = max(0.0, (quote_received_at - opened_at).total_seconds() / 60.0)
+    atr1_for_progress = float(structure.get("atr_1m") or active.get("risk_plan", {}).get("atr_1m") or 0.0)
+    best_spot_for_progress = float(active.get("favourable_spot_extreme") or entry_spot)
+    if direction == "BULLISH":
+        best_spot_for_progress = max(best_spot_for_progress, spot)
+        best_favourable_move = best_spot_for_progress - entry_spot
+    else:
+        best_spot_for_progress = min(best_spot_for_progress, spot)
+        best_favourable_move = entry_spot - best_spot_for_progress
+    active["favourable_spot_extreme"] = best_spot_for_progress
+    htf_now = str(structure.get("higher_timeframe_bias") or "UNKNOWN").upper()
+    sideways_votes = (
+        int(execution_now == "MIXED")
+        + int(htf_now in {"SIDEWAYS", "TRANSITION"})
+        + int(consensus_score <= config.sideways_consensus_abs_max)
+    )
+    if (not active.get("t1_hit") and elapsed_minutes >= config.sideways_exit_minutes
+            and atr1_for_progress > 0
+            and best_favourable_move < config.sideways_max_progress_atr * atr1_for_progress
+            and sideways_votes >= 2):
+        return close("SIDEWAYS_NO_PROGRESS", quote_received_at, spot, {
+            "elapsed_minutes": elapsed_minutes,
+            "best_favourable_spot_move": best_favourable_move,
+            "atr_1m": atr1_for_progress,
+            "consensus_score": consensus_now.get("score"),
+            "price_execution_direction": execution_now,
+            "higher_timeframe_bias": htf_now,
+        })
 
     if latest_bid is not None:
         entry_ask = float(active.get("entry_premium_ask") or 0.0)
@@ -3825,17 +4244,7 @@ def manage_active_position(
         if active.get("t1_hit") and peak_drawdown_pct >= config.premium_trailing_drawdown_pct:
             return close("PREMIUM_TRAILING_PROTECTION", quote_received_at, spot,
                          {"premium_bid": latest_bid, "peak_bid": peak_bid, "peak_drawdown_pct": peak_drawdown_pct})
-        elapsed_minutes = max(0.0, (quote_received_at - opened_at).total_seconds() / 60.0)
-        atr1 = float(structure.get("atr_1m") or active.get("risk_plan", {}).get("atr_1m") or 0.0)
-        best_spot = float(active.get("favourable_spot_extreme") or entry_spot)
-        if direction == "BULLISH":
-            best_spot = max(best_spot, spot)
-            active["favourable_spot_extreme"] = best_spot
-            best_favourable_move = best_spot - entry_spot
-        else:
-            best_spot = min(best_spot, spot)
-            active["favourable_spot_extreme"] = best_spot
-            best_favourable_move = entry_spot - best_spot
+        atr1 = atr1_for_progress
         if (elapsed_minutes >= config.premium_decay_review_minutes
                 and best_favourable_move < config.no_progress_min_spot_move_atr * atr1
                 and premium_loss_pct >= config.premium_decay_min_loss_pct):
@@ -3866,6 +4275,8 @@ def manage_active_position(
         "premium_loss_pct": active.get("premium_loss_pct"),
         "monitoring_status": active.get("monitoring_status"),
         "reversal_status": reversal_evidence.get("reversal_status") if 'reversal_evidence' in locals() else "NOT_CONFIRMED",
+        "direction_consensus": dict(consensus_now),
+        "opposite_consensus_count": active.get("opposite_consensus_count", 0),
     }
     return active, events, "POSITION_ACTIVE", summary
 
@@ -4346,6 +4757,15 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         tracked_setup = advance_setup_watch(index_candles, previous_processed, daily_candles, state, config, oi)
         current_setup = detect_setup(index_candles, levels, structure, config, oi)
         setup = select_active_setup(current_setup, tracked_setup, spot, oi, structure, quote_received_at, config)
+        # First score the market using the independent evidence already available,
+        # then allow a fresh continuation setup only when that consensus is strong.
+        direction_consensus = build_direction_consensus(oi, structure, future_context, setup, config)
+        setup = choose_setup_with_consensus(
+            setup, index_candles, levels, structure, direction_consensus, spot, quote_received_at, config
+        )
+        # Re-score once with the final setup, which is deliberately only a small
+        # component of the consensus and therefore cannot dominate it.
+        direction_consensus = build_direction_consensus(oi, structure, future_context, setup, config)
         detected_new_setup = setup is not None and (tracked_setup is None or setup.confirmed_at != tracked_setup.confirmed_at or setup.direction != tracked_setup.direction)
         state["last_processed_candle"] = index_candles[-1].start.isoformat()
         # Freshness-validated futures quote/VWAP context was built before levels.
@@ -4355,7 +4775,29 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         else:
             oi_state = oi.get("label", "MISSING")
         market_scenario = classify_market_scenario(oi, structure, future_context)
-        base_result.update({"expiry": expiry.isoformat(), "underlying_key": index_key, "spot": spot, "spot_context": spot_context, "oi": {k: v for k, v in oi.items() if k != "features"}, "oi_label": oi.get("label", "MISSING"), "oi_state": oi_state, "oi_raw_label": oi.get("raw_label", oi.get("label", "MISSING")), "option_chain_status": oi.get("source_refresh_status", "SUCCESS" if chain_refresh_ok else "UNKNOWN"), "option_chain_error": chain_refresh_error.code if chain_refresh_error else None, "structure": structure, "regime": structure.get("regime"), "market_scenario": market_scenario, "levels": level_summary, "futures": future_context, "setup": json_safe(setup) if setup else None, "decision": "NO_TRADE", "reason_code": "NO_CONFIRMED_SETUP"})
+        base_result.update({"expiry": expiry.isoformat(), "underlying_key": index_key, "spot": spot, "spot_context": spot_context, "oi": {k: v for k, v in oi.items() if k != "features"}, "oi_label": oi.get("label", "MISSING"), "oi_state": oi_state, "oi_raw_label": oi.get("raw_label", oi.get("label", "MISSING")), "option_chain_status": oi.get("source_refresh_status", "SUCCESS" if chain_refresh_ok else "UNKNOWN"), "option_chain_error": chain_refresh_error.code if chain_refresh_error else None, "structure": structure, "regime": structure.get("regime"), "market_scenario": market_scenario, "levels": level_summary, "futures": future_context, "setup": json_safe(setup) if setup else None, "direction_consensus": direction_consensus, "decision": "NO_TRADE", "reason_code": "NO_CONFIRMED_SETUP"})
+
+        # Always record what single contract would currently rank first when a
+        # directional consensus exists.  This is a shadow diagnostic only and
+        # never creates a position by itself; it makes missed opportunities and
+        # strike selection auditable after the fact.
+        shadow_direction = str(direction_consensus.get("direction") or "MIXED")
+        if chain_refresh_ok and shadow_direction in {"BULLISH", "BEARISH"}:
+            try:
+                shadow = select_option_and_risk(
+                    shadow_direction, spot, spot_quote_time, chain_records, full_quotes, expiry,
+                    quote_received_at, {"underlying_rr": None}, structure, config,
+                )
+                base_result["shadow_option_selection"] = {
+                    "direction": shadow_direction,
+                    "selected": {k: v for k, v in shadow.items() if k != "candidate_ranking"},
+                    "candidate_ranking": shadow.get("candidate_ranking", []),
+                }
+            except ScannerError as shadow_exc:
+                base_result["shadow_option_selection"] = {
+                    "direction": shadow_direction, "status": "UNAVAILABLE",
+                    "reason_code": shadow_exc.code, "message": str(shadow_exc),
+                }
         if setup is not None:
             setup_age = (quote_received_at - setup.confirmed_at).total_seconds()
             base_result["setup_age_seconds"] = setup_age
@@ -4419,6 +4861,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                     chain_refresh_ok=chain_refresh_ok,
                     option_quote=option_quote,
                     levels=levels,
+                    direction_consensus=direction_consensus,
                 )
                 if managed is not None:
                     state["active_position"] = managed
@@ -4461,6 +4904,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                         "regime": structure.get("regime"),
                         "market_scenario": market_scenario,
                         "futures": future_context,
+                        "direction_consensus": direction_consensus,
                     })
                     queue_notification(state, str(event_payload["signal_key"]), event_payload, quote_received_at)
 
@@ -4502,16 +4946,19 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                 })
             else:
                 setup_age = (quote_received_at - setup.confirmed_at).total_seconds()
-                if setup_age < -1 or setup_age > config.setup_max_age_minutes * 60:
+                max_setup_age = (config.setup_max_age_minutes if setup.kind != "CONSENSUS_PULLBACK_CONTINUATION"
+                                 else config.consensus_setup_max_age_minutes)
+                if setup_age < -1 or setup_age > max_setup_age * 60:
                     raise ScannerError("MISSED_OR_STALE_SETUP", f"Setup confirmation is {setup_age:.0f}s old; no backdated entry allowed")
                 validate_live_setup_trigger(setup, spot, max(0.5, float(structure.get("atr_1m") or 0.0) * 0.15))
                 extension = abs(spot - setup.trigger)
                 if structure.get("atr_1m") and extension > float(structure["atr_1m"]) * config.max_entry_extension_atr:
-                    raise ScannerError("ENTRY_TOO_EXTENDED", f"Current spot is {extension:.2f} points from setup trigger")
+                    base_result["entry_timing_status"] = "WAIT_FOR_PULLBACK_RETEST"
+                    raise ScannerError("ENTRY_TOO_EXTENDED", f"Current spot is {extension:.2f} points from setup trigger; thesis retained for a fresh pullback/retest")
                 if not chain_refresh_ok:
                     detail = chain_refresh_error.code if chain_refresh_error else "UNKNOWN_REFRESH_FAILURE"
                     raise ScannerError("OPTION_CHAIN_REFRESH_FAILED", f"A fresh option chain/Greeks snapshot is required before entry; latest refresh failed with {detail}")
-                authorize_direction(oi, setup, structure, config)
+                authorize_consensus_entry(direction_consensus, setup, oi, structure, config)
                 plan = choose_oi_targets_and_stop(spot, setup, oi, structure, config, quote_received_at, levels=levels)
                 base_result["risk_plan"] = plan
                 selected = select_option_and_risk(setup.direction, spot, spot_quote_time, chain_records, full_quotes, expiry, quote_received_at, plan, structure, config)
