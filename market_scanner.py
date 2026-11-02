@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 OI-first intraday scanner with persistent position management v107.0.0.
+"""NIFTY 50 OI-first intraday scanner with persistent position management v107.0.1.
 
 Single-file runtime for a GitHub Actions workflow dispatched about every three
 minutes. It never places orders. Tests and documentation are separate files.
@@ -44,13 +44,37 @@ from statistics import median
 from typing import Any, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "107.0.0"
+VERSION = "107.0.1"
 SCHEMA_VERSION = 107
 IST = ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
 API_BASE = "https://api.upstox.com"
 INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 LOG = logging.getLogger("nifty_scanner")
+
+# Operational failures must make the GitHub Actions step fail. Market-quality
+# blocks (for example low RR, missing OI persistence, stale setup) remain
+# fail-closed NO_TRADE decisions but are not process failures.
+OPERATIONAL_FAILURE_CODES = frozenset({
+    "UNEXPECTED_ERROR",
+    "STATE_SAVE_FAILED",
+    "STATE_READ_FAILED",
+    "STATE_BACKUP_FAILED",
+    "STATE_TOO_LARGE",
+    "STATE_SCHEMA_UNSUPPORTED",
+    "API_AUTH_FAILED",
+    "API_PERMISSION_DENIED",
+    "API_HTTP_ERROR",
+    "API_HTTP_403",
+    "API_HTTP_401",
+    "POSITION_CANDLE_GAP",
+    "ACTIVE_POSITION_STATE_INVALID",
+    "ACTIVE_POSITION_INVALID",
+})
+
+
+def is_operational_failure(code: Any) -> bool:
+    return str(code or "") in OPERATIONAL_FAILURE_CODES
 
 
 # ---------- Configuration and errors ----------
@@ -412,48 +436,85 @@ def _migrate_state_payload(state: Mapping[str, Any], source: Path) -> dict[str, 
 
 
 def read_state(path: Path) -> dict[str, Any]:
-    """Load v107 state or migrate a compatible v102-v106 state file."""
+    """Load v107 state or migrate a compatible v102-v106 state file.
+
+    A legacy filename alone is not proof of a compatible schema. Unknown or
+    missing schemas are preserved as backups and a clean v107 state is started
+    rather than being force-fed into the migration routine.
+    """
     source = path if path.exists() else None
     if source is None:
         # GitHub Actions may still persist state under an earlier versioned filename.
-        # Keep the old file untouched; migrate its compatible state into v105 on save.
-        candidates = [path.parent / "market_state_v106.json", path.parent / "market_state_v105.json",
-                      path.parent / "market_state_v104.json", path.parent / "market_state_v103.json",
-                      path.parent / "market_state_v102.json"]
+        # Keep the old file untouched; migrate only a schema explicitly known to v107.
+        candidates = [
+            path.parent / "market_state_v106.json",
+            path.parent / "market_state_v105.json",
+            path.parent / "market_state_v104.json",
+            path.parent / "market_state_v103.json",
+            path.parent / "market_state_v102.json",
+        ]
         source = next((candidate for candidate in candidates if candidate.exists()), None)
+
     if source is None:
         return {"schema_version": SCHEMA_VERSION, "scanner_version": VERSION}
+
     try:
         raw = source.read_bytes()
         if len(raw) > 2_000_000:
             raise ScannerError("STATE_TOO_LARGE", f"State file exceeds 2 MB: {source}")
+
         state = json.loads(raw.decode("utf-8"))
         if not isinstance(state, dict):
             raise ValueError("state root is not an object")
         _reject_non_finite(state)
-        schema = state.get("schema_version")
+
+        schema_raw = state.get("schema_version")
+        try:
+            schema = int(schema_raw) if schema_raw is not None else None
+        except (TypeError, ValueError):
+            schema = None
+
         if schema == SCHEMA_VERSION:
+            state["schema_version"] = SCHEMA_VERSION
+            state["scanner_version"] = VERSION
             return state
-        if source != path or schema in {102, 103, 104, 105, 106}:
+
+        if schema in {102, 103, 104, 105, 106}:
             migrated = _migrate_state_payload(state, source)
             LOG.warning("Migrated durable state schema %s to %s from %s", schema, SCHEMA_VERSION, source)
             return migrated
+
         old_schema = str(schema if schema is not None else "unknown")
-        backup = path.with_name(path.name + f".schema-{old_schema}.backup")
+        backup = source.with_name(source.name + f".schema-{old_schema}.backup")
         if backup.exists():
-            backup = path.with_name(path.name + f".schema-{old_schema}.{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.backup")
+            backup = source.with_name(
+                source.name
+                + f".schema-{old_schema}."
+                + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+                + ".backup"
+            )
         try:
-            shutil.copy2(path, backup)
+            shutil.copy2(source, backup)
         except OSError as exc:
-            raise ScannerError("STATE_BACKUP_FAILED", f"Cannot preserve incompatible state before reset: {exc}") from exc
-        LOG.warning("State schema %r is incompatible with v%s; old state copied to %s; starting clean state.", old_schema, VERSION, backup)
-        return {"schema_version": SCHEMA_VERSION, "scanner_version": VERSION,
-                "migration_note": "incompatible_state_not_reused", "migration_backup": str(backup)}
+            raise ScannerError(
+                "STATE_BACKUP_FAILED",
+                f"Cannot preserve incompatible state before reset: {exc}",
+            ) from exc
+
+        LOG.warning(
+            "State schema %r is incompatible with v%s; old state copied to %s; starting clean state.",
+            old_schema, VERSION, backup,
+        )
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "scanner_version": VERSION,
+            "migration_note": "incompatible_state_not_reused",
+            "migration_backup": str(backup),
+        }
     except ScannerError:
         raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ScannerError("STATE_READ_FAILED", f"Could not safely read state file: {exc}") from exc
-
 
 def append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
     _reject_non_finite(record)
@@ -478,7 +539,7 @@ def compact_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
     """Return a bounded, decision-complete audit/CLI representation."""
     root_fields = (
         "scanner_version", "schema_version", "timestamp", "evaluation_timestamp",
-        "session_date", "expiry", "underlying_key", "decision", "reason_code",
+        "session_date", "expiry", "underlying_key", "decision", "reason_code", "result_type",
         "error_type", "message", "spot", "oi_label", "oi_state", "oi_raw_label",
         "option_chain_status", "option_chain_error", "regime", "market_scenario", "setup_age_seconds",
         "setup_direction", "setup_kind", "signal_key", "notification_status",
@@ -577,10 +638,7 @@ def detailed_audit_triggers(record: Mapping[str, Any], debug_enabled: bool = Fal
         triggers.append("DEBUG_ENABLED")
     if record.get("decision") == "QUALIFIED":
         triggers.append("QUALIFIED_SIGNAL")
-    if record.get("error_type") or record.get("reason_code") in {
-        "UNEXPECTED_ERROR", "STATE_SAVE_FAILED", "API_AUTH_FAILED", "API_PERMISSION_DENIED",
-        "API_HTTP_ERROR", "API_HTTP_403", "API_HTTP_401",
-    }:
+    if record.get("error_type") or is_operational_failure(record.get("reason_code")):
         triggers.append("SCANNER_ERROR")
     oi = record.get("oi") if isinstance(record.get("oi"), Mapping) else {}
     state = str(record.get("oi_state") or "")
@@ -3200,6 +3258,12 @@ def create_active_position(
     if entry_ask <= 0 or not math.isfinite(entry_ask):
         raise ScannerError("ACTIVE_POSITION_INVALID", "Reference entry premium must be finite and positive")
     opened = opened_at.astimezone(IST)
+    # A full OHLC candle for the entry minute contains price action that occurred
+    # before the position existed, so it must not be replayed as post-entry risk.
+    # Use the entry minute as a sentinel checkpoint; the first safely replayable
+    # completed candle is the following minute.
+    entry_minute = opened.replace(second=0, microsecond=0)
+    monitoring_checkpoint = max(latest_candle.start.astimezone(IST), entry_minute)
     return {
         "position_id": signal_key,
         "signal_key": signal_key,
@@ -3231,7 +3295,7 @@ def create_active_position(
         "t1_hit_at": None,
         "t1_partial_exit_pct": float(config.t1_partial_exit_pct),
         "remaining_pct": 100.0,
-        "last_monitored_candle": latest_candle.start.isoformat(),
+        "last_monitored_candle": monitoring_checkpoint.isoformat(),
         "favourable_spot_extreme": float(risk_plan["entry_underlying"]),
         "recovered_from_legacy": bool(recovered),
         "recovered_at": opened.isoformat() if recovered else None,
@@ -3557,6 +3621,15 @@ def manage_active_position(
     last_candle = parse_datetime(active.get("last_monitored_candle"))
     if opened_at is None or last_candle is None:
         raise ScannerError("ACTIVE_POSITION_STATE_INVALID", "Active position has invalid opened_at or last_monitored_candle")
+
+    # v107.0.0 stored the last pre-entry completed candle as the checkpoint.
+    # Normalize that state in memory so an existing open position is repaired
+    # automatically on its next successful management pass.
+    entry_minute = opened_at.replace(second=0, microsecond=0)
+    if last_candle < entry_minute:
+        last_candle = entry_minute
+        active["last_monitored_candle"] = last_candle.isoformat()
+
     if active.get("status") != "OPEN":
         raise ScannerError("ACTIVE_POSITION_STATE_INVALID", "Only OPEN positions can be managed")
     entry_spot = float(active.get("entry_spot") or 0.0)
@@ -3598,8 +3671,10 @@ def manage_active_position(
                                       "closed_position": closed, **(dict(detail or {}))}
 
     # Process every completed one-minute candle since the prior persisted checkpoint.
-    new_candles = [c for c in sorted(candles, key=lambda item: item.start)
-                   if c.start > last_candle and c.start > opened_at.replace(second=0, microsecond=0)]
+    new_candles = [
+        candle for candle in sorted(candles, key=lambda item: item.start)
+        if candle.start > last_candle
+    ]
     if new_candles:
         first_gap = (new_candles[0].start - last_candle).total_seconds()
         if first_gap > 60.5:
@@ -3612,7 +3687,7 @@ def manage_active_position(
         if gap > 60.5:
             raise ScannerError("POSITION_CANDLE_GAP", f"Missing one-minute monitoring candles between {previous.start.isoformat()} and {current.start.isoformat()}; position lock retained")
     for candle in new_candles:
-        if candle.start <= last_candle or candle.start <= opened_at.replace(second=0, microsecond=0):
+        if candle.start <= last_candle:
             continue
         stop_hit = (candle.low <= stop) if direction == "BULLISH" else (candle.high >= stop)
         if stop_hit:
@@ -4507,7 +4582,22 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         )
         return json_safe(base_result)
     except ScannerError as exc:
-        base_result.update({"decision": "NO_TRADE", "error_type": "ScannerError", "reason_code": exc.code, "message": str(exc), "expiry": expiry.isoformat() if expiry else None, "underlying_key": index_row.get("instrument_key") if index_row else None, "oi_label": oi.get("label", "MISSING"), "regime": base_result.get("regime", "UNKNOWN"), "spot": base_result.get("spot", spot_chain or None)})
+        operational_failure = is_operational_failure(exc.code)
+        base_result.update({
+            "decision": "NO_TRADE",
+            "result_type": "ERROR" if operational_failure else "BLOCKED",
+            "reason_code": exc.code,
+            "message": str(exc),
+            "expiry": expiry.isoformat() if expiry else None,
+            "underlying_key": index_row.get("instrument_key") if index_row else None,
+            "oi_label": oi.get("label", "MISSING"),
+            "regime": base_result.get("regime", "UNKNOWN"),
+            "spot": base_result.get("spot", spot_chain or None),
+        })
+        if operational_failure:
+            base_result["error_type"] = "ScannerError"
+        else:
+            base_result.pop("error_type", None)
         # Preserve the last good baseline/snapshots on API errors; do not replace them with empty data.
         try:
             state["schema_version"] = SCHEMA_VERSION
@@ -4518,6 +4608,8 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         except Exception as persistence_error:
             LOG.error("Could not persist blocked scan state (%s); alerts suppressed", persistence_error)
             base_result["reason_code"] = "STATE_SAVE_FAILED"
+            base_result["result_type"] = "ERROR"
+            base_result["error_type"] = "ScannerError"
             base_result["message"] = f"{exc}; state persistence failed"
         base_result["audit_persistence"] = persist_audit_records(
             config, session_date, base_result, oi_diagnostics=oi
@@ -4525,7 +4617,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         return json_safe(base_result)
     except Exception as exc:
         LOG.exception("Unexpected scanner failure")
-        base_result.update({"decision": "NO_TRADE", "error_type": type(exc).__name__, "reason_code": "UNEXPECTED_ERROR", "message": str(exc)[:500]})
+        base_result.update({"decision": "NO_TRADE", "result_type": "ERROR", "error_type": type(exc).__name__, "reason_code": "UNEXPECTED_ERROR", "message": str(exc)[:500]})
         try:
             state["schema_version"] = SCHEMA_VERSION
             state["scanner_version"] = VERSION
@@ -4930,11 +5022,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # workflow still commits this durable claim before a separate
             # delivery invocation is allowed to contact Gmail.
             scan_result = run_scan(config)
-            failure_codes = {
-                "UNEXPECTED_ERROR", "STATE_SAVE_FAILED", "API_AUTH_FAILED",
-                "API_PERMISSION_DENIED", "API_HTTP_ERROR", "API_HTTP_403", "API_HTTP_401",
-            }
-            if scan_result.get("reason_code") in failure_codes:
+            if is_operational_failure(scan_result.get("reason_code")):
                 print(json.dumps(compact_audit_record(scan_result), separators=(",", ":"), sort_keys=True))
                 return 1
             claim_token = os.getenv("NOTIFICATION_CLAIM_TOKEN", "").strip()
@@ -4969,16 +5057,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         result = run_scan(config)
         print(json.dumps(compact_audit_record(result), separators=(",", ":"), sort_keys=True))
-        failure_codes = {
-            "UNEXPECTED_ERROR", "STATE_SAVE_FAILED", "API_AUTH_FAILED",
-            "API_PERMISSION_DENIED", "API_HTTP_ERROR", "API_HTTP_403", "API_HTTP_401",
-        }
-        return 0 if result.get("reason_code") not in failure_codes else 1
+        return 1 if is_operational_failure(result.get("reason_code")) else 0
     except ScannerError as exc:
         result = {
             "scanner_version": VERSION,
             "timestamp": now_ist().isoformat(),
             "decision": "NO_TRADE",
+            "result_type": "ERROR",
             "reason_code": exc.code,
             "error_type": "ScannerError",
             "message": str(exc),
@@ -4991,6 +5076,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "scanner_version": VERSION,
             "timestamp": now_ist().isoformat(),
             "decision": "NO_TRADE",
+            "result_type": "ERROR",
             "reason_code": "UNEXPECTED_ERROR",
             "error_type": type(exc).__name__,
             "message": str(exc)[:500],
