@@ -1,4 +1,4 @@
-name: NIFTY 50 Structure-First Position Manager v108.1.0
+name: NIFTY 50 Persistent Thesis Position Manager v109.0.0
 
 on:
   # The existing Cloudflare Worker controls dispatch cadence.
@@ -61,6 +61,7 @@ jobs:
           restore-keys: |
             upstox-nse-instrument-master-${{ runner.os }}-
 
+
       - name: Requeue one manually verified uncertain alert (optional)
         if: ${{ inputs.requeue_signal_key != '' }}
         env:
@@ -71,14 +72,14 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v108.json
+          STATE_FILE: state/market_state_v109.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           REQUEUE_SIGNAL_KEY: ${{ inputs.requeue_signal_key }}
         shell: bash
-        run: python market_scanner_v108.py --requeue-notification "$REQUEUE_SIGNAL_KEY"
+        run: python market_scanner.py --requeue-notification "$REQUEUE_SIGNAL_KEY"
 
-      - name: Run v108 market scan and claim queued notifications
+      - name: Run v109 market scan and claim queued notifications
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
@@ -87,7 +88,7 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v108.json
+          STATE_FILE: state/market_state_v109.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           NOTIFICATION_CLAIM_TOKEN: ${{ github.run_id }}:${{ github.run_attempt }}
@@ -97,9 +98,10 @@ jobs:
         run: |
           set -euo pipefail
           session_date="$(TZ=Asia/Kolkata date +%F)"
-          python market_scanner_v108.py --scan-and-claim 2>&1 | tee -a "audit/worker_${session_date}.log"
+          python market_scanner.py --scan-and-claim 2>&1 | tee -a "audit/worker_${session_date}.log"
 
-      # Persist the durable notification claim before contacting SMTP.
+      # Commit the durable claim before contacting SMTP. A later run must not
+      # resend a message whose delivery may already have been accepted.
       - name: Persist position state and notification claims before email
         id: persist_claims
         if: success()
@@ -107,32 +109,17 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          [[ ! -f state/market_state_v108.json ]] || \
-            git add -f -- state/market_state_v108.json
-
-          audit_files=(
-            audit/market_scan_*.jsonl
-            audit/market_scan_diagnostics_*.jsonl
-            audit/worker_*.log
-          )
-
-          if (( ${#audit_files[@]} > 0 )); then
-            git add -f -- "${audit_files[@]}"
-          fi
-
+          [[ ! -f state/market_state_v109.json ]] || git add -f -- state/market_state_v109.json
+          audit_files=(audit/market_scan_*.jsonl audit/market_scan_diagnostics_*.jsonl audit/worker_*.log)
+          if (( ${#audit_files[@]} > 0 )); then git add -f -- "${audit_files[@]}"; fi
           if git diff --cached --quiet; then
             echo "No pre-delivery state changes to persist."
             exit 0
           fi
-
-          git commit -m "Persist NIFTY v108 position state and email claims"
-
+          git commit -m "Persist NIFTY v109 position state and email claims"
           DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
-
           if ! git push origin "HEAD:${DEFAULT_BRANCH}"; then
             echo "::error::${DEFAULT_BRANCH} changed while this scanner run was executing."
             echo "::error::Refusing to merge durable trading state automatically."
@@ -148,12 +135,12 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v108.json
+          STATE_FILE: state/market_state_v109.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           NOTIFICATION_CLAIM_TOKEN: ${{ github.run_id }}:${{ github.run_attempt }}
         shell: bash
-        run: python market_scanner_v108.py --deliver-claimed
+        run: python market_scanner.py --deliver-claimed
 
       - name: Persist final position and notification status
         if: ${{ always() && steps.persist_claims.outcome == 'success' }}
@@ -161,32 +148,17 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          [[ ! -f state/market_state_v108.json ]] || \
-            git add -f -- state/market_state_v108.json
-
-          audit_files=(
-            audit/market_scan_*.jsonl
-            audit/market_scan_diagnostics_*.jsonl
-            audit/worker_*.log
-          )
-
-          if (( ${#audit_files[@]} > 0 )); then
-            git add -f -- "${audit_files[@]}"
-          fi
-
+          [[ ! -f state/market_state_v109.json ]] || git add -f -- state/market_state_v109.json
+          audit_files=(audit/market_scan_*.jsonl audit/market_scan_diagnostics_*.jsonl audit/worker_*.log)
+          if (( ${#audit_files[@]} > 0 )); then git add -f -- "${audit_files[@]}"; fi
           if git diff --cached --quiet; then
             echo "No final state changes to persist."
             exit 0
           fi
-
-          git commit -m "Update NIFTY v108 position and notification status"
-
+          git commit -m "Update NIFTY v109 position and notification status"
           DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
-
           if ! git push origin "HEAD:${DEFAULT_BRANCH}"; then
             echo "::error::${DEFAULT_BRANCH} changed before final notification state could be persisted."
             echo "::error::Refusing to merge durable trading state automatically."
