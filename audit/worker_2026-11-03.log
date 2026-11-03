@@ -1,0 +1,2 @@
+2026-11-03 03:42:42,988 WARNING State schema 'unknown' is incompatible with v107.1.0; old state copied to state/market_state_v107.json.schema-unknown.backup; starting clean state.
+{"notifications":{"claimed":0,"expired":0,"queued_or_held":0,"uncertain_previous_claims":0},"scan":{"decision":"NO_TRADE","oi":{"call_oi_walls":[],"label":"MISSING","put_oi_walls":[],"raw_label":"MISSING"},"oi_label":"MISSING","reason_code":"MARKET_CLOSED","regime":"UNKNOWN","scanner_version":"107.1.0","schema_version":107,"session_date":"2026-11-03","timestamp":"2026-11-03T09:12:42.988313+05:30"}}
