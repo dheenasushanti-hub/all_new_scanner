@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 multi-timeframe predictive intraday scanner with persistent position management v108.0.0.
+"""NIFTY 50 multi-timeframe predictive intraday scanner with persistent position management v108.1.0.
 
 Single-file runtime for an intraday workflow. Entry timing is based on completed
 1-minute and 3-minute structure, while 15-minute structure supplies market context. It never places orders. Tests and documentation are separate files.
@@ -44,7 +44,7 @@ from statistics import median
 from typing import Any, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "108.0.0"
+VERSION = "108.1.0"
 SCHEMA_VERSION = 108
 IST = ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
@@ -56,20 +56,54 @@ LOG = logging.getLogger("nifty_scanner")
 # blocks (for example low RR, missing OI persistence, stale setup) remain
 # fail-closed NO_TRADE decisions but are not process failures.
 OPERATIONAL_FAILURE_CODES = frozenset({
+    # Code/config/state integrity.
     "UNEXPECTED_ERROR",
+    "CONFIG_INVALID",
+    "CONFIG_TOKEN_MISSING",
+    "TIMEZONE_INVALID",
     "STATE_SAVE_FAILED",
     "STATE_READ_FAILED",
     "STATE_BACKUP_FAILED",
     "STATE_TOO_LARGE",
     "STATE_SCHEMA_UNSUPPORTED",
+    "STATE_COLLECTION_INVALID",
+    # Provider/network/data plumbing failures after built-in retries.
     "API_AUTH_FAILED",
     "API_PERMISSION_DENIED",
     "API_HTTP_ERROR",
     "API_HTTP_403",
     "API_HTTP_401",
+    "API_NETWORK_ERROR",
+    "API_RATE_LIMIT",
+    "API_SERVER_ERROR",
+    "API_REQUEST_FAILED",
+    "API_INVALID_JSON",
+    "API_INVALID_RESPONSE",
+    "API_PROVIDER_ERROR",
+    "INSTRUMENT_MASTER_INVALID",
+    "INSTRUMENT_MASTER_UNAVAILABLE",
+    "EXPIRY_NOT_FOUND",
+    "WEEKLY_EXPIRY_NOT_FOUND",
+    "CANDLE_DATA_MISSING",
+    "CANDLES_STALE",
+    "MARKET_QUOTES_INVALID",
+    "MARKET_QUOTES_LIMIT",
+    "QUOTE_TIMESTAMP_INVALID",
+    "SPOT_QUOTE_INVALID",
+    "SPOT_QUOTE_MISSING",
+    "SPOT_QUOTE_STALE",
+    "SPOT_QUOTE_TIMESTAMP_MISSING",
+    # Position/state invariants must fail closed.
     "POSITION_CANDLE_GAP",
+    "POSITION_SESSION_EXPIRED",
+    "POSITION_SESSION_MISMATCH",
+    "POSITION_RECONCILIATION_REQUIRED",
+    "ACTIVE_POSITION_EXPIRY_MISMATCH",
     "ACTIVE_POSITION_STATE_INVALID",
     "ACTIVE_POSITION_INVALID",
+    "DIRECTION_INVALID",
+    "STRIKE_GRID_INVALID",
+    "TARGET_GRID_INVALID",
 })
 
 
@@ -105,10 +139,18 @@ class Config:
     max_candle_age_seconds: int = 150
 
     # Entry architecture: 1m trigger + 3m confirmation + 15m context.
+    # Opening discovery deliberately becomes usable before a mature 15m trend
+    # exists; 15m is context, never a warm-up gate.
     direction_entry_score_min: float = 0.44
+    opening_entry_score_min: float = 0.52
+    opening_strong_price_override_score: float = 0.70
     direction_reversal_score_min: float = 0.52
     min_1m_execution_confidence: float = 0.42
     min_3m_execution_confidence: float = 0.46
+    opening_min_1m_bars: int = 6
+    opening_min_3m_bars: int = 2
+    opening_warmup_minutes: int = 6
+    min_entry_minutes_to_close: float = 20.0
     max_entry_extension_atr: float = 0.80
     setup_max_age_minutes: int = 3
     setup_state_ttl_minutes: int = 8
@@ -158,7 +200,6 @@ class Config:
     min_oi_direction_confidence: float = 0.52
     min_oi_score_margin: float = 0.12
     min_mixed_price_confirmation: float = 0.65
-    consensus_setup_max_age_minutes: int = 6
 
     email_sender: str = ""
     email_receiver: str = ""
@@ -213,6 +254,8 @@ class Config:
             raise ScannerError("CONFIG_INVALID", "SMTP_PORT must be 465 (SSL) or 587 (STARTTLS)")
         for name, value in {
             "direction_entry_score_min": self.direction_entry_score_min,
+            "opening_entry_score_min": self.opening_entry_score_min,
+            "opening_strong_price_override_score": self.opening_strong_price_override_score,
             "direction_reversal_score_min": self.direction_reversal_score_min,
             "min_1m_execution_confidence": self.min_1m_execution_confidence,
             "min_3m_execution_confidence": self.min_3m_execution_confidence,
@@ -222,6 +265,16 @@ class Config:
                 raise ScannerError("CONFIG_INVALID", f"{name} must be between 0 and 1")
         if self.direction_reversal_score_min < self.direction_entry_score_min:
             raise ScannerError("CONFIG_INVALID", "direction_reversal_score_min must be >= direction_entry_score_min")
+        if self.opening_entry_score_min < self.direction_entry_score_min:
+            raise ScannerError("CONFIG_INVALID", "opening_entry_score_min must be >= direction_entry_score_min")
+        if self.opening_strong_price_override_score < self.opening_entry_score_min:
+            raise ScannerError("CONFIG_INVALID", "opening_strong_price_override_score must be >= opening_entry_score_min")
+        if self.opening_min_1m_bars < 4 or self.opening_min_3m_bars < 2:
+            raise ScannerError("CONFIG_INVALID", "opening discovery requires at least 4 one-minute bars and 2 three-minute bars")
+        if self.opening_warmup_minutes < 3:
+            raise ScannerError("CONFIG_INVALID", "opening_warmup_minutes must be at least 3")
+        if not math.isfinite(float(self.min_entry_minutes_to_close)) or self.min_entry_minutes_to_close < 0:
+            raise ScannerError("CONFIG_INVALID", "min_entry_minutes_to_close must be finite and nonnegative")
         for name, value in {
             "t1_partial_exit_pct": self.t1_partial_exit_pct,
             "max_premium_loss_pct": self.max_premium_loss_pct,
@@ -293,9 +346,15 @@ class Config:
             max_quote_age_seconds=int_env("MAX_QUOTE_AGE_SECONDS", 120),
             max_candle_age_seconds=int_env("MAX_CANDLE_AGE_SECONDS", 150),
             direction_entry_score_min=float_env("DIRECTION_ENTRY_SCORE_MIN", 0.44),
+            opening_entry_score_min=float_env("OPENING_ENTRY_SCORE_MIN", 0.52),
+            opening_strong_price_override_score=float_env("OPENING_STRONG_PRICE_OVERRIDE_SCORE", 0.70),
             direction_reversal_score_min=float_env("DIRECTION_REVERSAL_SCORE_MIN", 0.52),
             min_1m_execution_confidence=float_env("MIN_1M_EXECUTION_CONFIDENCE", 0.42),
             min_3m_execution_confidence=float_env("MIN_3M_EXECUTION_CONFIDENCE", 0.46),
+            opening_min_1m_bars=max(4, int_env("OPENING_MIN_1M_BARS", 6)),
+            opening_min_3m_bars=max(2, int_env("OPENING_MIN_3M_BARS", 2)),
+            opening_warmup_minutes=max(3, int_env("OPENING_WARMUP_MINUTES", 6)),
+            min_entry_minutes_to_close=float_env("MIN_ENTRY_MINUTES_TO_CLOSE", 20.0),
             max_entry_extension_atr=float_env("MAX_ENTRY_EXTENSION_ATR", 0.80),
             setup_max_age_minutes=int_env("SETUP_MAX_AGE_MINUTES", 3),
             setup_state_ttl_minutes=int_env("SETUP_STATE_TTL_MINUTES", 8),
@@ -604,6 +663,7 @@ def compact_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "execution_status", "execution_3m_direction", "execution_3m_confidence",
         "market_context_15m_bias", "market_context_15m_confidence", "market_context_15m_status",
         "reason", "atr_1m", "atr_3m", "atr_15m", "atr_5m", "efficiency_ratio", "efficiency_3m",
+        "opening_minutes_elapsed", "ema_fast_1m",
         "momentum_3m_points", "completed_1m_contiguous_count", "completed_3m_contiguous_count",
         "completed_15m_contiguous_count", "completed_5m_contiguous_count", "duplicate_1m_candle_count",
         "duplicate_3m_candle_count", "duplicate_15m_candle_count", "duplicate_5m_candle_count",
@@ -1975,7 +2035,146 @@ def _timeframe_direction(bars: Sequence[Candle], *, fast_period: int, slow_perio
     return direction, round(confidence, 4), fast, slow, efficiency
 
 
-def price_regime(candles_1m: Sequence[Candle], candles_3m: Sequence[Candle], candles_15m: Sequence[Candle]) -> dict[str, Any]:
+def _opening_1m_direction(one: Sequence[Candle], atr1: Optional[float], minimum_bars: int) -> tuple[str, float, Optional[float], Optional[float]]:
+    """Fast but bounded opening read from completed 1m bars.
+
+    This is intentionally less lagging than the normal EMA8 logic but requires
+    a minimum six-minute sample by default and caps confidence because the
+    opening auction/first prints are noisier than mature intraday structure.
+    """
+    if len(one) < minimum_bars:
+        return "UNKNOWN", 0.0, None, None
+    closes = [float(c.close) for c in one]
+    recent = closes[-min(6, len(closes)):]
+    ema_fast = ema(recent, 5)
+    if ema_fast is None or len(recent) < 4:
+        return "UNKNOWN", 0.0, ema_fast, None
+    momentum = recent[-1] - recent[-4]
+    diffs = [b - a for a, b in zip(recent, recent[1:])]
+    up = sum(x > 0 for x in diffs)
+    down = sum(x < 0 for x in diffs)
+    scale = max(float(atr1 or 0.0), 1.0)
+    latest = one[-1]
+    body = float(latest.close - latest.open)
+    if closes[-1] > float(ema_fast) and momentum > 0.12 * scale and up >= 3 and body > 0:
+        direction = "BULLISH"
+    elif closes[-1] < float(ema_fast) and momentum < -0.12 * scale and down >= 3 and body < 0:
+        direction = "BEARISH"
+    else:
+        direction = "MIXED"
+    consistency = max(up, down) / max(1, len(diffs))
+    momentum_strength = min(1.0, abs(momentum) / max(scale * 0.70, 1.0))
+    ema_distance = min(1.0, abs(closes[-1] - float(ema_fast)) / max(scale * 0.50, 1.0))
+    confidence = min(0.82, 0.42 * consistency + 0.38 * momentum_strength + 0.20 * ema_distance)
+    if direction == "MIXED":
+        confidence = min(confidence, 0.48)
+    return direction, round(confidence, 4), ema_fast, momentum
+
+
+def _opening_3m_direction(three: Sequence[Candle], atr3: Optional[float], minimum_bars: int) -> tuple[str, float, Optional[float], Optional[float], float]:
+    """Opening 3m confirmation using two or three *completed* bars only.
+
+    No synthetic bars and no slow EMA are used before enough history exists.
+    Direction instead requires net progress, directional candle bodies and a
+    strong close location, which is more appropriate for opening discovery.
+    """
+    if len(three) < minimum_bars:
+        return "UNKNOWN", 0.0, None, None, 0.0
+    bars = list(three[-min(3, len(three)):])
+    closes = [float(c.close) for c in bars]
+    net = closes[-1] - closes[0]
+    path = sum(abs(b - a) for a, b in zip(closes, closes[1:]))
+    efficiency = abs(net) / path if path > 0 else 0.0
+    scale = max(float(atr3 or 0.0), 1.0)
+    bullish_bodies = sum(c.close > c.open for c in bars)
+    bearish_bodies = sum(c.close < c.open for c in bars)
+    latest = bars[-1]
+    rng = max(float(latest.high - latest.low), 1e-9)
+    close_location = (float(latest.close) - float(latest.low)) / rng
+    minimum_move = max(0.12 * scale, 1.0)
+    needed_bodies = max(1, (len(bars) + 1) // 2)
+    if net > minimum_move and bullish_bodies >= needed_bodies and close_location >= 0.58:
+        direction = "BULLISH"
+    elif net < -minimum_move and bearish_bodies >= needed_bodies and close_location <= 0.42:
+        direction = "BEARISH"
+    elif efficiency <= 0.20 and abs(net) <= max(0.35 * scale, 1.0):
+        direction = "SIDEWAYS"
+    else:
+        direction = "MIXED"
+    body_share = max(bullish_bodies, bearish_bodies) / max(1, len(bars))
+    magnitude = min(1.0, abs(net) / max(scale * 0.65, 1.0))
+    location_strength = abs(close_location - 0.5) * 2.0
+    cap = 0.72 if len(bars) == 2 else 0.84
+    confidence = min(cap, 0.36 * body_share + 0.38 * magnitude + 0.26 * location_strength)
+    if direction == "SIDEWAYS":
+        confidence = max(0.45, min(cap, 1.0 - efficiency))
+    if direction == "MIXED":
+        confidence = min(confidence, 0.50)
+    fast = ema(closes, min(3, len(closes)))
+    return direction, round(confidence, 4), fast, None, efficiency
+
+
+def _developing_15m_context(fifteen: Sequence[Candle], atr15: Optional[float]) -> tuple[str, float, Optional[float], Optional[float], float, str]:
+    """Use the first completed 15m bar immediately as low-confidence context.
+
+    One/two bars are deliberately provisional; from three bars onward the
+    normal multi-bar direction model takes over. Missing 15m context never
+    counts against an otherwise valid 1m/3m trade.
+    """
+    n = len(fifteen)
+    if n == 0:
+        return "UNKNOWN", 0.0, None, None, 0.0, "NO_COMPLETED_15M_BAR"
+    if n >= 3:
+        direction, confidence, fast, slow, efficiency = _timeframe_direction(
+            fifteen, fast_period=3, slow_period=5, atr_value=atr15, minimum_bars=3
+        )
+        status = "DEVELOPING_CONTEXT" if n < 5 else "MATURE_CONTEXT"
+        return direction, confidence, fast, slow, efficiency, status
+
+    bars = list(fifteen[-n:])
+    scale = max(float(atr15 or 0.0), 1.0)
+    if n == 1:
+        bar = bars[0]
+        rng = max(float(bar.high - bar.low), 1e-9)
+        body = float(bar.close - bar.open)
+        close_location = (float(bar.close) - float(bar.low)) / rng
+        body_strength = min(1.0, abs(body) / max(0.55 * scale, 1.0))
+        if body > max(0.10 * scale, 1.0) and close_location >= 0.60:
+            direction = "BULLISH"
+        elif body < -max(0.10 * scale, 1.0) and close_location <= 0.40:
+            direction = "BEARISH"
+        elif abs(body) <= max(0.18 * scale, 1.0):
+            direction = "SIDEWAYS"
+        else:
+            direction = "MIXED"
+        confidence = min(0.48, 0.24 + 0.16 * body_strength + 0.08 * abs(close_location - 0.5) * 2.0)
+        return direction, round(confidence, 4), float(bar.close), None, 0.0, "PROVISIONAL_1BAR_CONTEXT"
+
+    first, second = bars[-2], bars[-1]
+    net = float(second.close - first.close)
+    path = abs(float(second.close - first.close))
+    efficiency = 1.0 if path > 0 else 0.0
+    latest_range = max(float(second.high - second.low), 1e-9)
+    close_location = (float(second.close) - float(second.low)) / latest_range
+    body_votes_bull = sum(c.close > c.open for c in bars)
+    body_votes_bear = sum(c.close < c.open for c in bars)
+    minimum_move = max(0.10 * scale, 1.0)
+    if net > minimum_move and body_votes_bull >= 1 and close_location >= 0.55:
+        direction = "BULLISH"
+    elif net < -minimum_move and body_votes_bear >= 1 and close_location <= 0.45:
+        direction = "BEARISH"
+    elif abs(net) <= max(0.22 * scale, 1.0):
+        direction = "SIDEWAYS"
+    else:
+        direction = "MIXED"
+    magnitude = min(1.0, abs(net) / max(0.70 * scale, 1.0))
+    confidence = min(0.62, 0.34 + 0.20 * magnitude + 0.08 * abs(close_location - 0.5) * 2.0)
+    if direction == "MIXED":
+        confidence = min(confidence, 0.46)
+    return direction, round(confidence, 4), ema([first.close, second.close], 2), None, efficiency, "DEVELOPING_2BAR_CONTEXT"
+
+
+def price_regime(candles_1m: Sequence[Candle], candles_3m: Sequence[Candle], candles_15m: Sequence[Candle], config: Optional[Config] = None) -> dict[str, Any]:
     """v108 market structure: 1m trigger, 3m execution confirmation, 15m context.
 
     The 15-minute layer supplies regime/support-resistance context and never
@@ -1991,14 +2190,28 @@ def price_regime(candles_1m: Sequence[Candle], candles_3m: Sequence[Candle], can
     atr3 = atr(three, 10)
     atr15 = atr(fifteen, 8)
 
+    cfg_open_1m = int(config.opening_min_1m_bars) if config is not None else 6
+    cfg_open_3m = int(config.opening_min_3m_bars) if config is not None else 2
+    warmup_minutes = int(config.opening_warmup_minutes) if config is not None else 6
+    session_open = datetime.combine(one[-1].start.astimezone(IST).date(), dtime(9, 15), tzinfo=IST) if one else None
+    latest_close_time = one[-1].close_time.astimezone(IST) if one else None
+    opening_minutes_elapsed = ((latest_close_time - session_open).total_seconds() / 60.0) if session_open and latest_close_time else 0.0
+    before_0930 = bool(latest_close_time and latest_close_time.time() <= dtime(9, 30))
+
     execution_1m = "UNKNOWN"
     execution_1m_conf = 0.0
     ema8_1 = None
+    ema_fast_1m = None
     momentum_3m = None
     execution_status = "INSUFFICIENT_CONTIGUOUS_1M_HISTORY"
-    if len(one) >= 8:
+    if before_0930 and len(one) >= cfg_open_1m:
+        execution_1m, execution_1m_conf, ema_fast_1m, momentum_3m = _opening_1m_direction(one, atr1, cfg_open_1m)
+        ema8_1 = ema([c.close for c in one[-min(8, len(one)):]], min(8, len(one)))
+        execution_status = "OPENING_READY" if execution_1m in {"BULLISH", "BEARISH"} else "OPENING_MIXED_PRICE_ACTION"
+    elif len(one) >= 8:
         closes = [c.close for c in one]
         ema8_1 = ema(closes[-18:], 8)
+        ema_fast_1m = ema8_1
         prev_ema = ema(closes[-19:-1], 8) if len(closes) >= 9 else None
         momentum_3m = closes[-1] - closes[-4]
         recent = closes[-5:]
@@ -2018,20 +2231,22 @@ def price_regime(candles_1m: Sequence[Candle], candles_3m: Sequence[Candle], can
         execution_1m_conf = round(0.40 * consistency + 0.38 * momentum_strength + 0.22 * ema_distance, 4)
         execution_status = "READY" if execution_1m in {"BULLISH", "BEARISH"} else "MIXED_PRICE_ACTION"
 
-    direction_3m, confidence_3m, ema5_3m, ema9_3m, efficiency_3m = _timeframe_direction(
-        three, fast_period=5, slow_period=9, atr_value=atr3, minimum_bars=4
-    )
-    context_15m, confidence_15m, ema3_15m, ema5_15m, efficiency_15m = _timeframe_direction(
-        fifteen, fast_period=3, slow_period=5, atr_value=atr15, minimum_bars=3
-    )
-    context_status = (
-        "INSUFFICIENT_COMPLETED_15M_BARS" if len(fifteen) < 3
-        else "DEVELOPING_CONTEXT" if len(fifteen) < 5
-        else "MATURE_CONTEXT"
-    )
+    if before_0930 and len(three) >= cfg_open_3m and len(three) < 4:
+        direction_3m, confidence_3m, ema5_3m, ema9_3m, efficiency_3m = _opening_3m_direction(three, atr3, cfg_open_3m)
+    else:
+        direction_3m, confidence_3m, ema5_3m, ema9_3m, efficiency_3m = _timeframe_direction(
+            three, fast_period=5, slow_period=9, atr_value=atr3, minimum_bars=4
+        )
+    context_15m, confidence_15m, ema3_15m, ema5_15m, efficiency_15m, context_status = _developing_15m_context(fifteen, atr15)
 
-    if execution_1m == "UNKNOWN" or direction_3m == "UNKNOWN":
+    if opening_minutes_elapsed < warmup_minutes:
+        regime = "OPENING_WARMUP"
+    elif execution_1m == "UNKNOWN" or direction_3m == "UNKNOWN":
         regime = "EARLY_SESSION"
+    elif before_0930 and execution_1m == direction_3m == "BULLISH":
+        regime = "OPENING_DISCOVERY_BULLISH"
+    elif before_0930 and execution_1m == direction_3m == "BEARISH":
+        regime = "OPENING_DISCOVERY_BEARISH"
     elif context_15m == "SIDEWAYS":
         regime = "SIDEWAYS"
     elif execution_1m == direction_3m == "BULLISH":
@@ -2073,6 +2288,8 @@ def price_regime(candles_1m: Sequence[Candle], candles_3m: Sequence[Candle], can
         "atr_5m": atr3,
         "momentum_3m_points": momentum_3m,
         "ema8_1m": ema8_1,
+        "ema_fast_1m": ema_fast_1m,
+        "opening_minutes_elapsed": opening_minutes_elapsed,
         "ema5_3m": ema5_3m,
         "ema9_3m": ema9_3m,
         "ema3_15m": ema3_15m,
@@ -2168,7 +2385,15 @@ def build_levels(
         for idx, value in highs3[-6:]:
             levels.append(PriceLevel(value, "RESISTANCE", f"3M_SWING_HIGH_{candles_3m[idx].start.astimezone(IST).strftime('%H%M')}", 1.9))
 
-    # 15m pivots are broader regime support/resistance, not entry-delay gates.
+    # 15m context becomes useful from the first completed bar. One/two bars
+    # contribute developing range boundaries; confirmed pivots take over once
+    # sufficient bars exist. This improves early support/resistance without
+    # making 15m a timing gate.
+    if candles_15m:
+        context_tail = list(candles_15m[-min(2, len(candles_15m)):])
+        context_strength = 1.75 if len(candles_15m) == 1 else 2.05
+        levels.append(PriceLevel(min(c.low for c in context_tail), "SUPPORT", "15M_CONTEXT_RANGE_LOW", context_strength))
+        levels.append(PriceLevel(max(c.high for c in context_tail), "RESISTANCE", "15M_CONTEXT_RANGE_HIGH", context_strength))
     if len(candles_15m) >= 3:
         lows15, highs15 = confirmed_pivots(candles_15m, 1, 1)
         for idx, value in lows15[-4:]:
@@ -2265,7 +2490,10 @@ def detect_setup(candles: Sequence[Candle], levels: Sequence[PriceLevel], struct
     Fifteen-minute context classifies the setup (trend/reversal/range) but does
     not delay it. OI is intentionally not required to persist for two snapshots.
     """
-    if len(candles) < 8:
+    regime = str(structure.get("regime") or "TRANSITION").upper()
+    opening_mode = regime.startswith("OPENING_DISCOVERY")
+    minimum_1m_bars = config.opening_min_1m_bars if opening_mode else 8
+    if len(candles) < minimum_1m_bars:
         return None
     current = candles[-1]
     previous = candles[-2]
@@ -2293,7 +2521,7 @@ def detect_setup(candles: Sequence[Candle], levels: Sequence[PriceLevel], struct
     micro_break = current.close > previous.high if direction == "BULLISH" else current.close < previous.low
     recent = list(candles[-4:])
     pullback_seen = any(c.close < c.open for c in recent[:-1]) if direction == "BULLISH" else any(c.close > c.open for c in recent[:-1])
-    ema8 = structure.get("ema8_1m")
+    ema8 = structure.get("ema_fast_1m") if opening_mode else structure.get("ema8_1m")
     resumed_from_ema = False
     try:
         if ema8 is not None:
@@ -2700,10 +2928,12 @@ def build_direction_consensus(
             0.05, {"direction": setup.direction, "kind": setup.kind})
 
     score = weighted / used_weight if used_weight > 0 else 0.0
+    regime = str(structure.get("regime") or "TRANSITION").upper()
+    entry_threshold = config.opening_entry_score_min if regime.startswith("OPENING_DISCOVERY") else config.direction_entry_score_min
     direction = "MIXED"
-    if score >= config.direction_entry_score_min:
+    if score >= entry_threshold:
         direction = "BULLISH"
-    elif score <= -config.direction_entry_score_min:
+    elif score <= -entry_threshold:
         direction = "BEARISH"
     aligned = sum(1 for item in components.values() if item["signal"] * score > 0.02)
     opposed = sum(1 for item in components.values() if item["signal"] * score < -0.02)
@@ -2711,7 +2941,7 @@ def build_direction_consensus(
         "direction": direction,
         "score": round(score, 5),
         "confidence": round(abs(score), 5),
-        "entry_threshold": config.direction_entry_score_min,
+        "entry_threshold": entry_threshold,
         "reversal_threshold": config.direction_reversal_score_min,
         "aligned_components": aligned,
         "opposed_components": opposed,
@@ -2753,8 +2983,9 @@ def authorize_consensus_entry(
     """Authorize early entry from price structure; use OI as a veto only when extreme."""
     direction = str(consensus.get("direction") or "MIXED").upper()
     score = abs(float(consensus.get("score") or 0.0))
-    if direction not in {"BULLISH", "BEARISH"} or score < config.direction_entry_score_min:
-        raise ScannerError("DIRECTION_CONSENSUS_WEAK", f"Weighted direction score {float(consensus.get('score') or 0.0):.2f} is below the entry threshold")
+    required_threshold = float(consensus.get("entry_threshold") or config.direction_entry_score_min)
+    if direction not in {"BULLISH", "BEARISH"} or score < required_threshold:
+        raise ScannerError("DIRECTION_CONSENSUS_WEAK", f"Weighted direction score {float(consensus.get('score') or 0.0):.2f} is below the entry threshold {required_threshold:.2f}")
     if setup.direction != direction:
         raise ScannerError("SETUP_DIRECTION_CONFLICT", f"Setup points {setup.direction}, while weighted consensus points {direction}")
     d1 = str(structure.get("execution_direction") or "UNKNOWN").upper()
@@ -2765,6 +2996,22 @@ def authorize_consensus_entry(
         raise ScannerError("PRICE_1M_3M_NOT_ALIGNED", f"Entry requires aligned 1m/3m price direction; got {d1}/{d3}")
     if c1 < config.min_1m_execution_confidence or c3 < config.min_3m_execution_confidence:
         raise ScannerError("PRICE_CONFIRMATION_WEAK", f"1m/3m confidence {c1:.2f}/{c3:.2f} is below configured thresholds")
+
+    regime = str(structure.get("regime") or "TRANSITION").upper()
+    if regime.startswith("OPENING_DISCOVERY"):
+        components = consensus.get("components") if isinstance(consensus.get("components"), Mapping) else {}
+        direction_sign = _direction_sign(direction)
+        independent_aligned = False
+        for name in ("futures_positioning", "oi_current"):
+            item = components.get(name) if isinstance(components, Mapping) else None
+            if isinstance(item, Mapping) and float(item.get("signal") or 0.0) * direction_sign >= 0.08:
+                independent_aligned = True
+                break
+        if not independent_aligned and score < config.opening_strong_price_override_score:
+            raise ScannerError(
+                "OPENING_CONFIRMATION_INSUFFICIENT",
+                "Opening entry requires aligned futures/OI confirmation or an exceptionally strong 1m/3m price score",
+            )
 
     # No two-snapshot OI persistence requirement. Only block when fresh OI is
     # extremely opposite AND another independent derivative input agrees.
@@ -3147,6 +3394,11 @@ def choose_oi_targets_and_stop(
     minutes_left = max(0.0, (close_time - local_now).total_seconds() / 60.0)
     if minutes_left <= 0:
         raise ScannerError("MARKET_CLOSED", "No trading time remains")
+    if minutes_left < config.min_entry_minutes_to_close:
+        raise ScannerError(
+            "ENTRY_TOO_CLOSE_TO_MARKET_CLOSE",
+            f"Only {minutes_left:.1f} minutes remain; v108.1 requires at least {config.min_entry_minutes_to_close:.1f} minutes for a new position",
+        )
 
     intermediate = [row for row in deduped if row["distance"] < t1_distance - 1e-9][:5]
     return {
@@ -4138,7 +4390,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         futures_vwap = valid_futures_vwap(futures_candles)
         bars_3m = aggregate_candles(index_candles, 3, now)
         bars_15m = aggregate_candles(index_candles, 15, now)
-        structure = price_regime(index_candles, bars_3m, bars_15m)
+        structure = price_regime(index_candles, bars_3m, bars_15m, config)
         spot_quote_keys = [index_key] + ([future_key] if future_key else [])
         live_records, _ = _build_live_records(chain_records, option_instruments, spot_chain, step_limit=6)
         all_quote_keys = spot_quote_keys + [r.instrument_key for r in live_records]
@@ -4380,10 +4632,20 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                     "reason_code": "WAITING_FOR_POST_EXIT_SETUP",
                     "message": "A fresh setup confirmed after the prior position exit is required before another same-session entry.",
                 })
-            else:
+            elif exit_block is not None and not allow_reversal_entry:
+                last_exit = state.get("last_position_exit") if isinstance(state.get("last_position_exit"), Mapping) else {}
+                same_direction_reentry = str(last_exit.get("direction") or "").upper() == setup.direction
+                newest_3m_close = bars_3m[-1].close_time if bars_3m else None
+                if same_direction_reentry and (newest_3m_close is None or newest_3m_close <= exit_block):
+                    base_result.update({
+                        "decision": "NO_TRADE",
+                        "reason_code": "WAITING_FOR_FRESH_3M_STRUCTURE",
+                        "message": "Same-direction re-entry is allowed without a time cooldown, but requires a newly completed 3-minute structure bar after the prior exit.",
+                    })
+                    setup = None
+            if can_evaluate_new_entry and setup is not None and base_result.get("reason_code") != "WAITING_FOR_FRESH_3M_STRUCTURE":
                 setup_age = (quote_received_at - setup.confirmed_at).total_seconds()
-                max_setup_age = (config.setup_max_age_minutes if setup.kind != "CONSENSUS_PULLBACK_CONTINUATION"
-                                 else config.consensus_setup_max_age_minutes)
+                max_setup_age = config.setup_max_age_minutes
                 if setup_age < -1 or setup_age > max_setup_age * 60:
                     raise ScannerError("MISSED_OR_STALE_SETUP", f"Setup confirmation is {setup_age:.0f}s old; no backdated entry allowed")
                 validate_live_setup_trigger(setup, spot, max(0.5, float(structure.get("atr_1m") or 0.0) * 0.15))
