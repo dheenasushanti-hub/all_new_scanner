@@ -1,16 +1,9 @@
-name: NIFTY 50 OI-First Position Manager v108.1.0
+name: NIFTY 50 Structure-First Position Manager v108.1.0
 
 on:
   # The existing Cloudflare Worker controls dispatch cadence.
   workflow_dispatch:
     inputs:
-      reconcile_position:
-        description: >-
-          Optional legacy-position recovery only. Enter 'flat' to explicitly confirm
-          no legacy advisory position is being tracked, or provide the exact legacy
-          signal key you explicitly wish to recover. Never infer a brokerage holding.
-        required: false
-        type: string
       requeue_signal_key:
         description: >-
           Optional notification key to requeue only after manually checking
@@ -37,12 +30,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Synchronize scanner state with main
+      - name: Synchronize scanner state with default branch
         shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          git fetch origin main
-          git checkout -B main origin/main
+          git fetch origin "$DEFAULT_BRANCH"
+          git checkout -B "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -66,23 +61,6 @@ jobs:
           restore-keys: |
             upstox-nse-instrument-master-${{ runner.os }}-
 
-      - name: Reconcile v106 advisory position (first deployment only)
-        if: ${{ inputs.reconcile_position != '' }}
-        env:
-          UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
-          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-          EMAIL_USERNAME: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          SMTP_HOST: smtp.gmail.com
-          SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v108.json
-          AUDIT_DIR: audit
-          INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
-          RECONCILE_POSITION: ${{ inputs.reconcile_position }}
-        shell: bash
-        run: python market_scanner.py --reconcile-position "$RECONCILE_POSITION"
-
       - name: Requeue one manually verified uncertain alert (optional)
         if: ${{ inputs.requeue_signal_key != '' }}
         env:
@@ -98,7 +76,7 @@ jobs:
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           REQUEUE_SIGNAL_KEY: ${{ inputs.requeue_signal_key }}
         shell: bash
-        run: python market_scanner.py --requeue-notification "$REQUEUE_SIGNAL_KEY"
+        run: python market_scanner_v108.py --requeue-notification "$REQUEUE_SIGNAL_KEY"
 
       - name: Run v108 market scan and claim queued notifications
         env:
@@ -119,10 +97,9 @@ jobs:
         run: |
           set -euo pipefail
           session_date="$(TZ=Asia/Kolkata date +%F)"
-          python market_scanner.py --scan-and-claim 2>&1 | tee -a "audit/worker_${session_date}.log"
+          python market_scanner_v108.py --scan-and-claim 2>&1 | tee -a "audit/worker_${session_date}.log"
 
-      # Commit the durable claim before contacting SMTP. A later run must not
-      # resend a message whose delivery may already have been accepted.
+      # Persist the durable notification claim before contacting SMTP.
       - name: Persist position state and notification claims before email
         id: persist_claims
         if: success()
@@ -130,18 +107,34 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          [[ ! -f state/market_state_v108.json ]] || git add -f -- state/market_state_v108.json
-          audit_files=(audit/market_scan_*.jsonl audit/market_scan_diagnostics_*.jsonl audit/worker_*.log)
-          if (( ${#audit_files[@]} > 0 )); then git add -f -- "${audit_files[@]}"; fi
+
+          [[ ! -f state/market_state_v108.json ]] || \
+            git add -f -- state/market_state_v108.json
+
+          audit_files=(
+            audit/market_scan_*.jsonl
+            audit/market_scan_diagnostics_*.jsonl
+            audit/worker_*.log
+          )
+
+          if (( ${#audit_files[@]} > 0 )); then
+            git add -f -- "${audit_files[@]}"
+          fi
+
           if git diff --cached --quiet; then
             echo "No pre-delivery state changes to persist."
             exit 0
           fi
+
           git commit -m "Persist NIFTY v108 position state and email claims"
-          if ! git push origin HEAD:main; then
-            echo "::error::main changed while this scanner run was executing."
+
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+
+          if ! git push origin "HEAD:${DEFAULT_BRANCH}"; then
+            echo "::error::${DEFAULT_BRANCH} changed while this scanner run was executing."
             echo "::error::Refusing to merge durable trading state automatically."
             exit 1
           fi
@@ -160,7 +153,7 @@ jobs:
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           NOTIFICATION_CLAIM_TOKEN: ${{ github.run_id }}:${{ github.run_attempt }}
         shell: bash
-        run: python market_scanner.py --deliver-claimed
+        run: python market_scanner_v108.py --deliver-claimed
 
       - name: Persist final position and notification status
         if: ${{ always() && steps.persist_claims.outcome == 'success' }}
@@ -168,18 +161,34 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          [[ ! -f state/market_state_v108.json ]] || git add -f -- state/market_state_v108.json
-          audit_files=(audit/market_scan_*.jsonl audit/market_scan_diagnostics_*.jsonl audit/worker_*.log)
-          if (( ${#audit_files[@]} > 0 )); then git add -f -- "${audit_files[@]}"; fi
+
+          [[ ! -f state/market_state_v108.json ]] || \
+            git add -f -- state/market_state_v108.json
+
+          audit_files=(
+            audit/market_scan_*.jsonl
+            audit/market_scan_diagnostics_*.jsonl
+            audit/worker_*.log
+          )
+
+          if (( ${#audit_files[@]} > 0 )); then
+            git add -f -- "${audit_files[@]}"
+          fi
+
           if git diff --cached --quiet; then
             echo "No final state changes to persist."
             exit 0
           fi
+
           git commit -m "Update NIFTY v108 position and notification status"
-          if ! git push origin HEAD:main; then
-            echo "::error::main changed before final notification state could be persisted."
+
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+
+          if ! git push origin "HEAD:${DEFAULT_BRANCH}"; then
+            echo "::error::${DEFAULT_BRANCH} changed before final notification state could be persisted."
             echo "::error::Refusing to merge durable trading state automatically."
             exit 1
           fi
