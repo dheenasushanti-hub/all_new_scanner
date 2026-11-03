@@ -1,4 +1,4 @@
-name: NIFTY 50 OI-First Position Manager v107.0.0
+name: NIFTY 50 OI-First Position Manager v108.1.0
 
 on:
   # The existing Cloudflare Worker controls dispatch cadence.
@@ -6,7 +6,7 @@ on:
     inputs:
       reconcile_position:
         description: >-
-          First v107 deployment only. Enter 'flat' if no v106 advisory position
+          First v108 deployment only. Enter 'flat' if no v106 advisory position
           is being tracked, or the exact v106 signal key you explicitly wish to
           recover. Never infer an actual brokerage holding from last_signal.
         required: false
@@ -69,7 +69,7 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v107.json
+          STATE_FILE: state/market_state_v108.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           RECONCILE_POSITION: ${{ inputs.reconcile_position }}
@@ -86,14 +86,14 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v107.json
+          STATE_FILE: state/market_state_v108.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           REQUEUE_SIGNAL_KEY: ${{ inputs.requeue_signal_key }}
         shell: bash
         run: python market_scanner.py --requeue-notification "$REQUEUE_SIGNAL_KEY"
 
-      - name: Run v107 market scan and claim queued notifications
+      - name: Run v108 market scan and claim queued notifications
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
@@ -102,7 +102,7 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v107.json
+          STATE_FILE: state/market_state_v108.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           NOTIFICATION_CLAIM_TOKEN: ${{ github.run_id }}:${{ github.run_attempt }}
@@ -133,14 +133,14 @@ jobs:
           shopt -s nullglob
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          [[ ! -f state/market_state_v107.json ]] || git add -f -- state/market_state_v107.json
+          [[ ! -f state/market_state_v108.json ]] || git add -f -- state/market_state_v108.json
           audit_files=(audit/market_scan_*.jsonl audit/market_scan_diagnostics_*.jsonl audit/worker_*.log)
           if (( ${#audit_files[@]} > 0 )); then git add -f -- "${audit_files[@]}"; fi
           if git diff --cached --quiet; then
             echo "No pre-delivery state changes to persist."
             exit 0
           fi
-          git commit -m "Persist NIFTY v107 position state and email claims"
+          git commit -m "Persist NIFTY v108 position state and email claims"
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
 
@@ -153,7 +153,7 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
-          STATE_FILE: state/market_state_v107.json
+          STATE_FILE: state/market_state_v108.json
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           NOTIFICATION_CLAIM_TOKEN: ${{ github.run_id }}:${{ github.run_attempt }}
@@ -168,13 +168,13 @@ jobs:
           shopt -s nullglob
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          [[ ! -f state/market_state_v107.json ]] || git add -f -- state/market_state_v107.json
+          [[ ! -f state/market_state_v108.json ]] || git add -f -- state/market_state_v108.json
           audit_files=(audit/market_scan_*.jsonl audit/market_scan_diagnostics_*.jsonl audit/worker_*.log)
           if (( ${#audit_files[@]} > 0 )); then git add -f -- "${audit_files[@]}"; fi
           if git diff --cached --quiet; then
             echo "No final state changes to persist."
             exit 0
           fi
-          git commit -m "Update NIFTY v107 position and notification status"
+          git commit -m "Update NIFTY v108 position and notification status"
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
