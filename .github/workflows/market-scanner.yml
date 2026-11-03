@@ -6,9 +6,9 @@ on:
     inputs:
       reconcile_position:
         description: >-
-          First v108 deployment only. Enter 'flat' if no v106 advisory position
-          is being tracked, or the exact v106 signal key you explicitly wish to
-          recover. Never infer an actual brokerage holding from last_signal.
+          Optional legacy-position recovery only. Enter 'flat' to explicitly confirm
+          no legacy advisory position is being tracked, or provide the exact legacy
+          signal key you explicitly wish to recover. Never infer a brokerage holding.
         required: false
         type: string
       requeue_signal_key:
@@ -36,6 +36,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Synchronize scanner state with main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout -B main origin/main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -106,15 +113,6 @@ jobs:
           AUDIT_DIR: audit
           INSTRUMENT_CACHE_FILE: .cache/upstox_nse.json.gz
           NOTIFICATION_CLAIM_TOKEN: ${{ github.run_id }}:${{ github.run_attempt }}
-          OI_MATERIAL_THRESHOLD_PCT: "2.0"
-          MIN_UNDERLYING_RR: "2.0"
-          EXPECTED_OI_INTERVAL_SECONDS: "180"
-          T1_PARTIAL_EXIT_PCT: "50"
-          MAX_PREMIUM_LOSS_PCT: "20"
-          PREMIUM_TRAILING_DRAWDOWN_PCT: "25"
-          PREMIUM_DECAY_REVIEW_MINUTES: "15"
-          PREMIUM_DECAY_MIN_LOSS_PCT: "12"
-          NO_PROGRESS_MIN_SPOT_MOVE_ATR: "0.25"
           LOG_LEVEL: INFO
           SCANNER_DEBUG_AUDIT: "false"
         shell: bash
@@ -126,6 +124,7 @@ jobs:
       # Commit the durable claim before contacting SMTP. A later run must not
       # resend a message whose delivery may already have been accepted.
       - name: Persist position state and notification claims before email
+        id: persist_claims
         if: success()
         shell: bash
         run: |
@@ -141,8 +140,11 @@ jobs:
             exit 0
           fi
           git commit -m "Persist NIFTY v108 position state and email claims"
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          if ! git push origin HEAD:main; then
+            echo "::error::main changed while this scanner run was executing."
+            echo "::error::Refusing to merge durable trading state automatically."
+            exit 1
+          fi
 
       - name: Send only notifications claimed by this workflow attempt
         env:
@@ -161,7 +163,7 @@ jobs:
         run: python market_scanner.py --deliver-claimed
 
       - name: Persist final position and notification status
-        if: always()
+        if: ${{ always() && steps.persist_claims.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -176,5 +178,8 @@ jobs:
             exit 0
           fi
           git commit -m "Update NIFTY v108 position and notification status"
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          if ! git push origin HEAD:main; then
+            echo "::error::main changed before final notification state could be persisted."
+            echo "::error::Refusing to merge durable trading state automatically."
+            exit 1
+          fi
