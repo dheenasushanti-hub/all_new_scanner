@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY 50 multi-timeframe predictive intraday scanner with persistent position management v108.1.0.
+"""NIFTY 50 multi-timeframe predictive intraday scanner with persistent position management v109.0.0.
 
 Single-file runtime for an intraday workflow. Entry timing is based on completed
 1-minute and 3-minute structure, while 15-minute structure supplies market context. It never places orders. Tests and documentation are separate files.
@@ -13,8 +13,8 @@ Design contract:
 - spot risk/reward is validated against local structure; option premium RR is not used;
 - state is written atomically before notification is attempted;
 - failures produce explicit reason codes and never silently reuse stale data.
-
-Sources of truth for the API adapter are documented in RESEARCH_NOTES.md.
+- the persistent market thesis changes only on structural invalidation; short-term opposite momentum is treated as a pullback while defended structure survives.
+- after T1, the runner is managed as a separate profit-protection  with structural/OI stop ratcheting and option-premium/theta safeguards.
 """
 from __future__ import annotations
 
@@ -44,8 +44,8 @@ from statistics import median
 from typing import Any, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "108.1.0"
-SCHEMA_VERSION = 108
+VERSION = "109.0.0"
+SCHEMA_VERSION = 109
 IST = ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
 API_BASE = "https://api.upstox.com"
@@ -53,7 +53,7 @@ INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/N
 LOG = logging.getLogger("nifty_scanner")
 
 # Operational failures must make the GitHub Actions step fail. Market-quality
-# blocks (for example low RR, missing OI persistence, stale setup) remain
+# blocks (for example low RR, weak setup, intact countertrend support) remain
 # fail-closed NO_TRADE decisions but are not process failures.
 OPERATIONAL_FAILURE_CODES = frozenset({
     # Code/config/state integrity.
@@ -123,7 +123,7 @@ class ScannerError(RuntimeError):
 @dataclass(frozen=True)
 class Config:
     token: str
-    state_file: Path = Path("state/market_state_v108.json")
+    state_file: Path = Path("state/market_state_v109.json")
     audit_dir: Path = Path("audit")
     instrument_cache: Path = Path(".cache/upstox_nse.json.gz")
     explicit_expiry: Optional[date] = None
@@ -157,7 +157,16 @@ class Config:
     pivot_left: int = 2
     pivot_right: int = 2
 
-    # Local NIFTY risk/target design.
+    # Persistent market-thesis / structure invalidation.  A short-term momentum
+    # flip is a pullback until a defended support/resistance zone actually fails.
+    thesis_break_buffer_atr: float = 0.25
+    thesis_test_zone_atr: float = 0.45
+    thesis_min_level_strength: float = 1.80
+    thesis_oi_support_score_min: float = 0.45
+    thesis_oi_break_score_min: float = 0.55
+
+    # Local NIFTY risk/target design.  Trend trades use meaningful 50-point
+    # landmarks rather than tiny micro-swings as profit objectives.
     min_underlying_rr: float = 1.25
     minimum_stop_points: float = 6.0
     min_initial_stop_atr: float = 0.75
@@ -168,6 +177,9 @@ class Config:
     target1_min_points: float = 12.0
     target1_max_points: float = 65.0
     target2_max_points: float = 115.0
+    trend_target_min_points: float = 25.0
+    trend_target1_max_points: float = 85.0
+    trend_target2_max_points: float = 135.0
     level_cluster_atr_fraction: float = 0.12
     min_level_strength: float = 1.0
     t1_partial_exit_pct: float = 50.0
@@ -186,15 +198,24 @@ class Config:
     min_option_volume: float = 1.0
     expected_hold_minutes: float = 12.0
 
-    # Position management: react quickly to reversal/sideways/no-progress.
+    # Position management. Before T1 we protect the structural thesis; after T1
+    # we protect profit with a dedicated runner state so theta cannot silently
+    # consume a winning option while NIFTY chops around support/resistance.
     max_premium_loss_pct: float = 18.0
-    premium_trailing_drawdown_pct: float = 22.0
+    premium_trailing_drawdown_pct: float = 22.0  # legacy fallback / hard cap
     premium_decay_review_minutes: float = 8.0
     premium_decay_min_loss_pct: float = 10.0
     no_progress_min_spot_move_atr: float = 0.30
     sideways_exit_minutes: float = 6.0
     sideways_max_progress_atr: float = 0.40
     sideways_consensus_abs_max: float = 0.22
+    pre_t1_trail_min_progress_atr: float = 0.75
+    post_t1_base_peak_drawdown_pct: float = 13.0
+    post_t1_expiry_afternoon_drawdown_pct: float = 9.0
+    post_t1_min_no_progress_bars: int = 2
+    post_t1_supportive_oi_extra_bars: int = 1
+    post_t1_min_progress_atr: float = 0.25
+    post_t1_theta_fraction_limit: float = 0.04
 
     # Retained compatibility knobs used by diagnostics / legacy helpers.
     min_oi_direction_confidence: float = 0.52
@@ -231,7 +252,18 @@ class Config:
             "target1_min_points": self.target1_min_points,
             "target1_max_points": self.target1_max_points,
             "target2_max_points": self.target2_max_points,
+            "trend_target_min_points": self.trend_target_min_points,
+            "trend_target1_max_points": self.trend_target1_max_points,
+            "trend_target2_max_points": self.trend_target2_max_points,
+            "thesis_break_buffer_atr": self.thesis_break_buffer_atr,
+            "thesis_test_zone_atr": self.thesis_test_zone_atr,
+            "thesis_min_level_strength": self.thesis_min_level_strength,
             "premium_decay_review_minutes": self.premium_decay_review_minutes,
+            "pre_t1_trail_min_progress_atr": self.pre_t1_trail_min_progress_atr,
+            "post_t1_base_peak_drawdown_pct": self.post_t1_base_peak_drawdown_pct,
+            "post_t1_expiry_afternoon_drawdown_pct": self.post_t1_expiry_afternoon_drawdown_pct,
+            "post_t1_min_progress_atr": self.post_t1_min_progress_atr,
+            "post_t1_theta_fraction_limit": self.post_t1_theta_fraction_limit,
         }
         for name, value in positive.items():
             if not math.isfinite(float(value)) or float(value) <= 0:
@@ -242,6 +274,10 @@ class Config:
             raise ScannerError("CONFIG_INVALID", "TARGET1_MAX_POINTS must exceed TARGET1_MIN_POINTS")
         if self.target2_max_points <= self.target1_max_points:
             raise ScannerError("CONFIG_INVALID", "TARGET2_MAX_POINTS must exceed TARGET1_MAX_POINTS")
+        if self.trend_target1_max_points <= self.trend_target_min_points:
+            raise ScannerError("CONFIG_INVALID", "TREND_TARGET1_MAX_POINTS must exceed TREND_TARGET_MIN_POINTS")
+        if self.trend_target2_max_points <= self.trend_target1_max_points:
+            raise ScannerError("CONFIG_INVALID", "TREND_TARGET2_MAX_POINTS must exceed TREND_TARGET1_MAX_POINTS")
         if self.min_abs_delta < 0 or self.max_abs_delta > 1 or self.min_abs_delta >= self.max_abs_delta:
             raise ScannerError("CONFIG_INVALID", "Delta limits must satisfy 0 <= min_abs_delta < max_abs_delta <= 1")
         if not self.min_abs_delta <= self.preferred_abs_delta <= self.max_abs_delta:
@@ -260,6 +296,9 @@ class Config:
             "min_1m_execution_confidence": self.min_1m_execution_confidence,
             "min_3m_execution_confidence": self.min_3m_execution_confidence,
             "sideways_consensus_abs_max": self.sideways_consensus_abs_max,
+            "thesis_oi_support_score_min": self.thesis_oi_support_score_min,
+            "thesis_oi_break_score_min": self.thesis_oi_break_score_min,
+            "post_t1_theta_fraction_limit": self.post_t1_theta_fraction_limit,
         }.items():
             if not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0:
                 raise ScannerError("CONFIG_INVALID", f"{name} must be between 0 and 1")
@@ -269,6 +308,8 @@ class Config:
             raise ScannerError("CONFIG_INVALID", "opening_entry_score_min must be >= direction_entry_score_min")
         if self.opening_strong_price_override_score < self.opening_entry_score_min:
             raise ScannerError("CONFIG_INVALID", "opening_strong_price_override_score must be >= opening_entry_score_min")
+        if self.post_t1_min_no_progress_bars < 1 or self.post_t1_supportive_oi_extra_bars < 0:
+            raise ScannerError("CONFIG_INVALID", "post-T1 runner bar counts are invalid")
         if self.opening_min_1m_bars < 4 or self.opening_min_3m_bars < 2:
             raise ScannerError("CONFIG_INVALID", "opening discovery requires at least 4 one-minute bars and 2 three-minute bars")
         if self.opening_warmup_minutes < 3:
@@ -280,11 +321,15 @@ class Config:
             "max_premium_loss_pct": self.max_premium_loss_pct,
             "premium_trailing_drawdown_pct": self.premium_trailing_drawdown_pct,
             "premium_decay_min_loss_pct": self.premium_decay_min_loss_pct,
+            "post_t1_base_peak_drawdown_pct": self.post_t1_base_peak_drawdown_pct,
+            "post_t1_expiry_afternoon_drawdown_pct": self.post_t1_expiry_afternoon_drawdown_pct,
         }.items():
             if not math.isfinite(float(value)) or not 0.0 <= float(value) <= 100.0:
                 raise ScannerError("CONFIG_INVALID", f"{name} must be between 0 and 100")
         if not 0.0 < self.t1_partial_exit_pct < 100.0:
             raise ScannerError("CONFIG_INVALID", "T1_PARTIAL_EXIT_PCT must be greater than 0 and less than 100")
+        if self.post_t1_expiry_afternoon_drawdown_pct > self.post_t1_base_peak_drawdown_pct:
+            raise ScannerError("CONFIG_INVALID", "POST_T1_EXPIRY_AFTERNOON_DRAWDOWN_PCT must not exceed POST_T1_BASE_PEAK_DRAWDOWN_PCT")
 
     @property
     def email_configured(self) -> bool:
@@ -333,7 +378,7 @@ class Config:
 
         return cls(
             token=token,
-            state_file=Path(os.getenv("STATE_FILE", "state/market_state_v108.json")),
+            state_file=Path(os.getenv("STATE_FILE", "state/market_state_v109.json")),
             audit_dir=Path(os.getenv("AUDIT_DIR", "audit")),
             instrument_cache=Path(os.getenv("INSTRUMENT_CACHE_FILE", ".cache/upstox_nse.json.gz")),
             explicit_expiry=expiry,
@@ -358,6 +403,11 @@ class Config:
             max_entry_extension_atr=float_env("MAX_ENTRY_EXTENSION_ATR", 0.80),
             setup_max_age_minutes=int_env("SETUP_MAX_AGE_MINUTES", 3),
             setup_state_ttl_minutes=int_env("SETUP_STATE_TTL_MINUTES", 8),
+            thesis_break_buffer_atr=float_env("THESIS_BREAK_BUFFER_ATR", 0.25),
+            thesis_test_zone_atr=float_env("THESIS_TEST_ZONE_ATR", 0.45),
+            thesis_min_level_strength=float_env("THESIS_MIN_LEVEL_STRENGTH", 1.80),
+            thesis_oi_support_score_min=float_env("THESIS_OI_SUPPORT_SCORE_MIN", 0.45),
+            thesis_oi_break_score_min=float_env("THESIS_OI_BREAK_SCORE_MIN", 0.55),
             min_underlying_rr=float_env("MIN_UNDERLYING_RR", 1.25) or 1.25,
             minimum_stop_points=float_env("MINIMUM_STOP_POINTS", 6.0),
             min_initial_stop_atr=float_env("MIN_INITIAL_STOP_ATR", 0.75),
@@ -368,6 +418,9 @@ class Config:
             target1_min_points=float_env("TARGET1_MIN_POINTS", 12.0),
             target1_max_points=float_env("TARGET1_MAX_POINTS", 65.0),
             target2_max_points=float_env("TARGET2_MAX_POINTS", 115.0),
+            trend_target_min_points=float_env("TREND_TARGET_MIN_POINTS", 25.0),
+            trend_target1_max_points=float_env("TREND_TARGET1_MAX_POINTS", 85.0),
+            trend_target2_max_points=float_env("TREND_TARGET2_MAX_POINTS", 135.0),
             preferred_abs_delta=float_env("PREFERRED_ABS_DELTA", 0.58),
             min_abs_delta=float_env("MIN_ABS_DELTA", 0.30),
             max_abs_delta=float_env("MAX_ABS_DELTA", 0.85),
@@ -385,6 +438,13 @@ class Config:
             sideways_exit_minutes=float_env("SIDEWAYS_EXIT_MINUTES", 6.0),
             sideways_max_progress_atr=float_env("SIDEWAYS_MAX_PROGRESS_ATR", 0.40),
             sideways_consensus_abs_max=float_env("SIDEWAYS_CONSENSUS_ABS_MAX", 0.22),
+            pre_t1_trail_min_progress_atr=float_env("PRE_T1_TRAIL_MIN_PROGRESS_ATR", 0.75),
+            post_t1_base_peak_drawdown_pct=float_env("POST_T1_BASE_PEAK_DRAWDOWN_PCT", 13.0),
+            post_t1_expiry_afternoon_drawdown_pct=float_env("POST_T1_EXPIRY_AFTERNOON_DRAWDOWN_PCT", 9.0),
+            post_t1_min_no_progress_bars=max(1, int_env("POST_T1_MIN_NO_PROGRESS_BARS", 2)),
+            post_t1_supportive_oi_extra_bars=int_env("POST_T1_SUPPORTIVE_OI_EXTRA_BARS", 1),
+            post_t1_min_progress_atr=float_env("POST_T1_MIN_PROGRESS_ATR", 0.25),
+            post_t1_theta_fraction_limit=float_env("POST_T1_THETA_FRACTION_LIMIT", 0.04),
             email_sender=(os.getenv("EMAIL_SENDER", "").strip() or os.getenv("EMAIL_FROM", "").strip()),
             email_receiver=(os.getenv("EMAIL_RECEIVER", "").strip() or os.getenv("EMAIL_TO", "").strip()),
             email_password=os.getenv("EMAIL_PASSWORD", "").strip(),
@@ -483,9 +543,9 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _migrate_state_payload(state: Mapping[str, Any], source: Path) -> dict[str, Any]:
-    """Migrate compatible durable state into schema 108.
+    """Migrate compatible durable state into schema 109.
 
-    Schema 107 is structurally compatible with v108 position identity and
+    Schema 108 is structurally compatible with v109 position identity and
     notification state, so open positions can continue to be managed. Older
     schemas retain the conservative reconciliation behavior used previously.
     """
@@ -493,7 +553,7 @@ def _migrate_state_payload(state: Mapping[str, Any], source: Path) -> dict[str, 
         old_schema = int(state.get("schema_version", 0) or 0)
     except (TypeError, ValueError):
         old_schema = 0
-    if old_schema not in {102, 103, 104, 105, 106, 107}:
+    if old_schema not in {102, 103, 104, 105, 106, 107, 108}:
         raise ScannerError("STATE_SCHEMA_UNSUPPORTED", f"Cannot safely migrate schema {old_schema} from {source}")
     migrated = dict(state)
     migrated["schema_version"] = SCHEMA_VERSION
@@ -504,6 +564,22 @@ def _migrate_state_payload(state: Mapping[str, Any], source: Path) -> dict[str, 
     migrated.setdefault("position_entry_block_after", None)
     migrated.setdefault("last_position_exit", None)
     migrated.setdefault("last_position_event_key", None)
+    migrated.setdefault("market_thesis", None)
+    migrated.setdefault("thesis_history", [])
+    active_for_migration = migrated.get("active_position")
+    if old_schema == 108 and not isinstance(migrated.get("market_thesis"), Mapping) and isinstance(active_for_migration, Mapping) and active_for_migration.get("status") == "OPEN":
+        active_direction = str(active_for_migration.get("direction") or "").upper()
+        if active_direction in {"BULLISH", "BEARISH"}:
+            migrated["market_thesis"] = {
+                "direction": active_direction,
+                "state": "BULL_TREND" if active_direction == "BULLISH" else "BEAR_TREND",
+                "confidence": 0.55,
+                "established_at": active_for_migration.get("opened_at"),
+                "updated_at": active_for_migration.get("opened_at"),
+                "anchor_support": None, "anchor_resistance": None,
+                "break_confirmed": False, "broken_level": None,
+                "reason": "BOOTSTRAPPED_FROM_OPEN_V108_POSITION",
+            }
     if old_schema <= 106 and not isinstance(migrated.get("active_position"), Mapping):
         migrated["active_position"] = None
         migrated["position_reconciliation_required"] = True
@@ -527,15 +603,17 @@ def _migrate_state_payload(state: Mapping[str, Any], source: Path) -> dict[str, 
         "delivered_signal_keys", "notification_history", "last_signal", "last_decision", "instrument_cache_version",
         "active_position", "position_history", "position_reconciliation_required", "position_reconciliation_reason",
         "last_position_exit", "last_position_event_key", "position_entry_block_after",
+        "market_thesis", "thesis_history",
     }
     return {key: value for key, value in migrated.items() if key in allowed}
 
 
 def read_state(path: Path) -> dict[str, Any]:
-    """Load schema-108 state or safely migrate compatible historical state."""
+    """Load schema-109 state or safely migrate compatible historical state."""
     source = path if path.exists() else None
     if source is None:
         candidates = [
+            path.parent / "market_state_v108.json",
             path.parent / "market_state_v107.json",
             path.parent / "market_state_v106.json",
             path.parent / "market_state_v105.json",
@@ -565,7 +643,7 @@ def read_state(path: Path) -> dict[str, Any]:
             state["schema_version"] = SCHEMA_VERSION
             state["scanner_version"] = VERSION
             return state
-        if schema in {102, 103, 104, 105, 106, 107}:
+        if schema in {102, 103, 104, 105, 106, 107, 108}:
             migrated = _migrate_state_payload(state, source)
             LOG.warning("Migrated durable state schema %s to %s from %s", schema, SCHEMA_VERSION, source)
             return migrated
@@ -621,6 +699,7 @@ def compact_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "remaining_pct", "t1_hit", "premium_bid", "exit_spot", "exit_reason",
         "position_event_details", "active_position_summary", "position_reconciliation_required",
         "direction_consensus", "shadow_option_selection", "entry_timing_status",
+        "market_thesis", "oi_structure",
     )
     compact = {key: record[key] for key in root_fields if key in record}
 
@@ -668,6 +747,7 @@ def compact_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "completed_15m_contiguous_count", "completed_5m_contiguous_count", "duplicate_1m_candle_count",
         "duplicate_3m_candle_count", "duplicate_15m_candle_count", "duplicate_5m_candle_count",
         "ema8_1m", "ema5_3m", "ema9_3m", "ema3_15m", "ema5_15m",
+        "market_thesis_state", "market_thesis_direction", "market_thesis_support", "market_thesis_resistance",
     ))
     if structure is not None:
         compact["structure"] = structure
@@ -2175,7 +2255,7 @@ def _developing_15m_context(fifteen: Sequence[Candle], atr15: Optional[float]) -
 
 
 def price_regime(candles_1m: Sequence[Candle], candles_3m: Sequence[Candle], candles_15m: Sequence[Candle], config: Optional[Config] = None) -> dict[str, Any]:
-    """v108 market structure: 1m trigger, 3m execution confirmation, 15m context.
+    """v109 market structure: 1m trigger, 3m execution confirmation, 15m context.
 
     The 15-minute layer supplies regime/support-resistance context and never
     forces the entry engine to wait for repeated five-minute confirmations.
@@ -2340,7 +2420,7 @@ def build_levels(
 ) -> list[PriceLevel]:
     """Build local execution levels plus stronger 15m context levels.
 
-    v108 deliberately separates local trade management levels from broader
+    v109 deliberately separates local trade management levels from broader
     context. OI walls remain evidence but no longer dominate entry targets.
     """
     if not candles:
@@ -2471,24 +2551,371 @@ def _level_has_structural_provenance(level: PriceLevel) -> bool:
     sources = {part.strip() for part in level.source.split("+") if part.strip()}
     return bool(sources - context_only)
 
+def _thesis_level_quality(level: PriceLevel) -> float:
+    """Rank levels for durable session-thesis support/resistance.
 
-def _nearest_level(levels: Sequence[PriceLevel], side: str, price: float, minimum_strength: float = 1.0) -> Optional[PriceLevel]:
-    candidates = [
-        x for x in levels
-        if x.side == side and x.strength >= minimum_strength
-        and _level_has_structural_provenance(x)
-        and ((x.price > price + 1e-6) if side == "RESISTANCE" else (x.price < price - 1e-6))
-    ]
+    15m and 3m structure outrank one-minute noise. OI may strengthen a clustered
+    level but an OI-only wall is never allowed to become the sole thesis anchor.
+    """
+    source = str(level.source)
+    score = float(level.strength)
+    if "15M_CONTEXT" in source:
+        score += 1.00
+    if "3M_SWING" in source:
+        score += 0.70
+    if "OPENING_RANGE_15M" in source:
+        score += 0.65
+    if "SESSION_LOW" in source or "SESSION_HIGH" in source:
+        score += 0.45
+    if "OI_" in source and _level_has_structural_provenance(level):
+        score += 0.25
+    if "1M_SWING" in source and "3M_SWING" not in source and "15M_CONTEXT" not in source:
+        score -= 0.30
+    return score
+
+
+def _best_thesis_level(
+    levels: Sequence[PriceLevel], side: str, spot: float, config: Config,
+    *, max_distance: Optional[float] = None,
+) -> Optional[PriceLevel]:
+    side = side.upper()
+    if side not in {"SUPPORT", "RESISTANCE"}:
+        return None
+    max_distance = float(max_distance if max_distance is not None else max(config.trend_target2_max_points, 135.0))
+    candidates: list[PriceLevel] = []
+    for level in levels:
+        if level.side != side or level.strength < config.thesis_min_level_strength:
+            continue
+        if not _level_has_structural_provenance(level):
+            continue
+        distance = (spot - level.price) if side == "SUPPORT" else (level.price - spot)
+        if distance < -2.0 or distance > max_distance:
+            continue
+        candidates.append(level)
     if not candidates:
         return None
-    return min(candidates, key=lambda x: x.price) if side == "RESISTANCE" else max(candidates, key=lambda x: x.price)
+    # Prefer the closest durable level; quality breaks ties and avoids promoting
+    # a weak one-minute pivot over a nearby 3m/15m cluster.
+    return min(candidates, key=lambda level: (
+        max(0.0, (spot - level.price) if side == "SUPPORT" else (level.price - spot)),
+        -_thesis_level_quality(level),
+    ))
 
 
-def detect_setup(candles: Sequence[Candle], levels: Sequence[PriceLevel], structure: Mapping[str, Any], config: Config, oi_evidence: Optional[Mapping[str, Any]] = None) -> Optional[Setup]:
-    """Detect a fresh v108 entry from 1m momentum confirmed by 3m structure.
+def build_oi_structure_context(oi: Mapping[str, Any], spot: float, config: Config) -> dict[str, Any]:
+    """Translate strike OI into location-aware support/resistance evidence.
 
-    Fifteen-minute context classifies the setup (trend/reversal/range) but does
-    not delay it. OI is intentionally not required to persist for two snapshots.
+    A global bullish/bearish OI score is not enough for NIFTY. The important
+    question is *where* writers are active relative to current price and to the
+    support/resistance that the market is testing. This helper intentionally
+    separates support strength from break pressure.
+    """
+    raw_levels = oi.get("oi_levels") if isinstance(oi.get("oi_levels"), list) else []
+    levels = [x for x in raw_levels if isinstance(x, Mapping)]
+    strikes = sorted({float(x.get("strike")) for x in levels if x.get("strike") is not None})
+    diffs = [b - a for a, b in zip(strikes, strikes[1:]) if b > a]
+    step = median(diffs) if diffs else float(config.target_grid_points or 50.0)
+    near = [x for x in levels if abs(float(x.get("strike") or 0.0) - spot) <= max(step * 1.55, 75.0)]
+
+    def finite(value: Any, default: float = 0.0) -> float:
+        try:
+            number = float(value)
+            return number if math.isfinite(number) else default
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+    support_rows: list[dict[str, Any]] = []
+    resistance_rows: list[dict[str, Any]] = []
+    bearish_break_rows: list[dict[str, Any]] = []
+    bullish_break_rows: list[dict[str, Any]] = []
+    source_status = str(oi.get("source_refresh_status") or "SUCCESS").upper()
+    current_delta_available = oi.get("current_snapshot_delta_available")
+    try:
+        oi_age = float(oi.get("oi_age_seconds") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        oi_age = float(config.max_oi_age_seconds + 1)
+    fresh = (
+        bool(oi.get("compared_to_previous_successful_snapshot"))
+        and source_status == "SUCCESS"
+        and current_delta_available is not False
+        and oi_age <= config.max_oi_age_seconds
+    )
+
+    for row in near:
+        strike = finite(row.get("strike"))
+        if strike <= 0:
+            continue
+        put_rel = _clamp(finite(row.get("put_relative_oi")), 0.0, 1.0)
+        call_rel = _clamp(finite(row.get("call_relative_oi")), 0.0, 1.0)
+        put_writer = _clamp(finite(row.get("put_writer_strength") or row.get("put_support_flow_strength")), 0.0, 1.0)
+        call_writer = _clamp(finite(row.get("call_writer_strength") or row.get("call_resistance_flow_strength")), 0.0, 1.0)
+        put_delta_pct = finite(row.get("put_delta_oi_pct_snapshot"))
+        call_delta_pct = finite(row.get("call_delta_oi_pct_snapshot"))
+        put_flow = str(row.get("put_flow") or "NO_FLOW_EVIDENCE")
+        call_flow = str(row.get("call_flow") or "NO_FLOW_EVIDENCE")
+        proximity = max(0.0, 1.0 - abs(strike - spot) / max(step * 1.6, 1.0))
+
+        if strike <= spot + 0.35 * step:
+            support_score = _clamp((0.52 * put_rel + 0.48 * put_writer) * (0.75 + 0.25 * proximity), 0.0, 1.0)
+            support_rows.append({"strike": strike, "score": support_score, "put_relative_oi": put_rel,
+                                 "put_writer_strength": put_writer, "put_flow": put_flow,
+                                 "put_delta_oi_pct": put_delta_pct})
+            if fresh:
+                call_write_component = max(call_writer, min(1.0, max(call_delta_pct, 0.0) / max(config.oi_material_threshold_pct * 2.5, 1e-9)))
+                put_unwind_component = min(1.0, max(-put_delta_pct, 0.0) / max(config.oi_material_threshold_pct * 2.5, 1e-9))
+                bearish_break = _clamp((0.58 * call_write_component + 0.42 * put_unwind_component) * (0.70 + 0.30 * proximity), 0.0, 1.0)
+                bearish_break_rows.append({"strike": strike, "score": bearish_break,
+                                           "call_writer_strength": call_writer, "call_delta_oi_pct": call_delta_pct,
+                                           "put_delta_oi_pct": put_delta_pct, "call_flow": call_flow, "put_flow": put_flow})
+
+        if strike >= spot - 0.35 * step:
+            resistance_score = _clamp((0.52 * call_rel + 0.48 * call_writer) * (0.75 + 0.25 * proximity), 0.0, 1.0)
+            resistance_rows.append({"strike": strike, "score": resistance_score, "call_relative_oi": call_rel,
+                                    "call_writer_strength": call_writer, "call_flow": call_flow,
+                                    "call_delta_oi_pct": call_delta_pct})
+            if fresh:
+                put_write_component = max(put_writer, min(1.0, max(put_delta_pct, 0.0) / max(config.oi_material_threshold_pct * 2.5, 1e-9)))
+                call_unwind_component = min(1.0, max(-call_delta_pct, 0.0) / max(config.oi_material_threshold_pct * 2.5, 1e-9))
+                bullish_break = _clamp((0.58 * put_write_component + 0.42 * call_unwind_component) * (0.70 + 0.30 * proximity), 0.0, 1.0)
+                bullish_break_rows.append({"strike": strike, "score": bullish_break,
+                                           "put_writer_strength": put_writer, "put_delta_oi_pct": put_delta_pct,
+                                           "call_delta_oi_pct": call_delta_pct, "call_flow": call_flow, "put_flow": put_flow})
+
+    best_support = max(support_rows, key=lambda x: x["score"], default=None)
+    best_resistance = max(resistance_rows, key=lambda x: x["score"], default=None)
+    bear_break = max(bearish_break_rows, key=lambda x: x["score"], default=None)
+    bull_break = max(bullish_break_rows, key=lambda x: x["score"], default=None)
+    return {
+        "strike_step": step,
+        "directional_raw": str(oi.get("raw_label") or oi.get("label") or "MISSING").upper(),
+        "directional_confidence": float(oi.get("confidence") or 0.0),
+        "support": best_support,
+        "resistance": best_resistance,
+        "supportive_bullish_score": round(float((best_support or {}).get("score") or 0.0), 5),
+        "supportive_bearish_score": round(float((best_resistance or {}).get("score") or 0.0), 5),
+        "bearish_break_pressure": round(float((bear_break or {}).get("score") or 0.0), 5),
+        "bullish_break_pressure": round(float((bull_break or {}).get("score") or 0.0), 5),
+        "bearish_break_detail": bear_break,
+        "bullish_break_detail": bull_break,
+        "fresh_snapshot": fresh,
+    }
+
+
+def _futures_direction_signal(futures: Mapping[str, Any]) -> float:
+    return {
+        "LONG_BUILDUP_BULLISH": 1.0,
+        "SHORT_COVERING_BULLISH": 0.75,
+        "SHORT_BUILDUP_BEARISH": -1.0,
+        "LONG_UNWINDING_BEARISH": -0.80,
+    }.get(str(futures.get("futures_oi_signal") or "").upper(), 0.0)
+
+
+def update_market_thesis(
+    previous: Optional[Mapping[str, Any]], spot: float, structure: Mapping[str, Any],
+    levels: Sequence[PriceLevel], oi_structure: Mapping[str, Any], futures: Mapping[str, Any],
+    bars_3m: Sequence[Candle], now: datetime, config: Config,
+) -> dict[str, Any]:
+    """Maintain a persistent session thesis that changes only on structural evidence.
+
+    Short-term opposite momentum is a pullback/support test until a defended
+    support/resistance is actually accepted through. This is the central v109
+    change that prevents buying PE into intact support (and vice versa).
+    """
+    now = now.astimezone(IST)
+    d1 = str(structure.get("execution_direction") or "UNKNOWN").upper()
+    d3 = str(structure.get("execution_3m_direction") or "UNKNOWN").upper()
+    c1 = _clamp(float(structure.get("execution_confidence") or 0.0), 0.0, 1.0)
+    c3 = _clamp(float(structure.get("execution_3m_confidence") or 0.0), 0.0, 1.0)
+    d15 = str(structure.get("market_context_15m_bias") or "UNKNOWN").upper()
+    c15 = _clamp(float(structure.get("market_context_15m_confidence") or 0.0), 0.0, 1.0)
+    atr1 = max(float(structure.get("atr_1m") or 0.0), 1.0)
+    buffer = max(3.0, config.thesis_break_buffer_atr * atr1)
+    test_zone = max(5.0, config.thesis_test_zone_atr * atr1)
+    futures_signal = _futures_direction_signal(futures)
+    raw_oi = str((oi_structure or {}).get("raw_label") or "").upper()
+
+    existing = dict(previous) if isinstance(previous, Mapping) else {}
+    existing_direction = str(existing.get("direction") or "").upper()
+    if existing_direction not in {"BULLISH", "BEARISH"}:
+        existing_direction = ""
+
+    support = _best_thesis_level(levels, "SUPPORT", spot, config)
+    resistance = _best_thesis_level(levels, "RESISTANCE", spot, config)
+
+    def level_payload(level: Optional[PriceLevel]) -> tuple[Optional[float], Optional[str], Optional[float]]:
+        if level is None:
+            return None, None, None
+        return float(level.price), str(level.source), float(level.strength)
+
+    # Establish the first directional thesis from price plus one independent
+    # derivative/context input. This allows the 09:21 opening discovery without
+    # requiring a mature 15-minute candle.
+    if not existing_direction:
+        aligned = d1 if d1 == d3 and d1 in {"BULLISH", "BEARISH"} else ""
+        if aligned:
+            sign = _direction_sign(aligned)
+            oi_raw = str((oi_structure or {}).get("directional_raw") or "").upper()
+            independent = futures_signal * sign > 0.35 or oi_raw == aligned or d15 == aligned
+            strong_price = min(c1, c3) >= 0.68
+            if independent or strong_price:
+                state_name = "BULL_TREND" if aligned == "BULLISH" else "BEAR_TREND"
+                sup_p, sup_s, sup_strength = level_payload(support)
+                res_p, res_s, res_strength = level_payload(resistance)
+                return {
+                    "direction": aligned, "state": state_name,
+                    "confidence": round(_clamp(0.44 * c1 + 0.46 * c3 + 0.10 * (c15 if d15 == aligned else 0.0), 0.0, 1.0), 4),
+                    "established_at": now.isoformat(), "updated_at": now.isoformat(),
+                    "anchor_support": sup_p, "anchor_support_source": sup_s, "anchor_support_strength": sup_strength,
+                    "anchor_resistance": res_p, "anchor_resistance_source": res_s, "anchor_resistance_strength": res_strength,
+                    "break_pending_at": None, "break_confirmed": False, "broken_level": None,
+                    "reason": "OPENING_OR_FRESH_PRICE_STRUCTURE_WITH_INDEPENDENT_CONFIRMATION",
+                    "reclaim_confirmed": False,
+                }
+        return {
+            "direction": "RANGE", "state": "RANGE", "confidence": 0.0,
+            "established_at": existing.get("established_at") or now.isoformat(), "updated_at": now.isoformat(),
+            "anchor_support": float(support.price) if support else None,
+            "anchor_support_source": support.source if support else None,
+            "anchor_support_strength": support.strength if support else None,
+            "anchor_resistance": float(resistance.price) if resistance else None,
+            "anchor_resistance_source": resistance.source if resistance else None,
+            "anchor_resistance_strength": resistance.strength if resistance else None,
+            "break_pending_at": None, "break_confirmed": False, "broken_level": None,
+            "reason": "NO_DURABLE_DIRECTIONAL_THESIS_YET", "reclaim_confirmed": False,
+        }
+
+    direction = existing_direction
+    state_before = str(existing.get("state") or ("BULL_TREND" if direction == "BULLISH" else "BEAR_TREND"))
+    anchor_support = existing.get("anchor_support")
+    anchor_resistance = existing.get("anchor_resistance")
+    anchor_support_source = existing.get("anchor_support_source")
+    anchor_resistance_source = existing.get("anchor_resistance_source")
+    anchor_support_strength = existing.get("anchor_support_strength")
+    anchor_resistance_strength = existing.get("anchor_resistance_strength")
+
+    # Ratchet thesis anchors only in the direction of progress; never loosen a
+    # bullish support downward or bearish resistance upward during the same thesis.
+    if support is not None and (anchor_support is None or float(support.price) > float(anchor_support) + max(1.0, 0.08 * atr1)):
+        anchor_support, anchor_support_source, anchor_support_strength = float(support.price), support.source, support.strength
+    if resistance is not None and (anchor_resistance is None or float(resistance.price) < float(anchor_resistance) - max(1.0, 0.08 * atr1)):
+        anchor_resistance, anchor_resistance_source, anchor_resistance_strength = float(resistance.price), resistance.source, resistance.strength
+
+    latest3 = bars_3m[-1] if bars_3m else None
+    prev3 = bars_3m[-2] if len(bars_3m) >= 2 else None
+    break_pending_at = existing.get("break_pending_at")
+    broken_level = None
+    break_confirmed = False
+    reclaim_confirmed = False
+    reason = "THESIS_PERSISTS"
+
+    if direction == "BULLISH":
+        support_level = float(anchor_support) if anchor_support is not None else None
+        near_support = support_level is not None and spot <= support_level + test_zone
+        hard_break = bool(support_level is not None and latest3 is not None and latest3.close < support_level - buffer and spot < support_level - 0.50 * buffer)
+        accepted = bool(hard_break and prev3 is not None and prev3.close < support_level - 0.50 * buffer)
+        derivatives_break = (
+            hard_break
+            and float(oi_structure.get("bearish_break_pressure") or 0.0) >= config.thesis_oi_break_score_min
+            and futures_signal <= -0.50
+        )
+        if hard_break and not (accepted or derivatives_break):
+            break_pending_at = (latest3.start + timedelta(minutes=3)).isoformat() if latest3 else now.isoformat()
+        elif not hard_break:
+            break_pending_at = None
+        if accepted or derivatives_break:
+            break_confirmed = True
+            broken_level = support_level
+            direction = "BEARISH"
+            state = "REVERSAL_PENDING_BEAR"
+            reason = "BULL_SUPPORT_ACCEPTED_BELOW" if accepted else "BULL_SUPPORT_BROKEN_WITH_OI_FUTURES_MIGRATION"
+            anchor_resistance = support_level
+            anchor_resistance_source = f"BROKEN_SUPPORT|{anchor_support_source or 'STRUCTURE'}"
+            anchor_resistance_strength = max(float(anchor_support_strength or 0.0), config.thesis_min_level_strength)
+            # Start the new bearish thesis with the nearest lower support as objective context.
+            new_support = _best_thesis_level(levels, "SUPPORT", spot, config)
+            if new_support is not None:
+                anchor_support, anchor_support_source, anchor_support_strength = new_support.price, new_support.source, new_support.strength
+        else:
+            if state_before in {"BULL_SUPPORT_TEST", "BULL_PULLBACK"} and d1 == d3 == "BULLISH":
+                reclaim_confirmed = True
+            if near_support and d1 in {"BEARISH", "MIXED"}:
+                state = "BULL_SUPPORT_TEST"
+                reason = "BEARISH_OR_MIXED_PRICE_ACTION_AT_INTACT_SUPPORT"
+            elif d1 == d3 == "BEARISH":
+                state = "BULL_PULLBACK"
+                reason = "OPPOSITE_1M_3M_IS_PULLBACK_UNTIL_SUPPORT_BREAKS"
+            elif d1 == d3 == "BULLISH":
+                state = "BULL_TREND"
+                reason = "BULL_STRUCTURE_RESUMED" if reclaim_confirmed else "BULL_STRUCTURE_CONTINUES"
+            else:
+                state = "BULL_PULLBACK" if d3 == "BEARISH" else "BULL_TREND"
+    else:
+        resistance_level = float(anchor_resistance) if anchor_resistance is not None else None
+        near_resistance = resistance_level is not None and spot >= resistance_level - test_zone
+        hard_break = bool(resistance_level is not None and latest3 is not None and latest3.close > resistance_level + buffer and spot > resistance_level + 0.50 * buffer)
+        accepted = bool(hard_break and prev3 is not None and prev3.close > resistance_level + 0.50 * buffer)
+        derivatives_break = (
+            hard_break
+            and float(oi_structure.get("bullish_break_pressure") or 0.0) >= config.thesis_oi_break_score_min
+            and futures_signal >= 0.50
+        )
+        if hard_break and not (accepted or derivatives_break):
+            break_pending_at = (latest3.start + timedelta(minutes=3)).isoformat() if latest3 else now.isoformat()
+        elif not hard_break:
+            break_pending_at = None
+        if accepted or derivatives_break:
+            break_confirmed = True
+            broken_level = resistance_level
+            direction = "BULLISH"
+            state = "REVERSAL_PENDING_BULL"
+            reason = "BEAR_RESISTANCE_ACCEPTED_ABOVE" if accepted else "BEAR_RESISTANCE_BROKEN_WITH_OI_FUTURES_MIGRATION"
+            anchor_support = resistance_level
+            anchor_support_source = f"BROKEN_RESISTANCE|{anchor_resistance_source or 'STRUCTURE'}"
+            anchor_support_strength = max(float(anchor_resistance_strength or 0.0), config.thesis_min_level_strength)
+            new_resistance = _best_thesis_level(levels, "RESISTANCE", spot, config)
+            if new_resistance is not None:
+                anchor_resistance, anchor_resistance_source, anchor_resistance_strength = new_resistance.price, new_resistance.source, new_resistance.strength
+        else:
+            if state_before in {"BEAR_RESISTANCE_TEST", "BEAR_PULLBACK"} and d1 == d3 == "BEARISH":
+                reclaim_confirmed = True
+            if near_resistance and d1 in {"BULLISH", "MIXED"}:
+                state = "BEAR_RESISTANCE_TEST"
+                reason = "BULLISH_OR_MIXED_PRICE_ACTION_AT_INTACT_RESISTANCE"
+            elif d1 == d3 == "BULLISH":
+                state = "BEAR_PULLBACK"
+                reason = "OPPOSITE_1M_3M_IS_PULLBACK_UNTIL_RESISTANCE_BREAKS"
+            elif d1 == d3 == "BEARISH":
+                state = "BEAR_TREND"
+                reason = "BEAR_STRUCTURE_RESUMED" if reclaim_confirmed else "BEAR_STRUCTURE_CONTINUES"
+            else:
+                state = "BEAR_PULLBACK" if d3 == "BULLISH" else "BEAR_TREND"
+
+    aligned_conf = (c1 + c3) / 2.0 if d1 == d3 and d1 in {"BULLISH", "BEARISH"} else max(c15 * 0.65, 0.35)
+    return {
+        "direction": direction, "state": state, "previous_state": state_before,
+        "confidence": round(_clamp(aligned_conf, 0.0, 1.0), 4),
+        "established_at": existing.get("established_at") or now.isoformat(), "updated_at": now.isoformat(),
+        "anchor_support": anchor_support, "anchor_support_source": anchor_support_source,
+        "anchor_support_strength": anchor_support_strength,
+        "anchor_resistance": anchor_resistance, "anchor_resistance_source": anchor_resistance_source,
+        "anchor_resistance_strength": anchor_resistance_strength,
+        "break_pending_at": break_pending_at, "break_confirmed": break_confirmed,
+        "broken_level": broken_level, "reason": reason, "reclaim_confirmed": reclaim_confirmed,
+        "break_buffer_points": buffer, "test_zone_points": test_zone,
+    }
+
+
+
+def detect_setup(
+    candles: Sequence[Candle], levels: Sequence[PriceLevel], structure: Mapping[str, Any],
+    config: Config, oi_evidence: Optional[Mapping[str, Any]] = None,
+    market_thesis: Optional[Mapping[str, Any]] = None,
+) -> Optional[Setup]:
+    """Detect a fresh v109 entry from 1m timing inside persistent 3m/15m structure.
+
+    A counter-trend momentum burst into intact thesis support/resistance is not a
+    reversal setup. Reversal entries are created only after the thesis engine has
+    confirmed a structural break.
     """
     regime = str(structure.get("regime") or "TRANSITION").upper()
     opening_mode = regime.startswith("OPENING_DISCOVERY")
@@ -2502,22 +2929,29 @@ def detect_setup(candles: Sequence[Candle], levels: Sequence[PriceLevel], struct
         return None
     execution_1m = str(structure.get("execution_direction") or "UNKNOWN").upper()
     direction_3m = str(structure.get("execution_3m_direction") or "UNKNOWN").upper()
-    context_15m = str(structure.get("market_context_15m_bias") or structure.get("higher_timeframe_bias") or "UNKNOWN").upper()
     conf1 = float(structure.get("execution_confidence") or 0.0)
     conf3 = float(structure.get("execution_3m_confidence") or 0.0)
     if execution_1m not in {"BULLISH", "BEARISH"} or direction_3m != execution_1m:
         return None
     if conf1 < config.min_1m_execution_confidence or conf3 < config.min_3m_execution_confidence:
         return None
-
     direction = execution_1m
+
+    thesis = dict(market_thesis) if isinstance(market_thesis, Mapping) else {}
+    thesis_direction = str(thesis.get("direction") or "RANGE").upper()
+    thesis_state = str(thesis.get("state") or "RANGE").upper()
+    # The thesis engine already decides whether support/resistance has broken.
+    # Opposite price momentum alone cannot create a counter-trend entry.
+    if thesis_direction == "BULLISH" and direction == "BEARISH":
+        return None
+    if thesis_direction == "BEARISH" and direction == "BULLISH":
+        return None
+
     body_ok = current.close > current.open if direction == "BULLISH" else current.close < current.open
     progress_ok = current.close >= previous.close if direction == "BULLISH" else current.close <= previous.close
     if not body_ok or not progress_ok:
         return None
 
-    # Freshness: require either a one-minute micro break or a resumed move after
-    # a one-candle pullback. This prevents reusing the same unresolved setup.
     micro_break = current.close > previous.high if direction == "BULLISH" else current.close < previous.low
     recent = list(candles[-4:])
     pullback_seen = any(c.close < c.open for c in recent[:-1]) if direction == "BULLISH" else any(c.close > c.open for c in recent[:-1])
@@ -2526,10 +2960,42 @@ def detect_setup(candles: Sequence[Candle], levels: Sequence[PriceLevel], struct
     try:
         if ema8 is not None:
             ema8f = float(ema8)
-            resumed_from_ema = current.close > ema8f and previous.low <= ema8f + 0.25 * atr1 if direction == "BULLISH" else current.close < ema8f and previous.high >= ema8f - 0.25 * atr1
+            resumed_from_ema = (
+                current.close > ema8f and previous.low <= ema8f + 0.25 * atr1
+                if direction == "BULLISH"
+                else current.close < ema8f and previous.high >= ema8f - 0.25 * atr1
+            )
     except (TypeError, ValueError, OverflowError):
         resumed_from_ema = False
-    if not (micro_break or (pullback_seen and resumed_from_ema)):
+
+    # A support/resistance reclaim is stronger than a generic micro-break and is
+    # deliberately allowed early so v109 can capture the 12:24-type CE reclaim.
+    reclaim = False
+    thesis_anchor = None
+    if direction == "BULLISH" and thesis_direction == "BULLISH":
+        thesis_anchor = thesis.get("anchor_support")
+        try:
+            reclaim = bool(thesis.get("reclaim_confirmed")) or (
+                thesis_anchor is not None
+                and previous.low <= float(thesis_anchor) + max(5.0, config.thesis_test_zone_atr * atr1)
+                and current.close > float(thesis_anchor) + max(1.0, 0.08 * atr1)
+                and (micro_break or current.close > previous.close)
+            )
+        except (TypeError, ValueError, OverflowError):
+            reclaim = False
+    elif direction == "BEARISH" and thesis_direction == "BEARISH":
+        thesis_anchor = thesis.get("anchor_resistance")
+        try:
+            reclaim = bool(thesis.get("reclaim_confirmed")) or (
+                thesis_anchor is not None
+                and previous.high >= float(thesis_anchor) - max(5.0, config.thesis_test_zone_atr * atr1)
+                and current.close < float(thesis_anchor) - max(1.0, 0.08 * atr1)
+                and (micro_break or current.close < previous.close)
+            )
+        except (TypeError, ValueError, OverflowError):
+            reclaim = False
+
+    if not (micro_break or (pullback_seen and resumed_from_ema) or reclaim):
         return None
 
     risk_side = "SUPPORT" if direction == "BULLISH" else "RESISTANCE"
@@ -2544,13 +3010,30 @@ def detect_setup(candles: Sequence[Candle], levels: Sequence[PriceLevel], struct
     recent_low = min(c.low for c in candles[-4:])
     recent_high = max(c.high for c in candles[-4:])
     structural_invalid = recent_low if direction == "BULLISH" else recent_high
+    source_level = None
+    source = "RECENT_1M_STRUCTURE"
+
+    # For thesis-continuation/reclaim entries, the defended thesis level is the
+    # logical invalidation reference if it is closer/more durable than a tiny
+    # one-minute swing.
+    if thesis_anchor is not None:
+        try:
+            anchor = float(thesis_anchor)
+            if direction == "BULLISH" and anchor < current.close:
+                structural_invalid = max(structural_invalid, anchor)
+                source_level = anchor
+                source = str(thesis.get("anchor_support_source") or "MARKET_THESIS_SUPPORT")
+            elif direction == "BEARISH" and anchor > current.close:
+                structural_invalid = min(structural_invalid, anchor)
+                source_level = anchor
+                source = str(thesis.get("anchor_resistance_source") or "MARKET_THESIS_RESISTANCE")
+        except (TypeError, ValueError, OverflowError):
+            pass
     if nearest is not None:
-        structural_invalid = max(structural_invalid, nearest.price) if direction == "BULLISH" else min(structural_invalid, nearest.price)
-        source_level = nearest.price
-        source = nearest.source
-    else:
-        source_level = structural_invalid
-        source = "RECENT_1M_STRUCTURE"
+        if direction == "BULLISH" and nearest.price > structural_invalid:
+            structural_invalid, source_level, source = nearest.price, nearest.price, nearest.source
+        elif direction == "BEARISH" and nearest.price < structural_invalid:
+            structural_invalid, source_level, source = nearest.price, nearest.price, nearest.source
 
     buffer = max(1.0, 0.08 * atr1)
     invalidation = structural_invalid - buffer if direction == "BULLISH" else structural_invalid + buffer
@@ -2559,30 +3042,24 @@ def detect_setup(candles: Sequence[Candle], levels: Sequence[PriceLevel], struct
     if direction == "BEARISH" and invalidation <= current.close:
         invalidation = current.close + max(config.minimum_stop_points, 0.75 * atr1)
 
-    if context_15m == direction:
-        kind = "TREND_CONTINUATION_1M3M"
+    if thesis_state in {"REVERSAL_PENDING_BULL", "REVERSAL_PENDING_BEAR"}:
+        kind = "STRUCTURAL_BREAK_REVERSAL_1M3M"
+        context_bonus = 0.11
+    elif reclaim:
+        kind = "SUPPORT_RECLAIM_1M3M" if direction == "BULLISH" else "RESISTANCE_RECLAIM_1M3M"
+        context_bonus = 0.14
+    elif thesis_direction == direction:
+        kind = "THESIS_CONTINUATION_1M3M"
         context_bonus = 0.12
-    elif context_15m in {"BULLISH", "BEARISH"} and context_15m != direction:
-        kind = "EARLY_REVERSAL_1M3M"
-        context_bonus = 0.03
-    elif context_15m == "SIDEWAYS":
-        kind = "SIDEWAYS_BREAK_OR_EDGE_REVERSAL_1M3M"
-        context_bonus = 0.05
     else:
         kind = "MOMENTUM_1M3M"
-        context_bonus = 0.07
-    confidence = min(0.96, 0.42 + 0.24 * conf1 + 0.24 * conf3 + context_bonus + (0.05 if micro_break else 0.0))
+        context_bonus = 0.06
+    confidence = min(0.97, 0.42 + 0.24 * conf1 + 0.24 * conf3 + context_bonus + (0.05 if micro_break else 0.0))
     return Setup(
-        kind=kind,
-        direction=direction,
-        trigger=float(current.close),
-        invalidation=float(invalidation),
-        confirmed_at=current.close_time,
-        source_level=float(source_level) if source_level is not None else None,
-        source=f"{source}|1M_3M_CONFIRMATION",
-        price_confidence=confidence,
+        kind=kind, direction=direction, trigger=float(current.close), invalidation=float(invalidation),
+        confirmed_at=current.close_time, source_level=float(source_level) if source_level is not None else None,
+        source=f"{source}|1M_3M_THESIS_CONFIRMATION", price_confidence=confidence,
     )
-
 
 # ---------- Risk planning and option pricing ----------
 def option_quote_from_full(record: OptionRecord, raw: Mapping[str, Any]) -> OptionQuote:
@@ -2630,7 +3107,12 @@ def option_quote_from_full(record: OptionRecord, raw: Mapping[str, Any]) -> Opti
 
 def _strike_offsets_for_regime(direction: str, structure: Mapping[str, Any], config: Config) -> tuple[int, ...]:
     regime = str(structure.get("regime") or "TRANSITION").upper()
-    reversal_or_sideways = "REVERSAL" in regime or "SIDEWAYS" in regime
+    thesis_state = str(structure.get("market_thesis_state") or "").upper()
+    reversal_or_sideways = (
+        "REVERSAL" in regime or "SIDEWAYS" in regime
+        or thesis_state.startswith("REVERSAL_PENDING")
+        or thesis_state == "RANGE"
+    )
     if direction == "BULLISH":
         return config.reversal_sideways_offsets_ce if reversal_or_sideways else config.trend_strike_offsets_ce
     return config.reversal_sideways_offsets_pe if reversal_or_sideways else config.trend_strike_offsets_pe
@@ -2805,7 +3287,7 @@ def advance_setup_watch(
 ) -> Optional[Setup]:
     """Return only a still-valid recent setup watch.
 
-    v108 does not reconstruct old entries candle-by-candle. A fresh current
+    v109 does not reconstruct old entries candle-by-candle. A fresh current
     1m/3m setup is detected separately and always takes precedence.
     """
     pending = _setup_from_state(state.get("setup_watch"))
@@ -2858,17 +3340,16 @@ def _clamp(value: float, low: float = -1.0, high: float = 1.0) -> float:
     return max(low, min(high, float(value)))
 
 
-def build_direction_consensus(
-    oi: Mapping[str, Any],
-    structure: Mapping[str, Any],
-    futures: Mapping[str, Any],
-    setup: Optional[Setup],
-    config: Config,
-) -> dict[str, Any]:
-    """v108 weighted direction model led by 1m/3m price structure.
 
-    OI confirms or challenges the trade but cannot make the engine wait for two
-    snapshots after price structure has already moved.
+def build_direction_consensus(
+    oi: Mapping[str, Any], structure: Mapping[str, Any], futures: Mapping[str, Any],
+    setup: Optional[Setup], config: Config, market_thesis: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """v109 direction score led by price but stabilized by the persistent thesis.
+
+    OI remains low-weight in the global score because strike *location* is handled
+    separately by the structural gate. This prevents one noisy OI snapshot from
+    flipping a trend while still letting confirmed support/resistance breaks act.
     """
     components: dict[str, dict[str, Any]] = {}
     weighted = 0.0
@@ -2889,43 +3370,48 @@ def build_direction_consensus(
     d1 = str(structure.get("execution_direction") or "UNKNOWN").upper()
     c1 = _clamp(float(structure.get("execution_confidence") or 0.0), 0.0, 1.0)
     if d1 in {"BULLISH", "BEARISH"}:
-        add("price_1m", _direction_sign(d1) * c1, 0.25, {"direction": d1, "confidence": c1})
+        add("price_1m", _direction_sign(d1) * c1, 0.22, {"direction": d1, "confidence": c1})
 
     d3 = str(structure.get("execution_3m_direction") or "UNKNOWN").upper()
     c3 = _clamp(float(structure.get("execution_3m_confidence") or 0.0), 0.0, 1.0)
     if d3 in {"BULLISH", "BEARISH"}:
-        add("price_3m", _direction_sign(d3) * c3, 0.30, {"direction": d3, "confidence": c3})
+        add("price_3m", _direction_sign(d3) * c3, 0.25, {"direction": d3, "confidence": c3})
+
+    thesis = dict(market_thesis) if isinstance(market_thesis, Mapping) else {}
+    td = str(thesis.get("direction") or "RANGE").upper()
+    tc = _clamp(float(thesis.get("confidence") or 0.0), 0.0, 1.0)
+    if td in {"BULLISH", "BEARISH"}:
+        add("market_thesis", _direction_sign(td) * max(tc, 0.55), 0.20,
+            {"direction": td, "state": thesis.get("state"), "confidence": tc})
 
     d15 = str(structure.get("market_context_15m_bias") or structure.get("higher_timeframe_bias") or "UNKNOWN").upper()
     c15 = _clamp(float(structure.get("market_context_15m_confidence") or structure.get("higher_timeframe_confidence") or 0.0), 0.0, 1.0)
     if d15 in {"BULLISH", "BEARISH"}:
-        add("context_15m", _direction_sign(d15) * c15, 0.15, {"direction": d15, "confidence": c15})
+        add("context_15m", _direction_sign(d15) * c15, 0.12, {"direction": d15, "confidence": c15})
 
     futures_signal = str(futures.get("futures_oi_signal") or "").upper()
     futures_map = {
-        "LONG_BUILDUP_BULLISH": 1.0,
-        "SHORT_COVERING_BULLISH": 0.75,
-        "SHORT_BUILDUP_BEARISH": -1.0,
-        "LONG_UNWINDING_BEARISH": -0.80,
+        "LONG_BUILDUP_BULLISH": 1.0, "SHORT_COVERING_BULLISH": 0.75,
+        "SHORT_BUILDUP_BEARISH": -1.0, "LONG_UNWINDING_BEARISH": -0.80,
     }
     if futures_signal in futures_map:
-        add("futures_positioning", futures_map[futures_signal], 0.12, futures_signal)
+        add("futures_positioning", futures_map[futures_signal], 0.10, futures_signal)
 
     if oi.get("compared_to_previous_successful_snapshot"):
         balance = _clamp(float(oi.get("directional_balance") or 0.0))
         confidence = _clamp(float(oi.get("confidence") or 0.0), 0.0, 1.0)
-        add("oi_current", balance * confidence, 0.08,
+        add("oi_current", balance * confidence, 0.05,
             {"raw": oi.get("raw_label"), "stable": oi.get("label"), "confidence": confidence})
         h15 = ((oi.get("oi_horizons") or {}).get("15m") or {}) if isinstance(oi.get("oi_horizons"), Mapping) else {}
         h15_label = str(h15.get("raw_label") or "MISSING").upper()
         h15_conf = _clamp(float(h15.get("confidence") or 0.0), 0.0, 1.0)
         if h15_label in {"BULLISH", "BEARISH"}:
-            add("oi_15m", _direction_sign(h15_label) * h15_conf, 0.05,
+            add("oi_15m", _direction_sign(h15_label) * h15_conf, 0.03,
                 {"direction": h15_label, "confidence": h15_conf})
 
     if setup is not None:
         add("setup", _direction_sign(setup.direction) * _clamp(setup.price_confidence, 0.0, 1.0),
-            0.05, {"direction": setup.direction, "kind": setup.kind})
+            0.03, {"direction": setup.direction, "kind": setup.kind})
 
     score = weighted / used_weight if used_weight > 0 else 0.0
     regime = str(structure.get("regime") or "TRANSITION").upper()
@@ -2938,17 +3424,11 @@ def build_direction_consensus(
     aligned = sum(1 for item in components.values() if item["signal"] * score > 0.02)
     opposed = sum(1 for item in components.values() if item["signal"] * score < -0.02)
     return {
-        "direction": direction,
-        "score": round(score, 5),
-        "confidence": round(abs(score), 5),
-        "entry_threshold": entry_threshold,
-        "reversal_threshold": config.direction_reversal_score_min,
-        "aligned_components": aligned,
-        "opposed_components": opposed,
-        "components": components,
-        "architecture": "1M_TRIGGER_3M_CONFIRMATION_15M_CONTEXT_OI_CONFIRMATION",
+        "direction": direction, "score": round(score, 5), "confidence": round(abs(score), 5),
+        "entry_threshold": entry_threshold, "reversal_threshold": config.direction_reversal_score_min,
+        "aligned_components": aligned, "opposed_components": opposed, "components": components,
+        "architecture": "PERSISTENT_THESIS_1M_TRIGGER_3M_CONFIRMATION_15M_CONTEXT_LOCATION_AWARE_OI",
     }
-
 
 def choose_setup_with_consensus(
     existing: Optional[Setup],
@@ -2973,14 +3453,18 @@ def choose_setup_with_consensus(
     return None if invalid else existing
 
 
+
 def authorize_consensus_entry(
-    consensus: Mapping[str, Any],
-    setup: Setup,
-    oi: Mapping[str, Any],
-    structure: Mapping[str, Any],
-    config: Config,
+    consensus: Mapping[str, Any], setup: Setup, oi: Mapping[str, Any], structure: Mapping[str, Any],
+    config: Config, market_thesis: Optional[Mapping[str, Any]] = None,
+    oi_structure: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    """Authorize early entry from price structure; use OI as a veto only when extreme."""
+    """Authorize a price-structure entry only if it agrees with the durable thesis.
+
+    v109 explicitly prohibits PE into intact bullish support and CE into intact
+    bearish resistance. An opposite trade requires the thesis engine itself to
+    have flipped after structural acceptance/break evidence.
+    """
     direction = str(consensus.get("direction") or "MIXED").upper()
     score = abs(float(consensus.get("score") or 0.0))
     required_threshold = float(consensus.get("entry_threshold") or config.direction_entry_score_min)
@@ -2988,6 +3472,14 @@ def authorize_consensus_entry(
         raise ScannerError("DIRECTION_CONSENSUS_WEAK", f"Weighted direction score {float(consensus.get('score') or 0.0):.2f} is below the entry threshold {required_threshold:.2f}")
     if setup.direction != direction:
         raise ScannerError("SETUP_DIRECTION_CONFLICT", f"Setup points {setup.direction}, while weighted consensus points {direction}")
+
+    thesis = dict(market_thesis) if isinstance(market_thesis, Mapping) else {}
+    thesis_direction = str(thesis.get("direction") or "RANGE").upper()
+    thesis_state = str(thesis.get("state") or "RANGE").upper()
+    if thesis_direction in {"BULLISH", "BEARISH"} and setup.direction != thesis_direction:
+        reason = "COUNTERTREND_SUPPORT_INTACT" if thesis_direction == "BULLISH" else "COUNTERTREND_RESISTANCE_INTACT"
+        raise ScannerError(reason, f"{setup.direction} setup conflicts with persistent {thesis_direction} thesis ({thesis_state}); structural invalidation has not flipped the thesis")
+
     d1 = str(structure.get("execution_direction") or "UNKNOWN").upper()
     d3 = str(structure.get("execution_3m_direction") or "UNKNOWN").upper()
     c1 = float(structure.get("execution_confidence") or 0.0)
@@ -3008,21 +3500,23 @@ def authorize_consensus_entry(
                 independent_aligned = True
                 break
         if not independent_aligned and score < config.opening_strong_price_override_score:
-            raise ScannerError(
-                "OPENING_CONFIRMATION_INSUFFICIENT",
-                "Opening entry requires aligned futures/OI confirmation or an exceptionally strong 1m/3m price score",
-            )
+            raise ScannerError("OPENING_CONFIRMATION_INSUFFICIENT", "Opening entry requires aligned futures/OI confirmation or exceptionally strong 1m/3m price structure")
 
-    # No two-snapshot OI persistence requirement. Only block when fresh OI is
-    # extremely opposite AND another independent derivative input agrees.
+    # Extreme global OI + futures opposition remains a veto, but ordinary OI
+    # disagreement is handled as context rather than a timing gate.
     raw_oi = str(oi.get("raw_label") or oi.get("label") or "MISSING").upper()
     oi_conf = float(oi.get("confidence") or 0.0)
     opposite = "BEARISH" if direction == "BULLISH" else "BULLISH"
-    if raw_oi == opposite and oi_conf >= 0.92:
+    if raw_oi == opposite and oi_conf >= 0.95:
         futures_component = (consensus.get("components") or {}).get("futures_positioning") if isinstance(consensus.get("components"), Mapping) else None
         futures_signal = float((futures_component or {}).get("signal") or 0.0) if isinstance(futures_component, Mapping) else 0.0
-        if futures_signal * _direction_sign(direction) < -0.5:
-            raise ScannerError("DERIVATIVES_STRONGLY_OPPOSE_ENTRY", "Current OI and futures positioning both strongly oppose the 1m/3m price signal")
+        if futures_signal * _direction_sign(direction) < -0.65:
+            raise ScannerError("DERIVATIVES_STRONGLY_OPPOSE_ENTRY", "Fresh OI and futures positioning both strongly oppose the price/thesis signal")
+
+    # A structural reversal entry must have a confirmed broken level in state;
+    # this prevents a transient 1m/3m flip from masquerading as a reversal.
+    if setup.kind == "STRUCTURAL_BREAK_REVERSAL_1M3M" and not thesis.get("break_confirmed"):
+        raise ScannerError("REVERSAL_STRUCTURE_NOT_CONFIRMED", "Reversal setup requires a confirmed support/resistance break in the persistent market thesis")
 
 def validate_live_setup_trigger(setup: Setup, spot: float, tolerance_points: float = 0.0) -> None:
     """Require the live underlying quote to remain on the trigger side.
@@ -3230,7 +3724,7 @@ def build_futures_context(
 
 
 def classify_market_scenario(oi: Mapping[str, Any], structure: Mapping[str, Any], futures: Mapping[str, Any]) -> dict[str, Any]:
-    """Describe the v108 structure-first market scenario for audit/email context."""
+    """Describe the v109 persistent-thesis market scenario for audit/email context."""
     raw = str(oi.get("raw_label", oi.get("label", "MISSING"))).upper()
     stable = str(oi.get("label", "MISSING")).upper()
     d1 = str(structure.get("execution_direction") or "UNKNOWN").upper()
@@ -3273,20 +3767,18 @@ def _next_grid_price(entry: float, direction: str, grid: float, minimum_distance
     return level
 
 
-def choose_oi_targets_and_stop(
-    entry: float,
-    setup: Setup,
-    oi: Mapping[str, Any],
-    structure: Mapping[str, Any],
-    config: Config,
-    now: datetime,
-    levels: Sequence[PriceLevel] = (),
-) -> dict[str, Any]:
-    """v108 local risk plan with fixed T1/T2.
 
-    Targets are selected from nearby 1m/3m/15m structure and the NIFTY 50-point
-    grid. OI is context only. T1/T2 are fixed when the position is created and
-    are not repeatedly reassessed while the trade is open.
+def choose_oi_targets_and_stop(
+    entry: float, setup: Setup, oi: Mapping[str, Any], structure: Mapping[str, Any],
+    config: Config, now: datetime, levels: Sequence[PriceLevel] = (),
+    market_thesis: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Build one immutable v109 risk plan.
+
+    Trend/thesis-continuation trades use meaningful NIFTY 50-point objectives.
+    Reversal/range trades retain tighter local structural objectives. Minor
+    1m/3m levels before T1 are recorded as intermediate barriers, not promoted
+    to profit targets merely because they are nearby.
     """
     direction = setup.direction
     if direction not in {"BULLISH", "BEARISH"}:
@@ -3312,19 +3804,23 @@ def choose_oi_targets_and_stop(
     risk = max(raw_risk + buffer, min_risk)
     max_risk = min(config.max_initial_stop_points, max(config.minimum_stop_points, config.max_stop_atr * atr1))
     if risk > max_risk + 1e-9:
-        raise ScannerError("STOP_TOO_WIDE", f"Fresh setup requires {risk:.1f} NIFTY points of risk; v108 limit is {max_risk:.1f}")
+        raise ScannerError("STOP_TOO_WIDE", f"Fresh setup requires {risk:.1f} NIFTY points of risk; v109 limit is {max_risk:.1f}")
     stop = entry - risk if direction == "BULLISH" else entry + risk
+
+    thesis = dict(market_thesis) if isinstance(market_thesis, Mapping) else {}
+    thesis_direction = str(thesis.get("direction") or "RANGE").upper()
+    thesis_state = str(thesis.get("state") or "RANGE").upper()
+    trend_trade = thesis_direction == direction and thesis_state not in {"RANGE", "REVERSAL_PENDING_BULL", "REVERSAL_PENDING_BEAR"}
 
     target_side = "RESISTANCE" if direction == "BULLISH" else "SUPPORT"
     rows: list[dict[str, Any]] = []
+    max_target_distance = config.trend_target2_max_points if trend_trade else config.target2_max_points
     for level in levels:
         if level.side != target_side:
             continue
         distance = (level.price - entry) if direction == "BULLISH" else (entry - level.price)
-        if distance < config.target1_min_points - 1e-9 or distance > config.target2_max_points + 1e-9:
+        if distance <= 0 or distance > max_target_distance + 1e-9:
             continue
-        # Prefer execution/context structure and grid landmarks. OI-only levels
-        # are retained as secondary evidence, not as the sole target reason.
         source = str(level.source)
         priority = 3
         if "15M_CONTEXT" in source:
@@ -3338,56 +3834,60 @@ def choose_oi_targets_and_stop(
         rows.append({"price": float(level.price), "source": source, "strength": float(level.strength),
                      "distance": float(distance), "priority": priority})
 
-    grid1 = _next_grid_price(entry, direction, config.target_grid_points, config.target1_min_points)
-    grid1_distance = abs(grid1 - entry)
-    if grid1_distance <= config.target2_max_points + 1e-9:
+    if trend_trade:
+        grid1 = _next_grid_price(entry, direction, config.target_grid_points, config.trend_target_min_points)
+        grid2 = grid1 + config.target_grid_points if direction == "BULLISH" else grid1 - config.target_grid_points
+        grid1_distance, grid2_distance = abs(grid1 - entry), abs(grid2 - entry)
+        if grid1_distance > config.trend_target1_max_points + 1e-9:
+            raise ScannerError("LOCAL_TARGET_RR_UNAVAILABLE", f"Next meaningful 50-point trend target is {grid1_distance:.1f} points away, beyond the v109 trend T1 limit")
+        if grid1_distance / max(risk, 1e-9) < config.min_underlying_rr:
+            raise ScannerError("LOCAL_TARGET_RR_UNAVAILABLE", f"Trend T1 {grid1:.2f} offers only {grid1_distance / max(risk,1e-9):.2f}R with {risk:.1f}-point risk")
+        t1, t2 = grid1, grid2 if grid2_distance <= config.trend_target2_max_points + 1e-9 else None
+        t1_row = {"price": t1, "source": "NIFTY_50_GRID_TREND_OBJECTIVE", "strength": 1.5, "distance": grid1_distance, "priority": 0}
+        t2_row = ({"price": t2, "source": "NIFTY_50_GRID_TREND_RUNNER", "strength": 1.5, "distance": grid2_distance, "priority": 0}
+                  if t2 is not None else None)
+        # Levels before the grid objective remain useful management barriers.
+        intermediate = sorted([r for r in rows if r["distance"] < grid1_distance - 1e-9], key=lambda r: r["distance"])[:6]
+        target_method = "THESIS_TREND_MEANINGFUL_50_POINT_GRID"
+    else:
+        grid1 = _next_grid_price(entry, direction, config.target_grid_points, config.target1_min_points)
         rows.append({"price": grid1, "source": "NIFTY_50_GRID", "strength": 1.25,
-                     "distance": grid1_distance, "priority": 2})
-    grid2 = grid1 + config.target_grid_points if direction == "BULLISH" else grid1 - config.target_grid_points
-    grid2_distance = abs(grid2 - entry)
-    if grid2_distance <= config.target2_max_points + 1e-9:
-        rows.append({"price": grid2, "source": "NIFTY_50_GRID_NEXT", "strength": 1.25,
-                     "distance": grid2_distance, "priority": 2})
+                     "distance": abs(grid1 - entry), "priority": 2})
+        grid2 = grid1 + config.target_grid_points if direction == "BULLISH" else grid1 - config.target_grid_points
+        if abs(grid2 - entry) <= config.target2_max_points + 1e-9:
+            rows.append({"price": grid2, "source": "NIFTY_50_GRID_NEXT", "strength": 1.25,
+                         "distance": abs(grid2 - entry), "priority": 2})
+        deduped: list[dict[str, Any]] = []
+        for row in sorted(rows, key=lambda r: (r["distance"], r["priority"], -r["strength"])):
+            if row["distance"] < config.target1_min_points - 1e-9:
+                continue
+            existing = next((x for x in deduped if abs(float(x["price"]) - float(row["price"])) <= max(1.5, 0.10 * atr1)), None)
+            if existing is None:
+                deduped.append(row)
+            elif (row["priority"], -row["strength"]) < (existing["priority"], -existing["strength"]):
+                existing.update(row)
+        deduped.sort(key=lambda r: r["distance"])
+        t1_candidates = [r for r in deduped if r["distance"] <= config.target1_max_points + 1e-9
+                         and r["distance"] / max(risk, 1e-9) >= config.min_underlying_rr]
+        if not t1_candidates:
+            raise ScannerError("LOCAL_TARGET_RR_UNAVAILABLE", f"No local reversal/range T1 within {config.target1_max_points:.0f} points offers at least {config.min_underlying_rr:.2f}R")
+        t1_row = min(t1_candidates, key=lambda r: (r["distance"], r["priority"], -r["strength"]))
+        t1 = float(t1_row["price"])
+        t1_distance = abs(t1 - entry)
+        beyond = [r for r in deduped if r["distance"] >= t1_distance + max(8.0, 0.45 * atr1)
+                  and r["distance"] <= config.target2_max_points + 1e-9]
+        t2_row = min(beyond, key=lambda r: (r["distance"], r["priority"], -r["strength"]), default=None)
+        t2 = float(t2_row["price"]) if t2_row is not None else None
+        if t2 is None:
+            synthetic = t1 + config.target_grid_points if direction == "BULLISH" else t1 - config.target_grid_points
+            if abs(synthetic - entry) <= config.target2_max_points + 1e-9:
+                t2 = synthetic
+                t2_row = {"price": synthetic, "source": "NIFTY_50_GRID_RUNNER", "strength": 1.0,
+                          "distance": abs(synthetic - entry), "priority": 2}
+        intermediate = [r for r in deduped if r["distance"] < t1_distance - 1e-9][:5]
+        target_method = "REVERSAL_RANGE_LOCAL_STRUCTURE_AND_50_POINT_GRID"
 
-    # Deduplicate nearby levels while retaining the stronger/more structural row.
-    deduped: list[dict[str, Any]] = []
-    for row in sorted(rows, key=lambda r: (r["distance"], r["priority"], -r["strength"])):
-        existing = next((x for x in deduped if abs(float(x["price"]) - float(row["price"])) <= max(1.5, 0.10 * atr1)), None)
-        if existing is None:
-            deduped.append(row)
-        elif (row["priority"], -row["strength"]) < (existing["priority"], -existing["strength"]):
-            existing.update(row)
-    deduped.sort(key=lambda r: r["distance"])
-
-    t1_candidates = [
-        row for row in deduped
-        if row["distance"] <= config.target1_max_points + 1e-9
-        and row["distance"] / max(risk, 1e-9) >= config.min_underlying_rr
-    ]
-    if not t1_candidates:
-        raise ScannerError(
-            "LOCAL_TARGET_RR_UNAVAILABLE",
-            f"No local T1 within {config.target1_max_points:.0f} points offers at least {config.min_underlying_rr:.2f}R with {risk:.1f}-point risk",
-        )
-    # Nearest valid local target wins. Structural priority is a tie-breaker only.
-    t1_row = min(t1_candidates, key=lambda r: (r["distance"], r["priority"], -r["strength"]))
-    t1 = float(t1_row["price"])
-    t1_distance = abs(t1 - entry)
-
-    beyond = [
-        row for row in deduped
-        if row["distance"] >= t1_distance + max(8.0, 0.45 * atr1)
-        and row["distance"] <= config.target2_max_points + 1e-9
-    ]
-    t2_row = min(beyond, key=lambda r: (r["distance"], r["priority"], -r["strength"]), default=None)
-    t2 = float(t2_row["price"]) if t2_row is not None else None
-    if t2 is None:
-        synthetic = t1 + config.target_grid_points if direction == "BULLISH" else t1 - config.target_grid_points
-        if abs(synthetic - entry) <= config.target2_max_points + 1e-9:
-            t2 = synthetic
-            t2_row = {"price": synthetic, "source": "NIFTY_50_GRID_RUNNER", "strength": 1.0,
-                      "distance": abs(synthetic - entry), "priority": 2}
-
+    t1_distance = abs(float(t1) - entry)
     rr = t1_distance / risk
     local_now = now.astimezone(IST)
     close_time = datetime.combine(local_now.date(), dtime(15, 30), tzinfo=IST)
@@ -3395,50 +3895,30 @@ def choose_oi_targets_and_stop(
     if minutes_left <= 0:
         raise ScannerError("MARKET_CLOSED", "No trading time remains")
     if minutes_left < config.min_entry_minutes_to_close:
-        raise ScannerError(
-            "ENTRY_TOO_CLOSE_TO_MARKET_CLOSE",
-            f"Only {minutes_left:.1f} minutes remain; v108.1 requires at least {config.min_entry_minutes_to_close:.1f} minutes for a new position",
-        )
+        raise ScannerError("ENTRY_TOO_CLOSE_TO_MARKET_CLOSE", f"Only {minutes_left:.1f} minutes remain; v109 requires at least {config.min_entry_minutes_to_close:.1f} minutes for a new position")
 
-    intermediate = [row for row in deduped if row["distance"] < t1_distance - 1e-9][:5]
     return {
-        "entry_underlying": entry,
-        "stop_underlying": stop,
-        "initial_stop_underlying": stop,
+        "entry_underlying": entry, "stop_underlying": stop, "initial_stop_underlying": stop,
         "stop_source": "FRESH_1M_3M_INVALIDATION_WITH_ATR_FLOOR",
-        "stop_reference_price": invalidation,
-        "stop_reference_source": setup.source,
-        "risk_points": risk,
-        "stop_buffer_points": buffer,
-        "atr_1m": atr1,
-        "atr_3m": atr3,
-        "atr_15m": atr15,
-        "atr_5m": atr3,
-        "t1_underlying": t1,
-        "t1_source": t1_row["source"],
-        "t1_confluence": "LOCAL_PRICE_STRUCTURE_OR_50_GRID",
-        "t1_level_strength": t1_row["strength"],
-        "t1_oi_score": None,
-        "t1_oi": None,
-        "t1_flow": None,
-        "t2_underlying": t2,
+        "stop_reference_price": invalidation, "stop_reference_source": setup.source,
+        "risk_points": risk, "stop_buffer_points": buffer, "atr_1m": atr1, "atr_3m": atr3,
+        "atr_15m": atr15, "atr_5m": atr3,
+        "t1_underlying": float(t1), "t1_source": t1_row["source"],
+        "t1_confluence": "THESIS_TREND_GRID" if trend_trade else "LOCAL_PRICE_STRUCTURE_OR_50_GRID",
+        "t1_level_strength": t1_row["strength"], "t1_oi_score": None, "t1_oi": None, "t1_flow": None,
+        "t2_underlying": float(t2) if t2 is not None else None,
         "t2_source": t2_row["source"] if t2_row else None,
-        "t2_confluence": "LOCAL_PRICE_STRUCTURE_OR_50_GRID" if t2_row else None,
+        "t2_confluence": "THESIS_TREND_GRID" if trend_trade and t2_row else ("LOCAL_PRICE_STRUCTURE_OR_50_GRID" if t2_row else None),
         "t2_level_strength": t2_row["strength"] if t2_row else None,
-        "t2_oi_score": None,
-        "t2_oi": None,
-        "underlying_rr": rr,
-        "t2_underlying_rr": abs(t2 - entry) / risk if t2 is not None else None,
-        "minutes_to_market_close": minutes_left,
-        "target_method": "FIXED_LOCAL_1M_3M_15M_STRUCTURE_AND_50_POINT_GRID",
-        "targets_fixed_at_entry": True,
-        "target1_distance_points": t1_distance,
-        "target2_distance_points": abs(t2 - entry) if t2 is not None else None,
+        "underlying_rr": rr, "t2_underlying_rr": abs(float(t2) - entry) / risk if t2 is not None else None,
+        "minutes_to_market_close": minutes_left, "target_method": target_method,
+        "targets_fixed_at_entry": True, "target1_distance_points": t1_distance,
+        "target2_distance_points": abs(float(t2) - entry) if t2 is not None else None,
         "intermediate_soft_barriers": intermediate,
-        "t1_hard_barrier": t1_row["priority"] <= 1,
-        "t1_barrier_quality": t1_row["strength"],
+        "t1_hard_barrier": not trend_trade and t1_row.get("priority", 3) <= 1,
+        "t1_barrier_quality": t1_row["strength"], "trend_trade": trend_trade,
+        "thesis_state_at_entry": thesis_state, "thesis_direction_at_entry": thesis_direction,
     }
-
 
 def _position_direction(position: Mapping[str, Any]) -> str:
     direction = str(position.get("direction") or "").upper()
@@ -3517,6 +3997,13 @@ def create_active_position(
         "t1_hit_at": None,
         "t1_partial_exit_pct": float(config.t1_partial_exit_pct),
         "remaining_pct": 100.0,
+        "management_state": "ENTRY_ACTIVE",
+        "post_t1_started_at": None,
+        "post_t1_anchor_spot": None,
+        "post_t1_peak_spot": None,
+        "post_t1_peak_premium_bid": None,
+        "post_t1_last_progress_at": None,
+        "post_t1_no_progress_bars": 0,
         "last_monitored_candle": monitoring_checkpoint.isoformat(),
         "favourable_spot_extreme": float(risk_plan["entry_underlying"]),
         "recovered_from_legacy": bool(recovered),
@@ -3524,25 +4011,6 @@ def create_active_position(
         "created_at": now_ist().isoformat(),
     }
 
-
-def _continuation_is_confirmed(
-    direction: str,
-    oi: Mapping[str, Any],
-    structure: Mapping[str, Any],
-    config: Config,
-) -> bool:
-    raw = str(oi.get("raw_label") or oi.get("label") or "MISSING").upper()
-    stable = str(oi.get("label") or "MISSING").upper()
-    execution = str(structure.get("execution_direction") or "UNKNOWN").upper()
-    confidence = float(oi.get("confidence") or 0.0)
-    return (
-        raw == direction
-        and stable in {direction, "MIXED"}
-        and execution == direction
-        and confidence >= config.min_oi_direction_confidence
-        and bool(oi.get("compared_to_previous_successful_snapshot"))
-        and (oi.get("oi_age_seconds") is None or float(oi.get("oi_age_seconds")) <= config.max_oi_age_seconds)
-    )
 
 
 def _position_event(
@@ -3619,82 +4087,182 @@ def close_active_position(
     return closed, event
 
 
-def _trail_active_stop(active: dict[str, Any], levels: Sequence[PriceLevel], spot: float,
-                       structure: Mapping[str, Any], config: Config) -> Optional[dict[str, Any]]:
-    """After T1, trail the stop only behind a confirmed structural level."""
-    if not active.get("t1_hit"):
-        return None
+
+def _runner_support_score(direction: str, oi_structure: Optional[Mapping[str, Any]]) -> float:
+    if not isinstance(oi_structure, Mapping):
+        return 0.0
+    key = "supportive_bullish_score" if direction == "BULLISH" else "supportive_bearish_score"
+    try:
+        return _clamp(float(oi_structure.get(key) or 0.0), 0.0, 1.0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _adaptive_runner_drawdown_limit(
+    active: Mapping[str, Any], now: datetime, structure: Mapping[str, Any],
+    market_thesis: Optional[Mapping[str, Any]], oi_structure: Optional[Mapping[str, Any]],
+    config: Config,
+) -> float:
+    """Return adaptive post-T1 premium giveback tolerance as a percentage."""
+    limit = float(config.post_t1_base_peak_drawdown_pct)
+    expiry = parse_expiry(active.get("expiry"))
+    local = now.astimezone(IST)
+    if expiry == local.date():
+        # Same-day expiry becomes progressively less forgiving after lunch.
+        if local.time() >= dtime(12, 30):
+            minutes = max(0.0, (local - datetime.combine(local.date(), dtime(12, 30), tzinfo=IST)).total_seconds() / 60.0)
+            span = 120.0  # 12:30 -> 14:30
+            fraction = min(1.0, minutes / span)
+            limit = limit + fraction * (config.post_t1_expiry_afternoon_drawdown_pct - limit)
+    thesis = dict(market_thesis) if isinstance(market_thesis, Mapping) else {}
+    if str(thesis.get("direction") or "").upper() == _position_direction(active):
+        state = str(thesis.get("state") or "")
+        if state.endswith("_TREND"):
+            limit += 1.5
+        elif "PULLBACK" in state or "TEST" in state:
+            limit -= 1.0
+    supportive = _runner_support_score(_position_direction(active), oi_structure)
+    if supportive >= 0.70:
+        limit += 1.5
+    d3 = str(structure.get("execution_3m_direction") or "UNKNOWN").upper()
+    if d3 in {"SIDEWAYS", "MIXED"}:
+        limit -= 1.0
+    return round(max(7.5, min(18.0, limit)), 2)
+
+
+def _initialize_runner_state(active: dict[str, Any], at: datetime, spot_anchor: float, premium_bid: Optional[float]) -> None:
+    active["management_state"] = "RUNNER_TRENDING"
+    active["post_t1_started_at"] = at.astimezone(IST).isoformat()
+    active["post_t1_anchor_spot"] = float(spot_anchor)
+    active["post_t1_peak_spot"] = float(spot_anchor)
+    active["post_t1_peak_premium_bid"] = float(premium_bid) if premium_bid is not None and premium_bid > 0 else None
+    active["post_t1_last_progress_at"] = at.astimezone(IST).isoformat()
+    active["post_t1_no_progress_bars"] = 0
+
+
+def _trail_active_stop(
+    active: dict[str, Any], levels: Sequence[PriceLevel], spot: float,
+    structure: Mapping[str, Any], config: Config,
+    *, market_thesis: Optional[Mapping[str, Any]] = None,
+    oi_structure: Optional[Mapping[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
+    """Ratchet the underlying stop behind improving structural/OI support.
+
+    Before T1 a trail is allowed only after meaningful favourable progress and
+    supportive location-aware OI. After T1 the runner may also use a strong OI
+    support/resistance strike as a profit-protection reference. The stop can
+    never loosen.
+    """
     direction = _position_direction(active)
     atr1 = float(structure.get("atr_1m") or (active.get("risk_plan") or {}).get("atr_1m") or 0.0)
     if atr1 <= 0:
         return None
-    buffer = max(config.minimum_stop_points, atr1 * max(config.stop_buffer_atr_fraction, 0.12))
-    side = "SUPPORT" if direction == "BULLISH" else "RESISTANCE"
-    old_stop = float(active["stop_underlying"])
-    qualifying = [
-        level for level in levels
-        if level.side == side and level.strength >= max(config.min_level_strength, 1.5)
-        and _level_has_structural_provenance(level)
-    ]
-    candidates: list[tuple[float, PriceLevel]] = []
-    for level in qualifying:
-        candidate = float(level.price) - buffer if direction == "BULLISH" else float(level.price) + buffer
-        improves = candidate > old_stop if direction == "BULLISH" else candidate < old_stop
-        remains_behind_spot = candidate < spot if direction == "BULLISH" else candidate > spot
-        if improves and remains_behind_spot:
-            candidates.append((candidate, level))
-    if not candidates:
+    entry = float(active.get("entry_spot") or 0.0)
+    old_stop = float(active.get("stop_underlying") or 0.0)
+    if entry <= 0 or old_stop <= 0:
         return None
-    candidate, source = (max(candidates, key=lambda item: item[0]) if direction == "BULLISH"
-                         else min(candidates, key=lambda item: item[0]))
+    favourable_extreme = float(active.get("favourable_spot_extreme") or entry)
+    progress = (favourable_extreme - entry) if direction == "BULLISH" else (entry - favourable_extreme)
+    supportive = _runner_support_score(direction, oi_structure)
+    after_t1 = bool(active.get("t1_hit"))
+    if not after_t1 and (progress < config.pre_t1_trail_min_progress_atr * atr1 or supportive < config.thesis_oi_support_score_min):
+        return None
+
+    buffer_fraction = 0.22 if after_t1 else 0.32
+    buffer = max(3.0 if after_t1 else 4.0, atr1 * buffer_fraction)
+    side = "SUPPORT" if direction == "BULLISH" else "RESISTANCE"
+    candidates: list[tuple[float, str, float]] = []
+    for level in levels:
+        if level.side != side or level.strength < max(config.min_level_strength, 1.5):
+            continue
+        if not _level_has_structural_provenance(level):
+            continue
+        candidate = float(level.price) - buffer if direction == "BULLISH" else float(level.price) + buffer
+        candidates.append((candidate, level.source, float(level.strength)))
+
+    thesis = dict(market_thesis) if isinstance(market_thesis, Mapping) else {}
+    thesis_anchor = thesis.get("anchor_support") if direction == "BULLISH" else thesis.get("anchor_resistance")
+    thesis_source = thesis.get("anchor_support_source") if direction == "BULLISH" else thesis.get("anchor_resistance_source")
+    if thesis_anchor is not None:
+        try:
+            anchor = float(thesis_anchor)
+            candidates.append((anchor - buffer if direction == "BULLISH" else anchor + buffer,
+                               str(thesis_source or "MARKET_THESIS_LEVEL"), 2.5))
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    # Post-T1 only: strong fresh writer support/resistance is allowed as a soft
+    # runner-profit reference even without a second structural source.
+    if after_t1 and supportive >= config.thesis_oi_support_score_min and isinstance(oi_structure, Mapping):
+        row = oi_structure.get("support") if direction == "BULLISH" else oi_structure.get("resistance")
+        if isinstance(row, Mapping):
+            try:
+                strike = float(row.get("strike"))
+                if strike > 0:
+                    candidates.append((strike - buffer if direction == "BULLISH" else strike + buffer,
+                                       "OI_RUNNER_SUPPORT" if direction == "BULLISH" else "OI_RUNNER_RESISTANCE",
+                                       1.0 + supportive))
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+    valid: list[tuple[float, str, float]] = []
+    minimum_gap = max(2.0, 0.12 * atr1)
+    for candidate, source, strength in candidates:
+        improves = candidate > old_stop + 0.25 if direction == "BULLISH" else candidate < old_stop - 0.25
+        behind = candidate <= spot - minimum_gap if direction == "BULLISH" else candidate >= spot + minimum_gap
+        if after_t1:
+            locks_profit = candidate >= entry if direction == "BULLISH" else candidate <= entry
+        else:
+            locks_profit = True
+        if improves and behind and locks_profit:
+            valid.append((candidate, source, strength))
+    if not valid:
+        return None
+    candidate, source, strength = (max(valid, key=lambda x: (x[0], x[2])) if direction == "BULLISH"
+                                   else min(valid, key=lambda x: (x[0], -x[2])))
     active["stop_underlying"] = candidate
     risk = dict(active.get("risk_plan") or {})
-    risk.update({"stop_underlying": candidate, "trailing_stop_source": source.source,
-                 "trailing_stop_buffer_points": buffer})
+    risk.update({"stop_underlying": candidate, "trailing_stop_source": source,
+                 "trailing_stop_buffer_points": buffer, "trailing_oi_support_score": supportive})
     active["risk_plan"] = risk
-    return {"previous_stop": old_stop, "new_stop": candidate,
-            "source": source.source, "buffer_points": buffer}
+    return {"previous_stop": old_stop, "new_stop": candidate, "source": source,
+            "buffer_points": buffer, "oi_support_score": supportive}
 
 
 def manage_active_position(
-    active: dict[str, Any],
-    candles: Sequence[Candle],
-    spot: float,
-    quote_received_at: datetime,
-    oi: Mapping[str, Any],
-    structure: Mapping[str, Any],
-    setup: Optional[Setup],
-    config: Config,
-    *,
-    chain_refresh_ok: bool,
-    option_quote: Optional[OptionQuote],
-    levels: Sequence[PriceLevel] = (),
+    active: dict[str, Any], candles: Sequence[Candle], spot: float,
+    quote_received_at: datetime, oi: Mapping[str, Any], structure: Mapping[str, Any],
+    setup: Optional[Setup], config: Config, *, chain_refresh_ok: bool,
+    option_quote: Optional[OptionQuote], levels: Sequence[PriceLevel] = (),
     direction_consensus: Optional[Mapping[str, Any]] = None,
+    market_thesis: Optional[Mapping[str, Any]] = None,
+    oi_structure: Optional[Mapping[str, Any]] = None,
 ) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]], str, dict[str, Any]]:
-    """Advance the one active signal position; no new strike can replace it while open."""
+    """Manage one locked contract with thesis-aware and option-aware protection.
+
+    Before T1 the durable market thesis is protected. After T1 the remaining
+    runner switches to profit protection: structural/OI stop ratchet, post-T1
+    premium peak drawdown, and theta/no-progress exits. An option may be exited
+    while the broader market thesis remains intact; a fresh 3m setup can re-enter.
+    """
     active = dict(active)
     direction = _position_direction(active)
     opened_at = parse_datetime(active.get("opened_at"))
     last_candle = parse_datetime(active.get("last_monitored_candle"))
     if opened_at is None or last_candle is None:
         raise ScannerError("ACTIVE_POSITION_STATE_INVALID", "Active position has invalid opened_at or last_monitored_candle")
-
-    # v107.0.0 stored the last pre-entry completed candle as the checkpoint.
-    # Normalize that state in memory so an existing open position is repaired
-    # automatically on its next successful management pass.
     entry_minute = opened_at.replace(second=0, microsecond=0)
     if last_candle < entry_minute:
         last_candle = entry_minute
         active["last_monitored_candle"] = last_candle.isoformat()
-
     if active.get("status") != "OPEN":
         raise ScannerError("ACTIVE_POSITION_STATE_INVALID", "Only OPEN positions can be managed")
+
     entry_spot = float(active.get("entry_spot") or 0.0)
     t1 = float(active.get("t1_underlying") or 0.0)
     t2_raw = active.get("t2_underlying")
     t2 = float(t2_raw) if t2_raw is not None else None
-    stop = float(active.get("stop_underlying") or 0.0)
-    if min(entry_spot, t1, stop) <= 0:
+    if min(entry_spot, t1, float(active.get("stop_underlying") or 0.0)) <= 0:
         raise ScannerError("ACTIVE_POSITION_STATE_INVALID", "Active position contains invalid entry, stop or T1")
 
     events: list[dict[str, Any]] = []
@@ -3711,151 +4279,134 @@ def manage_active_position(
             active["last_premium_bid"] = latest_bid
             active["peak_premium_bid"] = max(float(active.get("peak_premium_bid") or 0.0), latest_bid)
 
-    # v108 targets are immutable after entry.  Do not generate repeated T1/T2
-    # reassessment events from ordinary OI changes.  Only the protective stop
-    # may trail after T1.
-    t1 = float(active["t1_underlying"])
-    t2_raw = active.get("t2_underlying")
-    t2 = float(t2_raw) if t2_raw is not None else None
-
     def close(reason: str, at: datetime, price: float, detail: Optional[Mapping[str, Any]] = None):
         closed, event = close_active_position(active, reason, at, price, premium_bid=latest_bid, details=detail)
         events.append(event)
         return None, events, reason, {"position_closed": True, "exit_reason": reason,
                                       "closed_position": closed, **(dict(detail or {}))}
 
-    # Process every completed one-minute candle since the prior persisted checkpoint.
-    new_candles = [
-        candle for candle in sorted(candles, key=lambda item: item.start)
-        if candle.start > last_candle
-    ]
+    def hit_t1(at: datetime, source: str) -> Optional[tuple[Optional[dict[str, Any]], list[dict[str, Any]], str, dict[str, Any]]]:
+        if active.get("t1_hit"):
+            return None
+        if t2 is None:
+            return close("TARGET_1_HIT_NO_T2", at, t1, {"full_exit_pct": active.get("remaining_pct", 100.0), "touch_source": source})
+        active["t1_hit"] = True
+        active["t1_hit_at"] = at.astimezone(IST).isoformat()
+        partial_pct = float(active.get("t1_partial_exit_pct") or config.t1_partial_exit_pct)
+        active["remaining_pct"] = max(0.0, 100.0 - partial_pct)
+        old_stop = float(active.get("stop_underlying") or entry_spot)
+        active["stop_underlying"] = max(old_stop, entry_spot) if direction == "BULLISH" else min(old_stop, entry_spot)
+        _initialize_runner_state(active, at, t1, latest_bid)
+        events.append(_position_event(
+            active, "TARGET_1_PARTIAL", "TARGET_1_HIT_CONTINUE_MANAGING", at, t1,
+            premium_bid=latest_bid,
+            details={"partial_exit_pct": partial_pct, "remaining_pct": active["remaining_pct"],
+                     "t1_underlying": t1, "t2_underlying": t2, "stop_moved_to_at_least_entry": True,
+                     "management_state": "RUNNER_TRENDING", "touch_source": source},
+        ))
+        return None
+
+    new_candles = [c for c in sorted(candles, key=lambda x: x.start) if c.start > last_candle]
     if new_candles:
         first_gap = (new_candles[0].start - last_candle).total_seconds()
         if first_gap > 60.5:
-            raise ScannerError(
-                "POSITION_CANDLE_GAP",
-                f"First available monitoring candle {new_candles[0].start.isoformat()} is more than one minute after checkpoint {last_candle.isoformat()}; position lock retained",
-            )
+            raise ScannerError("POSITION_CANDLE_GAP", f"First available monitoring candle {new_candles[0].start.isoformat()} is more than one minute after checkpoint {last_candle.isoformat()}; position lock retained")
     for previous, current in zip(new_candles, new_candles[1:]):
-        gap = (current.start - previous.start).total_seconds()
-        if gap > 60.5:
+        if (current.start - previous.start).total_seconds() > 60.5:
             raise ScannerError("POSITION_CANDLE_GAP", f"Missing one-minute monitoring candles between {previous.start.isoformat()} and {current.start.isoformat()}; position lock retained")
+
+    progress_step = max(2.0, 0.12 * float(structure.get("atr_1m") or 1.0))
     for candle in new_candles:
         if candle.start <= last_candle:
             continue
-        stop_hit = (candle.low <= stop) if direction == "BULLISH" else (candle.high >= stop)
+        current_stop = float(active.get("stop_underlying") or 0.0)  # refreshed every candle; T1 may have ratcheted it
+        stop_hit = (candle.low <= current_stop) if direction == "BULLISH" else (candle.high >= current_stop)
         if stop_hit:
             active["last_monitored_candle"] = candle.start.isoformat()
             return close("STOP_LOSS_HIT" if not active.get("t1_hit") else "BREAKEVEN_OR_TRAILING_STOP_HIT",
-                         candle.close_time, stop, {"monitoring_candle": candle.start.isoformat(), "candle_high": candle.high, "candle_low": candle.low})
+                         candle.close_time, current_stop,
+                         {"monitoring_candle": candle.start.isoformat(), "candle_high": candle.high, "candle_low": candle.low})
 
-        t1_hit = (candle.high >= t1) if direction == "BULLISH" else (candle.low <= t1)
-        t2_hit = t2 is not None and ((candle.high >= t2) if direction == "BULLISH" else (candle.low <= t2))
-        if not active.get("t1_hit") and t1_hit:
-            if t2 is None:
-                return close(
-                    "TARGET_1_HIT_NO_T2", candle.close_time, t1,
-                    {"full_exit_pct": active.get("remaining_pct", 100.0),
-                     "reason": "No second qualified OI/structure barrier was available; T1 is the final objective.",
-                     "monitoring_candle": candle.start.isoformat()},
-                )
-            active["t1_hit"] = True
-            active["t1_hit_at"] = candle.close_time.isoformat()
-            partial_pct = float(active.get("t1_partial_exit_pct") or config.t1_partial_exit_pct)
-            active["remaining_pct"] = max(0.0, 100.0 - partial_pct)
-            active["stop_underlying"] = entry_spot
-            events.append(_position_event(
-                active, "TARGET_1_PARTIAL", "TARGET_1_HIT_CONTINUE_MANAGING", candle.close_time,
-                t1, premium_bid=latest_bid,
-                details={"partial_exit_pct": partial_pct, "remaining_pct": active["remaining_pct"],
-                         "t1_underlying": t1, "t2_underlying": t2, "stop_moved_to_entry": True,
-                         "continuation_status": "CONFIRMED" if _continuation_is_confirmed(direction, oi, structure, config) else "WAITING_FOR_OI_PRICE_ALIGNMENT",
-                         "monitoring_candle": candle.start.isoformat()},
-            ))
-            continuation_ok = _continuation_is_confirmed(direction, oi, structure, config)
-            active["continuation_status"] = "CONFIRMED" if continuation_ok else "WAITING_FOR_OI_PRICE_ALIGNMENT"
-            # A temporary loss of alignment is not itself a reversal. Keep the
-            # remaining runner protected at entry; a confirmed opposite reversal,
-            # premium safeguard, breakeven stop or T2 will close it.
-            # If a single candle trades through both sequential targets, the T1
-            # partial is recorded first and the remaining quantity closes at T2.
-            if t2_hit:
-                return close("TARGET_2_HIT", candle.close_time, t2,
-                             {"partial_exit_pct": partial_pct, "remaining_pct_before_exit": active["remaining_pct"],
-                              "monitoring_candle": candle.start.isoformat()})
-        elif active.get("t1_hit") and t2_hit:
-            return close("TARGET_2_HIT", candle.close_time, t2,
-                         {"remaining_pct_before_exit": active.get("remaining_pct"),
-                          "monitoring_candle": candle.start.isoformat()})
+        t1_cross = (candle.high >= t1) if direction == "BULLISH" else (candle.low <= t1)
+        t2_cross = t2 is not None and ((candle.high >= t2) if direction == "BULLISH" else (candle.low <= t2))
+        if not active.get("t1_hit") and t1_cross:
+            closed = hit_t1(candle.close_time, "COMPLETED_1M_CANDLE")
+            if closed is not None:
+                return closed
+            if t2_cross:
+                return close("TARGET_2_HIT", candle.close_time, float(t2),
+                             {"remaining_pct_before_exit": active.get("remaining_pct"), "monitoring_candle": candle.start.isoformat()})
+        elif active.get("t1_hit") and t2_cross:
+            return close("TARGET_2_HIT", candle.close_time, float(t2),
+                         {"remaining_pct_before_exit": active.get("remaining_pct"), "monitoring_candle": candle.start.isoformat()})
 
-        favourable = (candle.high - entry_spot) if direction == "BULLISH" else (entry_spot - candle.low)
-        if favourable > 0:
-            active["favourable_spot_extreme"] = max(
-                float(active.get("favourable_spot_extreme") or entry_spot),
-                entry_spot + favourable if direction == "BULLISH" else entry_spot - favourable,
-            ) if direction == "BULLISH" else min(
-                float(active.get("favourable_spot_extreme") or entry_spot),
-                entry_spot - favourable,
-            )
+        favourable_price = candle.high if direction == "BULLISH" else candle.low
+        old_extreme = float(active.get("favourable_spot_extreme") or entry_spot)
+        improved = favourable_price > old_extreme + progress_step if direction == "BULLISH" else favourable_price < old_extreme - progress_step
+        if (direction == "BULLISH" and favourable_price > old_extreme) or (direction == "BEARISH" and favourable_price < old_extreme):
+            active["favourable_spot_extreme"] = favourable_price
+        if active.get("t1_hit"):
+            peak = float(active.get("post_t1_peak_spot") or t1)
+            post_progress_step = max(2.0, config.post_t1_min_progress_atr * float(structure.get("atr_1m") or 1.0))
+            post_improved = favourable_price > peak + post_progress_step if direction == "BULLISH" else favourable_price < peak - post_progress_step
+            if (direction == "BULLISH" and favourable_price > peak) or (direction == "BEARISH" and favourable_price < peak):
+                active["post_t1_peak_spot"] = favourable_price
+            if post_improved or improved:
+                active["post_t1_last_progress_at"] = candle.close_time.astimezone(IST).isoformat()
+                active["post_t1_no_progress_bars"] = 0
         active["last_monitored_candle"] = candle.start.isoformat()
 
-    replay = active.get("pending_replay_reversal")
-    if isinstance(replay, Mapping):
-        replay_at = parse_datetime(replay.get("timestamp"))
-        if replay_at is not None and replay_at <= quote_received_at:
-            active.pop("pending_replay_reversal", None)
-            return close("REVERSAL_CONFIRMED", replay_at, float(replay.get("spot") or spot),
-                         {**dict(replay), "replayed_from_audit": True})
-
-    # Check the current fresh NIFTY quote too; completed-candle monitoring above
-    # catches intrainterval touches even when price has since retraced.
-    spot_stop_hit = (spot <= float(active["stop_underlying"])) if direction == "BULLISH" else (spot >= float(active["stop_underlying"]))
+    # Current spot catches touches after the last completed candle.
+    current_stop = float(active.get("stop_underlying") or 0.0)
+    spot_stop_hit = (spot <= current_stop) if direction == "BULLISH" else (spot >= current_stop)
     if spot_stop_hit:
         return close("STOP_LOSS_HIT" if not active.get("t1_hit") else "BREAKEVEN_OR_TRAILING_STOP_HIT",
-                     quote_received_at, float(active["stop_underlying"]), {"touch_source": "LIVE_SPOT_QUOTE"})
+                     quote_received_at, current_stop, {"touch_source": "LIVE_SPOT_QUOTE"})
     if not active.get("t1_hit"):
-        spot_t1_hit = (spot >= t1) if direction == "BULLISH" else (spot <= t1)
-        if spot_t1_hit:
-            if t2 is None:
-                return close(
-                    "TARGET_1_HIT_NO_T2", quote_received_at, t1,
-                    {"full_exit_pct": active.get("remaining_pct", 100.0),
-                     "reason": "No second qualified OI/structure barrier was available; T1 is the final objective.",
-                     "touch_source": "LIVE_SPOT_QUOTE"},
-                )
-            active["t1_hit"] = True
-            active["t1_hit_at"] = quote_received_at.isoformat()
-            partial_pct = float(active.get("t1_partial_exit_pct") or config.t1_partial_exit_pct)
-            active["remaining_pct"] = max(0.0, 100.0 - partial_pct)
-            active["stop_underlying"] = entry_spot
-            events.append(_position_event(active, "TARGET_1_PARTIAL", "TARGET_1_HIT_CONTINUE_MANAGING",
-                                          quote_received_at, t1, premium_bid=latest_bid,
-                                          details={"partial_exit_pct": partial_pct, "remaining_pct": active["remaining_pct"],
-                                                   "t1_underlying": t1, "t2_underlying": t2,
-                                                   "stop_moved_to_entry": True,
-                                                   "continuation_status": "CONFIRMED" if _continuation_is_confirmed(direction, oi, structure, config) else "WAITING_FOR_OI_PRICE_ALIGNMENT",
-                                                   "touch_source": "LIVE_SPOT_QUOTE"}))
-            spot_t2_hit_same_quote = (spot >= t2) if direction == "BULLISH" else (spot <= t2)
-            if spot_t2_hit_same_quote:
-                return close("TARGET_2_HIT", quote_received_at, t2,
-                             {"partial_exit_pct": partial_pct, "remaining_pct_before_exit": active["remaining_pct"],
-                              "touch_source": "LIVE_SPOT_QUOTE_CROSSED_T1_AND_T2"})
-            continuation_ok = _continuation_is_confirmed(direction, oi, structure, config)
-            active["continuation_status"] = "CONFIRMED" if continuation_ok else "WAITING_FOR_OI_PRICE_ALIGNMENT"
-    elif t2 is not None:
-        spot_t2_hit = (spot >= t2) if direction == "BULLISH" else (spot <= t2)
-        if spot_t2_hit:
-            return close("TARGET_2_HIT", quote_received_at, t2, {"touch_source": "LIVE_SPOT_QUOTE"})
+        spot_t1 = (spot >= t1) if direction == "BULLISH" else (spot <= t1)
+        if spot_t1:
+            closed = hit_t1(quote_received_at, "LIVE_SPOT_QUOTE")
+            if closed is not None:
+                return closed
+            if t2 is not None and ((spot >= t2) if direction == "BULLISH" else (spot <= t2)):
+                return close("TARGET_2_HIT", quote_received_at, t2, {"touch_source": "LIVE_SPOT_QUOTE_CROSSED_T1_AND_T2"})
+    elif t2 is not None and ((spot >= t2) if direction == "BULLISH" else (spot <= t2)):
+        return close("TARGET_2_HIT", quote_received_at, t2, {"touch_source": "LIVE_SPOT_QUOTE"})
 
+    if active.get("t1_hit") and active.get("post_t1_started_at") is None:
+        _initialize_runner_state(active, parse_datetime(active.get("t1_hit_at")) or quote_received_at, t1, latest_bid)
+
+    # Update live spot/premium runner peaks before applying protection.
     if active.get("t1_hit"):
-        active["continuation_status"] = (
-            "CONFIRMED" if _continuation_is_confirmed(direction, oi, structure, config)
-            else "WAITING_FOR_OI_PRICE_ALIGNMENT"
-        )
-        # Trailing-stop changes are persisted and audited, but v108 deliberately
-        # does not email every management adjustment.  User-facing notifications
-        # remain entry, T1 partial and final exit.
-        _trail_active_stop(active, levels, spot, structure, config)
+        peak_spot = float(active.get("post_t1_peak_spot") or t1)
+        post_progress_step = max(2.0, config.post_t1_min_progress_atr * float(structure.get("atr_1m") or 1.0))
+        live_improved = spot > peak_spot + post_progress_step if direction == "BULLISH" else spot < peak_spot - post_progress_step
+        if (direction == "BULLISH" and spot > peak_spot) or (direction == "BEARISH" and spot < peak_spot):
+            active["post_t1_peak_spot"] = spot
+        if live_improved:
+            active["post_t1_last_progress_at"] = quote_received_at.isoformat()
+            active["post_t1_no_progress_bars"] = 0
+    if active.get("t1_hit") and latest_bid is not None:
+        post_peak = float(active.get("post_t1_peak_premium_bid") or 0.0)
+        if latest_bid > post_peak:
+            active["post_t1_peak_premium_bid"] = latest_bid
+            active["post_t1_last_progress_at"] = quote_received_at.isoformat()
+            active["post_t1_no_progress_bars"] = 0
+
+    thesis = dict(market_thesis) if isinstance(market_thesis, Mapping) else {}
+    thesis_direction = str(thesis.get("direction") or "RANGE").upper()
+    thesis_state = str(thesis.get("state") or "RANGE").upper()
+    if thesis_direction in {"BULLISH", "BEARISH"} and thesis_direction != direction and bool(thesis.get("break_confirmed")):
+        return close("THESIS_STRUCTURAL_REVERSAL", quote_received_at, spot, {
+            "market_thesis_state": thesis_state, "broken_level": thesis.get("broken_level"),
+            "market_thesis_reason": thesis.get("reason"),
+        })
+
+    # Ratchet stop before evaluating slower premium/time exits.
+    trail_update = _trail_active_stop(active, levels, spot, structure, config,
+                                      market_thesis=thesis, oi_structure=oi_structure)
+    if trail_update:
+        active["last_trailing_stop_update"] = {**trail_update, "at": quote_received_at.isoformat()}
 
     consensus_now = direction_consensus if isinstance(direction_consensus, Mapping) else {}
     consensus_direction = str(consensus_now.get("direction") or "MIXED").upper()
@@ -3863,59 +4414,26 @@ def manage_active_position(
     opposite = "BEARISH" if direction == "BULLISH" else "BULLISH"
     execution_now = str(structure.get("execution_direction") or "UNKNOWN").upper()
     execution_3m_now = str(structure.get("execution_3m_direction") or "UNKNOWN").upper()
-    execution_1m_conf = float(structure.get("execution_confidence") or 0.0)
-    execution_3m_conf = float(structure.get("execution_3m_confidence") or 0.0)
-    context_15m_now = str(structure.get("market_context_15m_bias") or structure.get("higher_timeframe_bias") or "UNKNOWN").upper()
+    context_15m_now = str(structure.get("market_context_15m_bias") or "UNKNOWN").upper()
+    supportive = _runner_support_score(direction, oi_structure)
 
-    # v108 exits on a fresh 1m + 3m opposite structure.  It does not require a
-    # second five-minute/OI persistence cycle after the reversal is visible.
-    fast_reversal = (
-        execution_now == opposite and execution_3m_now == opposite
-        and execution_1m_conf >= config.min_1m_execution_confidence
-        and execution_3m_conf >= config.min_3m_execution_confidence
-    )
-    consensus_reversal = consensus_direction == opposite and consensus_score >= config.direction_reversal_score_min
-    setup_reversal = setup is not None and setup.direction == opposite and setup.price_confidence >= 0.62
-    if fast_reversal and (consensus_reversal or setup_reversal):
-        return close("REVERSAL_CONFIRMED", quote_received_at, spot, {
-            "reversal_source": "1M_3M_STRUCTURE",
-            "reversal_direction": opposite,
-            "consensus_score": consensus_now.get("score"),
-            "price_1m_direction": execution_now,
-            "price_3m_direction": execution_3m_now,
-            "context_15m": context_15m_now,
-        })
+    # Opposite 1m/3m price action is a pullback while the thesis level survives;
+    # it no longer closes a trend trade by itself.
+    thesis_in_pullback = "PULLBACK" in thesis_state or "TEST" in thesis_state
+    if (execution_now == opposite and execution_3m_now == opposite) or thesis_in_pullback:
+        active["management_state"] = "RUNNER_PULLBACK" if active.get("t1_hit") else "THESIS_PULLBACK"
+    elif active.get("t1_hit"):
+        active["management_state"] = "RUNNER_TRENDING"
+    else:
+        active["management_state"] = "ENTRY_ACTIVE"
 
     elapsed_minutes = max(0.0, (quote_received_at - opened_at).total_seconds() / 60.0)
-    atr1_for_progress = float(structure.get("atr_1m") or active.get("risk_plan", {}).get("atr_1m") or 0.0)
-    best_spot_for_progress = float(active.get("favourable_spot_extreme") or entry_spot)
-    if direction == "BULLISH":
-        best_spot_for_progress = max(best_spot_for_progress, spot)
-        best_favourable_move = best_spot_for_progress - entry_spot
-    else:
-        best_spot_for_progress = min(best_spot_for_progress, spot)
-        best_favourable_move = entry_spot - best_spot_for_progress
-    active["favourable_spot_extreme"] = best_spot_for_progress
-    sideways_votes = (
-        int(execution_now == "MIXED")
-        + int(execution_3m_now in {"MIXED", "SIDEWAYS"})
-        + int(context_15m_now in {"SIDEWAYS", "TRANSITION"})
-        + int(consensus_score <= config.sideways_consensus_abs_max)
-    )
-    if (not active.get("t1_hit") and elapsed_minutes >= config.sideways_exit_minutes
-            and atr1_for_progress > 0
-            and best_favourable_move < config.sideways_max_progress_atr * atr1_for_progress
-            and sideways_votes >= 2):
-        return close("SIDEWAYS_NO_PROGRESS", quote_received_at, spot, {
-            "elapsed_minutes": elapsed_minutes,
-            "best_favourable_spot_move": best_favourable_move,
-            "atr_1m": atr1_for_progress,
-            "consensus_score": consensus_now.get("score"),
-            "price_1m_direction": execution_now,
-            "price_3m_direction": execution_3m_now,
-            "context_15m": context_15m_now,
-        })
+    atr1 = float(structure.get("atr_1m") or (active.get("risk_plan") or {}).get("atr_1m") or 0.0)
+    best_extreme = float(active.get("favourable_spot_extreme") or entry_spot)
+    best_move = (best_extreme - entry_spot) if direction == "BULLISH" else (entry_spot - best_extreme)
 
+    premium_loss_pct = 0.0
+    peak_drawdown_pct = 0.0
     if latest_bid is not None:
         entry_ask = float(active.get("entry_premium_ask") or 0.0)
         peak_bid = float(active.get("peak_premium_bid") or latest_bid)
@@ -3926,45 +4444,95 @@ def manage_active_position(
         if premium_loss_pct >= config.max_premium_loss_pct:
             return close("PREMIUM_MAX_LOSS", quote_received_at, spot,
                          {"premium_bid": latest_bid, "entry_ask": entry_ask, "premium_loss_pct": premium_loss_pct})
-        if active.get("t1_hit") and peak_drawdown_pct >= config.premium_trailing_drawdown_pct:
-            return close("PREMIUM_TRAILING_PROTECTION", quote_received_at, spot,
-                         {"premium_bid": latest_bid, "peak_bid": peak_bid, "peak_drawdown_pct": peak_drawdown_pct})
-        atr1 = atr1_for_progress
-        if (elapsed_minutes >= config.premium_decay_review_minutes
-                and best_favourable_move < config.no_progress_min_spot_move_atr * atr1
-                and premium_loss_pct >= config.premium_decay_min_loss_pct):
-            return close("PREMIUM_DECAY_NO_PROGRESS", quote_received_at, spot,
-                         {"premium_bid": latest_bid, "premium_loss_pct": premium_loss_pct,
-                          "elapsed_minutes": elapsed_minutes, "best_favourable_spot_move": best_favourable_move,
-                          "atr_1m": atr1})
+
+    if not active.get("t1_hit"):
+        sideways_votes = (
+            int(execution_now == "MIXED") + int(execution_3m_now in {"MIXED", "SIDEWAYS"})
+            + int(context_15m_now in {"SIDEWAYS", "TRANSITION"})
+            + int(consensus_score <= config.sideways_consensus_abs_max)
+        )
+        no_progress = atr1 > 0 and best_move < config.sideways_max_progress_atr * atr1
+        if elapsed_minutes >= config.sideways_exit_minutes and no_progress and sideways_votes >= 2:
+            # Supportive OI earns time only while premium remains healthy.
+            if latest_bid is None or premium_loss_pct >= min(6.0, config.premium_decay_min_loss_pct) or supportive < config.thesis_oi_support_score_min:
+                return close("SIDEWAYS_NO_PROGRESS", quote_received_at, spot, {
+                    "elapsed_minutes": elapsed_minutes, "best_favourable_spot_move": best_move,
+                    "atr_1m": atr1, "premium_loss_pct": premium_loss_pct,
+                    "oi_support_score": supportive, "market_thesis_state": thesis_state,
+                })
+        if (latest_bid is not None and elapsed_minutes >= config.premium_decay_review_minutes
+                and no_progress and premium_loss_pct >= config.premium_decay_min_loss_pct):
+            return close("PREMIUM_DECAY_NO_PROGRESS", quote_received_at, spot, {
+                "premium_bid": latest_bid, "premium_loss_pct": premium_loss_pct,
+                "elapsed_minutes": elapsed_minutes, "best_favourable_spot_move": best_move, "atr_1m": atr1,
+            })
+    else:
+        # Dedicated post-T1 runner economics.
+        t1_at = parse_datetime(active.get("post_t1_started_at")) or parse_datetime(active.get("t1_hit_at")) or quote_received_at
+        last_progress_at = parse_datetime(active.get("post_t1_last_progress_at")) or t1_at
+        stall_minutes = max(0.0, (quote_received_at - last_progress_at).total_seconds() / 60.0)
+        no_progress_bars = int(stall_minutes // 3.0)
+        active["post_t1_no_progress_bars"] = no_progress_bars
+        required_bars = int(config.post_t1_min_no_progress_bars)
+        if supportive >= config.thesis_oi_support_score_min and thesis_direction == direction:
+            required_bars += int(config.post_t1_supportive_oi_extra_bars)
+        active["runner_required_no_progress_bars"] = required_bars
+
+        post_peak = float(active.get("post_t1_peak_premium_bid") or latest_bid or 0.0)
+        post_drawdown = (max(0.0, (post_peak - latest_bid) / post_peak * 100.0)
+                         if latest_bid is not None and post_peak > 0 else 0.0)
+        active["post_t1_peak_drawdown_pct"] = post_drawdown
+        drawdown_limit = _adaptive_runner_drawdown_limit(active, quote_received_at, structure, thesis, oi_structure, config)
+        active["post_t1_drawdown_limit_pct"] = drawdown_limit
+
+        theta_fraction = 0.0
+        if option_quote is not None and option_quote.theta is not None and post_peak > 0:
+            try:
+                expected_theta_points = abs(float(option_quote.theta)) * stall_minutes / 1440.0
+                theta_fraction = expected_theta_points / post_peak
+            except (TypeError, ValueError, OverflowError):
+                theta_fraction = 0.0
+        active["post_t1_theta_fraction_since_progress"] = theta_fraction
+
+        if latest_bid is not None and post_drawdown >= drawdown_limit:
+            return close("POST_T1_PREMIUM_PROFIT_PROTECTION", quote_received_at, spot, {
+                "premium_bid": latest_bid, "post_t1_peak_premium_bid": post_peak,
+                "post_t1_peak_drawdown_pct": post_drawdown, "drawdown_limit_pct": drawdown_limit,
+                "oi_support_score": supportive, "market_thesis_state": thesis_state,
+            })
+        stall_economic = latest_bid is not None and (
+            post_drawdown >= max(4.0, drawdown_limit * 0.45)
+            and (theta_fraction >= config.post_t1_theta_fraction_limit or post_drawdown >= drawdown_limit * 0.65)
+        )
+        if no_progress_bars >= required_bars and stall_economic:
+            return close("POST_T1_THETA_NO_PROGRESS", quote_received_at, spot, {
+                "no_progress_3m_bars": no_progress_bars, "required_bars": required_bars,
+                "minutes_since_runner_progress": stall_minutes, "premium_bid": latest_bid,
+                "post_t1_peak_premium_bid": post_peak, "post_t1_peak_drawdown_pct": post_drawdown,
+                "theta_fraction_since_progress": theta_fraction, "oi_support_score": supportive,
+                "market_thesis_state": thesis_state,
+            })
 
     active["last_checked_at"] = quote_received_at.isoformat()
     active["last_spot"] = spot
     active["last_oi_direction"] = oi.get("raw_label", oi.get("label"))
     active["last_price_execution"] = structure.get("execution_direction")
+    active["last_market_thesis_state"] = thesis_state
     active["monitoring_status"] = "ACTIVE" if latest_bid is not None else "SPOT_ONLY_OPTION_QUOTE_UNAVAILABLE"
     summary = {
-        "position_open": True,
-        "position_id": active.get("position_id"),
-        "instrument_key": active.get("instrument_key"),
-        "side": active.get("side"),
-        "strike": active.get("strike"),
-        "direction": direction,
-        "entry_spot": entry_spot,
-        "stop_underlying": active.get("stop_underlying"),
-        "t1_underlying": t1,
-        "t2_underlying": t2,
-        "t1_hit": active.get("t1_hit"),
-        "remaining_pct": active.get("remaining_pct"),
-        "premium_bid": latest_bid,
-        "premium_loss_pct": active.get("premium_loss_pct"),
-        "monitoring_status": active.get("monitoring_status"),
-        "reversal_status": reversal_evidence.get("reversal_status") if 'reversal_evidence' in locals() else "NOT_CONFIRMED",
-        "direction_consensus": dict(consensus_now),
-        "opposite_consensus_count": active.get("opposite_consensus_count", 0),
+        "position_open": True, "position_id": active.get("position_id"), "instrument_key": active.get("instrument_key"),
+        "side": active.get("side"), "strike": active.get("strike"), "direction": direction,
+        "entry_spot": entry_spot, "stop_underlying": active.get("stop_underlying"),
+        "t1_underlying": t1, "t2_underlying": t2, "t1_hit": active.get("t1_hit"),
+        "remaining_pct": active.get("remaining_pct"), "premium_bid": latest_bid,
+        "premium_loss_pct": active.get("premium_loss_pct"), "monitoring_status": active.get("monitoring_status"),
+        "management_state": active.get("management_state"), "market_thesis_state": thesis_state,
+        "post_t1_peak_drawdown_pct": active.get("post_t1_peak_drawdown_pct"),
+        "post_t1_drawdown_limit_pct": active.get("post_t1_drawdown_limit_pct"),
+        "post_t1_no_progress_bars": active.get("post_t1_no_progress_bars"),
+        "oi_support_score": supportive, "direction_consensus": dict(consensus_now),
     }
     return active, events, "POSITION_ACTIVE", summary
-
 
 def queue_notification(state: dict[str, Any], signal_key: str, payload: Mapping[str, Any], created_at: datetime) -> bool:
     """Queue a unique entry or position-event alert without replaying prior keys."""
@@ -4203,9 +4771,6 @@ def _option_record_from_active_position(active: Mapping[str, Any]) -> OptionReco
         raise ScannerError("ACTIVE_POSITION_INVALID", f"Stored active contract cannot be normalized: {exc}") from exc
 
 
-def _nearest_quote_key(full_quotes: Mapping[str, Mapping[str, Any]], instrument_key: str) -> Optional[Mapping[str, Any]]:
-    return full_quotes.get(instrument_key)
-
 
 def _build_live_records(records: Sequence[OptionRecord], instrument_rows: Sequence[Mapping[str, Any]], spot: float, step_limit: int = 6) -> tuple[list[OptionRecord], list[str]]:
     strikes = sorted({r.strike for r in records})
@@ -4283,14 +4848,18 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
             "last_position_exit": state.get("last_position_exit"),
             "last_processed_candle": None,
             "setup_watch": None,
+            "market_thesis": None,
+            "thesis_history": [],
         }
     for collection in (
         "chain_snapshots", "seen_signal_keys", "pending_notifications",
-        "delivered_signal_keys", "notification_history", "oi_evidence_history", "position_history",
+        "delivered_signal_keys", "notification_history", "oi_evidence_history", "position_history", "thesis_history",
     ):
         _ensure_state_list(state, collection)
     state.setdefault("active_position", None)
     state.setdefault("position_reconciliation_required", False)
+    state.setdefault("market_thesis", None)
+    state.setdefault("thesis_history", [])
     normalize_notification_queue(state)
     client = client or UpstoxClient(config.token, config.request_timeout, config.max_retries)
     master = master or InstrumentMaster(client, config.instrument_cache, config.instrument_cache_hours)
@@ -4441,19 +5010,50 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
             candles_3m=bars_3m, candles_15m=bars_15m,
         )
         level_summary = _levels_summary(levels, spot)
-        # Retain only a still-valid recent watch; v108 does not reconstruct
+        oi_structure = build_oi_structure_context(oi, spot, config)
+        previous_thesis = state.get("market_thesis") if isinstance(state.get("market_thesis"), Mapping) else None
+        market_thesis = update_market_thesis(
+            previous_thesis, spot, structure, levels, oi_structure, future_context, bars_3m, quote_received_at, config
+        )
+        structure = dict(structure)
+        structure["market_thesis_state"] = market_thesis.get("state")
+        structure["market_thesis_direction"] = market_thesis.get("direction")
+        structure["market_thesis_support"] = market_thesis.get("anchor_support")
+        structure["market_thesis_resistance"] = market_thesis.get("anchor_resistance")
+        previous_thesis_key = (
+            str((previous_thesis or {}).get("direction") or ""),
+            str((previous_thesis or {}).get("state") or ""),
+            (previous_thesis or {}).get("anchor_support"),
+            (previous_thesis or {}).get("anchor_resistance"),
+        )
+        current_thesis_key = (
+            str(market_thesis.get("direction") or ""), str(market_thesis.get("state") or ""),
+            market_thesis.get("anchor_support"), market_thesis.get("anchor_resistance"),
+        )
+        if previous_thesis_key != current_thesis_key:
+            thesis_history = _ensure_state_list(state, "thesis_history")
+            thesis_history.append({
+                "at": quote_received_at.isoformat(), "direction": market_thesis.get("direction"),
+                "state": market_thesis.get("state"), "reason": market_thesis.get("reason"),
+                "anchor_support": market_thesis.get("anchor_support"),
+                "anchor_resistance": market_thesis.get("anchor_resistance"),
+                "broken_level": market_thesis.get("broken_level"),
+            })
+            state["thesis_history"] = thesis_history[-120:]
+        state["market_thesis"] = market_thesis
+        # Retain only a still-valid recent watch; v109 does not reconstruct
         # historical entries after the move has already occurred.
         tracked_setup = advance_setup_watch(index_candles, previous_processed, daily_candles, state, config, oi)
-        current_setup = detect_setup(index_candles, levels, structure, config, oi)
+        current_setup = detect_setup(index_candles, levels, structure, config, oi, market_thesis)
         setup = select_active_setup(current_setup, tracked_setup, spot, oi, structure, quote_received_at, config)
-        # Score the market after the fresh 1m/3m setup is known. The setup is a
-        # small component; price structure remains the primary entry evidence.
-        direction_consensus = build_direction_consensus(oi, structure, future_context, setup, config)
+        # Price leads timing, but the persistent thesis prevents a transient
+        # opposite 1m/3m move from becoming a counter-trend trade.
+        direction_consensus = build_direction_consensus(oi, structure, future_context, setup, config, market_thesis)
         setup = choose_setup_with_consensus(
             setup, index_candles, levels, structure, direction_consensus, spot, quote_received_at, config
         )
         # Re-score after filtering the setup against the current direction.
-        direction_consensus = build_direction_consensus(oi, structure, future_context, setup, config)
+        direction_consensus = build_direction_consensus(oi, structure, future_context, setup, config, market_thesis)
         detected_new_setup = setup is not None and (tracked_setup is None or setup.confirmed_at != tracked_setup.confirmed_at or setup.direction != tracked_setup.direction)
         state["last_processed_candle"] = index_candles[-1].start.isoformat()
         # Freshness-validated futures quote/VWAP context was built before levels.
@@ -4463,7 +5063,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         else:
             oi_state = oi.get("label", "MISSING")
         market_scenario = classify_market_scenario(oi, structure, future_context)
-        base_result.update({"expiry": expiry.isoformat(), "underlying_key": index_key, "spot": spot, "spot_context": spot_context, "oi": {k: v for k, v in oi.items() if k != "features"}, "oi_label": oi.get("label", "MISSING"), "oi_state": oi_state, "oi_raw_label": oi.get("raw_label", oi.get("label", "MISSING")), "option_chain_status": oi.get("source_refresh_status", "SUCCESS" if chain_refresh_ok else "UNKNOWN"), "option_chain_error": chain_refresh_error.code if chain_refresh_error else None, "structure": structure, "regime": structure.get("regime"), "market_scenario": market_scenario, "levels": level_summary, "futures": future_context, "setup": json_safe(setup) if setup else None, "direction_consensus": direction_consensus, "decision": "NO_TRADE", "reason_code": "NO_CONFIRMED_SETUP"})
+        base_result.update({"expiry": expiry.isoformat(), "underlying_key": index_key, "spot": spot, "spot_context": spot_context, "oi": {k: v for k, v in oi.items() if k != "features"}, "oi_label": oi.get("label", "MISSING"), "oi_state": oi_state, "oi_raw_label": oi.get("raw_label", oi.get("label", "MISSING")), "option_chain_status": oi.get("source_refresh_status", "SUCCESS" if chain_refresh_ok else "UNKNOWN"), "option_chain_error": chain_refresh_error.code if chain_refresh_error else None, "structure": structure, "regime": structure.get("regime"), "market_scenario": market_scenario, "levels": level_summary, "futures": future_context, "market_thesis": market_thesis, "oi_structure": oi_structure, "setup": json_safe(setup) if setup else None, "direction_consensus": direction_consensus, "decision": "NO_TRADE", "reason_code": "NO_CONFIRMED_SETUP"})
 
         # Always record what single contract would currently rank first when a
         # directional consensus exists.  This is a shadow diagnostic only and
@@ -4550,6 +5150,8 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                     option_quote=option_quote,
                     levels=levels,
                     direction_consensus=direction_consensus,
+                    market_thesis=market_thesis,
+                    oi_structure=oi_structure,
                 )
                 if managed is not None:
                     state["active_position"] = managed
@@ -4573,7 +5175,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                         "reason": exit_reason,
                         "details": {k: v for k, v in management_detail.items() if k != "closed_position"},
                     }
-                    if exit_reason == "REVERSAL_CONFIRMED":
+                    if exit_reason in {"REVERSAL_CONFIRMED", "THESIS_STRUCTURAL_REVERSAL"}:
                         allow_reversal_entry = True
                         can_evaluate_new_entry = True
                     else:
@@ -4593,6 +5195,8 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                         "market_scenario": market_scenario,
                         "futures": future_context,
                         "direction_consensus": direction_consensus,
+                        "market_thesis": market_thesis,
+                        "oi_structure": oi_structure,
                     })
                     queue_notification(state, str(event_payload["signal_key"]), event_payload, quote_received_at)
 
@@ -4635,7 +5239,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
             elif exit_block is not None and not allow_reversal_entry:
                 last_exit = state.get("last_position_exit") if isinstance(state.get("last_position_exit"), Mapping) else {}
                 same_direction_reentry = str(last_exit.get("direction") or "").upper() == setup.direction
-                newest_3m_close = bars_3m[-1].close_time if bars_3m else None
+                newest_3m_close = (bars_3m[-1].start + timedelta(minutes=3)) if bars_3m else None
                 if same_direction_reentry and (newest_3m_close is None or newest_3m_close <= exit_block):
                     base_result.update({
                         "decision": "NO_TRADE",
@@ -4656,8 +5260,8 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                 if not chain_refresh_ok:
                     detail = chain_refresh_error.code if chain_refresh_error else "UNKNOWN_REFRESH_FAILURE"
                     raise ScannerError("OPTION_CHAIN_REFRESH_FAILED", f"A fresh option chain/Greeks snapshot is required before entry; latest refresh failed with {detail}")
-                authorize_consensus_entry(direction_consensus, setup, oi, structure, config)
-                plan = choose_oi_targets_and_stop(spot, setup, oi, structure, config, quote_received_at, levels=levels)
+                authorize_consensus_entry(direction_consensus, setup, oi, structure, config, market_thesis, oi_structure)
+                plan = choose_oi_targets_and_stop(spot, setup, oi, structure, config, quote_received_at, levels=levels, market_thesis=market_thesis)
                 base_result["risk_plan"] = plan
                 selected = select_option_and_risk(setup.direction, spot, spot_quote_time, chain_records, full_quotes, expiry, quote_received_at, plan, structure, config)
                 signal_key_raw = f"{session_date}|{expiry}|{setup.direction}|{selected['instrument_key']}|{setup.kind}|{setup.confirmed_at.isoformat()}"
@@ -4687,6 +5291,8 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                             "entry_spot": plan["entry_underlying"], "stop_underlying": plan["stop_underlying"],
                             "t1_underlying": plan["t1_underlying"], "t2_underlying": plan.get("t2_underlying"),
                             "t1_partial_exit_pct": config.t1_partial_exit_pct,
+                            "market_thesis_state": market_thesis.get("state"),
+                            "market_thesis_direction": market_thesis.get("direction"),
                         },
                     })
                     state.setdefault("seen_signal_keys", []).append(signal_key)
@@ -4855,6 +5461,8 @@ def build_trade_email(payload: Mapping[str, Any]) -> EmailMessage:
     setup = data.get("setup") or {}
     oi = data.get("oi") or {}
     structure = data.get("structure") or {}
+    thesis = data.get("market_thesis") if isinstance(data.get("market_thesis"), Mapping) else {}
+    oi_structure = data.get("oi_structure") if isinstance(data.get("oi_structure"), Mapping) else {}
     timestamp = parse_datetime(data.get("timestamp")) or now_ist()
     side = str(selected.get("side") or "OPTION")
     strike = _format_value(selected.get("strike"), 0)
@@ -4899,6 +5507,12 @@ def build_trade_email(payload: Mapping[str, Any]) -> EmailMessage:
         for key, label in (("partial_exit_pct", "Quantity exited at T1"),
                             ("continuation_status", "Continuation assessment"),
                             ("reversal_status", "Reversal assessment"),
+                            ("management_state", "Management state"),
+                            ("market_thesis_state", "Market thesis state"),
+                            ("post_t1_peak_drawdown_pct", "Post-T1 premium drawdown"),
+                            ("drawdown_limit_pct", "Post-T1 drawdown limit"),
+                            ("no_progress_3m_bars", "Post-T1 no-progress 3m bars"),
+                            ("theta_fraction_since_progress", "Theta fraction since progress"),
                             ("peak_drawdown_pct", "Premium drawdown from peak"),
                             ("premium_loss_pct", "Premium loss from entry"),
                             ("new_t2", "Revised T2"), ("new_stop", "Revised stop")):
@@ -4926,7 +5540,11 @@ def build_trade_email(payload: Mapping[str, Any]) -> EmailMessage:
         "", "OI / STRUCTURE RISK PLAN", plain_table(risk_rows), "", "MARKET CONFIRMATION",
         f"Setup: {setup_kind}", f"Setup confirmed: {setup_confirmed}",
         f"OI raw / stable: {oi_direction} / {oi_stable}", f"OI confidence: {oi_confidence}",
-        f"Price execution: {structure.get('execution_direction', '—')}",
+        f"Market thesis: {thesis.get('direction', structure.get('market_thesis_direction', '—'))} / {thesis.get('state', structure.get('market_thesis_state', '—'))}",
+        f"Thesis support / resistance: {_format_value(thesis.get('anchor_support', structure.get('market_thesis_support')))} / {_format_value(thesis.get('anchor_resistance', structure.get('market_thesis_resistance')))}",
+        f"OI support score: {_format_value(oi_structure.get('supportive_bullish_score') if direction.upper() == 'BULLISH' else oi_structure.get('supportive_bearish_score'), 3)}",
+        f"OI break pressure: {_format_value(oi_structure.get('bearish_break_pressure') if direction.upper() == 'BULLISH' else oi_structure.get('bullish_break_pressure'), 3)}",
+        f"Price execution 1m / 3m: {structure.get('execution_direction', '—')} / {structure.get('execution_3m_direction', '—')}",
         f"Market regime: {data.get('regime', structure.get('regime', '—'))}",
         "", "The JSON attachment contains the compact technical audit record.",
         "This is an analytical alert, not an order placed by the scanner.",
@@ -4956,7 +5574,11 @@ def build_trade_email(payload: Mapping[str, Any]) -> EmailMessage:
   <div style="padding:0 24px 22px"><h3 style="margin:0 0 8px;font-size:15px">Market confirmation</h3>{html_table([
       ('Setup', setup_kind), ('Setup confirmed', setup_confirmed),
       ('OI raw / stable', f'{oi_direction} / {oi_stable}'), ('OI confidence', oi_confidence),
-      ('Price execution', str(structure.get('execution_direction') or '—')),
+      ('Market thesis', f"{thesis.get('direction', structure.get('market_thesis_direction', '—'))} / {thesis.get('state', structure.get('market_thesis_state', '—'))}"),
+      ('Thesis support / resistance', f"{_format_value(thesis.get('anchor_support', structure.get('market_thesis_support')))} / {_format_value(thesis.get('anchor_resistance', structure.get('market_thesis_resistance')))}"),
+      ('OI support score', _format_value(oi_structure.get('supportive_bullish_score') if direction.upper() == 'BULLISH' else oi_structure.get('supportive_bearish_score'), 3)),
+      ('OI break pressure', _format_value(oi_structure.get('bearish_break_pressure') if direction.upper() == 'BULLISH' else oi_structure.get('bullish_break_pressure'), 3)),
+      ('Price execution 1m / 3m', f"{structure.get('execution_direction') or '—'} / {structure.get('execution_3m_direction') or '—'}"),
       ('Market regime', str(data.get('regime') or structure.get('regime') or '—')),
   ])}</div>
   <div style="padding:14px 24px;background:#f8fafc;border-top:1px solid #e8ebef;font-size:12px;color:#667085">
@@ -4969,7 +5591,7 @@ def build_trade_email(payload: Mapping[str, Any]) -> EmailMessage:
     message["Subject"] = f"NIFTY v{VERSION} | {subject_label} | {side} {strike} | {timestamp.strftime('%d-%b %I:%M %p IST')}"
     message["X-Scanner-Version"] = VERSION
     if signal_key:
-        message["Message-ID"] = f"<nifty-v108-{signal_key}@market-scanner.local>"
+        message["Message-ID"] = f"<nifty-v109-{signal_key}@market-scanner.local>"
     message.set_content(text_body)
     message.add_alternative(html_body, subtype="html")
     attachment = dict(data)
@@ -4977,7 +5599,7 @@ def build_trade_email(payload: Mapping[str, Any]) -> EmailMessage:
     message.add_attachment(
         json.dumps(json_safe(attachment), indent=2, allow_nan=False).encode("utf-8"),
         maintype="application", subtype="json",
-        filename=f"nifty_v108_signal_{signal_short}.json",
+        filename=f"nifty_v109_signal_{signal_short}.json",
     )
     return message
 
@@ -5126,7 +5748,7 @@ def deliver_claimed_notifications(config: Config, claim_token: str) -> dict[str,
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="NIFTY 50 v108 1m/3m execution + 15m context scanner (no order execution)"
+        description="NIFTY 50 v109 persistent structural-thesis + option-aware runner scanner (no order execution)"
     )
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--config-check", action="store_true", help="Validate Upstox and Gmail configuration")
@@ -5135,7 +5757,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     modes.add_argument("--claim-notifications", action="store_true", help="Claim queued alerts for this GitHub run attempt")
     modes.add_argument("--deliver-claimed", action="store_true", help="Send only alerts claimed by this GitHub run attempt")
     modes.add_argument("--requeue-notification", metavar="SIGNAL_KEY", help="Manually requeue one uncertain alert after checking Gmail")
-    modes.add_argument("--reconcile-position", metavar="FLAT_OR_SIGNAL_KEY", help="v108 migration/recovery: explicitly confirm flat or recover one legacy signal position")
+    modes.add_argument("--reconcile-position", metavar="FLAT_OR_SIGNAL_KEY", help="Legacy migration/recovery utility: explicitly confirm flat or recover one legacy signal position")
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args(argv)
     logging.basicConfig(
