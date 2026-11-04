@@ -1,4 +1,4 @@
-name: NIFTY 50 Persistent Thesis Position Manager v111.0.0
+name: NIFTY 50 Persistent Thesis Position Manager v112.0.0
 
 on:
   # The existing Cloudflare Worker controls dispatch cadence.
@@ -79,7 +79,8 @@ jobs:
         shell: bash
         run: python market_scanner.py --requeue-notification "$REQUEUE_SIGNAL_KEY"
 
-      - name: Run v111 market scan and claim queued notifications
+      - name: Run v112 market scan and claim queued notifications
+        id: scan
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
@@ -99,6 +100,26 @@ jobs:
           set -euo pipefail
           session_date="$(TZ=Asia/Kolkata date +%F)"
           python market_scanner.py --scan-and-claim 2>&1 | tee -a "audit/worker_${session_date}.log"
+
+      - name: Preserve state and audit after a scan failure
+        if: ${{ always() && steps.scan.outcome == 'failure' }}
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          [[ ! -f state/market_state_v109.json ]] || git add -f -- state/market_state_v109.json
+          audit_files=(audit/market_scan_*.jsonl audit/market_scan_diagnostics_*.jsonl audit/worker_*.log)
+          if (( ${#audit_files[@]} > 0 )); then git add -f -- "${audit_files[@]}"; fi
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Preserve failed NIFTY v112 scan state and audit"
+          if ! git push origin "HEAD:${DEFAULT_BRANCH}"; then
+            echo "::error::Failed to preserve scan state; default branch changed. Reconcile before the next run."
+            exit 1
+          fi
 
       # Commit the durable claim before contacting SMTP. A later run must not
       # resend a message whose delivery may already have been accepted.
