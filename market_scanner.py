@@ -14,7 +14,7 @@ Design contract:
 - state is written atomically before notification is attempted;
 - failures produce explicit reason codes and never silently reuse stale data.
 - the persistent market thesis changes only on structural invalidation; short-term opposite momentum is treated as a pullback while defended structure survives.
-- after T1, the runner is managed as a separate profit-protection  with structural/OI stop ratcheting and option-premium/theta safeguards.
+- after T1, the runner is managed as a separate profit-protection state with structural/OI stop ratcheting and option-premium/theta safeguards.
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ from statistics import median
 from typing import Any, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "109.0.0"
+VERSION = "109.1.0"
 SCHEMA_VERSION = 109
 IST = ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
@@ -699,7 +699,8 @@ def compact_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "remaining_pct", "t1_hit", "premium_bid", "exit_spot", "exit_reason",
         "position_event_details", "active_position_summary", "position_reconciliation_required",
         "direction_consensus", "shadow_option_selection", "entry_timing_status",
-        "market_thesis", "oi_structure",
+        "market_thesis", "oi_structure", "candle_freshness", "local_reversal_watch",
+        "entry_gate_diagnostics", "position_exit",
     )
     compact = {key: record[key] for key in root_fields if key in record}
 
@@ -2838,7 +2839,10 @@ def update_market_thesis(
         else:
             if state_before in {"BULL_SUPPORT_TEST", "BULL_PULLBACK"} and d1 == d3 == "BULLISH":
                 reclaim_confirmed = True
-            if near_support and d1 in {"BEARISH", "MIXED"}:
+            if hard_break:
+                state = "BULL_SUPPORT_TEST"
+                reason = "SUPPORT_BREAK_PENDING_CONFIRMATION"
+            elif near_support and d1 in {"BEARISH", "MIXED"}:
                 state = "BULL_SUPPORT_TEST"
                 reason = "BEARISH_OR_MIXED_PRICE_ACTION_AT_INTACT_SUPPORT"
             elif d1 == d3 == "BEARISH":
@@ -2878,7 +2882,10 @@ def update_market_thesis(
         else:
             if state_before in {"BEAR_RESISTANCE_TEST", "BEAR_PULLBACK"} and d1 == d3 == "BEARISH":
                 reclaim_confirmed = True
-            if near_resistance and d1 in {"BULLISH", "MIXED"}:
+            if hard_break:
+                state = "BEAR_RESISTANCE_TEST"
+                reason = "RESISTANCE_BREAK_PENDING_CONFIRMATION"
+            elif near_resistance and d1 in {"BULLISH", "MIXED"}:
                 state = "BEAR_RESISTANCE_TEST"
                 reason = "BULLISH_OR_MIXED_PRICE_ACTION_AT_INTACT_RESISTANCE"
             elif d1 == d3 == "BULLISH":
@@ -2904,6 +2911,56 @@ def update_market_thesis(
         "break_buffer_points": buffer, "test_zone_points": test_zone,
     }
 
+
+
+def candle_freshness(candles: Sequence[Candle], now: datetime) -> dict[str, Any]:
+    """Compare with the last minute fully elapsed at scan start, in exchange time."""
+    now = now.astimezone(IST)
+    expected = now.replace(second=0, microsecond=0) - timedelta(minutes=1)
+    latest = candles[-1].start.astimezone(IST) if candles else None
+    return {"expected_start": expected.isoformat(),
+            "latest_start": latest.isoformat() if latest else None,
+            "latest_expected_available": latest == expected,
+            "missing_latest_minutes": max(0, int((expected - latest).total_seconds() // 60)) if latest else None}
+
+
+def local_reversal_watch(candles: Sequence[Candle], levels: Sequence[PriceLevel],
+                         structure: Mapping[str, Any], thesis: Mapping[str, Any]) -> dict[str, Any]:
+    """Diagnostic local level rejection; never authorizes or backdates a trade."""
+    if len(candles) < 3:
+        return {"status": "INSUFFICIENT_CANDLES"}
+    current, previous = candles[-1], candles[-2]
+    atr1 = float(structure.get("atr_1m") or 0.0)
+    if not math.isfinite(atr1) or atr1 <= 0:
+        return {"status": "ATR_UNAVAILABLE"}
+    band = max(2.0, 0.2 * atr1)
+    recent = candles[-6:]
+    candidates = []
+    for level in levels:
+        if level.strength < 1.0 or "FUTURES_VWAP_CONTEXT_ONLY" in level.source:
+            continue
+        if level.side == "RESISTANCE":
+            touched = any(abs(c.high - level.price) <= band for c in recent)
+            rejected = current.close < current.open and current.close < previous.low and current.close < level.price - 0.08 * atr1
+            direction = "BEARISH"
+            invalidation = max(c.high for c in recent) + max(1.0, 0.08 * atr1)
+        elif level.side == "SUPPORT":
+            touched = any(abs(c.low - level.price) <= band for c in recent)
+            rejected = current.close > current.open and current.close > previous.high and current.close > level.price + 0.08 * atr1
+            direction = "BULLISH"
+            invalidation = min(c.low for c in recent) - max(1.0, 0.08 * atr1)
+        else:
+            continue
+        if touched and rejected:
+            candidates.append((abs(current.close - level.price), level, direction, invalidation))
+    if not candidates:
+        return {"status": "NO_LOCAL_REJECTION"}
+    _, level, direction, invalidation = min(candidates, key=lambda x: x[0])
+    return {"status": "SHADOW_ONLY", "direction": direction, "level": level.price,
+            "level_source": level.source, "trigger": current.close,
+            "invalidation_reference": invalidation, "confirmed_at": current.close_time.isoformat(),
+            "thesis_direction": thesis.get("direction"),
+            "note": "Research candidate only; not an entry or trade recommendation"}
 
 
 def detect_setup(
@@ -4874,6 +4931,8 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
     chain_refresh_ok = False
     chain_refresh_error: Optional[ScannerError] = None
     try:
+        if now.time() < dtime(9, 16) and not state.get("active_position") and not state.get("position_reconciliation_required"):
+            raise ScannerError("OPENING_CANDLE_WARMUP", "Waiting for the first completed one-minute candle")
         master.load(now)
         index_row = master.resolve_index()
         index_key = str(index_row["instrument_key"])
@@ -4943,6 +5002,15 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                 oi.update({"source_refresh_status": "FAILED_NO_SESSION_BASELINE", "source_refresh_error": chain_exc.code, "current_snapshot_delta_available": False, "oi_age_seconds": None})
         # Fetch index and nearest current futures candles even if chain refresh failed.
         index_candles = fetch_candles(client, index_key, now, minutes=1)
+        freshness = candle_freshness(index_candles, now)
+        # Retry the same snapshot boundary; do not add an unfinished candle.
+        for _ in range(2):
+            if freshness["latest_expected_available"]:
+                break
+            time.sleep(1.0)
+            index_candles = fetch_candles(client, index_key, now, minutes=1)
+            freshness = candle_freshness(index_candles, now)
+        base_result["candle_freshness"] = freshness
         latest_close_time = index_candles[-1].close_time
         candle_age = (now - latest_close_time).total_seconds()
         if candle_age < -1 or candle_age > config.max_candle_age_seconds:
@@ -5065,6 +5133,19 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         market_scenario = classify_market_scenario(oi, structure, future_context)
         base_result.update({"expiry": expiry.isoformat(), "underlying_key": index_key, "spot": spot, "spot_context": spot_context, "oi": {k: v for k, v in oi.items() if k != "features"}, "oi_label": oi.get("label", "MISSING"), "oi_state": oi_state, "oi_raw_label": oi.get("raw_label", oi.get("label", "MISSING")), "option_chain_status": oi.get("source_refresh_status", "SUCCESS" if chain_refresh_ok else "UNKNOWN"), "option_chain_error": chain_refresh_error.code if chain_refresh_error else None, "structure": structure, "regime": structure.get("regime"), "market_scenario": market_scenario, "levels": level_summary, "futures": future_context, "market_thesis": market_thesis, "oi_structure": oi_structure, "setup": json_safe(setup) if setup else None, "direction_consensus": direction_consensus, "decision": "NO_TRADE", "reason_code": "NO_CONFIRMED_SETUP"})
 
+        base_result["local_reversal_watch"] = local_reversal_watch(index_candles, levels, structure, market_thesis)
+        base_result["entry_gate_diagnostics"] = {
+            "latest_candle_ready": freshness["latest_expected_available"],
+            "price_1m": structure.get("execution_direction"),
+            "price_3m": structure.get("execution_3m_direction"),
+            "thesis_direction": market_thesis.get("direction"),
+            "thesis_state": market_thesis.get("state"),
+            "thesis_break_pending_at": market_thesis.get("break_pending_at"),
+            "thesis_break_confirmed": market_thesis.get("break_confirmed"),
+            "setup_before_consensus": json_safe(current_setup) if current_setup else None,
+            "setup_after_consensus": json_safe(setup) if setup else None,
+        }
+
         # Always record what single contract would currently rank first when a
         # directional consensus exists.  This is a shadow diagnostic only and
         # never creates a position by itself; it makes missed opportunities and
@@ -5173,6 +5254,11 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                         "strike": active_position.get("strike"),
                         "direction": active_position.get("direction"),
                         "reason": exit_reason,
+                        "detected_at": quote_received_at.isoformat(),
+                        "recorded_close_time": (closed_position or {}).get("closed_at"),
+                        "recorded_stop_or_exit_spot": (closed_position or {}).get("exit_spot"),
+                        "reference_option_bid_at_detection": (closed_position or {}).get("exit_premium_bid"),
+                        "option_quote_time": (closed_position or {}).get("last_premium_quote_at"),
                         "details": {k: v for k, v in management_detail.items() if k != "closed_position"},
                     }
                     if exit_reason in {"REVERSAL_CONFIRMED", "THESIS_STRUCTURAL_REVERSAL"}:
@@ -5226,6 +5312,10 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                     "message": "An active-position record exists with an unsupported state; position lock retained for manual reconciliation.",
                 })
 
+        if can_evaluate_new_entry and not freshness["latest_expected_available"]:
+            can_evaluate_new_entry = False
+            base_result.update({"decision": "NO_TRADE", "reason_code": "WAITING_FOR_LATEST_CANDLE",
+                                "message": "Latest completed one-minute candle is unavailable after retries; new entries blocked."})
         if can_evaluate_new_entry:
             exit_block = parse_datetime(state.get("position_entry_block_after"))
             if setup is None:
