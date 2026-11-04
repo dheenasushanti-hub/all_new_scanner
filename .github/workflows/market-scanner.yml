@@ -1,4 +1,4 @@
-name: NIFTY 50 Persistent Thesis Position Manager v109.1.0
+name: NIFTY 50 Persistent Thesis Position Manager v110.0.0
 
 on:
   # The existing Cloudflare Worker controls dispatch cadence.
@@ -79,7 +79,7 @@ jobs:
         shell: bash
         run: python market_scanner.py --requeue-notification "$REQUEUE_SIGNAL_KEY"
 
-      - name: Run v109.1 market scan and claim queued notifications
+      - name: Run v110 market scan and claim queued notifications
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
