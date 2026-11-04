@@ -44,7 +44,7 @@ from statistics import median
 from typing import Any, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "111.0.0"
+VERSION = "112.0.0"
 SCHEMA_VERSION = 109
 IST = ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
@@ -700,7 +700,7 @@ def compact_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "position_event_details", "active_position_summary", "position_reconciliation_required",
         "direction_consensus", "shadow_option_selection", "entry_timing_status",
         "market_thesis", "oi_structure", "candle_freshness", "local_reversal_watch",
-        "entry_gate_diagnostics", "position_exit", "early_oi_reversal", "v111_evidence",
+        "entry_gate_diagnostics", "position_exit", "early_oi_reversal", "v111_evidence", "v112_candidate_evaluations",
     )
     compact = {key: record[key] for key in root_fields if key in record}
 
@@ -3102,7 +3102,7 @@ def v111_price_candidate(candles: Sequence[Candle], levels: Sequence[PriceLevel]
         return None, {"reason": "NO_PRICE_PATTERN"}
     # Prefer nearest actual reversal zone; otherwise the continuation setup.
     hypotheses.sort(key=lambda q: (q.kind != "V111_REVERSAL", abs((q.source_level or q.trigger) - q.trigger)))
-    return hypotheses[0], {"reason": "PRICE_CANDIDATE", "candidates": [json_safe(x) for x in hypotheses[:4]]}
+    return hypotheses[0], {"reason": "PRICE_CANDIDATE", "candidates": [json_safe(x) for x in hypotheses[:40]]}
 
 
 def v111_oi_confirmation(setup: Setup, oi: Mapping[str, Any], oi_structure: Mapping[str, Any],
@@ -3195,6 +3195,140 @@ def v111_risk_plan(entry: float, setup: Setup, structure: Mapping[str, Any], lev
             "target_method": "NEAREST_OPPOSING_LEVEL", "targets_fixed_at_entry": True,
             "target1_distance_points": distance, "intermediate_soft_barriers": [],
             "thesis_state_at_entry": thesis.get("state"), "thesis_direction_at_entry": thesis.get("direction")}
+
+
+def v112_oi_support(setup: Setup, oi: Mapping[str, Any], oi_structure: Mapping[str, Any], spot: float) -> dict[str, Any]:
+    """Assess price-location matched OI changes, without guessing trade initiator."""
+    if not oi_structure.get("fresh_snapshot") or oi.get("source_refresh_status") != "SUCCESS":
+        return {"approved": False, "reason": "OI_SNAPSHOT_NOT_FRESH"}
+    step = float(oi_structure.get("strike_step") or 50.0)
+    if not math.isfinite(step) or step <= 0:
+        return {"approved": False, "reason": "INVALID_STRIKE_GRID"}
+    reference = float(setup.source_level if setup.source_level is not None else spot)
+    evidence = []
+    for row in oi.get("oi_levels", []):
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            strike = float(row.get("strike"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(strike) or abs(strike-reference) > step*0.55:
+            continue
+        def value(key: str) -> Optional[float]:
+            try:
+                x = float(row.get(key))
+                return x if math.isfinite(x) else None
+            except (TypeError, ValueError, OverflowError):
+                return None
+        c = value("call_delta_oi_pct_snapshot"); q = value("put_delta_oi_pct_snapshot")
+        evidence.append({"strike": strike, "call_delta_pct": c, "put_delta_pct": q,
+                         "call_relative_oi": value("call_relative_oi"), "put_relative_oi": value("put_relative_oi"),
+                         "call_flow": row.get("call_flow"), "put_flow": row.get("put_flow")})
+    if not evidence:
+        return {"approved": False, "reason": "NO_MATCHING_STRIKE_OI", "reference": reference}
+    row = min(evidence, key=lambda x: abs(x["strike"]-reference))
+    c, q = row["call_delta_pct"], row["put_delta_pct"]
+    # Comparable positive put / negative call is bullish; reverse is bearish.
+    # Opposite signs of both sides are treated as conflict, not a bullish shortcut.
+    if c is None or q is None:
+        return {"approved": False, "reason": "INCOMPLETE_OI_COMPARISON", "observed": row}
+    bullish = int(q > 0) + int(c < 0)
+    bearish = int(c > 0) + int(q < 0)
+    bullish_flows = {"CALL_LONG_BUILDUP_LIKELY", "CALL_SHORT_COVERING_LIKELY", "PUT_WRITING_LIKELY", "PUT_LONG_UNWINDING_LIKELY"}
+    bearish_flows = {"CALL_WRITING_LIKELY", "CALL_LONG_UNWINDING_LIKELY", "PUT_LONG_BUILDUP_LIKELY", "PUT_SHORT_COVERING_LIKELY"}
+    flows = [row.get("call_flow"), row.get("put_flow")]
+    supportive = bullish_flows if setup.direction == "BULLISH" else bearish_flows
+    opposing = bearish_flows if setup.direction == "BULLISH" else bullish_flows
+    if sum(f in opposing for f in flows) == 2 and not any(f in supportive for f in flows):
+        return {"approved": False, "reason": "PREMIUM_FLOW_CONFLICT", "observed": row}
+    aligned = bullish > bearish if setup.direction == "BULLISH" else bearish > bullish
+    # If both sides add OI at a reversal zone, a meaningful strengthening local
+    # wall may support the bounce/rejection; the directional opposing pair still
+    # blocks it. This remains a hypothesis about support, not proof of writers.
+    local_wall = False
+    if bullish == bearish and c > 0 and q > 0 and "REVERSAL" in setup.kind:
+        rel = row["put_relative_oi"] if setup.direction == "BULLISH" else row["call_relative_oi"]
+        local_wall = rel is not None and rel >= 0.30
+    aligned = aligned or local_wall
+    return {"approved": aligned, "reason": "OI_LEVELS_ALIGNED" if aligned else "OI_LEVELS_MIXED_OR_OPPOSED",
+            "observed": row, "bullish_components": bullish, "bearish_components": bearish,
+            "snapshot_status": oi.get("snapshot_status")}
+
+
+def v112_candidates(candles: Sequence[Candle], levels: Sequence[PriceLevel], structure: Mapping[str, Any],
+                    thesis: Mapping[str, Any]) -> tuple[list[Setup], dict[str, Any]]:
+    # v111 generator provides independent recent bounce, rejection and continuation
+    # observations. Restore all candidates instead of using only its first choice.
+    _, details = v111_price_candidate(candles, levels, structure, thesis)
+    candidates = [x for x in (_setup_from_state(d) for d in details.get("candidates", [])) if x is not None]
+    recent = _contiguous_tail(candles, 1)
+    if len(recent) >= 6:
+        current, previous = recent[-1], recent[-2]
+        atr1 = float(structure.get("atr_1m") or 0)
+        if math.isfinite(atr1) and atr1 > 0:
+            buffer = max(1.0, 0.08*atr1)
+            for level in levels:
+                if level.strength < 1.0 or "FUTURES_VWAP_CONTEXT_ONLY" in level.source:
+                    continue
+                if level.side == "RESISTANCE" and previous.close <= level.price and current.close > level.price + buffer and current.close > current.open:
+                    candidates.append(Setup("V112_BREAKOUT", "BULLISH", current.close, min(c.low for c in recent[-4:])-buffer, current.close_time, level.price, level.source, 0.65))
+                elif level.side == "SUPPORT" and previous.close >= level.price and current.close < level.price-buffer and current.close < current.open:
+                    candidates.append(Setup("V112_BREAKDOWN", "BEARISH", current.close, max(c.high for c in recent[-4:])+buffer, current.close_time, level.price, level.source, 0.65))
+    # Preserve multiple setup families even when several nearby levels overlap.
+    groups: dict[tuple[str, str], list[Setup]] = defaultdict(list)
+    for candidate in candidates:
+        groups[(candidate.kind, candidate.direction)].append(candidate)
+    diverse: list[Setup] = []
+    for depth in range(4):
+        for key in sorted(groups):
+            if depth < len(groups[key]):
+                diverse.append(groups[key][depth])
+    return diverse[:24], details
+
+
+def v112_selection_scenario(setup: Setup, structure: Mapping[str, Any]) -> str:
+    if "REVERSAL" in setup.kind:
+        return "REVERSAL"
+    if "SIDEWAYS" in str(structure.get("regime") or "").upper() or str(structure.get("market_thesis_state") or "").upper() == "RANGE":
+        return "RANGE"
+    return "TREND"
+
+
+def v112_evaluate_candidates(candidates: Sequence[Setup], *, spot: float, now: datetime,
+                            oi: Mapping[str, Any], oi_structure: Mapping[str, Any],
+                            structure: Mapping[str, Any], levels: Sequence[PriceLevel],
+                            config: Config, thesis: Mapping[str, Any], spot_quote_time: datetime,
+                            chain_records: Sequence[OptionRecord], full_quotes: Mapping[str, Mapping[str, Any]],
+                            expiry: date) -> tuple[Optional[tuple[Setup, dict[str, Any], dict[str, Any], dict[str, Any]]], list[dict[str, Any]]]:
+    """Evaluate every candidate independently with no mutation or notification."""
+    rows = []; passing = []
+    for candidate in candidates:
+        row: dict[str, Any] = {"setup": json_safe(candidate)}
+        try:
+            age = (now-candidate.confirmed_at).total_seconds()
+            if age < -1 or age > config.setup_max_age_minutes*60:
+                raise ScannerError("MISSED_OR_STALE_SETUP", f"Setup age {age:.1f}s")
+            validate_live_setup_trigger(candidate, spot, max(0.5,float(structure.get("atr_1m") or 0)*0.15))
+            extension = abs(spot-candidate.trigger)
+            if structure.get("atr_1m") and extension > float(structure["atr_1m"])*config.max_entry_extension_atr:
+                raise ScannerError("ENTRY_TOO_EXTENDED", f"Live price is {extension:.2f} points from trigger")
+            confirmation = v112_oi_support(candidate, oi, oi_structure, spot)
+            row["oi"] = confirmation
+            if not confirmation.get("approved"):
+                raise ScannerError(str(confirmation.get("reason")), "OI structure does not confirm this candidate")
+            target_levels = [x for x in levels if _level_has_structural_provenance(x) or ("OI_" in x.source and x.strength >= 1.5)]
+            plan = v111_risk_plan(spot,candidate,structure,target_levels,config,now,thesis)
+            selected_structure = dict(structure, selection_scenario=v112_selection_scenario(candidate, structure))
+            selected = select_option_and_risk(candidate.direction,spot,spot_quote_time,chain_records,full_quotes,expiry,now,plan,selected_structure,config)
+            row.update(status="QUALIFIED", reason="ALL_GATES_PASSED", risk_points=plan["risk_points"], rr=plan["underlying_rr"], strike=selected["strike"])
+            passing.append((candidate,plan,selected,selected_structure))
+        except ScannerError as exc:
+            row.update(status="BLOCKED",reason=exc.code,message=str(exc))
+        rows.append(row)
+    # Deterministic: prefer less risk, then newest setup. Do not use fake probability.
+    winner = min(passing,key=lambda x:(float(x[1]["risk_points"]),-x[0].confirmed_at.timestamp())) if passing else None
+    return winner, rows
 
 
 def detect_setup(
@@ -3397,7 +3531,12 @@ def option_quote_from_full(record: OptionRecord, raw: Mapping[str, Any]) -> Opti
 
 
 def _strike_offsets_for_regime(direction: str, structure: Mapping[str, Any], config: Config) -> tuple[int, ...]:
-    # Fixed ATM / one-ITM universe for all setups.
+    scenario = str(structure.get("selection_scenario") or "").upper()
+    regime = str(structure.get("regime") or "").upper()
+    thesis_state = str(structure.get("market_thesis_state") or "").upper()
+    reversal = scenario in {"REVERSAL", "RANGE"} if scenario else ("REVERSAL" in regime or "SIDEWAYS" in regime or thesis_state.startswith("REVERSAL_PENDING") or thesis_state == "RANGE")
+    if reversal:
+        return (-1, -2) if direction == "BULLISH" else (1, 2)
     return (0, -1) if direction == "BULLISH" else (0, 1)
 
 
@@ -3514,6 +3653,12 @@ def select_option_and_risk(
         reason = rejections.most_common(1)[0][0] if rejections else "NO_VALID_OPTION_QUOTES"
         details = ", ".join(f"{key}:{value}" for key, value in rejections.most_common(5))
         raise ScannerError(reason, f"No eligible {side} contract among allowed offsets {list(offsets)}. {details}")
+    largest_oi = max(float(candidate.get("oi") or 0.0) for candidate in candidates)
+    for candidate in candidates:
+        oi_relative = float(candidate.get("oi") or 0.0) / largest_oi if largest_oi > 0 else 0.0
+        candidate["oi_relative_to_candidates"] = round(oi_relative, 5)
+        candidate["selection_score"] = round(0.95 * candidate["selection_score"] + 0.05 * oi_relative, 5)
+        candidate["_rank"] = (candidate["selection_score"], -candidate["spread_pct"], candidate["delta_score"], candidate["volume"], candidate["bid_qty"] + candidate["ask_qty"])
     candidates.sort(key=lambda candidate: candidate["_rank"], reverse=True)
     ranking = [{k: v for k, v in candidate.items() if k != "_rank"} | {"rank": rank}
                for rank, candidate in enumerate(candidates[:5], 1)]
@@ -3970,12 +4115,16 @@ def build_futures_context(
     futures_price_delta = None
     futures_oi_pct = None
     recent_futures = _contiguous_tail(futures_candles, 1) if futures_candles else []
-    if len(recent_futures) >= 2:
+    expected_futures_close = received_at.astimezone(IST).replace(second=0, microsecond=0)
+    if len(recent_futures) >= 2 and recent_futures[-1].close_time >= expected_futures_close:
         prev_bar, last_bar = recent_futures[-2], recent_futures[-1]
         futures_oi_delta = last_bar.oi - prev_bar.oi
         futures_price_delta = last_bar.close - prev_bar.close
         futures_oi_pct = 100.0 * futures_oi_delta / prev_bar.oi if prev_bar.oi > 0 else None
-        if prev_bar.oi > 0 and last_bar.oi > 0 and futures_oi_delta != 0 and futures_price_delta != 0:
+        futures_atr = atr(recent_futures) or 0.0
+        material_price = abs(futures_price_delta) >= max(0.5, 0.1 * futures_atr)
+        material_oi = futures_oi_pct is not None and abs(futures_oi_pct) >= 0.01
+        if prev_bar.oi > 0 and last_bar.oi > 0 and material_oi and material_price:
             if futures_price_delta > 0 and futures_oi_delta > 0:
                 futures_oi_signal = "LONG_BUILDUP_BULLISH"
             elif futures_price_delta < 0 and futures_oi_delta > 0:
@@ -5233,12 +5382,15 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         index_candles = fetch_candles(client, index_key, now, minutes=1)
         freshness = candle_freshness(index_candles, now)
         # Retry the same snapshot boundary; do not add an unfinished candle.
-        for _ in range(2):
+        candle_retries = 0
+        for _ in range(3):
             if freshness["latest_expected_available"]:
                 break
             time.sleep(1.0)
+            candle_retries += 1
             index_candles = fetch_candles(client, index_key, now, minutes=1)
             freshness = candle_freshness(index_candles, now)
+        freshness["retry_count"] = candle_retries
         base_result["candle_freshness"] = freshness
         latest_close_time = index_candles[-1].close_time
         candle_age = (now - latest_close_time).total_seconds()
@@ -5338,14 +5490,29 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
             })
             state["thesis_history"] = thesis_history[-120:]
         state["market_thesis"] = market_thesis
-        tracked_setup = advance_setup_watch(index_candles, previous_processed, daily_candles, state, config, oi)
-        if tracked_setup is not None and not tracked_setup.kind.startswith("V111_"):
-            tracked_setup = None  # never upgrade an old version's watch into a v111 trade
-        current_setup, price_evidence = v111_price_candidate(index_candles, levels, structure, market_thesis)
-        setup = select_active_setup(current_setup, tracked_setup, spot, oi, structure, quote_received_at, config)
+        old_watch_rows = state.get("v112_setup_watches") if isinstance(state.get("v112_setup_watches"), list) else []
+        # Carry each candidate independently; no single preferred watch can hide
+        # an alternative on the next scan. Validate every intervening candle.
+        retained_watches = []
+        for watch_row in old_watch_rows[:24]:
+            temporary_watch_state = {"setup_watch": watch_row}
+            watch = advance_setup_watch(index_candles, previous_processed, daily_candles, temporary_watch_state, config, oi)
+            if watch is not None and watch.kind.startswith(("V111_", "V112_")):
+                retained_watches.append(watch)
+        all_candidates, price_evidence = v112_candidates(index_candles, levels, structure, market_thesis)
+        if not freshness["latest_expected_available"]:
+            all_candidates = []  # incomplete snapshot cannot create a new watch
+        for watch in retained_watches:
+            if watch not in all_candidates:
+                all_candidates.append(watch)
+        all_candidates = all_candidates[:24]
+        state["v112_setup_watches"] = [json_safe(x) for x in all_candidates]
+        tracked_setup = retained_watches[0] if retained_watches else None
+        current_setup = all_candidates[0] if all_candidates else None
+        setup = current_setup
         direction_consensus = build_direction_consensus(oi, structure, future_context, setup, config, market_thesis)
-        early_evidence = {"status": "REPLACED_BY_V111_PATHS"}
-        oi_confirmation = v111_oi_confirmation(setup, oi, oi_structure, future_context, spot) if setup else {"approved": False, "reason": "NO_PRICE_CANDIDATE"}
+        early_evidence = {"status": "V112_INDEPENDENT_CANDIDATES"}
+        oi_confirmation = v112_oi_support(setup, oi, oi_structure, spot) if setup else {"approved": False, "reason": "NO_PRICE_CANDIDATE"}
         detected_new_setup = setup is not None and (tracked_setup is None or setup.confirmed_at != tracked_setup.confirmed_at or setup.direction != tracked_setup.direction)
         state["last_processed_candle"] = index_candles[-1].start.isoformat()
         # Freshness-validated futures quote/VWAP context was built before levels.
@@ -5542,48 +5709,30 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                                 "message": "Latest completed one-minute candle is unavailable after retries; new entries blocked."})
         if can_evaluate_new_entry:
             exit_block = parse_datetime(state.get("position_entry_block_after"))
-            if setup is None:
-                base_result.setdefault("reason_code", "NO_CONFIRMED_SETUP")
-            elif exit_block is not None and not allow_reversal_entry and setup.confirmed_at <= exit_block:
-                base_result.update({
-                    "decision": "NO_TRADE",
-                    "reason_code": "WAITING_FOR_POST_EXIT_SETUP",
-                    "message": "A fresh setup confirmed after the prior position exit is required before another same-session entry.",
-                })
-            elif exit_block is not None and not allow_reversal_entry:
+            eligible_candidates = []
+            for candidate in all_candidates:
+                if exit_block is not None and candidate.confirmed_at <= exit_block:
+                    continue
                 last_exit = state.get("last_position_exit") if isinstance(state.get("last_position_exit"), Mapping) else {}
-                same_direction_reentry = str(last_exit.get("direction") or "").upper() == setup.direction
-                newest_3m_close = (bars_3m[-1].start + timedelta(minutes=3)) if bars_3m else None
-                if same_direction_reentry and (newest_3m_close is None or newest_3m_close <= exit_block):
-                    base_result.update({
-                        "decision": "NO_TRADE",
-                        "reason_code": "WAITING_FOR_FRESH_3M_STRUCTURE",
-                        "message": "Same-direction re-entry is allowed without a time cooldown, but requires a newly completed 3-minute structure bar after the prior exit.",
-                    })
-                    setup = None
-            if can_evaluate_new_entry and setup is not None and base_result.get("reason_code") != "WAITING_FOR_FRESH_3M_STRUCTURE":
-                setup_age = (quote_received_at - setup.confirmed_at).total_seconds()
-                max_setup_age = config.setup_max_age_minutes
-                if setup_age < -1 or setup_age > max_setup_age * 60:
-                    raise ScannerError("MISSED_OR_STALE_SETUP", f"Setup confirmation is {setup_age:.0f}s old; no backdated entry allowed")
-                validate_live_setup_trigger(setup, spot, max(0.5, float(structure.get("atr_1m") or 0.0) * 0.15))
-                extension = abs(spot - setup.trigger)
-                if structure.get("atr_1m") and extension > float(structure["atr_1m"]) * config.max_entry_extension_atr:
-                    base_result["entry_timing_status"] = "WAIT_FOR_PULLBACK_RETEST"
-                    raise ScannerError("ENTRY_TOO_EXTENDED", f"Current spot is {extension:.2f} points from setup trigger; thesis retained for a fresh pullback/retest")
-                if not chain_refresh_ok:
-                    detail = chain_refresh_error.code if chain_refresh_error else "UNKNOWN_REFRESH_FAILURE"
-                    raise ScannerError("OPTION_CHAIN_REFRESH_FAILED", f"A fresh option chain/Greeks snapshot is required before entry; latest refresh failed with {detail}")
-                if not oi_confirmation.get("approved"):
-                    raise ScannerError(str(oi_confirmation.get("reason") or "OI_CONFIRMATION_MISSING"), "Current price setup lacks fresh compatible OI confirmation")
-                if setup.kind == "V111_CONTINUATION":
-                    d3 = str(structure.get("execution_3m_direction") or "")
-                    if d3 in {"BULLISH", "BEARISH"} and d3 != setup.direction and float(structure.get("execution_3m_confidence") or 0) >= 0.70:
-                        raise ScannerError("THREE_MINUTE_STRONGLY_OPPOSES", "Strong opposing three-minute structure blocks continuation")
-                plan = v111_risk_plan(spot, setup, structure, levels, config, quote_received_at, market_thesis)
+                newest_3m_close = bars_3m[-1].start + timedelta(minutes=3) if bars_3m else None
+                if exit_block and str(last_exit.get("direction") or "").upper() == candidate.direction and (newest_3m_close is None or newest_3m_close <= exit_block):
+                    continue
+                eligible_candidates.append(candidate)
+            if chain_refresh_ok:
+                winner, candidate_evaluations = v112_evaluate_candidates(eligible_candidates, spot=spot, now=quote_received_at, oi=oi, oi_structure=oi_structure, structure=structure, levels=levels, config=config, thesis=market_thesis, spot_quote_time=spot_quote_time, chain_records=chain_records, full_quotes=full_quotes, expiry=expiry)
+            else:
+                winner = None
+                candidate_evaluations = [{"setup":json_safe(x),"status":"BLOCKED","reason":"OPTION_CHAIN_REFRESH_FAILED"} for x in eligible_candidates]
+            base_result["v112_candidate_evaluations"] = candidate_evaluations
+            if winner is None and candidate_evaluations:
+                base_result["reason_code"] = candidate_evaluations[0]["reason"]
+                base_result["message"] = candidate_evaluations[0].get("message")
+            if winner is not None:
+                setup, plan, selected, selection_structure = winner
                 base_result["risk_plan"] = plan
-                selection_structure = dict(structure)
-                selected = select_option_and_risk(setup.direction, spot, spot_quote_time, chain_records, full_quotes, expiry, quote_received_at, plan, selection_structure, config)
+                base_result["setup_direction"] = setup.direction
+                base_result["setup_kind"] = setup.kind
+                base_result["direction_consensus"] = build_direction_consensus(oi, structure, future_context, setup, config, market_thesis)
                 signal_key_raw = f"{session_date}|{expiry}|{setup.direction}|{selected['instrument_key']}|{setup.kind}|{setup.confirmed_at.isoformat()}"
                 signal_key = hashlib.sha256(signal_key_raw.encode()).hexdigest()[:24]
                 if signal_key in state.get("seen_signal_keys", []):
