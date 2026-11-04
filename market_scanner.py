@@ -44,7 +44,7 @@ from statistics import median
 from typing import Any, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-VERSION = "109.1.0"
+VERSION = "110.0.0"
 SCHEMA_VERSION = 109
 IST = ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
@@ -700,7 +700,7 @@ def compact_audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "position_event_details", "active_position_summary", "position_reconciliation_required",
         "direction_consensus", "shadow_option_selection", "entry_timing_status",
         "market_thesis", "oi_structure", "candle_freshness", "local_reversal_watch",
-        "entry_gate_diagnostics", "position_exit",
+        "entry_gate_diagnostics", "position_exit", "early_oi_reversal",
     )
     compact = {key: record[key] for key in root_fields if key in record}
 
@@ -2963,6 +2963,91 @@ def local_reversal_watch(candles: Sequence[Candle], levels: Sequence[PriceLevel]
             "note": "Research candidate only; not an entry or trade recommendation"}
 
 
+def evaluate_early_oi_reversal(candles: Sequence[Candle], levels: Sequence[PriceLevel],
+                               structure: Mapping[str, Any], thesis: Mapping[str, Any],
+                               oi: Mapping[str, Any], oi_structure: Mapping[str, Any],
+                               futures: Mapping[str, Any]) -> tuple[Optional[Setup], dict[str, Any]]:
+    """Local reversal hypothesis: causal price rejection plus fresh strike OI.
+
+    Thresholds are provisional research parameters, not calibrated probabilities.
+    Candidates are recomputed on every run and never carried forward as watches.
+    """
+    if len(_contiguous_tail(candles, 1)) < 6:
+        return None, {"status": "BLOCKED", "reason": "RECENT_CANDLE_GAP_OR_INSUFFICIENT"}
+    watch = local_reversal_watch(candles, levels, structure, thesis)
+    out = {"status": "BLOCKED", "reason": "NO_PRICE_REJECTION", "price_watch": watch}
+    if watch.get("status") != "SHADOW_ONLY":
+        return None, out
+    direction = str(watch["direction"])
+    out["direction"] = direction
+    if not oi_structure.get("fresh_snapshot"):
+        out["reason"] = "OI_SNAPSHOT_NOT_FRESH"
+        return None, out
+    if str(structure.get("execution_direction") or "") != direction:
+        out["reason"] = "ONE_MINUTE_DIRECTION_NOT_ALIGNED"
+        return None, out
+    if float(structure.get("execution_confidence") or 0.0) < 0.55:
+        out["reason"] = "ONE_MINUTE_CONFIDENCE_WEAK"
+        return None, out
+    fsignal = _futures_direction_signal(futures)
+    if fsignal * _direction_sign(direction) < -0.35:
+        out["reason"] = "FUTURES_OPPOSE"
+        return None, out
+    raw = str(oi.get("raw_label") or "MISSING")
+    if raw in {"BULLISH", "BEARISH"} and raw != direction and float(oi.get("confidence") or 0) >= 0.80:
+        out["reason"] = "STRONG_GLOBAL_OI_OPPOSES"
+        return None, out
+    rows = [r for r in oi.get("oi_levels", []) if isinstance(r, Mapping) and r.get("strike") is not None]
+    if not rows:
+        out["reason"] = "STRIKE_OI_UNAVAILABLE"
+        return None, out
+    level = float(watch["level"])
+    row = min(rows, key=lambda r: abs(float(r["strike"]) - level))
+    step = float(oi_structure.get("strike_step") or 50.0)
+    if not math.isfinite(step) or step <= 0 or abs(float(row["strike"]) - level) > step * 0.55:
+        out["reason"] = "NO_OI_AT_REJECTION_LEVEL"
+        return None, out
+    prefix = "call" if direction == "BEARISH" else "put"
+    try:
+        delta = float(row.get(prefix + "_delta_oi_pct_snapshot"))
+        writer = float(row.get(prefix + "_writer_strength") or 0)
+        relative = float(row.get(prefix + "_relative_oi") or 0)
+    except (TypeError, ValueError, OverflowError):
+        out["reason"] = "STRIKE_OI_INCOMPLETE"
+        return None, out
+    out["strike_evidence"] = {"strike": row["strike"], "oi_change_pct": delta,
+                              "writer_strength": writer, "relative_oi": relative,
+                              "flow": row.get(prefix + "_flow")}
+    if not all(math.isfinite(x) for x in (delta, writer, relative)) or delta <= 0 or writer < 0.35 or relative < 0.25:
+        out["reason"] = "STRIKE_WRITING_NOT_CONFIRMED"
+        return None, out
+    out.update(status="CANDIDATE", reason="PRICE_REJECTION_WITH_FRESH_STRIKE_OI")
+    setup = Setup(kind="EARLY_OI_LEVEL_REVERSAL", direction=direction,
+                  trigger=float(watch["trigger"]), invalidation=float(watch["invalidation_reference"]),
+                  confirmed_at=candles[-1].close_time, source_level=level,
+                  source=str(watch["level_source"]) + "|FRESH_STRIKE_OI",
+                  price_confidence=min(0.95, max(0.55, float(structure.get("execution_confidence") or 0))))
+    return setup, out
+
+
+def validate_early_target_room(setup: Setup, spot: float, plan: Mapping[str, Any],
+                               levels: Sequence[PriceLevel], config: Config) -> None:
+    """Do not project through the nearest meaningful opposing structural level."""
+    side = "SUPPORT" if setup.direction == "BEARISH" else "RESISTANCE"
+    nearby = [x for x in levels if x.side == side and x.strength >= max(config.min_level_strength, 1.5)
+              and _level_has_structural_provenance(x)
+              and ((x.price < spot) if setup.direction == "BEARISH" else (x.price > spot))]
+    if not nearby:
+        raise ScannerError("EARLY_TARGET_STRUCTURE_UNAVAILABLE", "No meaningful opposing price structure available for early reversal target")
+    nearest = min(nearby, key=lambda x: abs(x.price - spot))
+    distance = abs(nearest.price - spot)
+    risk = float(plan["risk_points"])
+    if distance / risk < config.min_underlying_rr:
+        raise ScannerError("EARLY_TARGET_ROOM_INSUFFICIENT", f"Nearest opposing structure offers only {distance/risk:.2f}R")
+    if abs(float(plan["t1_underlying"]) - spot) > distance + 1e-6:
+        raise ScannerError("EARLY_TARGET_BEYOND_STRUCTURE", "Planned target is beyond nearest opposing structural level")
+
+
 def detect_setup(
     candles: Sequence[Candle], levels: Sequence[PriceLevel], structure: Mapping[str, Any],
     config: Config, oi_evidence: Optional[Mapping[str, Any]] = None,
@@ -3867,7 +3952,7 @@ def choose_oi_targets_and_stop(
     thesis = dict(market_thesis) if isinstance(market_thesis, Mapping) else {}
     thesis_direction = str(thesis.get("direction") or "RANGE").upper()
     thesis_state = str(thesis.get("state") or "RANGE").upper()
-    trend_trade = thesis_direction == direction and thesis_state not in {"RANGE", "REVERSAL_PENDING_BULL", "REVERSAL_PENDING_BEAR"}
+    trend_trade = setup.kind != "EARLY_OI_LEVEL_REVERSAL" and thesis_direction == direction and thesis_state not in {"RANGE", "REVERSAL_PENDING_BULL", "REVERSAL_PENDING_BEAR"}
 
     target_side = "RESISTANCE" if direction == "BULLISH" else "SUPPORT"
     rows: list[dict[str, Any]] = []
@@ -5122,6 +5207,12 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         )
         # Re-score after filtering the setup against the current direction.
         direction_consensus = build_direction_consensus(oi, structure, future_context, setup, config, market_thesis)
+        early_setup, early_evidence = evaluate_early_oi_reversal(index_candles, levels, structure, market_thesis, oi, oi_structure, future_context)
+        # Fresh candidates are evaluated on this run only; never revive a prior early watch.
+        if setup is not None and setup.kind == "EARLY_OI_LEVEL_REVERSAL":
+            setup = None
+        if setup is None and early_setup is not None:
+            setup = early_setup
         detected_new_setup = setup is not None and (tracked_setup is None or setup.confirmed_at != tracked_setup.confirmed_at or setup.direction != tracked_setup.direction)
         state["last_processed_candle"] = index_candles[-1].start.isoformat()
         # Freshness-validated futures quote/VWAP context was built before levels.
@@ -5134,6 +5225,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
         base_result.update({"expiry": expiry.isoformat(), "underlying_key": index_key, "spot": spot, "spot_context": spot_context, "oi": {k: v for k, v in oi.items() if k != "features"}, "oi_label": oi.get("label", "MISSING"), "oi_state": oi_state, "oi_raw_label": oi.get("raw_label", oi.get("label", "MISSING")), "option_chain_status": oi.get("source_refresh_status", "SUCCESS" if chain_refresh_ok else "UNKNOWN"), "option_chain_error": chain_refresh_error.code if chain_refresh_error else None, "structure": structure, "regime": structure.get("regime"), "market_scenario": market_scenario, "levels": level_summary, "futures": future_context, "market_thesis": market_thesis, "oi_structure": oi_structure, "setup": json_safe(setup) if setup else None, "direction_consensus": direction_consensus, "decision": "NO_TRADE", "reason_code": "NO_CONFIRMED_SETUP"})
 
         base_result["local_reversal_watch"] = local_reversal_watch(index_candles, levels, structure, market_thesis)
+        base_result["early_oi_reversal"] = early_evidence
         base_result["entry_gate_diagnostics"] = {
             "latest_candle_ready": freshness["latest_expected_available"],
             "price_1m": structure.get("execution_direction"),
@@ -5350,10 +5442,19 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                 if not chain_refresh_ok:
                     detail = chain_refresh_error.code if chain_refresh_error else "UNKNOWN_REFRESH_FAILURE"
                     raise ScannerError("OPTION_CHAIN_REFRESH_FAILED", f"A fresh option chain/Greeks snapshot is required before entry; latest refresh failed with {detail}")
-                authorize_consensus_entry(direction_consensus, setup, oi, structure, config, market_thesis, oi_structure)
+                if setup.kind == "EARLY_OI_LEVEL_REVERSAL":
+                    if early_setup is None or early_evidence.get("status") != "CANDIDATE" or setup != early_setup:
+                        raise ScannerError("EARLY_CONFIRMATION_UNAVAILABLE", "A current price and strike OI confirmation is required")
+                else:
+                    authorize_consensus_entry(direction_consensus, setup, oi, structure, config, market_thesis, oi_structure)
                 plan = choose_oi_targets_and_stop(spot, setup, oi, structure, config, quote_received_at, levels=levels, market_thesis=market_thesis)
+                if setup.kind == "EARLY_OI_LEVEL_REVERSAL":
+                    validate_early_target_room(setup, spot, plan, levels, config)
                 base_result["risk_plan"] = plan
-                selected = select_option_and_risk(setup.direction, spot, spot_quote_time, chain_records, full_quotes, expiry, quote_received_at, plan, structure, config)
+                selection_structure = dict(structure)
+                if setup.kind == "EARLY_OI_LEVEL_REVERSAL":
+                    selection_structure["regime"] = "REVERSAL_EARLY_OI"
+                selected = select_option_and_risk(setup.direction, spot, spot_quote_time, chain_records, full_quotes, expiry, quote_received_at, plan, selection_structure, config)
                 signal_key_raw = f"{session_date}|{expiry}|{setup.direction}|{selected['instrument_key']}|{setup.kind}|{setup.confirmed_at.isoformat()}"
                 signal_key = hashlib.sha256(signal_key_raw.encode()).hexdigest()[:24]
                 if signal_key in state.get("seen_signal_keys", []):
@@ -5373,7 +5474,7 @@ def run_scan(config: Config, *, now: Optional[datetime] = None, client: Optional
                         "selected_contract": selected,
                         "risk_plan": plan,
                         "setup": json_safe(setup),
-                        "candidate_offsets_allowed": list(_strike_offsets_for_regime(setup.direction, structure, config)),
+                        "candidate_offsets_allowed": list(_strike_offsets_for_regime(setup.direction, selection_structure, config)),
                         "notification_status": "QUEUED" if config.email_configured else "NOT_CONFIGURED",
                         "active_position_summary": {
                             "position_id": signal_key, "direction": setup.direction,
