@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY scenario engine v115.0.0 — complete standalone analytical scanner.
+"""NIFTY scenario engine v116.0.0 — complete standalone analytical scanner.
 
 Completed price bars -> protected structure -> conditional forward scenarios ->
 independent setup watches -> fixed risk plan -> one quoted option contract ->
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 
 # scanner/__init__.py
-__version__ = '115.0.0'
+__version__ = '116.0.0'
 
 
 # scanner/core.py
@@ -73,7 +73,7 @@ class Config:
     forecast_horizon_minutes: int = 15
     session_exit_lead_minutes: int = 20
     entry_cutoff_lead_minutes: int = 30
-    # v115 configuration, documented engineering choices; not fitted probabilities.
+    # v116 configuration, documented engineering choices; not fitted probabilities.
     oi_nearby_points: float = 400.0
     oi_material_change_fraction: float = 0.005
     oi_horizon_max_seconds: int = 3600
@@ -183,7 +183,7 @@ def classify_flow(old_oi: float, new_oi: float, old_price: float, new_price: flo
         return 'UNCHANGED_OR_NOISY'
     return {(True, True): 'LONG_BUILDUP_HYPOTHESIS', (True, False): 'SHORT_COVERING_HYPOTHESIS', (False, True): 'SHORT_BUILDUP_HYPOTHESIS', (False, False): 'LONG_UNWINDING_HYPOTHESIS'}[dp > 0, doi > 0]
 
-# v115 STRATEGY RESEARCH IMPLEMENTATION.
+# v116 STRATEGY RESEARCH IMPLEMENTATION.
 # All regime inference, setups, watches, risk and contract ranking below were
 # designed independently of the previous release's trading functions.
 # Provider, wire format and persistence facilities are retained for compatibility.
@@ -362,7 +362,7 @@ def _structure_at(bars: list[Candle]) -> dict[str, Any]:
     context='DEVELOPING'
     if len(fifteens)>=2:
         context='BULLISH' if fifteens[-1].close>fifteens[-2].close else 'BEARISH' if fifteens[-1].close<fifteens[-2].close else 'SIDEWAYS'
-    return {'engine_revision':1150,'direction':direction,'state':phase,'support':support,
+    return {'engine_revision':1160,'direction':direction,'state':phase,'support':support,
             'resistance':resistance,'boundary_source':boundary_source,'pending_break':pending,
             'break_confirmed':reversal is not None and last_reason in ('SUPPORT_BREAK_CONFIRMED','RESISTANCE_BREAK_CONFIRMED'),
             'last_reversal':reversal,'reason':last_reason,'established_at':established_at,
@@ -983,7 +983,7 @@ class Upstox:
 
     def get(self, path: str, params: dict | None=None):
         url = 'https://api.upstox.com' + path + ('?' + urlencode(params) if params else '')
-        req = Request(url, headers={'Authorization': 'Bearer ' + self._token, 'Accept': 'application/json', 'User-Agent': 'nifty-scanner/115'})
+        req = Request(url, headers={'Authorization': 'Bearer ' + self._token, 'Accept': 'application/json', 'User-Agent': 'nifty-scanner/116'})
         for attempt in range(3):
             try:
                 with urlopen(req, timeout=12) as r:
@@ -1165,7 +1165,7 @@ class Upstox:
             else:
                 instruments = []
             if not instruments:
-                req = Request('https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz', headers={'User-Agent': 'nifty-scanner/115'})
+                req = Request('https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz', headers={'User-Agent': 'nifty-scanner/116'})
                 with urlopen(req, timeout=20) as response:
                     raw = response.read(40000001)
                 if len(raw) > 40000000:
@@ -1266,7 +1266,7 @@ def migrate_state(source, destination, now):
     """Import an existing alert state once, without changing its source bytes.
 
     Operational records are translated. No previous strategy implementation,
-    old setup watch or old directional thesis becomes a v115 trading rule.
+    old setup watch or old directional thesis becomes a v116 trading rule.
     """
     from math import isfinite
     if destination.exists():
@@ -1283,11 +1283,11 @@ def migrate_state(source, destination, now):
         raise StateError('Migration source is unreadable') from None
     if legacy.get('schema') in (1, 2, 3, 4):
         state = load(source, allow_legacy=True)
-        state.update(schema=4, engine_version='115.0.0', thesis=None, setup_watches=[], oi_snapshot=None, oi_history=[], futures_snapshot=None)
+        state.update(schema=4, engine_version='116.0.0', thesis=None, setup_watches=[], oi_snapshot=None, oi_history=[], futures_snapshot=None)
     elif legacy.get('schema_version') in (107, 109):
         if legacy.get('position_reconciliation_required'):
             raise StateError('Legacy state requires reconciliation; it cannot be migrated as flat')
-        state = {'schema': 4, 'engine_version': '115.0.0', 'initialized_at': now.isoformat(), 'session_date': legacy.get('session_date'), 'thesis': None, 'position': None, 'history': [], 'outbox': [], 'last_exit': None, 'oi_snapshot': None, 'oi_history': [], 'setup_watches': [], 'thesis_history': []}
+        state = {'schema': 4, 'engine_version': '116.0.0', 'initialized_at': now.isoformat(), 'session_date': legacy.get('session_date'), 'thesis': None, 'position': None, 'history': [], 'outbox': [], 'last_exit': None, 'oi_snapshot': None, 'oi_history': [], 'setup_watches': [], 'thesis_history': []}
         original = legacy.get('active_position')
         if original is not None:
             if not isinstance(original, dict) or original.get('status') != 'OPEN':
@@ -1323,7 +1323,7 @@ def migrate_state(source, destination, now):
     else:
         raise StateError('Unsupported migration schema; no state was created')
     digest = hashlib.sha256(raw).hexdigest()
-    archive = destination.parent / 'archives_v115' / (source.name + '.' + digest[:16] + '.json')
+    archive = destination.parent / 'archives_v116' / (source.name + '.' + digest[:16] + '.json')
     if not archive.exists():
         archive.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=archive.parent, prefix='.migration-')
@@ -1405,7 +1405,7 @@ def load(path: Path, allow_legacy=False):
         s['setup_watches'] = []
         s['oi_snapshot'] = None
     s['schema'] = 4
-    s['engine_version'] = '115.0.0'
+    s['engine_version'] = '116.0.0'
     s.setdefault('oi_history', [])
     s.setdefault('setup_watches', [])
     s.setdefault('thesis_history', [])
@@ -1414,7 +1414,7 @@ def load(path: Path, allow_legacy=False):
 def initialize(path: Path, now: datetime):
     if path.exists():
         raise StateError('State already exists; refusing to overwrite')
-    save(path, {'schema': 4, 'engine_version': '115.0.0', 'initialized_at': now.isoformat(), 'initialized_flat': True, 'session_date': None, 'thesis': None, 'position': None, 'history': [], 'outbox': [], 'last_exit': None, 'oi_snapshot': None, 'oi_history': [], 'setup_watches': [], 'thesis_history': []})
+    save(path, {'schema': 4, 'engine_version': '116.0.0', 'initialized_at': now.isoformat(), 'initialized_flat': True, 'session_date': None, 'thesis': None, 'position': None, 'history': [], 'outbox': [], 'last_exit': None, 'oi_snapshot': None, 'oi_history': [], 'setup_watches': [], 'thesis_history': []})
 
 def queue(state: dict, kind: str, details: dict, when: datetime):
     raw = json.dumps([kind, details], sort_keys=True, separators=(',', ':'), allow_nan=False)
@@ -1600,7 +1600,7 @@ def record_and_assess(state, bars, now, forecast, horizon_minutes=15):
 from datetime import datetime, timedelta
 from math import isfinite
 
-# v115.1 independent, completed-candle chronological position management.
+# v116.1 independent, completed-candle chronological position management.
 from datetime import datetime, timedelta
 from math import isfinite
 
@@ -1630,6 +1630,37 @@ def manage(position, bars, spot, quote, now, market_close, config, structure=Non
         raise DataError('POSITION_MONITORING_CANDLE_GAP')
     if any(c.start+timedelta(minutes=1)>now for c in new):
         raise DataError('UNCOMPLETED_POSITION_CANDLE')
+    # The entry checkpoint is initialized to the minute containing the alert.
+    # Review that completed candle once, separately from the later candles.
+    # Its OHLC cannot establish whether a touch preceded or followed entry.
+    entry_start = opened.replace(second=0, microsecond=0)
+    if not p.get('entry_minute_reviewed') and now >= entry_start + timedelta(minutes=1):
+        entry_bars = [c for c in ordered if c.start == entry_start]
+        if not entry_bars:
+            events.append({'kind':'MONITORING_DEGRADED', 'position_id':p['id'],
+                           'at':now.isoformat(), 'reason':'ENTRY_MINUTE_HISTORY_UNAVAILABLE',
+                           'fill_confirmed':False})
+        else:
+            entry_bar = entry_bars[0]
+            adverse = entry_bar.low if sign == 1 else entry_bar.high
+            favourable = entry_bar.high if sign == 1 else entry_bar.low
+            # A migrated position may already have a ratcheted stop. Prefer
+            # the original plan rather than projecting a later stop backward.
+            initial_stop = (p.get('plan') or {}).get('stop_underlying')
+            initial_stop = float(initial_stop) if initial_stop is not None else float(p['stop'])
+            touched = []
+            if sign*(adverse-initial_stop) <= 0:
+                touched.append('STOP')
+            if sign*(favourable-p['t1']) >= 0:
+                touched.append('T1')
+            if touched:
+                events.append({'kind':'MONITORING_DEGRADED', 'position_id':p['id'],
+                               'at':(entry_start+timedelta(minutes=1)).isoformat(),
+                               'reason':'ENTRY_MINUTE_TOUCH_ORDER_UNKNOWN',
+                               'possible_touches':touched, 'stop_reference':initial_stop,
+                               'stop_reference_source':'INITIAL_PLAN' if (p.get('plan') or {}).get('stop_underlying') is not None else 'CURRENT_STOP_LEGACY',
+                               'fill_confirmed':False})
+        p['entry_minute_reviewed'] = True
     quote_bid=None
     if quote:
         try:
@@ -1692,15 +1723,6 @@ def manage(position, bars, spot, quote, now, market_close, config, structure=Non
     # Walk all unseen *completed* candles chronologically.
     for i,c in enumerate(new):
         if c.start<=opened.replace(second=0,microsecond=0):
-            # A bar spanning the alert has unknown ordering. Do not silently
-            # ignore a possible post-entry stop touch or claim it happened.
-            if c.start == opened.replace(second=0,microsecond=0):
-                adverse = c.low if sign == 1 else c.high
-                if sign*(adverse-p['stop']) <= 0:
-                    events.append({'kind':'MONITORING_DEGRADED', 'position_id':p['id'],
-                                   'at':(c.start+timedelta(minutes=1)).isoformat(),
-                                   'reason':'ENTRY_MINUTE_STOP_TOUCH_ORDER_UNKNOWN',
-                                   'stop':p['stop'], 'fill_confirmed':False})
             p['last_candle']=c.start.isoformat(); continue
         event_at=c.start+timedelta(minutes=1)
         adverse=c.low if sign==1 else c.high
@@ -2049,7 +2071,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             if reversal_exit is None:
                 return result
         try:
-            future = api.nearest_nifty_future(now, Path('.cache/nifty_futures_v115.json'))
+            future = api.nearest_nifty_future(now, Path('.cache/nifty_futures_v116.json'))
             fq = api.quotes([future['instrument_key']]).get(future['instrument_key'], {})
             ft = tick()
             fp = checked_spot(fq, ft, config.max_quote_age)
@@ -2266,311 +2288,13 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         # a qualified reference position or its durable outbox lock. main()
         # still commits state and exits nonzero so the workflow reports failure.
         try:
-            result['input_capture'] = capture_inputs(audit_dir / 'inputs_v115' / day, identifier, evidence)
+            result['input_capture'] = capture_inputs(audit_dir / 'inputs_v116' / day, identifier, evidence)
         except (OSError,ValueError,TypeError) as exc:
             result['persistence_error']='INPUT_CAPTURE_FAILED_'+type(exc).__name__
         try:
-            append_audit(audit_dir / ('market_scan_v115_' + day + '.jsonl'), result)
+            append_audit(audit_dir / ('market_scan_v116_' + day + '.jsonl'), result)
         except (OSError,ValueError,TypeError) as exc:
             result['persistence_error']='AUDIT_WRITE_FAILED_'+type(exc).__name__
-
-def replay_capture(path: Path, audit_dir: Path):
-    """Replay an input capture with no network access or notification delivery."""
-    import gzip
-    data = json.loads(gzip.decompress(path.read_bytes()))
-    if data.get('version') != __version__:
-        raise DataError('REPLAY_VERSION_MISMATCH')
-    if data.get('release_sha256') != release_fingerprint():
-        raise DataError('REPLAY_SOURCE_MISMATCH')
-    if any((row.get('error_type') not in (None, 'ProviderError', 'DataError') for row in data['api_events'])):
-        raise DataError('REPLAY_UNSUPPORTED_RECORDED_FAILURE')
-
-    class ReplayAPI:
-        replay_mode = True
-
-        def __init__(self):
-            self.index = 0
-
-        def __getattr__(self, name):
-
-            def call(*args, **kwargs):
-                if self.index >= len(data['api_events']):
-                    raise DataError('REPLAY_API_EXHAUSTED')
-                row = data['api_events'][self.index]
-                self.index += 1
-                if row['method'] != name or row['args'] != wire(args) or row['kwargs'] != wire(kwargs):
-                    raise DataError('REPLAY_CALL_MISMATCH')
-                if 'error_type' in row:
-                    errors = {'ProviderError': ProviderError, 'DataError': DataError}
-                    if row['error_type'] not in errors:
-                        raise DataError('REPLAY_UNSUPPORTED_RECORDED_FAILURE')
-                    raise errors[row['error_type']](row['error_message'])
-                return unwire(row['result'])
-            return call
-    times = iter(data['clock_samples'])
-    state = copy.deepcopy(data['state_before'])
-    api = ReplayAPI()
-
-    def time_source():
-        try:
-            return datetime.fromisoformat(next(times))
-        except StopIteration:
-            raise DataError('REPLAY_CLOCK_EXHAUSTED') from None
-    result = scan(state, api, Config(**data['config']), audit_dir, time_source=time_source)
-    if api.index != len(data['api_events']) or list(times):
-        raise DataError('REPLAY_INCOMPLETE_CONSUMPTION')
-    if {k: v for k, v in result.items() if k != 'input_capture'} != data['expected_result'] or state != data['expected_state_after']:
-        raise DataError('REPLAY_RESULT_OR_STATE_MISMATCH')
-    return result
-
-
-# scanner/recorded.py
-import json, gzip, hashlib
-from collections import defaultdict
-from datetime import datetime, timedelta
-from pathlib import Path
-
-def validate_recorded(corpus_path):
-    corpus_path = Path(corpus_path)
-    raw = corpus_path.read_bytes()
-    if corpus_path.suffix == '.gz':
-        raw = gzip.decompress(raw)
-    corpus = json.loads(raw)
-    cfg = Config()
-    recorded_lot_text = os.environ.get('RECORDED_LOT_SIZE', '').strip()
-    recorded_lot = int(recorded_lot_text) if recorded_lot_text else None
-    if recorded_lot is not None and not 1 <= recorded_lot <= 2000:
-        raise DataError('Invalid externally verified recorded lot size')
-    if not isinstance(corpus.get('audits'), list) or not corpus['audits'] or (not corpus.get('manifest')):
-        raise DataError('INVALID_RECORDED_CORPUS')
-    summary = {'scope': 'Recorded component checks only; lot size supplied separately if RECORDED_LOT_SIZE is set; not a full historical strategy replay', 'sources': corpus['manifest'], 'counts': {k: len(corpus[k]) for k in ('audits', 'diagnostics', 'snapshots', 'positions')}}
-    audits = sorted(corpus['audits'], key=lambda x: x['data']['timestamp'])
-    byday = defaultdict(list)
-    for record in audits:
-        byday[record['data']['timestamp'][:10]].append(record)
-    summary['days'] = {d: {'decisions': len(rs), 'first': rs[0]['data']['timestamp'], 'last': rs[-1]['data']['timestamp']} for d, rs in sorted(byday.items())}
-    snapshot_results = []
-    listings = defaultdict(dict)
-    snapshot_map = {}
-    for item in corpus['snapshots']:
-        s = item['data']
-        rows = s['rows']
-        now = datetime.fromisoformat(s['fetched_at'])
-        day = now.date().isoformat()
-        exp = s['expiry']
-        context = oi_context(rows, float(s['spot']), cfg)
-        if not (context['put_support'] is None or context['put_support']['strike'] <= s['spot']):
-            raise DataError('Recorded-input invariant failed')
-        if not (context['call_resistance'] is None or context['call_resistance']['strike'] >= s['spot']):
-            raise DataError('Recorded-input invariant failed')
-        for r in rows:
-            listings[day, exp][r['instrument_key']] = {k: r[k] for k in ('instrument_key', 'expiry', 'side', 'strike')}
-        snapshot_map[day, exp, s['fetched_at']] = s
-        snapshot_results.append({'id': item['id'], 'day': day, 'at': s['fetched_at'], 'spot': s['spot'], 'context': context})
-    quote_results = []
-    seen = set()
-    for item in audits:
-        r = item['data']
-        day = r['timestamp'][:10]
-        bundles = []
-        for label, value in [('selected', r.get('selected_contract')), ('shadow', (r.get('shadow_option_selection') or {}).get('selected'))]:
-            if not value:
-                continue
-            ranking = value.get('candidate_ranking') or (r.get('shadow_option_selection') or {}).get('candidate_ranking') if label == 'shadow' else value.get('candidate_ranking')
-            ranking = ranking or [value]
-            direction = 'BULLISH' if value['side'] == 'CE' else 'BEARISH'
-            scenario = 'REVERSAL' if 'REVERSAL' in str(value.get('selection_regime', '')) or value.get('allowed_offsets') in ([-1, -2], [1, 2]) else 'TREND'
-            bundles.append((label, value, ranking, direction, scenario))
-        for label, value, ranking, direction, scenario in bundles:
-            signature = json.dumps([r['timestamp'], direction, scenario, ranking], sort_keys=True)
-            if signature in seen:
-                continue
-            seen.add(signature)
-            exp = value['expiry']
-            metadata = list(listings[day, exp].values())
-            quote_rows = {}
-            greeks = {}
-            for c in ranking:
-                if not all((k in c for k in ('quote_timestamp', 'reference_bid', 'reference_entry_ask', 'bid_qty', 'ask_qty'))):
-                    continue
-                key = c['instrument_key']
-                quote_rows[key] = {'timestamp': c['quote_timestamp'], 'bid': c['reference_bid'], 'ask': c['reference_entry_ask'], 'bid_qty': c['bid_qty'], 'ask_qty': c['ask_qty']}
-                greeks[key] = {k: c.get(k) for k in ('delta', 'gamma', 'theta', 'volume')}
-            if not quote_rows or not metadata:
-                continue
-            strikes = sorted({x['strike'] for x in metadata if x['side'] == value['side']})
-            atm = min(strikes, key=lambda x: (abs(x - r['spot']), x))
-            if atm != value.get('atm_strike'):
-                continue
-            chain = [dict(x, **greeks.get(x['instrument_key'], {}), **({'lot_size': recorded_lot} if recorded_lot else {})) for x in metadata]
-            receipt = r.get('evaluation_timestamp') or (r.get('spot_context') or {}).get('spot_quote_received_at')
-            receipt_method = 'LOGGED_EVALUATION_OR_RECEIPT'
-            if receipt:
-                now = datetime.fromisoformat(receipt)
-            elif value.get('quote_age_seconds') is not None:
-                now = datetime.fromisoformat(value['quote_timestamp']) + timedelta(seconds=float(value['quote_age_seconds']))
-                receipt_method = 'DERIVED_FROM_LOGGED_QUOTE_AGE'
-            else:
-                continue
-            selected, rejected = select_contract(chain, quote_rows, direction, scenario, float(r['spot']), now, exp, cfg)
-            allowed = ([-1, -2] if direction == 'BULLISH' else [1, 2]) if scenario == 'REVERSAL' else [0, -1] if direction == 'BULLISH' else [0, 1]
-            if selected:
-                if not (selected['offset'] in allowed and selected['instrument_key'] in quote_rows):
-                    raise DataError('Recorded-input invariant failed')
-                if not (selected['bid'] > 0 and selected['ask'] >= selected['bid']):
-                    raise DataError('Recorded-input invariant failed')
-            quote_results.append({'record': item['id'], 'at': r['timestamp'], 'bundle': label, 'scenario': scenario, 'direction': direction, 'old_strike': value['strike'], 'selected': selected, 'rejected': rejected, 'receipt_method': receipt_method, 'lot_source': 'EXTERNAL_CONTRACT_SPEC_NOT_IN_ARCHIVED_QUOTES' if recorded_lot else 'UNAVAILABLE_IN_ARCHIVED_BUNDLES'})
-    policies = []
-    seen = set()
-    for item in audits:
-        r = item['data']
-        thesis = r.get('market_thesis')
-        candidates = []
-        if r.get('setup'):
-            candidates.append(r['setup'])
-        candidates.extend((x['setup'] for x in r.get('v112_candidate_evaluations', []) if x.get('setup')))
-        candidates.extend((r.get('v111_evidence') or {}).get('price', {}).get('candidates', []))
-        for c in candidates:
-            key = json.dumps([r['timestamp'], c], sort_keys=True)
-            if key in seen:
-                continue
-            seen.add(key)
-            approved, reason = gate_candidate(c, thesis) if thesis else (None, 'UNVERIFIABLE_NO_RECORDED_THESIS')
-            if not (not approved or c['direction'] == thesis['direction'] or (thesis['direction'] == 'RANGE' and c['kind'].startswith('RANGE_'))):
-                raise DataError('Recorded-input invariant failed')
-            levels = r.get('oi_structure') or {}
-            context = {'put_support': levels.get('support'), 'call_resistance': levels.get('resistance')}
-            plan, risk_reason = risk_plan(c, float(r['spot']), context, cfg)
-            if plan:
-                if not (0 < plan['risk_points'] <= 30 and plan['underlying_rr'] >= 1.25):
-                    raise DataError('Recorded-input invariant failed')
-                sign = 1 if c['direction'] == 'BULLISH' else -1
-                if not (sign * (plan['t1_underlying'] - r['spot']) > 0 and sign * (plan['t2_underlying'] - plan['t1_underlying']) > 0):
-                    raise DataError('Recorded-input invariant failed')
-            policies.append({'record': item['id'], 'at': r['timestamp'], 'spot': r['spot'], 'setup': c, 'recorded_thesis': thesis['direction'] if thesis else None, 'gate_pass': approved, 'gate_reason': reason, 'risk_reason': risk_reason, 'plan': plan})
-    changes = []
-    for day in summary['days']:
-        snapshots = sorted([x['data'] for x in corpus['snapshots'] if x['data']['fetched_at'].startswith(day)], key=lambda x: x['fetched_at'])
-        for a, b in zip(snapshots, snapshots[1:]):
-            p = {'session_date': day, 'expiry': a['expiry'], 'fetched_at': a['fetched_at'], 'rows': a['rows']}
-            result = oi_comparison(p, b['rows'], b['expiry'], datetime.fromisoformat(b['fetched_at']), b['spot'])
-            changes.append({'day': day, 'at': b['fetched_at'], 'comparison': result})
-    historical_risks = []
-    for item in corpus['positions']:
-        p = item['data']
-        entry = p['entry_spot']
-        stop = p['initial_stop_underlying']
-        sign = 1 if p['direction'] == 'BULLISH' else -1
-        risk = sign * (entry - stop)
-        sourceplan = p.get('risk_plan') or {}
-        historical_risks.append({'at': p['opened_at'], 'position_id': p['position_id'], 'entry': entry, 'side': p['side'], 'strike': p['strike'], 'actual_stop_distance': risk, 'exceeds_30': risk > 30, 'recorded_rr': sourceplan.get('underlying_rr'), 'recomputed_rr': sign * (sourceplan['t1_underlying'] - entry) / risk if sourceplan.get('t1_underlying') and risk > 0 else None})
-    diagnostic_levels = []
-    for item in corpus['diagnostics']:
-        d = item['data']
-        features = d['per_contract_features'] or []
-        if not features:
-            continue
-        spots = [float(f['strike']) - float(f['distance_from_spot_points']) for f in features if f.get('distance_from_spot_points') is not None]
-        if not spots:
-            continue
-        spot = spots[0]
-        if not all((abs(x - spot) < 0.001 for x in spots)):
-            raise DataError('Recorded-input invariant failed')
-        levels = oi_context(features, spot, cfg)
-        if not (levels['put_support'] is None or levels['put_support']['strike'] <= spot):
-            raise DataError('Recorded-input invariant failed')
-        if not (levels['call_resistance'] is None or levels['call_resistance']['strike'] >= spot):
-            raise DataError('Recorded-input invariant failed')
-        diagnostic_levels.append({'id': item['id'], 'at': d['timestamp'], 'spot': spot, 'context': levels})
-    freshness = []
-    for item in audits:
-        r = item['data']
-        context = r.get('spot_context') or {}
-        latest = context.get('latest_completed_candle_time')
-        receipt = r.get('evaluation_timestamp') or context.get('spot_quote_received_at')
-        if not latest or not receipt:
-            continue
-        try:
-            validate_latest_start(datetime.fromisoformat(latest), datetime.fromisoformat(receipt))
-            status = 'CURRENT'
-        except DataError:
-            status = 'LATEST_MINUTE_UNAVAILABLE'
-        freshness.append({'at': r['timestamp'], 'latest': latest, 'evaluated_at': receipt, 'status': status})
-    summary.update(snapshot_results=snapshot_results, diagnostic_levels=diagnostic_levels, freshness=freshness, quote_results=quote_results, policy_results=policies, oi_comparisons=changes, historical_risks=historical_risks)
-    summary['totals'] = {'oi_snapshots_tested': len(snapshot_results), 'diagnostic_oi_contexts_tested': len(diagnostic_levels), 'full_quote_bundles_tested': len(quote_results), 'quote_bundles_selected': sum((x['selected'] is not None for x in quote_results)), 'candidate_risks_tested': len(policies), 'candidate_gates_tested': sum((x['gate_pass'] is not None for x in policies)), 'countertrend_candidates_blocked': sum((x['gate_pass'] is False and x['recorded_thesis'] in ('BULLISH', 'BEARISH') for x in policies)), 'risk_plans_passed': sum((x['plan'] is not None for x in policies)), 'chain_intervals_tested': len(changes), 'positions_checked': len(historical_risks), 'old_positions_exceeding_30': sum((x['exceeds_30'] for x in historical_risks)), 'candle_timestamps_tested': len(freshness), 'unavailable_latest_minutes': sum((x['status'] != 'CURRENT' for x in freshness))}
-    return summary
-
-
-# scanner/selftest.py
-import json
-import tempfile
-from pathlib import Path
-from datetime import datetime, timedelta
-
-def run_self_test():
-    """No network, credentials or notifications; fails with a nonzero exit."""
-    completed = []
-    config = Config()
-    start = datetime(2026, 1, 6, 9, 15, tzinfo=IST)
-
-    def series(closes):
-        out = []
-        previous = closes[0] - 1
-        for i, value in enumerate(closes):
-            out.append(Candle(start + timedelta(minutes=i), previous, max(previous, value) + 1, min(previous, value) - 1, value, 100))
-            previous = value
-        return out
-
-    def check(name, condition):
-        if not condition:
-            raise AssertionError(name)
-        completed.append(name)
-    try:
-        up = series([24000 + 2 * i for i in range(12)])
-        thesis = update_structure(up, None)
-        check('opening_bullish_structure', thesis['direction'] == 'BULLISH')
-        setup = make_setup(up, thesis, up[-1].close + 0.05, config, {})
-        check('fresh_bullish_setup', setup and setup['direction'] == 'BULLISH')
-        down = series([24050 - 2 * i for i in range(12)])
-        check('opening_bearish_structure', update_structure(down, None)['direction'] == 'BEARISH')
-        pullback = series([24000 + 2 * i for i in range(15)] + [24028 - i for i in range(1, 7)])
-        held = update_structure(pullback, None)
-        check('pullback_preserves_protected_thesis', held['direction'] == 'BULLISH')
-        check('opposite_entry_blocked', not gate_candidate({'direction': 'BEARISH', 'kind': 'REVERSAL'}, held)[0])
-        forecast = forecast_market(pullback, held, pullback[-1].close, {})
-        check('conditional_outlook_is_explicit', len(forecast['scenarios']) == 2 and forecast['strength_is_probability'] is False)
-        plan, reason = risk_plan({'direction': 'BULLISH', 'invalidation': 24000}, 24010, {}, config)
-        check('risk_and_targets', reason == 'OK' and plan['risk_points'] <= 30 and (plan['underlying_rr'] >= 1.25))
-        check('wide_risk_rejected', risk_plan({'direction': 'BULLISH', 'invalidation': 24000}, 24031, {}, config)[1] == 'STOP_TOO_WIDE')
-        now = start + timedelta(minutes=12, seconds=20)
-        chain = [{'instrument_key': 'NSE_FO|100', 'strike': 24000, 'side': 'CE', 'expiry': '2026-01-13', 'volume': 10000, 'delta': 0.55, 'lot_size': 65}, {'instrument_key': 'NSE_FO|101', 'strike': 24050, 'side': 'CE', 'expiry': '2026-01-13', 'volume': 10000, 'delta': 0.4, 'lot_size': 65}]
-        for row in chain:
-            row.update(gamma=0.001, theta=-5.0)
-        quotes = {r['instrument_key']: {'timestamp': now.isoformat(), 'bid': 100, 'ask': 100.5, 'bid_qty': 130, 'ask_qty': 130} for r in chain}
-        selected, _ = select_contract(chain, quotes, 'BULLISH', 'TREND', 24024, now, '2026-01-13', config)
-        check('fresh_contract_selected', selected and selected['instrument_key'] == 'NSE_FO|100')
-        quotes['NSE_FO|100']['timestamp'] = (now - timedelta(minutes=5)).isoformat()
-        selected, _ = select_contract(chain, quotes, 'BULLISH', 'TREND', 24024, now, '2026-01-13', config)
-        check('stale_quote_rejected', selected is None)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'state.json'
-            initialize(path, now)
-            state = load(path)
-            queue(state, 'ENTRY', {'test': 'offline'}, now)
-            queue(state, 'ENTRY', {'test': 'offline'}, now)
-            check('notification_deduplication', len(state['outbox']) == 1)
-            claim(state, 'offline-check')
-            save(path, state)
-            check('durable_claim', load(path)['outbox'][0]['claim'] == 'offline-check')
-            migrated = Path(directory) / 'migrated.json'
-            migrate_state(path, migrated, now)
-            check('safe_migration', load(migrated)['schema'] == 4 and path.exists())
-        print(json.dumps({'status': 'PASS', 'version': __version__, 'checks': completed, 'count': len(completed)}))
-        return 0
-    except Exception as exc:
-        print(json.dumps({'status': 'FAIL', 'completed': completed, 'error_type': type(exc).__name__, 'message': str(exc)}))
-        return 1
-
 
 # market_scanner.py
 import argparse
@@ -2584,7 +2308,7 @@ from email.message import EmailMessage
 from pathlib import Path
 
 def paths():
-    return (Path(os.environ.get('STATE_FILE', 'state/market_state_v115.json')), Path(os.environ.get('AUDIT_DIR', 'audit')))
+    return (Path(os.environ.get('STATE_FILE', 'state/market_state_v116.json')), Path(os.environ.get('AUDIT_DIR', 'audit')))
 
 def alert_text(event):
     d = event['details']
@@ -2688,37 +2412,12 @@ def main():
     mode.add_argument('--deliver-claimed', action='store_true')
     mode.add_argument('--reconcile-flat', metavar='POSITION_ID', help='After manual verification, close the matching alert lock without inventing a fill')
     mode.add_argument('--requeue-alert', metavar='ALERT_ID', help='After verifying non-delivery, explicitly requeue an uncertain alert')
-    mode.add_argument('--replay-input', metavar='CAPTURE', help='Replay a captured scan locally without API or email access')
     mode.add_argument('--migrate-state', metavar='SOURCE', help='Migrate a recognized existing state once; preserves its source and active lock')
-    mode.add_argument('--self-test', action='store_true', help='Run offline built-in release checks without credentials, network or email')
     mode.add_argument('--forecast-report', action='store_true', help='Summarize recorded forward-underlying outcomes, without calling the API')
-    mode.add_argument('--validate-recorded', metavar='CORPUS', help='Run actual recorded-input component checks on a supplied normalized corpus (.json/.json.gz)')
     args = parser.parse_args()
     if args.version:
         print(__version__)
         return 0
-    if args.self_test:
-        return run_self_test()
-    if args.validate_recorded:
-        try:
-            validated = validate_recorded(Path(args.validate_recorded))
-            nov5 = [r for r in validated['quote_results'] if r['at'].startswith('2026-11-05T09:45')]
-            print(json.dumps({'status': 'PASS', 'scope': validated['scope'], 'days': validated['days'], 'totals': validated['totals'], 'recorded_lot_size': os.environ.get('RECORDED_LOT_SIZE'), 'nov5_0945_selected_strikes': [r['selected']['strike'] for r in nov5 if r['selected']]}, sort_keys=True))
-            return 0
-        except Exception as exc:
-            print(json.dumps({'status': 'FAIL', 'error_type': type(exc).__name__, 'message': str(exc)}), file=sys.stderr)
-            return 1
-    if args.replay_input:
-        import tempfile
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                result = replay_capture(Path(args.replay_input), Path(directory))
-            result.pop('input_capture', None)
-            print(json.dumps(result, sort_keys=True, allow_nan=False))
-            return 0
-        except (ValueError, OSError, RuntimeError) as exc:
-            print(json.dumps({'decision': 'REPLAY_ERROR', 'message': str(exc)}), file=sys.stderr)
-            return 1
     state_path, audit_dir = paths()
     try:
         with lock(state_path):
@@ -2744,7 +2443,7 @@ def main():
                 state['position'] = None
                 state['last_exit'] = {'at': now, 'direction': closed.get('direction'), 'three': (state.get('thesis') or {}).get('last_3m')}
                 save(state_path, state)
-                append_audit(audit_dir / ('market_scan_v115_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_RECONCILIATION', 'position_id': args.reconcile_flat, 'at': now, 'fill': 'UNKNOWN'})
+                append_audit(audit_dir / ('market_scan_v116_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_RECONCILIATION', 'position_id': args.reconcile_flat, 'at': now, 'fill': 'UNKNOWN'})
                 print(json.dumps({'status': 'RECONCILED_FLAT', 'position_id': args.reconcile_flat, 'at': now}))
                 return 0
             if args.requeue_alert:
@@ -2753,7 +2452,7 @@ def main():
                     raise StateError('Alert ID is not an uncertain or previously claimed alert')
                 event.update(status='PENDING', claim=None, manually_requeued_at=datetime.now(IST).isoformat())
                 save(state_path, state)
-                append_audit(audit_dir / ('market_scan_v115_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_ALERT_REQUEUE', 'alert_id': args.requeue_alert, 'at': datetime.now(IST).isoformat()})
+                append_audit(audit_dir / ('market_scan_v116_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_ALERT_REQUEUE', 'alert_id': args.requeue_alert, 'at': datetime.now(IST).isoformat()})
                 print(json.dumps({'status': 'REQUEUED', 'alert_id': args.requeue_alert}))
                 return 0
             token = os.environ.get('NOTIFICATION_CLAIM_TOKEN', '')
