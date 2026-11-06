@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY scenario engine v117.0.0 — complete standalone analytical scanner.
+"""NIFTY scenario engine v117.1.0 — complete standalone analytical scanner.
 
 Completed price bars -> protected structure -> conditional forward scenarios ->
 independent setup watches -> fixed risk plan -> one quoted option contract ->
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 
 # scanner/__init__.py
-__version__ = '117.0.0'
+__version__ = '117.1.0'
 
 
 # scanner/core.py
@@ -86,9 +86,11 @@ class Config:
     depth_full_score_lots: float = 12.0
     premium_proxy_max_spread_pct: float = 15.0
     iv_shock_points: float = 1.0
+    candle_publication_grace_seconds: float = 20.0
+    candle_retry_interval_seconds: float = 2.0
 
     def __post_init__(self):
-        for field in (self.max_risk, self.min_rr, self.max_quote_age, self.max_spread_pct, self.max_entry_extension_atr, self.min_wall_fraction, self.strike_step, self.stop_buffer, self.premium_hard_loss_pct, self.premium_runner_drawdown_pct, self.min_stop_atr, self.runner_progress_atr, self.oi_nearby_points, self.oi_material_change_fraction, self.oi_horizon_max_seconds, self.min_option_volume, self.target_clearance_atr, self.min_intraday_projection_atr, self.max_option_iv, self.max_premium_cost_ratio, self.depth_full_score_lots, self.premium_proxy_max_spread_pct, self.iv_shock_points):
+        for field in (self.max_risk, self.min_rr, self.max_quote_age, self.max_spread_pct, self.max_entry_extension_atr, self.min_wall_fraction, self.strike_step, self.stop_buffer, self.premium_hard_loss_pct, self.premium_runner_drawdown_pct, self.min_stop_atr, self.runner_progress_atr, self.oi_nearby_points, self.oi_material_change_fraction, self.oi_horizon_max_seconds, self.min_option_volume, self.target_clearance_atr, self.min_intraday_projection_atr, self.max_option_iv, self.max_premium_cost_ratio, self.depth_full_score_lots, self.premium_proxy_max_spread_pct, self.iv_shock_points, self.candle_publication_grace_seconds, self.candle_retry_interval_seconds):
             if not isfinite(field) or field <= 0:
                 raise DataError('Invalid strategy configuration')
         if any((not isinstance(v, int) or isinstance(v, bool) for v in (self.min_bars, self.no_progress_minutes, self.watch_minutes, self.opening_oi_baseline_cutoff_minutes))) or self.min_wall_fraction > 1 or self.max_premium_cost_ratio >= 1 or self.oi_material_change_fraction >= 1 or self.min_bars < 6 or (self.no_progress_minutes < 1) or (self.watch_minutes < 1) or (self.opening_oi_baseline_cutoff_minutes < 1 or self.opening_oi_baseline_cutoff_minutes > 60) or (not 0 < self.max_entry_risk_fraction <= 1) or (max(self.premium_hard_loss_pct, self.premium_runner_drawdown_pct) >= 100):
@@ -99,11 +101,32 @@ class Config:
             raise DataError('Invalid forecast horizon')
         if any((not isinstance(v, int) or isinstance(v, bool) for v in (self.session_exit_lead_minutes, self.entry_cutoff_lead_minutes))) or self.session_exit_lead_minutes < 3 or self.entry_cutoff_lead_minutes < self.session_exit_lead_minutes + 3:
             raise DataError('Entry and exit windows must leave a monitoring interval')
+        if self.candle_publication_grace_seconds > 60 or self.candle_retry_interval_seconds > 10 or self.candle_retry_interval_seconds > self.candle_publication_grace_seconds:
+            raise DataError('Invalid candle publication grace/retry configuration')
 
-def normalize_candles(raw: list[list[Any]], now: datetime) -> list[Candle]:
+def scan_candle_watermark(started: datetime) -> datetime:
+    """Latest whole 1m candle that was complete when this scan began.
+
+    This value is immutable for the scan.  Crossing a minute boundary while
+    later API calls are running must not move the analytical candle universe.
+    """
+    if started.tzinfo is None:
+        raise DataError('NAIVE_CANDLE_TIME')
+    return started.astimezone(IST).replace(second=0, microsecond=0) - timedelta(minutes=1)
+
+def candle_publication_deadline(required_start: datetime, grace_seconds: float) -> datetime:
+    if required_start.tzinfo is None or not isfinite(float(grace_seconds)) or float(grace_seconds) <= 0:
+        raise DataError('INVALID_CANDLE_PUBLICATION_POLICY')
+    return required_start.astimezone(IST) + timedelta(minutes=1, seconds=float(grace_seconds))
+
+def normalize_candles(raw: list[list[Any]], now: datetime, latest_allowed_start: datetime | None = None) -> list[Candle]:
     if now.tzinfo is None:
         raise DataError('naive evaluation time')
-    today = now.astimezone(IST).date()
+    now_ist = now.astimezone(IST)
+    today = now_ist.date()
+    if latest_allowed_start is not None and latest_allowed_start.tzinfo is None:
+        raise DataError('NAIVE_CANDLE_TIME')
+    cap = latest_allowed_start.astimezone(IST) if latest_allowed_start is not None else None
     by_time: dict[datetime, Candle] = {}
     for row in raw:
         if len(row) < 5:
@@ -112,7 +135,9 @@ def normalize_candles(raw: list[list[Any]], now: datetime) -> list[Candle]:
         if t.tzinfo is None:
             raise DataError('Candle timestamp has no timezone')
         t = t.astimezone(IST)
-        if t.date() != today or t + timedelta(minutes=1) > now.astimezone(IST):
+        if t.date() != today or t + timedelta(minutes=1) > now_ist:
+            continue
+        if cap is not None and t > cap:
             continue
         c = Candle(t, *(float(v) for v in row[1:5]), float(row[5] or 0) if len(row) > 5 else 0.0)
         if t in by_time and by_time[t] != c:
@@ -120,17 +145,22 @@ def normalize_candles(raw: list[list[Any]], now: datetime) -> list[Candle]:
         by_time[t] = c
     return [by_time[t] for t in sorted(by_time)]
 
-def validate_latest_start(latest_start: datetime, now: datetime) -> None:
-    if latest_start.tzinfo is None or now.tzinfo is None:
+def validate_latest_start(latest_start: datetime, now: datetime | None = None, required_start: datetime | None = None) -> None:
+    if latest_start.tzinfo is None:
         raise DataError('NAIVE_CANDLE_TIME')
-    expected = now.astimezone(IST).replace(second=0, microsecond=0) - timedelta(minutes=1)
-    if latest_start != expected:
+    if required_start is None:
+        if now is None or now.tzinfo is None:
+            raise DataError('NAIVE_CANDLE_TIME')
+        required_start = scan_candle_watermark(now)
+    elif required_start.tzinfo is None:
+        raise DataError('NAIVE_CANDLE_TIME')
+    if latest_start.astimezone(IST) != required_start.astimezone(IST):
         raise DataError('LATEST_COMPLETED_CANDLE_MISSING')
 
-def validate_candles(bars: list[Candle], now: datetime, minimum: int=9) -> None:
+def validate_candles(bars: list[Candle], now: datetime | None = None, minimum: int=9, required_start: datetime | None = None) -> None:
     if len(bars) < minimum:
         raise DataError('INSUFFICIENT_CANDLES')
-    validate_latest_start(bars[-1].start, now)
+    validate_latest_start(bars[-1].start, now, required_start)
     for a, b in zip(bars, bars[1:]):
         if b.start - a.start != timedelta(minutes=1):
             raise DataError('CANDLE_GAP')
@@ -1895,25 +1925,51 @@ def release_fingerprint():
     """Bind replay evidence to these exact executable source bytes."""
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
-def fresh_candles(api: Upstox, config: Config, raw=None, clock_fn=None):
-    """Bounded retry for publication lag; never reuse an incomplete last minute."""
-    for attempt in range(3):
+def fresh_candles(api: Upstox, config: Config, raw=None, clock_fn=None, required_start=None, publication_deadline=None):
+    """Fetch one immutable per-scan candle watermark with bounded provider grace.
+
+    `required_start` is fixed by the caller at scan start.  A later wall-clock
+    minute must never advance it.  If the provider has not published the candle
+    that was already due at scan start, retries continue only until the deadline
+    associated with that candle's completion boundary.
+    """
+    clock_source = clock_fn or clock
+    first_now = clock_source()
+    if first_now.tzinfo is None:
+        raise DataError('NAIVE_CANDLE_TIME')
+    required = required_start or scan_candle_watermark(first_now)
+    if required.tzinfo is None:
+        raise DataError('NAIVE_CANDLE_TIME')
+    deadline = publication_deadline or candle_publication_deadline(required, config.candle_publication_grace_seconds)
+    if deadline.tzinfo is None:
+        raise DataError('NAIVE_CANDLE_TIME')
+    max_attempts = max(1, int(config.candle_publication_grace_seconds / config.candle_retry_interval_seconds) + 2)
+    attempt = 0
+    now = first_now
+    while attempt < max_attempts:
         if raw is None:
             raw = api.candles()
-        now = (clock_fn or clock)()
-        bars, discarded = contiguous_tail(normalize_candles(raw, now))
+        bars, discarded = contiguous_tail(normalize_candles(raw, now, required))
         try:
             if not bars:
                 raise DataError('LATEST_COMPLETED_CANDLE_MISSING')
-            validate_latest_start(bars[-1].start, now)
-            validate_candles(bars, now, config.min_bars)
+            validate_candles(bars, now, config.min_bars, required_start=required)
             return (bars, discarded, now, attempt)
         except DataError as exc:
-            if str(exc) != 'LATEST_COMPLETED_CANDLE_MISSING' or attempt == 2:
+            if str(exc) != 'LATEST_COMPLETED_CANDLE_MISSING':
                 raise
-            if not getattr(api, 'replay_mode', False):
-                time.sleep(2)
+            current = clock_source()
+            if current.tzinfo is None:
+                raise DataError('NAIVE_CANDLE_TIME')
+            if current >= deadline or attempt + 1 >= max_attempts:
+                raise
+            remaining = max(0.0, (deadline - current).total_seconds())
+            sleep_for = min(float(config.candle_retry_interval_seconds), remaining)
+            if sleep_for > 0 and not getattr(api, 'replay_mode', False):
+                time.sleep(sleep_for)
             raw = None
+            attempt += 1
+            now = clock_source()
     raise DataError('LATEST_COMPLETED_CANDLE_MISSING')
 
 def _chain_premium_proxy(row, max_spread_pct=15.0):
@@ -2058,8 +2114,14 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         return t
     started = tick()
     day = started.date().isoformat()
-    result = {'timestamp': started.isoformat(), 'version': __version__, 'session_date': day, 'decision': 'NO_TRADE', 'reason': 'UNSET'}
-    evidence = {'version': __version__, 'started_at': started.isoformat(), 'state_before': copy.deepcopy(state)}
+    required_candle_start = scan_candle_watermark(started)
+    publication_deadline = candle_publication_deadline(required_candle_start, config.candle_publication_grace_seconds)
+    result = {'timestamp': started.isoformat(), 'version': __version__, 'session_date': day, 'decision': 'NO_TRADE', 'reason': 'UNSET',
+              'scan_candle_watermark': required_candle_start.isoformat(),
+              'candle_publication_grace_deadline': publication_deadline.isoformat()}
+    evidence = {'version': __version__, 'started_at': started.isoformat(), 'state_before': copy.deepcopy(state),
+                'scan_candle_watermark': required_candle_start.isoformat(),
+                'candle_publication_grace_deadline': publication_deadline.isoformat()}
     evidence.update(clock_samples=samples, api_events=[], config=asdict(config))
     evidence['release_sha256'] = release_fingerprint()
     api = RecordingAPI(api, evidence['api_events'])
@@ -2097,8 +2159,10 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         if open_position and previous_future.get('instrument_key'):
             keys.append(previous_future['instrument_key'])
         quotes = api.quotes(keys)
-        bars, discarded, now, retries = fresh_candles(api, config, raw, clock_fn=tick)
+        bars, discarded, now, retries = fresh_candles(api, config, raw, clock_fn=tick, required_start=required_candle_start, publication_deadline=publication_deadline)
         result['candle_refresh_retries'] = retries
+        result['candle_refresh_attempts'] = retries + 1
+        result['latest_candle_received'] = bars[-1].start.isoformat()
         evidence.update(candles=[[c.start.isoformat(), c.open, c.high, c.low, c.close, c.volume] for c in bars], quotes=quotes, evaluated_at=now.isoformat())
         spot = checked_spot(quotes.get(INDEX, {}), now, config.max_quote_age)
         complete_history = bars[0].start == session_start.replace(second=0, microsecond=0)
@@ -2135,7 +2199,9 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             except (ProviderError, DataError, ValueError, TypeError, KeyError):
                 result['oi_monitoring'] = 'UNAVAILABLE_SPOT_PROTECTION_CONTINUES'
             quotes = api.quotes(keys)
-            bars, _, now, _ = fresh_candles(api, config, clock_fn=tick)
+            bars, _, now, management_retries = fresh_candles(api, config, clock_fn=tick, required_start=required_candle_start, publication_deadline=publication_deadline)
+            result['position_monitoring_candle_refresh_retries'] = management_retries
+            result['position_monitoring_candle_refresh_attempts'] = management_retries + 1
             spot = checked_spot(quotes.get(INDEX, {}), now, config.max_quote_age)
             thesis = update_structure(bars, thesis)
             thesis['boundary_trusted'] = bars[0].start == session_start.replace(second=0, microsecond=0)
@@ -2190,7 +2256,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             if reversal_exit is None:
                 return result
         try:
-            future = api.nearest_nifty_future(now, Path('.cache/nifty_futures_v117.json'))
+            future = api.nearest_nifty_future(now, Path('.cache/nifty_futures_v117_1.json'))
             fq = api.quotes([future['instrument_key']]).get(future['instrument_key'], {})
             ft = tick()
             fp = checked_spot(fq, ft, config.max_quote_age)
@@ -2207,8 +2273,9 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             state['futures_snapshot'] = current
             result['futures'] = {**future, 'price': fp, 'average_price': fq.get('average_price'), 'price_oi_pattern': pattern, 'role': 'CONTEXT_ONLY'}
             try:
-                future_bars = normalize_candles(api.candles(future['instrument_key']), tick())
-                validate_candles(future_bars, tick(), 1)
+                future_now = tick()
+                future_bars = normalize_candles(api.candles(future['instrument_key']), future_now, required_candle_start)
+                validate_candles(future_bars, future_now, 1, required_start=required_candle_start)
                 volume = sum((c.volume for c in future_bars))
                 if volume > 0:
                     result['futures']['candle_vwap_estimate'] = sum(((c.high + c.low + c.close) / 3 * c.volume for c in future_bars)) / volume
@@ -2267,18 +2334,18 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         full = api.quotes(keys)
         now = tick()
         try:
-            validate_candles(bars, now, config.min_bars)
+            validate_candles(bars, now, config.min_bars, required_start=required_candle_start)
         except DataError as exc:
             if str(exc) != 'LATEST_COMPLETED_CANDLE_MISSING':
                 raise
-            bars, discarded, now, retries = fresh_candles(api, config, clock_fn=tick)
+            bars, discarded, now, retries = fresh_candles(api, config, clock_fn=tick, required_start=required_candle_start, publication_deadline=publication_deadline)
             if discarded and datetime.fromisoformat(state['last_processed_candle']) < bars[0].start:
                 thesis = None
             thesis = update_structure(bars, thesis)
             thesis['boundary_trusted'] = bars[0].start == session_start.replace(second=0, microsecond=0)
             remember_structure(thesis, now)
             state['last_processed_candle'] = bars[-1].start.isoformat()
-            result.update(structure=thesis, last_complete_1m=bars[-1].start.isoformat(), post_chain_candle_refresh=True, post_chain_candle_refresh_retries=retries)
+            result.update(structure=thesis, last_complete_1m=bars[-1].start.isoformat(), latest_candle_received=bars[-1].start.isoformat(), post_chain_candle_refresh=True, post_chain_candle_refresh_retries=retries)
         if (now - chain_at).total_seconds() > config.max_quote_age:
             raise DataError('CHAIN_TOO_OLD')
         if bars[0].start != session_start.replace(second=0, microsecond=0):
@@ -2412,11 +2479,11 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         # a qualified reference position or its durable outbox lock. main()
         # still commits state and exits nonzero so the workflow reports failure.
         try:
-            result['input_capture'] = capture_inputs(audit_dir / 'inputs_v117' / day, identifier, evidence)
+            result['input_capture'] = capture_inputs(audit_dir / 'inputs_v117_1' / day, identifier, evidence)
         except (OSError,ValueError,TypeError) as exc:
             result['persistence_error']='INPUT_CAPTURE_FAILED_'+type(exc).__name__
         try:
-            append_audit(audit_dir / ('market_scan_v117_' + day + '.jsonl'), result)
+            append_audit(audit_dir / ('market_scan_v117_1_' + day + '.jsonl'), result)
         except (OSError,ValueError,TypeError) as exc:
             result['persistence_error']='AUDIT_WRITE_FAILED_'+type(exc).__name__
 
@@ -2571,7 +2638,7 @@ def main():
                 state['position'] = None
                 state['last_exit'] = {'at': now, 'direction': closed.get('direction'), 'three': (state.get('thesis') or {}).get('last_3m')}
                 save(state_path, state)
-                append_audit(audit_dir / ('market_scan_v117_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_RECONCILIATION', 'position_id': args.reconcile_flat, 'at': now, 'fill': 'UNKNOWN'})
+                append_audit(audit_dir / ('market_scan_v117_1_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_RECONCILIATION', 'position_id': args.reconcile_flat, 'at': now, 'fill': 'UNKNOWN'})
                 print(json.dumps({'status': 'RECONCILED_FLAT', 'position_id': args.reconcile_flat, 'at': now}))
                 return 0
             if args.requeue_alert:
@@ -2580,7 +2647,7 @@ def main():
                     raise StateError('Alert ID is not an uncertain or previously claimed alert')
                 event.update(status='PENDING', claim=None, manually_requeued_at=datetime.now(IST).isoformat())
                 save(state_path, state)
-                append_audit(audit_dir / ('market_scan_v117_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_ALERT_REQUEUE', 'alert_id': args.requeue_alert, 'at': datetime.now(IST).isoformat()})
+                append_audit(audit_dir / ('market_scan_v117_1_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_ALERT_REQUEUE', 'alert_id': args.requeue_alert, 'at': datetime.now(IST).isoformat()})
                 print(json.dumps({'status': 'REQUEUED', 'alert_id': args.requeue_alert}))
                 return 0
             token = os.environ.get('NOTIFICATION_CLAIM_TOKEN', '')
