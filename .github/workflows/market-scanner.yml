@@ -1,4 +1,4 @@
-name: NIFTY predictive scanner v118 (external dispatcher)
+name: NIFTY predictive scanner v118.1 (external dispatcher)
 
 on:
   workflow_dispatch:
@@ -63,8 +63,8 @@ jobs:
       - name: Cache current-session futures master
         uses: actions/cache@v4
         with:
-          path: .cache/nifty_futures_v118.json
-          key: nifty-futures-v118-${{ steps.session.outputs.date }}
+          path: .cache/nifty_futures_v118_1.json
+          key: nifty-futures-v118-1-${{ steps.session.outputs.date }}
       - name: Initialize only after verifying flat
         if: ${{ inputs.operation == 'initialize_flat' }}
         run: python market_scanner.py --initialize-flat
@@ -87,7 +87,7 @@ jobs:
         run: |
           set -euo pipefail
           python market_scanner.py --requeue-alert "${ALERT_ID:-$LEGACY_ALERT_ID}"
-      - name: Run v118 integrated scenario engine and claim alerts
+      - name: Run v118.1 integrated scenario engine and claim alerts
         id: scan
         if: ${{ inputs.operation == 'scan' || inputs.operation == '' }}
         env:
@@ -97,7 +97,7 @@ jobs:
           set -euo pipefail
           mkdir -p audit
           session_date="$(TZ=Asia/Kolkata date +%F)"
-          python market_scanner.py --scan-and-claim 2>&1 | tee -a "audit/worker_v118_${session_date}.log"
+          python market_scanner.py --scan-and-claim 2>&1 | tee -a "audit/worker_v118_1_${session_date}.log"
       - name: Persist state, input evidence and alert claims
         id: persist
         if: ${{ always() }}
@@ -109,13 +109,13 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           if [[ -f state/market_state_v118.json ]]; then git add -f -- state/market_state_v118.json; fi
-          if [[ -d state/archives_v118 ]]; then git add -f -- state/archives_v118; fi
-          if [[ -d audit/inputs_v118 ]]; then git add -f -- audit/inputs_v118; fi
+          if [[ -d state/archives_v118_1 ]]; then git add -f -- state/archives_v118_1; fi
+          if [[ -d audit/inputs_v118_1 ]]; then git add -f -- audit/inputs_v118_1; fi
           shopt -s nullglob
-          files=(audit/market_scan_v118_*.jsonl audit/worker_v118_*.log)
+          files=(audit/market_scan_v118_1_*.jsonl audit/worker_v118_1_*.log)
           if (( ${#files[@]} )); then git add -f -- "${files[@]}"; fi
           if ! git diff --cached --quiet; then
-            git commit -m 'Persist NIFTY v118 state, forecast evidence and claims'
+            git commit -m 'Persist NIFTY v118.1 state, forecast evidence and claims'
             # Fail closed on concurrent branch updates. A rebase conflict leaves this
             # step failed, so claimed notifications are not delivered from state that
             # was not durably persisted to the default branch.
@@ -136,18 +136,18 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! -f state/market_state_v118.json ]]; then
-            echo 'No v118 state file exists; skipping delivery.'
+            echo 'No v118 schema-6 state file exists; skipping delivery.'
             exit 0
           fi
           if ! python - <<'PY'
           from pathlib import Path
           import importlib.util, sys
-          spec=importlib.util.spec_from_file_location('market_scanner_v118_runtime','market_scanner.py')
+          spec=importlib.util.spec_from_file_location('market_scanner_v118_1_runtime','market_scanner.py')
           scanner=importlib.util.module_from_spec(spec);sys.modules[spec.name]=scanner;spec.loader.exec_module(scanner)
           try:
               scanner.load(Path('state/market_state_v118.json'))
           except Exception as exc:
-              print(f'v118 state is not readable; skipping delivery: {type(exc).__name__}')
+              print(f'v118.1 state is not readable; skipping delivery: {type(exc).__name__}')
               raise SystemExit(1)
           PY
           then
@@ -162,12 +162,12 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! -f state/market_state_v118.json ]]; then
-            echo 'No v118 state file exists; nothing to persist after delivery.'
+            echo 'No v118 schema-6 state file exists; nothing to persist after delivery.'
             exit 0
           fi
           git add -f -- state/market_state_v118.json
           if ! git diff --cached --quiet; then
-            git commit -m 'Persist NIFTY v118 delivery outcome'
+            git commit -m 'Persist NIFTY v118.1 delivery outcome'
             git fetch origin "${DEFAULT_BRANCH}"
             git rebase "origin/${DEFAULT_BRANCH}"
             git push origin "HEAD:${DEFAULT_BRANCH}"
