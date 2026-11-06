@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY scenario engine v118.0.0 — complete standalone analytical scanner.
+"""NIFTY scenario engine v118.1.0 — complete standalone analytical scanner.
 
 Completed price bars -> protected structure -> conditional forward scenarios ->
 independent setup watches -> fixed risk plan -> one quoted option contract ->
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 
 # scanner/__init__.py
-__version__ = '118.0.0'
+__version__ = '118.1.0'
 
 
 # scanner/core.py
@@ -71,9 +71,10 @@ class Config:
     max_entry_risk_fraction: float = 0.5
     runner_progress_atr: float = 0.3
     forecast_horizon_minutes: int = 15
-    session_exit_lead_minutes: int = 20
-    entry_cutoff_lead_minutes: int = 30
-    # v118 configuration, documented engineering choices; not fitted probabilities.
+    intraday_hard_exit_hour: int = 15
+    intraday_hard_exit_minute: int = 15
+    entry_cutoff_lead_minutes: int = 10
+    # v118.1 configuration, documented engineering choices; not fitted probabilities.
     oi_nearby_points: float = 400.0
     oi_material_change_fraction: float = 0.005
     oi_horizon_max_seconds: int = 3600
@@ -88,7 +89,7 @@ class Config:
     iv_shock_points: float = 1.0
     candle_publication_grace_seconds: float = 20.0
     candle_retry_interval_seconds: float = 2.0
-    # v118 entry/target orchestration. These are deterministic engineering
+    # v118.1 entry/target orchestration. These are deterministic engineering
     # constraints, not fitted probabilities or claims of future performance.
     reversal_acceptance_window_minutes: int = 12
     acceptance_hold_bars: int = 2
@@ -106,8 +107,10 @@ class Config:
             raise DataError('Approved risk limits cannot be weakened')
         if not isinstance(self.forecast_horizon_minutes, int) or isinstance(self.forecast_horizon_minutes, bool) or (not 3 <= self.forecast_horizon_minutes <= 60):
             raise DataError('Invalid forecast horizon')
-        if any((not isinstance(v, int) or isinstance(v, bool) for v in (self.session_exit_lead_minutes, self.entry_cutoff_lead_minutes))) or self.session_exit_lead_minutes < 3 or self.entry_cutoff_lead_minutes < self.session_exit_lead_minutes + 3:
-            raise DataError('Entry and exit windows must leave a monitoring interval')
+        if any((not isinstance(v, int) or isinstance(v, bool) for v in (self.intraday_hard_exit_hour, self.intraday_hard_exit_minute, self.entry_cutoff_lead_minutes))):
+            raise DataError('Invalid intraday cutoff configuration')
+        if not 0 <= self.intraday_hard_exit_hour <= 23 or not 0 <= self.intraday_hard_exit_minute <= 59 or not 3 <= self.entry_cutoff_lead_minutes <= 30:
+            raise DataError('Invalid intraday cutoff configuration')
         if self.candle_publication_grace_seconds > 60 or self.candle_retry_interval_seconds > 10 or self.candle_retry_interval_seconds > self.candle_publication_grace_seconds:
             raise DataError('Invalid candle publication grace/retry configuration')
         if not 3 <= self.reversal_acceptance_window_minutes <= 30 or not 1 <= self.acceptance_hold_bars <= 3:
@@ -443,7 +446,7 @@ def _round_directional_target(value: float, direction: str, step: float) -> floa
 def forecast_market(bars, structure, spot, oi, futures=None, config=None):
     """Explain the evolving thesis as conditional scenarios, never guarantees.
 
-    v118 deliberately distinguishes a *forecast hurdle* from a target-limiting
+    v118.1 deliberately distinguishes a *forecast hurdle* from a target-limiting
     barrier. Potential OI concentrations and historical pivots are surfaced,
     but they do not automatically cap a directional continuation objective
     unless later price/OI evidence upgrades them to a hard barrier.
@@ -631,6 +634,17 @@ ACCEPTANCE_SETUP_KINDS = {
     'TREND_ACCEPTANCE_CONTINUATION',
 }
 
+# Pure momentum/breakout entries may become stale after rapid extension.
+# Acceptance/reclaim/recovery setups are structure-led: their eligibility is
+# governed by the still-valid tactical stop, dependencies and live RR rather
+# than by a universal ATR chase cap.
+CHASE_SENSITIVE_SETUP_KINDS = {
+    'OPENING_MOMENTUM',
+    'TREND_BREAKOUT',
+    'ACCEPTED_RANGE_BREAKOUT',
+    'ACCEPTED_RANGE_BREAKDOWN',
+}
+
 
 def _accepted_price_level(structure, side, close, a):
     """Return the nearest already-crossed price level whose acceptance matters.
@@ -668,7 +682,7 @@ def _accepted_price_level(structure, side, close, a):
 def _candidate_at(bars, structure, config, context):
     """Generate causal entry setups from completed 1m and closed 3m only.
 
-    v118 adds an explicit post-reversal/trend acceptance path. A confirmed
+    v118.1 retains an explicit post-reversal/trend acceptance path. A confirmed
     directional structure does not have to prove itself again by printing a
     fresh micro-breakout above the immediately preceding 1m high. Instead, an
     accepted former resistance/support level plus an aligned completed 3m bar
@@ -915,10 +929,14 @@ def refresh_setup_watches(bars, structure, spot, now, prior, config, context, fr
             elif three_end<prior_confirmed:
                 reason='SETUP_3M_CONFIRMATION_MISSING'
             if reason is None:
-                if extension < -max(0.5,0.15*current_atr):reason='TRIGGER_NOT_RECLAIMED'
-                elif extension>config.max_entry_extension_atr*current_atr:reason='STALE_ENTRY_CHASE_LIMIT'
-                elif r<=0 or extension>config.max_entry_risk_fraction*r:reason='ENTRY_RISK_EXTENSION_LIMIT'
-                else:eligible.append(s);reason='PRICE_STRUCTURE_DEPENDENCIES_AND_3M_READY'
+                if extension < -max(0.5,0.15*current_atr):
+                    reason='TRIGGER_NOT_RECLAIMED'
+                elif s.get('kind') in CHASE_SENSITIVE_SETUP_KINDS and extension>config.max_entry_extension_atr*current_atr:
+                    reason='STALE_ENTRY_CHASE_LIMIT'
+                elif r<=0 or extension>config.max_entry_risk_fraction*r:
+                    reason='ENTRY_RISK_EXTENSION_LIMIT'
+                else:
+                    eligible.append(s);reason='PRICE_STRUCTURE_DEPENDENCIES_AND_3M_READY'
             diagnostics.append({'setup':s,'reason':reason,'age_seconds':age,'dependency_details':dependency_details})
         except (KeyError,ValueError,TypeError):diagnostics.append({'setup':s,'reason':'INVALID_SAVED_WATCH'})
     return eligible,retained[:30],diagnostics
@@ -1000,7 +1018,7 @@ def contextual_futures_alignment(futures, structure, spot):
 def risk_plan(setup,spot,context,config):
     """Build the actual underlying trade plan without clipping structural risk.
 
-    v118 separates three concepts that v117.1 could conflate:
+    v118.1 separates three concepts that v117.1 could conflate:
       * tactical trade invalidation (the stop used for this entry),
       * broad protected-thesis invalidation (a setup dependency), and
       * soft intermediate hurdles versus genuinely hard target barriers.
@@ -1615,7 +1633,7 @@ def migrate_state(source, destination, now):
     if schema in (1,2,3,4,5,6):
         state=load(source,allow_legacy=True)
         preserve_intraday_oi=(schema in (5,6))
-        state.update(schema=6,engine_version='118.0.0',thesis=None,setup_watches=[],futures_snapshot=None)
+        state.update(schema=6,engine_version='118.1.0',thesis=None,setup_watches=[],futures_snapshot=None)
         if not preserve_intraday_oi:
             state.update(oi_snapshot=None,oi_history=[],session_oi_baseline=None)
         state['strategy_migration']={
@@ -1628,7 +1646,7 @@ def migrate_state(source, destination, now):
     elif legacy.get('schema_version') in (107,109):
         if legacy.get('position_reconciliation_required'):
             raise StateError('Legacy state requires reconciliation; it cannot be migrated as flat')
-        state={'schema':6,'engine_version':'118.0.0','initialized_at':now.isoformat(),'session_date':legacy.get('session_date'),
+        state={'schema':6,'engine_version':'118.1.0','initialized_at':now.isoformat(),'session_date':legacy.get('session_date'),
                'thesis':None,'position':None,'history':[],'outbox':[],'last_exit':None,'oi_snapshot':None,'oi_history':[],
                'session_oi_baseline':None,'setup_watches':[],'thesis_history':[]}
         original=legacy.get('active_position')
@@ -1670,7 +1688,7 @@ def migrate_state(source, destination, now):
         raise StateError('Unsupported migration schema; no state was created')
 
     digest=hashlib.sha256(raw).hexdigest()
-    archive=destination.parent/'archives_v118'/(source.name+'.'+digest[:16]+'.json')
+    archive=destination.parent/'archives_v118_1'/(source.name+'.'+digest[:16]+'.json')
     if not archive.exists():
         archive.parent.mkdir(parents=True,exist_ok=True)
         fd,tmp=tempfile.mkstemp(dir=archive.parent,prefix='.migration-')
@@ -1744,13 +1762,13 @@ def load(path: Path, allow_legacy=False):
             raise StateError('Invalid state collection: '+field)
     state.setdefault('oi_history',[]);state.setdefault('session_oi_baseline',None);state.setdefault('setup_watches',[]);state.setdefault('thesis_history',[])
     if not allow_legacy:
-        state['schema']=6;state['engine_version']='118.0.0'
+        state['schema']=6;state['engine_version']='118.1.0'
     return state
 
 
 def initialize(path: Path, now: datetime):
     if path.exists():raise StateError('State already exists; refusing to overwrite')
-    save(path,{'schema':6,'engine_version':'118.0.0','initialized_at':now.isoformat(),'initialized_flat':True,'session_date':None,
+    save(path,{'schema':6,'engine_version':'118.1.0','initialized_at':now.isoformat(),'initialized_flat':True,'session_date':None,
                'thesis':None,'position':None,'history':[],'outbox':[],'last_exit':None,'oi_snapshot':None,'oi_history':[],
                'session_oi_baseline':None,'setup_watches':[],'thesis_history':[]})
 
@@ -1939,9 +1957,28 @@ def record_and_assess(state, bars, now, forecast, horizon_minutes=15):
 from datetime import datetime, timedelta
 from math import isfinite
 
-# v118 independent, completed-candle chronological position management.
+# v118.1 independent, completed-candle chronological position management.
 from datetime import datetime, timedelta
 from math import isfinite
+
+def intraday_hard_exit_at(reference: datetime, config: Config) -> datetime:
+    """Absolute IST end-of-day exit required by the strategy contract.
+
+    This is intentionally independent of the exchange-reported NFO session end.
+    The scanner may still use the exchange session for data validity, but every
+    reference option position must be flat at the first scan at/after 15:15 IST.
+    """
+    if reference.tzinfo is None:
+        raise DataError('NAIVE_INTRADAY_EXIT_REFERENCE')
+    local=reference.astimezone(IST)
+    return local.replace(hour=config.intraday_hard_exit_hour,
+                         minute=config.intraday_hard_exit_minute,
+                         second=0,microsecond=0)
+
+
+def entry_cutoff_at(reference: datetime, config: Config) -> datetime:
+    return intraday_hard_exit_at(reference,config)-timedelta(minutes=config.entry_cutoff_lead_minutes)
+
 
 def manage(position, bars, spot, quote, now, market_close, config, structure=None, oi=None):
     """Manage the *alert reference*, not a broker-confirmed position or fill.
@@ -1962,7 +1999,12 @@ def manage(position, bars, spot, quote, now, market_close, config, structure=Non
     if opened>now or checkpoint>now.replace(second=0,microsecond=0):
         raise DataError('POSITION_CLOCK_NOT_MONOTONIC')
     ordered=sorted(bars,key=lambda b:b.start)
-    new=[c for c in ordered if c.start>checkpoint]
+    hard_exit=intraday_hard_exit_at(now,config)
+    unseen=[c for c in ordered if c.start>checkpoint]
+    # If a scan is delayed beyond 15:15, only events that were knowable by the
+    # mandated exit time are allowed to affect the position. Later candles must
+    # never retroactively change a position that should already be flat.
+    new=[c for c in unseen if now<hard_exit or c.start+timedelta(minutes=1)<=hard_exit]
     if new and new[0].start!=checkpoint+timedelta(minutes=1):
         raise DataError('POSITION_MONITORING_CANDLE_GAP')
     if any(b.start-a.start!=timedelta(minutes=1) for a,b in zip(new,new[1:])):
@@ -2078,6 +2120,11 @@ def manage(position, bars, spot, quote, now, market_close, config, structure=Non
             return finish('TARGET_2_TOUCHED',event_at,p['t2'],'COMPLETED_1M_EXTREME')
         progress(favourable,event_at)
         p['last_candle']=c.start.isoformat()
+    if now>=hard_exit:
+        exit_bar=next((c for c in reversed(ordered) if c.start+timedelta(minutes=1)==hard_exit),None)
+        reference=float(exit_bar.close) if exit_bar is not None else float(spot)
+        source='COMPLETED_1M_1515_CLOSE_REFERENCE' if exit_bar is not None else 'FRESH_LIVE_INDEX_QUOTE_AFTER_1515'
+        return finish('INTRADAY_HARD_EXIT_1515',hard_exit,reference,source)
     # Live spot protects a position even if the option bid is missing.
     if sign*(spot-p['stop'])<=0:
         return finish('STOP_TOUCHED',now,spot,'FRESH_LIVE_INDEX_QUOTE')
@@ -2109,23 +2156,49 @@ def manage(position, bars, spot, quote, now, market_close, config, structure=Non
                         abs(float(wall['strike'])-pivot)<=config.strike_step)
             if supportive and sign*(spot-p['entry_spot'])>=progress_increment:
                 update_stop(candidate,'CONFIRMED_3M_PIVOT_AND_MATCHED_OI',now)
+    premium_drawdown=None; premium_cap=None
     if quote_bid is not None:
         if quote_bid<=float(p['entry_ask'])*(1-config.premium_hard_loss_pct/100):
             return finish('PREMIUM_LOSS_GUARD',now,spot,'FRESH_LIVE_OPTION_BID')
         if p.get('t1_hit'):
             # On the T1 detection scan no historical bid is invented; only
-            # subsequent *observations* count for drawdown.
+            # subsequent observed bids count for runner drawdown. Premium decay
+            # is supporting evidence; it cannot override intact price structure.
             start=datetime.fromisoformat(p['runner_started_at'])
             if now>start:
                 peak=max(float(p.get('runner_peak_bid') or 0),quote_bid)
                 p['runner_peak_bid']=peak
                 days_left=(market_close-now).total_seconds()/60
                 same_day=p.get('expiry')==now.date().isoformat()
-                cap=config.premium_runner_drawdown_pct if not same_day else max(8.0,min(config.premium_runner_drawdown_pct,8+days_left/120*10))
-                p['runner_bid_drawdown_pct']=100*(peak-quote_bid)/peak
-                p['runner_drawdown_limit_pct']=cap
-                if p['runner_bid_drawdown_pct']>=cap:
-                    return finish('RUNNER_PREMIUM_DRAWDOWN',now,spot,'FRESH_LIVE_OPTION_BID')
+                premium_cap=config.premium_runner_drawdown_pct if not same_day else max(8.0,min(config.premium_runner_drawdown_pct,8+days_left/120*10))
+                premium_drawdown=100*(peak-quote_bid)/peak
+                p['runner_bid_drawdown_pct']=premium_drawdown
+                p['runner_drawdown_limit_pct']=premium_cap
+
+    def structure_weakening():
+        if not structure:
+            return False,{'available':False}
+        same_thesis=(structure.get('direction')==direction and not structure.get('pending_break'))
+        recent_opposed=(structure.get('recent_3m') in ('BULLISH','BEARISH') and structure.get('recent_3m')!=direction)
+        context_opposed=(structure.get('context_15m') in ('BULLISH','BEARISH') and structure.get('context_15m')!=direction)
+        local=structure.get('support' if sign==1 else 'resistance')
+        local_failed=(local is not None and sign*(spot-float(local))<-max(config.stop_buffer,0.15*volatility))
+        peak=float(p.get('runner_peak_spot') or p.get('best_spot') or p['entry_spot'])
+        underlying_drawdown=max(0.0,sign*(peak-spot))
+        meaningful_drawdown=underlying_drawdown>=max(0.75*volatility,progress_increment)
+        stop_room=max(0.0,sign*(spot-float(p['stop'])))
+        close_to_stop=stop_room<=max(0.75*volatility,2*config.stop_buffer)
+        weakened=(not same_thesis and recent_opposed and meaningful_drawdown) or \
+                 (recent_opposed and meaningful_drawdown and (context_opposed or local_failed or close_to_stop)) or \
+                 (local_failed and meaningful_drawdown)
+        return weakened,{'available':True,'same_thesis':same_thesis,'recent_3m_opposed':recent_opposed,
+                         'context_15m_opposed':context_opposed,'local_structure_failed':local_failed,
+                         'underlying_drawdown_points':round(underlying_drawdown,5),
+                         'meaningful_underlying_drawdown':meaningful_drawdown,
+                         'stop_room_points':round(stop_room,5),'close_to_stop':close_to_stop}
+
+    weakened,weak_diag=structure_weakening()
+    p['runner_structure_diagnostics']=weak_diag
     if p.get('t1_hit'):
         t1time=datetime.fromisoformat(p.get('runner_started_at') or p['t1_at'])
         last=datetime.fromisoformat(p.get('runner_last_progress_at') or p['t1_at'])
@@ -2134,26 +2207,27 @@ def manage(position, bars, spot, quote, now, market_close, config, structure=Non
         theta=(p.get('contract') or {}).get('theta')
         decay=abs(float(theta))*elapsed/(1440*float(p['entry_ask'])) if theta is not None and isfinite(float(theta)) else None
         p.update(runner_idle_minutes=idle,estimated_runner_theta_fraction=decay,
-                 runner_no_progress_3m_bars=int(idle//3))
+                 runner_no_progress_3m_bars=int(idle//3),runner_structure_weakening=weakened)
         stalled=idle>=config.no_progress_minutes
-        theta_stalled=decay is not None and idle>=6 and decay>=0.005
-        if stalled or theta_stalled:
-            grace_until=p.get('runner_grace_until')
-            if grace_until and now<datetime.fromisoformat(grace_until):
-                pass
-            elif grace_until:
-                return finish('RUNNER_THETA_NO_PROGRESS' if theta_stalled else 'RUNNER_NO_PROGRESS',now,spot,'POST_T1_PROGRESS')
-            else:
-                wall=oi.get('put_support' if sign==1 else 'call_resistance') or {}
-                supportive=oi.get('fresh_snapshot') and float(wall.get('oi_change') or 0)>0
-                if supportive and not p.get('runner_grace_used'):
-                    p.update(runner_grace_used=True,runner_grace_until=(now+timedelta(minutes=3)).isoformat())
-                else:
-                    return finish('RUNNER_THETA_NO_PROGRESS' if theta_stalled else 'RUNNER_NO_PROGRESS',now,spot,'POST_T1_PROGRESS')
+        theta_caution=decay is not None and idle>=6 and decay>=0.005
+        premium_material=(premium_drawdown is not None and premium_cap is not None and premium_drawdown>=premium_cap)
+        premium_confirming=(premium_drawdown is not None and premium_cap is not None and premium_drawdown>=0.5*premium_cap)
+        prolonged=idle>=max(config.no_progress_minutes+6,18)
+        theta_material=decay is not None and decay>=0.01
+        # Structure is primary. Time/theta and premium deterioration may confirm
+        # a weakening runner, but never close an otherwise intact trend alone.
+        if premium_material and weakened:
+            return finish('RUNNER_PREMIUM_DRAWDOWN_WITH_STRUCTURE_WEAKENING',now,spot,'FRESH_LIVE_OPTION_BID_AND_PRICE_STRUCTURE')
+        if weakened and stalled and (premium_confirming or prolonged or theta_material):
+            return finish('RUNNER_STRUCTURE_WEAKENING_NO_PROGRESS',now,spot,'POST_T1_STRUCTURE_AND_PROGRESS')
+        p['runner_theta_caution']=bool(theta_caution)
+        p['runner_no_progress_caution']=bool(stalled)
     elif (now-opened).total_seconds()/60>=config.no_progress_minutes and sign*(p['best_spot']-p['entry_spot'])<.3*volatility:
-        return finish('ENTRY_NO_PROGRESS',now,spot,'PRE_T1_NO_PROGRESS')
-    if (market_close-now).total_seconds()<=60*config.session_exit_lead_minutes:
-        return finish('SESSION_EXIT_WINDOW',now,spot,'SESSION_TIMINGS')
+        # Pre-T1 no-progress is not a standalone exit either. The tactical stop
+        # and confirmed structure remain authoritative.
+        if weakened:
+            return finish('ENTRY_STRUCTURE_WEAKENING_NO_PROGRESS',now,spot,'PRE_T1_STRUCTURE_AND_PROGRESS')
+        p['entry_no_progress_caution']=True
     if p.get('expiry')==now.date().isoformat() and (market_close-now).total_seconds()<=25*60 and p.get('t1_hit'):
         return finish('EXPIRY_RUNNER_PROTECTION',now,spot,'EXPIRY_TIME_WINDOW')
     p['management_state']='RUNNER' if p.get('t1_hit') else 'INITIAL'
@@ -2392,6 +2466,8 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             return result
         session_start, session_end = session
         evidence['session'] = [session_start.isoformat(), session_end.isoformat()]
+        result['intraday_hard_exit_at'] = intraday_hard_exit_at(started,config).isoformat()
+        result['entry_cutoff_at'] = entry_cutoff_at(started,config).isoformat()
         if not state.get('position') and started < session_start + timedelta(minutes=config.min_bars):
             result['reason'] = 'OPENING_CANDLE_WARMUP'
             return result
@@ -2499,7 +2575,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             if reversal_exit is None:
                 return result
         try:
-            future = api.nearest_nifty_future(now, Path('.cache/nifty_futures_v118.json'))
+            future = api.nearest_nifty_future(now, Path('.cache/nifty_futures_v118_1.json'))
             fq = api.quotes([future['instrument_key']]).get(future['instrument_key'], {})
             ft = tick()
             fp = checked_spot(fq, ft, config.max_quote_age)
@@ -2620,8 +2696,10 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         if not setups:
             result['reason'] = 'WAIT_FOR_ALIGNED_PRICE_SETUP'
             return result
-        if (session_end - now).total_seconds() <= config.entry_cutoff_lead_minutes * 60:
-            result['reason'] = 'ENTRY_TOO_CLOSE_TO_SESSION_END'
+        hard_exit=intraday_hard_exit_at(now,config)
+        if now>=entry_cutoff_at(now,config):
+            result['reason'] = 'ENTRY_TOO_CLOSE_TO_1515_HARD_EXIT'
+            result['intraday_hard_exit_at'] = hard_exit.isoformat()
             return result
         last = state.get('last_exit') or {}
         evaluations = []
@@ -2723,11 +2801,11 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         # a qualified reference position or its durable outbox lock. main()
         # still commits state and exits nonzero so the workflow reports failure.
         try:
-            result['input_capture'] = capture_inputs(audit_dir / 'inputs_v118' / day, identifier, evidence)
+            result['input_capture'] = capture_inputs(audit_dir / 'inputs_v118_1' / day, identifier, evidence)
         except (OSError,ValueError,TypeError) as exc:
             result['persistence_error']='INPUT_CAPTURE_FAILED_'+type(exc).__name__
         try:
-            append_audit(audit_dir / ('market_scan_v118_' + day + '.jsonl'), result)
+            append_audit(audit_dir / ('market_scan_v118_1_' + day + '.jsonl'), result)
         except (OSError,ValueError,TypeError) as exc:
             result['persistence_error']='AUDIT_WRITE_FAILED_'+type(exc).__name__
 
@@ -2882,7 +2960,7 @@ def main():
                 state['position'] = None
                 state['last_exit'] = {'at': now, 'direction': closed.get('direction'), 'three': (state.get('thesis') or {}).get('last_3m')}
                 save(state_path, state)
-                append_audit(audit_dir / ('market_scan_v118_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_RECONCILIATION', 'position_id': args.reconcile_flat, 'at': now, 'fill': 'UNKNOWN'})
+                append_audit(audit_dir / ('market_scan_v118_1_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_RECONCILIATION', 'position_id': args.reconcile_flat, 'at': now, 'fill': 'UNKNOWN'})
                 print(json.dumps({'status': 'RECONCILED_FLAT', 'position_id': args.reconcile_flat, 'at': now}))
                 return 0
             if args.requeue_alert:
@@ -2891,7 +2969,7 @@ def main():
                     raise StateError('Alert ID is not an uncertain or previously claimed alert')
                 event.update(status='PENDING', claim=None, manually_requeued_at=datetime.now(IST).isoformat())
                 save(state_path, state)
-                append_audit(audit_dir / ('market_scan_v118_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_ALERT_REQUEUE', 'alert_id': args.requeue_alert, 'at': datetime.now(IST).isoformat()})
+                append_audit(audit_dir / ('market_scan_v118_1_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_ALERT_REQUEUE', 'alert_id': args.requeue_alert, 'at': datetime.now(IST).isoformat()})
                 print(json.dumps({'status': 'REQUEUED', 'alert_id': args.requeue_alert}))
                 return 0
             token = os.environ.get('NOTIFICATION_CLAIM_TOKEN', '')
