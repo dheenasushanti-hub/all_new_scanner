@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY scenario engine v117.1.0 — complete standalone analytical scanner.
+"""NIFTY scenario engine v118.0.0 — complete standalone analytical scanner.
 
 Completed price bars -> protected structure -> conditional forward scenarios ->
 independent setup watches -> fixed risk plan -> one quoted option contract ->
@@ -13,13 +13,13 @@ from __future__ import annotations
 
 
 # scanner/__init__.py
-__version__ = '117.1.0'
+__version__ = '118.0.0'
 
 
 # scanner/core.py
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
-from math import isfinite, log1p
+from math import isfinite, log1p, ceil, floor
 from statistics import median
 from typing import Any
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -73,7 +73,7 @@ class Config:
     forecast_horizon_minutes: int = 15
     session_exit_lead_minutes: int = 20
     entry_cutoff_lead_minutes: int = 30
-    # v117 configuration, documented engineering choices; not fitted probabilities.
+    # v118 configuration, documented engineering choices; not fitted probabilities.
     oi_nearby_points: float = 400.0
     oi_material_change_fraction: float = 0.005
     oi_horizon_max_seconds: int = 3600
@@ -88,12 +88,19 @@ class Config:
     iv_shock_points: float = 1.0
     candle_publication_grace_seconds: float = 20.0
     candle_retry_interval_seconds: float = 2.0
+    # v118 entry/target orchestration. These are deterministic engineering
+    # constraints, not fitted probabilities or claims of future performance.
+    reversal_acceptance_window_minutes: int = 12
+    acceptance_hold_bars: int = 2
+    acceptance_buffer_atr: float = 0.12
+    max_target_projection_atr: float = 4.0
+    one_itm_execution_tolerance: float = 0.06
 
     def __post_init__(self):
-        for field in (self.max_risk, self.min_rr, self.max_quote_age, self.max_spread_pct, self.max_entry_extension_atr, self.min_wall_fraction, self.strike_step, self.stop_buffer, self.premium_hard_loss_pct, self.premium_runner_drawdown_pct, self.min_stop_atr, self.runner_progress_atr, self.oi_nearby_points, self.oi_material_change_fraction, self.oi_horizon_max_seconds, self.min_option_volume, self.target_clearance_atr, self.min_intraday_projection_atr, self.max_option_iv, self.max_premium_cost_ratio, self.depth_full_score_lots, self.premium_proxy_max_spread_pct, self.iv_shock_points, self.candle_publication_grace_seconds, self.candle_retry_interval_seconds):
+        for field in (self.max_risk, self.min_rr, self.max_quote_age, self.max_spread_pct, self.max_entry_extension_atr, self.min_wall_fraction, self.strike_step, self.stop_buffer, self.premium_hard_loss_pct, self.premium_runner_drawdown_pct, self.min_stop_atr, self.runner_progress_atr, self.oi_nearby_points, self.oi_material_change_fraction, self.oi_horizon_max_seconds, self.min_option_volume, self.target_clearance_atr, self.min_intraday_projection_atr, self.max_option_iv, self.max_premium_cost_ratio, self.depth_full_score_lots, self.premium_proxy_max_spread_pct, self.iv_shock_points, self.candle_publication_grace_seconds, self.candle_retry_interval_seconds, self.acceptance_buffer_atr, self.max_target_projection_atr, self.one_itm_execution_tolerance):
             if not isfinite(field) or field <= 0:
                 raise DataError('Invalid strategy configuration')
-        if any((not isinstance(v, int) or isinstance(v, bool) for v in (self.min_bars, self.no_progress_minutes, self.watch_minutes, self.opening_oi_baseline_cutoff_minutes))) or self.min_wall_fraction > 1 or self.max_premium_cost_ratio >= 1 or self.oi_material_change_fraction >= 1 or self.min_bars < 6 or (self.no_progress_minutes < 1) or (self.watch_minutes < 1) or (self.opening_oi_baseline_cutoff_minutes < 1 or self.opening_oi_baseline_cutoff_minutes > 60) or (not 0 < self.max_entry_risk_fraction <= 1) or (max(self.premium_hard_loss_pct, self.premium_runner_drawdown_pct) >= 100):
+        if any((not isinstance(v, int) or isinstance(v, bool) for v in (self.min_bars, self.no_progress_minutes, self.watch_minutes, self.opening_oi_baseline_cutoff_minutes, self.reversal_acceptance_window_minutes, self.acceptance_hold_bars))) or self.min_wall_fraction > 1 or self.max_premium_cost_ratio >= 1 or self.oi_material_change_fraction >= 1 or self.min_bars < 6 or (self.no_progress_minutes < 1) or (self.watch_minutes < 1) or (self.opening_oi_baseline_cutoff_minutes < 1 or self.opening_oi_baseline_cutoff_minutes > 60) or (not 0 < self.max_entry_risk_fraction <= 1) or (max(self.premium_hard_loss_pct, self.premium_runner_drawdown_pct) >= 100):
             raise DataError('Invalid strategy configuration')
         if self.max_risk > 30 or self.min_rr < 1.25:
             raise DataError('Approved risk limits cannot be weakened')
@@ -103,6 +110,10 @@ class Config:
             raise DataError('Entry and exit windows must leave a monitoring interval')
         if self.candle_publication_grace_seconds > 60 or self.candle_retry_interval_seconds > 10 or self.candle_retry_interval_seconds > self.candle_publication_grace_seconds:
             raise DataError('Invalid candle publication grace/retry configuration')
+        if not 3 <= self.reversal_acceptance_window_minutes <= 30 or not 1 <= self.acceptance_hold_bars <= 3:
+            raise DataError('Invalid acceptance-entry configuration')
+        if self.acceptance_buffer_atr > 0.5 or not 1.25 <= self.max_target_projection_atr <= 6.0 or self.one_itm_execution_tolerance > 0.15:
+            raise DataError('Invalid continuation target/contract configuration')
 
 def scan_candle_watermark(started: datetime) -> datetime:
     """Latest whole 1m candle that was complete when this scan began.
@@ -217,7 +228,7 @@ def classify_flow(old_oi: float, new_oi: float, old_price: float, new_price: flo
         return 'UNCHANGED_OR_NOISY'
     return {(True, True): 'LONG_BUILDUP_HYPOTHESIS', (True, False): 'SHORT_COVERING_HYPOTHESIS', (False, True): 'SHORT_BUILDUP_HYPOTHESIS', (False, False): 'LONG_UNWINDING_HYPOTHESIS'}[dp > 0, doi > 0]
 
-# v117 STRATEGY RESEARCH IMPLEMENTATION.
+# v118 STRATEGY RESEARCH IMPLEMENTATION.
 # All regime inference, setups, watches, risk and contract ranking below were
 # designed independently of the previous release's trading functions.
 # Provider, wire format and persistence facilities are retained for compatibility.
@@ -396,7 +407,7 @@ def _structure_at(bars: list[Candle]) -> dict[str, Any]:
     context='DEVELOPING'
     if len(fifteens)>=2:
         context='BULLISH' if fifteens[-1].close>fifteens[-2].close else 'BEARISH' if fifteens[-1].close<fifteens[-2].close else 'SIDEWAYS'
-    return {'engine_revision':1170,'direction':direction,'state':phase,'support':support,
+    return {'engine_revision':1180,'direction':direction,'state':phase,'support':support,
             'resistance':resistance,'boundary_source':boundary_source,'pending_break':pending,
             'break_confirmed':reversal is not None and last_reason in ('SUPPORT_BREAK_CONFIRMED','RESISTANCE_BREAK_CONFIRMED'),
             'last_reversal':reversal,'reason':last_reason,'established_at':established_at,
@@ -421,8 +432,23 @@ def update_structure(bars, old=None):
     return _structure_at(bars)
 
 
-def forecast_market(bars, structure, spot, oi, futures=None):
-    """Explain the evolving thesis as conditional scenarios, never guarantees."""
+def _round_directional_target(value: float, direction: str, step: float) -> float:
+    """Round a forward projection outward to the live strike grid."""
+    if not all(isfinite(float(x)) and float(x) > 0 for x in (value, step)):
+        raise DataError('INVALID_TARGET_ROUNDING_INPUT')
+    scaled=float(value)/float(step)
+    return float(ceil(scaled-1e-12)*step if direction=='BULLISH' else floor(scaled+1e-12)*step)
+
+
+def forecast_market(bars, structure, spot, oi, futures=None, config=None):
+    """Explain the evolving thesis as conditional scenarios, never guarantees.
+
+    v118 deliberately distinguishes a *forecast hurdle* from a target-limiting
+    barrier. Potential OI concentrations and historical pivots are surfaced,
+    but they do not automatically cap a directional continuation objective
+    unless later price/OI evidence upgrades them to a hard barrier.
+    """
+    config=config or Config()
     d=structure['direction']; pending=structure.get('pending_break')
     boundary=structure.get('support') if d=='BULLISH' else structure.get('resistance') if d=='BEARISH' else None
     if not structure.get('boundary_trusted',True):
@@ -448,20 +474,29 @@ def forecast_market(bars, structure, spot, oi, futures=None):
                 px=float(level['price'])
                 if sign*(px-spot)<=0.25: continue
                 source=str(level.get('source') or level.get('kind') or 'LEVEL')
-                rows.append((abs(px-spot), px, source))
+                rows.append((abs(px-spot), px, source, bool(level.get('hard_barrier') or level.get('price_rejection_confirmed'))))
             except (KeyError,TypeError,ValueError):
                 continue
-        if not rows:
-            wall=oi.get('call_resistance' if direction=='BULLISH' else 'put_support') or {}
-            try:
-                px=float(wall['strike'])
-                if sign*(px-spot)>0.25: rows.append((abs(px-spot),px,'OI_'+wall.get('side','WALL')))
-            except (KeyError,TypeError,ValueError):
-                pass
-        rows.sort()
-        return [{'level':round(px,5),'source':source} for _,px,source in rows[:2]]
+        rows.sort(key=lambda x:(x[0],x[1]))
+        result=[]
+        for _,px,source,hard in rows[:2]:
+            result.append({'level':round(px,5),'source':source,'role':'HARD_BARRIER' if hard else 'SOFT_INTERMEDIATE_HURDLE'})
+        a=max(float(structure.get('atr_1m') or atr(bars) or 1),1.0)
+        recent=float(oi.get('recent_impulse_height') or 0)
+        thesis_leg=0.0
+        try:
+            if boundary is not None:
+                thesis_leg=abs(float(bars[-1].close)-float(boundary))
+        except (TypeError,ValueError):
+            thesis_leg=0.0
+        projection=max(config.min_intraday_projection_atr*a,
+                       min(max(recent,thesis_leg),config.max_target_projection_atr*a) if max(recent,thesis_leg)>0 else 0)
+        projected=_round_directional_target(spot+sign*projection,direction,config.strike_step)
+        if sign*(projected-spot)>0.25 and all(abs(projected-x['level'])>1e-6 for x in result):
+            result.append({'level':round(projected,5),'source':'CAUSAL_CONTINUATION_PROJECTION','role':'CONTINUATION_OBJECTIVE'})
+        return result[:3]
 
-    common_entry=['NEW_COMPLETED_1M_PRICE_TRIGGER','LATEST_COMPLETED_3M_CONFIRMATION','ENTRY_NOT_STALE_OR_CHASED']
+    common_entry=['COMPLETED_1M_ACCEPTANCE_OR_FRESH_PRICE_TRIGGER','LATEST_COMPLETED_3M_CONFIRMATION','ENTRY_NOT_STALE_OR_CHASED']
     if d in ('BULLISH','BEARISH'):
         evidence.append('DEFENDED_PRICE_STRUCTURE_'+d)
         if structure.get('recent_3m')==d:evidence.append('LAST_COMPLETED_3M_ALIGNED')
@@ -474,16 +509,23 @@ def forecast_market(bars, structure, spot, oi, futures=None):
         supportive={'LONG_BUILDUP_HYPOTHESIS','SHORT_COVERING_HYPOTHESIS'} if d=='BULLISH' else {'SHORT_BUILDUP_HYPOTHESIS','LONG_UNWINDING_HYPOTHESIS'}
         if pattern in supportive:evidence.append('FUTURES_PRICE_OI_HYPOTHESIS_COMPATIBLE')
         elif pattern and pattern not in ('UNAVAILABLE','UNCHANGED_OR_NOISY'):cautions.append('FUTURES_FLOW_MIXED')
+        recent_reversal=structure.get('last_reversal') or {}
+        if recent_reversal.get('direction')==d:
+            try:
+                if datetime.fromisoformat((bars[-1].start+timedelta(minutes=1)).isoformat())-datetime.fromisoformat(recent_reversal['confirmed_at']) <= timedelta(minutes=config.reversal_acceptance_window_minutes):
+                    evidence.append('RECENT_CONFIRMED_REVERSAL_ACCEPTANCE_WINDOW')
+            except (ValueError,TypeError,KeyError):
+                pass
         alt='BEARISH' if d=='BULLISH' else 'BULLISH'
         scenarios=[
             {'name':'CONTINUATION_OR_PULLBACK_RESUMPTION','direction':d,
-             'entry_conditions':common_entry+['PROTECTED_LEVEL_HOLDS','PRICE_RECOVERS_OR_CONTINUES_IN_THESIS_DIRECTION'],
+             'entry_conditions':common_entry+['PROTECTED_LEVEL_HOLDS','FORMER_RESISTANCE_SUPPORT_OR_ACCEPTANCE_LEVEL_HOLDS','PRICE_RECOVERS_OR_CONTINUES_IN_THESIS_DIRECTION'],
              'invalidation':{'type':'PROTECTED_STRUCTURE','level':boundary,
                              'requires':'TWO_SEPARATE_COMPLETED_3M_CLOSES_BEYOND_DEFENDED_LEVEL'},
              'potential_targets':targets_for(d),
              'supporting_evidence':list(evidence),'status':'WATCH' if not pending else 'BLOCKED_PENDING_BREAK'},
             {'name':'GENUINE_REVERSAL','direction':alt,
-             'entry_conditions':['MEANINGFUL_BREAK_OF_PROTECTED_STRUCTURE','TWO_SEPARATE_COMPLETED_3M_ACCEPTANCES_BEYOND_PROTECTED_LEVEL','FRESH_COMPLETED_1M_TRIGGER_AFTER_REVERSAL','NO_STALE_WATCH_REUSE'],
+             'entry_conditions':['MEANINGFUL_BREAK_OF_PROTECTED_STRUCTURE','TWO_SEPARATE_COMPLETED_3M_ACCEPTANCES_BEYOND_PROTECTED_LEVEL','FRESH_COMPLETED_1M_ACCEPTANCE_OR_TRIGGER_AFTER_REVERSAL','NO_STALE_WATCH_REUSE'],
              'invalidation':{'type':'FAILED_REVERSAL','level':boundary,'requires':'PRICE_RECLAIMS_OR_REJECTS_BROKEN_BOUNDARY'},
              'potential_targets':targets_for(alt),
              'supporting_evidence':['OPPOSITE_ENTRY_REQUIRES_CONFIRMED_STRUCTURE_CHANGE'],
@@ -503,7 +545,7 @@ def forecast_market(bars, structure, spot, oi, futures=None):
     return {'as_of':(bars[-1].start+timedelta(minutes=1)).isoformat(),
             'primary_scenario':primary,'directional_thesis':d,'protected_boundary':boundary,
             'invalidation_requires':'TWO_SEPARATE_CLOSED_3M_ACCEPTANCES_BEYOND_DEFENDED_PRICE_LEVEL',
-            'entry_readiness':'ASSESS_TRIGGER' if structure.get('boundary_trusted',True) and not pending and structure.get('recent_3m')==d and d!='RANGE' else 'WAIT',
+            'entry_readiness':'ASSESS_ACCEPTANCE_OR_TRIGGER' if structure.get('boundary_trusted',True) and not pending and structure.get('recent_3m')==d and d!='RANGE' else 'WAIT',
             'supporting_evidence':evidence,'cautions':cautions,'scenarios':scenarios,
             'spot':spot,'conditional_analysis_not_prediction_guarantee':True}
 
@@ -584,8 +626,54 @@ def price_oi_evidence(context, comparison, structure, spot):
     report['votes']=votes
     return report
 
+ACCEPTANCE_SETUP_KINDS = {
+    'POST_REVERSAL_ACCEPTANCE_CONTINUATION',
+    'TREND_ACCEPTANCE_CONTINUATION',
+}
+
+
+def _accepted_price_level(structure, side, close, a):
+    """Return the nearest already-crossed price level whose acceptance matters.
+
+    The broad protected thesis boundary remains a dependency, but a continuation
+    trade should normally be invalidated by the local accepted/retested price
+    structure rather than by a much more distant session thesis boundary.
+    """
+    sign=1 if side=='BULLISH' else -1
+    tolerance=max(0.5,min(2.5,0.18*max(a,1.0)))
+    rows=[]
+    rev=structure.get('last_reversal') or {}
+    if rev.get('direction')==side and rev.get('level') is not None:
+        rows.append(('CONFIRMED_REVERSAL_BREAK_LEVEL',float(rev['level'])))
+    if side=='BULLISH':
+        for source,key in (('FORMER_STRUCTURE_RESISTANCE','resistance'),('CONFIRMED_3M_PIVOT_HIGH','confirmed_pivot_high'),('CONFIRMED_15M_PIVOT_HIGH','confirmed_15m_pivot_high')):
+            value=structure.get(key)
+            if value is not None and float(value)<=close+tolerance:
+                rows.append((source,float(value)))
+        if not rows:return None,None
+        source,level=max(rows,key=lambda x:x[1])
+    else:
+        for source,key in (('FORMER_STRUCTURE_SUPPORT','support'),('CONFIRMED_3M_PIVOT_LOW','confirmed_pivot_low'),('CONFIRMED_15M_PIVOT_LOW','confirmed_15m_pivot_low')):
+            value=structure.get(key)
+            if value is not None and float(value)>=close-tolerance:
+                rows.append((source,float(value)))
+        if not rows:return None,None
+        source,level=min(rows,key=lambda x:x[1])
+    # Do not call a level accepted if it is actually on the wrong side.
+    if sign*(close-level)<-tolerance:
+        return None,None
+    return level,source
+
+
 def _candidate_at(bars, structure, config, context):
-    """Generate conditional price triggers from completed 1m and closed 3m only."""
+    """Generate causal entry setups from completed 1m and closed 3m only.
+
+    v118 adds an explicit post-reversal/trend acceptance path. A confirmed
+    directional structure does not have to prove itself again by printing a
+    fresh micro-breakout above the immediately preceding 1m high. Instead, an
+    accepted former resistance/support level plus an aligned completed 3m bar
+    may qualify, subject to the same live extension, dependency and risk gates.
+    """
     if len(bars)<config.min_bars or len(aggregate(bars,3))<2:return []
     c,p=bars[-1],bars[-2]; d=structure['direction']; a=max(atr(bars),1.0)
     t=(c.start+timedelta(minutes=1)).isoformat(); threes=aggregate(bars,3)
@@ -612,41 +700,89 @@ def _candidate_at(bars, structure, config, context):
             level=context.get('call_resistance') or {}; wall=level.get('strike')
             wall_reclaim=wall is not None and max(x.high for x in bars[-4:])>=wall-0.3*a and c.close<wall-0.1*a and c.close<p.low
             boundary=structure.get('resistance'); reaction_level=p.high; oi_side='CE'
-        if body<max(0.4,0.1*a) or not three_aligned:continue
-        if trend and boundary is not None and sign*(c.close-boundary)<=0:continue
-        if trend:
-            kinds=[]
-            if momentum:
-                prev_range=bars[-6:-1]; prior_extreme=max(x.high for x in prev_range) if sign==1 else min(x.low for x in prev_range)
-                kinds.append('TREND_BREAKOUT' if sign*(c.close-prior_extreme)>0 else 'OPENING_MOMENTUM' if len(bars)<=12 else 'TREND_CONTINUATION')
-            if recovery or wall_reclaim:kinds.append('TREND_SUPPORT_RECLAIM' if sign==1 else 'TREND_RESISTANCE_REJECTION')
-            protected=structure.get('support' if sign==1 else 'resistance')
-            if protected is not None and any((x.low < protected if sign==1 else x.high > protected) for x in bars[-4:-1]) and sign*(c.close-protected)>0 and momentum:kinds.insert(0,'FALSE_BREAK_RECLAIM' if sign==1 else 'FALSE_BREAK_REJECTION')
-            if structure.get('reason')=='RANGE_BREAK_ACCEPTED' and momentum:kinds.insert(0,'ACCEPTED_RANGE_BREAKOUT' if sign==1 else 'ACCEPTED_RANGE_BREAKDOWN')
-            recent_reversal=structure.get('last_reversal') or {}
-            if recent_reversal.get('direction')==side and datetime.fromisoformat(t)-datetime.fromisoformat(recent_reversal['confirmed_at'])<=timedelta(minutes=8) and momentum:kinds.insert(0,'CONFIRMED_REVERSAL')
-        else:
-            kinds=[]
-            if wall_reclaim or recovery:kinds=['RANGE_SUPPORT_RECLAIM' if sign==1 else 'RANGE_RESISTANCE_REJECTION']
+
+        kinds=[]
+        acceptance_level=None; acceptance_source=None; acceptance_kind=None
+        if trend and three_aligned:
+            acceptance_level,acceptance_source=_accepted_price_level(structure,side,c.close,a)
+            if acceptance_level is not None:
+                buffer=max(0.5,min(2.0,config.acceptance_buffer_atr*a))
+                recent=bars[-3:]
+                accepted=sum(1 for x in recent if sign*(x.close-acceptance_level)>=-0.25*buffer)
+                latest_holds=sign*(c.close-acceptance_level)>=buffer
+                three_holds=sign*(three.close-acceptance_level)>=buffer
+                non_opposing=sign*(c.close-c.open)>=-0.15*a
+                prior_near_or_below=sign*(threes[-2].close-acceptance_level)<=max(buffer,0.20*a)
+                if accepted>=config.acceptance_hold_bars and latest_holds and three_holds and non_opposing and prior_near_or_below:
+                    recent_reversal=structure.get('last_reversal') or {}
+                    reversal_fresh=False
+                    if recent_reversal.get('direction')==side and recent_reversal.get('confirmed_at'):
+                        try:
+                            reversal_fresh=datetime.fromisoformat(t)-datetime.fromisoformat(recent_reversal['confirmed_at'])<=timedelta(minutes=config.reversal_acceptance_window_minutes)
+                        except (ValueError,TypeError):
+                            reversal_fresh=False
+                    acceptance_kind='POST_REVERSAL_ACCEPTANCE_CONTINUATION' if reversal_fresh else 'TREND_ACCEPTANCE_CONTINUATION'
+                    kinds.append(acceptance_kind)
+
+        # Existing momentum/recovery paths remain available, but their body
+        # threshold is intentionally not imposed on the acceptance path above.
+        if body>=max(0.4,0.1*a) and three_aligned:
+            if trend and boundary is not None and sign*(c.close-boundary)<=0:
+                pass
+            elif trend:
+                if momentum:
+                    prev_range=bars[-6:-1]; prior_extreme=max(x.high for x in prev_range) if sign==1 else min(x.low for x in prev_range)
+                    kinds.append('TREND_BREAKOUT' if sign*(c.close-prior_extreme)>0 else 'OPENING_MOMENTUM' if len(bars)<=12 else 'TREND_CONTINUATION')
+                if recovery or wall_reclaim:kinds.append('TREND_SUPPORT_RECLAIM' if sign==1 else 'TREND_RESISTANCE_REJECTION')
+                protected=structure.get('support' if sign==1 else 'resistance')
+                if protected is not None and any((x.low < protected if sign==1 else x.high > protected) for x in bars[-4:-1]) and sign*(c.close-protected)>0 and momentum:kinds.insert(0,'FALSE_BREAK_RECLAIM' if sign==1 else 'FALSE_BREAK_REJECTION')
+                if structure.get('reason')=='RANGE_BREAK_ACCEPTED' and momentum:kinds.insert(0,'ACCEPTED_RANGE_BREAKOUT' if sign==1 else 'ACCEPTED_RANGE_BREAKDOWN')
+                recent_reversal=structure.get('last_reversal') or {}
+                if recent_reversal.get('direction')==side and recent_reversal.get('confirmed_at'):
+                    try:
+                        if datetime.fromisoformat(t)-datetime.fromisoformat(recent_reversal['confirmed_at'])<=timedelta(minutes=config.reversal_acceptance_window_minutes) and momentum:
+                            kinds.insert(0,'CONFIRMED_REVERSAL')
+                    except (ValueError,TypeError):
+                        pass
+            else:
+                if wall_reclaim or recovery:kinds=['RANGE_SUPPORT_RECLAIM' if sign==1 else 'RANGE_RESISTANCE_REJECTION']
+
         for kind in dict.fromkeys(kinds):
+            # Tactical stop is local and setup-specific. The much broader
+            # protected thesis boundary is persisted separately as a dependency.
             invalid=price_stop
+            if kind in ACCEPTANCE_SETUP_KINDS and acceptance_level is not None:
+                local_window=bars[-3:]
+                invalid=(min(x.low for x in local_window)-config.stop_buffer if sign==1
+                         else max(x.high for x in local_window)+config.stop_buffer)
             if side=='BULLISH' and invalid>=c.close or side=='BEARISH' and invalid<=c.close:continue
             dependencies=[]
             if trend and boundary is not None:
                 dependencies.append({'kind':'PROTECTED_STRUCTURE','direction':side,'level':float(boundary),
                                      'role':'SUPPORT' if sign==1 else 'RESISTANCE','source':structure.get('boundary_source')})
+            if kind in ACCEPTANCE_SETUP_KINDS and acceptance_level is not None:
+                dependencies.append({'kind':'PRICE_ACCEPTANCE_LEVEL','direction':side,'level':float(acceptance_level),
+                                     'role':'FORMER_RESISTANCE_ACCEPTED_AS_SUPPORT' if sign==1 else 'FORMER_SUPPORT_ACCEPTED_AS_RESISTANCE',
+                                     'source':acceptance_source})
             if wall_reclaim and wall is not None:
                 dependencies.append({'kind':'OI_WALL','direction':side,'side':oi_side,'strike':float(wall),
                                      'instrument_key':level.get('instrument_key'),'expiry':level.get('expiry'),
                                      'relative_strength_at_creation':level.get('relative_to_side_max'),
                                      'barrier_status_at_creation':level.get('barrier_status','POTENTIAL')})
-            elif recovery:
+            elif recovery and kind not in ACCEPTANCE_SETUP_KINDS:
                 dependencies.append({'kind':'PRICE_REACTION_LEVEL','direction':side,'level':float(reaction_level),
                                      'role':'PULLBACK_LOW_RECLAIM' if sign==1 else 'BOUNCE_HIGH_REJECTION'})
-            evidence=['COMPLETE_1M_TRIGGER','COMPLETED_3M_DIRECTION','PROTECTED_REGIME_OR_RANGE_LEVEL']
+            evidence=['COMPLETE_1M_TRIGGER_OR_ACCEPTANCE','COMPLETED_3M_DIRECTION','PROTECTED_REGIME_OR_RANGE_LEVEL']
+            if kind in ACCEPTANCE_SETUP_KINDS:
+                evidence.extend(['FORMER_LEVEL_ACCEPTED_ON_COMPLETED_PRICE','TACTICAL_TRADE_INVALIDATION_SEPARATE_FROM_THESIS_INVALIDATION'])
             if wall_reclaim:evidence.append('CURRENT_OI_WALL_PRICE_REACTION')
             results.append({'direction':side,'kind':kind,'trigger':c.close,'confirmed_at':t,'invalidation':invalid,
-                            'atr_1m':a,'stop_role':'RECENT_COMPLETED_1M_PRICE_EXTREME','protected_thesis_boundary':boundary,
+                            'trade_invalidation':invalid,'atr_1m':a,'stop_role':'LOCAL_COMPLETED_1M_PRICE_STRUCTURE',
+                            'protected_thesis_boundary':boundary,
+                            'thesis_invalidation':{'level':boundary,'requires':'CONFIRMED_PROTECTED_STRUCTURE_BREAK'} if boundary is not None else None,
+                            'acceptance_level':acceptance_level if kind in ACCEPTANCE_SETUP_KINDS else None,
+                            'acceptance_source':acceptance_source if kind in ACCEPTANCE_SETUP_KINDS else None,
+                            'confirmation_locked':kind in ACCEPTANCE_SETUP_KINDS,
                             'three_confirmed_at':last_completed.isoformat(),'dependencies':dependencies,'evidence':evidence})
     return results
 
@@ -704,6 +840,11 @@ def validate_setup_dependencies(setup, structure, context, spot, config):
             if sign*(spot-level)<-max(0.5,0.15*a):
                 return False,'WATCH_PRICE_LEVEL_DEPENDENCY_FAILED',diagnostics+[dep]
             diagnostics.append({'kind':kind,'status':'VALID','level':level})
+        elif kind=='PRICE_ACCEPTANCE_LEVEL':
+            level=float(dep['level']); band=max(0.5,min(2.0,config.acceptance_buffer_atr*a))
+            if sign*(spot-level)<-band:
+                return False,'WATCH_ACCEPTANCE_LEVEL_FAILED',diagnostics+[dep]
+            diagnostics.append({'kind':kind,'status':'VALID','level':level,'source':dep.get('source')})
         elif kind=='OI_WALL':
             if not context.get('fresh_snapshot'):
                 return False,'WATCH_OI_DEPENDENCY_UNAVAILABLE',diagnostics+[dep]
@@ -726,6 +867,14 @@ def validate_setup_dependencies(setup, structure, context, spot, config):
 
 
 def refresh_setup_watches(bars, structure, spot, now, prior, config, context, fresh_candidates=None):
+    """Revalidate each setup independently; one rejection never suppresses others.
+
+    Acceptance setups carry the completed 3m confirmation that created them.
+    During their short watch window they do not require a second, redundant 3m
+    confirmation merely because the dispatcher runs later; they still require
+    the protected thesis, accepted price level, live trigger and tactical stop
+    to remain valid. Other setup types keep the stricter latest-3m alignment.
+    """
     fresh=list(fresh_candidates) if fresh_candidates is not None else make_setups(bars,structure,spot,config,context)
     bykey={}
     for row in fresh+list(prior or []):
@@ -733,6 +882,7 @@ def refresh_setup_watches(bars, structure, spot, now, prior, config, context, fr
         key=(row['confirmed_at'],row['direction'],row['kind'],round(float(row['trigger']),3))
         bykey.setdefault(key,dict(row))
     eligible=[]; retained=[]; diagnostics=[]
+    current_atr=max(atr(bars),1.0)
     for s in sorted(bykey.values(),key=lambda r:r['confirmed_at'],reverse=True):
         try:
             at=datetime.fromisoformat(s['confirmed_at']); age=(now-at).total_seconds(); sign=1 if s['direction']=='BULLISH' else -1
@@ -751,12 +901,24 @@ def refresh_setup_watches(bars, structure, spot, now, prior, config, context, fr
             extension=sign*(spot-float(s['trigger'])); r=sign*(spot-float(s['invalidation']))
             three_end=datetime.fromisoformat(structure['last_3m'])+timedelta(minutes=3)
             prior_confirmed=datetime.fromisoformat(s.get('three_confirmed_at',s['confirmed_at']))
-            if structure.get('recent_3m')!=s['direction']:reason='WAIT_FOR_NEW_COMPLETED_3M_ALIGNMENT'
-            elif three_end<prior_confirmed:reason='SETUP_3M_CONFIRMATION_MISSING'
-            elif extension < -max(0.5,0.15*atr(bars)):reason='TRIGGER_NOT_RECLAIMED'
-            elif extension>config.max_entry_extension_atr*max(atr(bars),1):reason='STALE_ENTRY_CHASE_LIMIT'
-            elif r<=0 or extension>config.max_entry_risk_fraction*r:reason='ENTRY_RISK_EXTENSION_LIMIT'
-            else:eligible.append(s);reason='PRICE_STRUCTURE_DEPENDENCIES_AND_3M_READY'
+            acceptance_kind=s.get('kind') in ACCEPTANCE_SETUP_KINDS and bool(s.get('confirmation_locked'))
+            if acceptance_kind:
+                level=s.get('acceptance_level')
+                acceptance_live=True
+                if level is not None:
+                    band=max(0.5,min(2.0,config.acceptance_buffer_atr*current_atr))
+                    acceptance_live=sign*(bars[-1].close-float(level))>=-band and sign*(spot-float(level))>=-band
+                if not acceptance_live:reason='WAIT_FOR_ACCEPTANCE_LEVEL_RECLAIM'
+                elif three_end<prior_confirmed:reason='SETUP_3M_CONFIRMATION_MISSING'
+            elif structure.get('recent_3m')!=s['direction']:
+                reason='WAIT_FOR_NEW_COMPLETED_3M_ALIGNMENT'
+            elif three_end<prior_confirmed:
+                reason='SETUP_3M_CONFIRMATION_MISSING'
+            if reason is None:
+                if extension < -max(0.5,0.15*current_atr):reason='TRIGGER_NOT_RECLAIMED'
+                elif extension>config.max_entry_extension_atr*current_atr:reason='STALE_ENTRY_CHASE_LIMIT'
+                elif r<=0 or extension>config.max_entry_risk_fraction*r:reason='ENTRY_RISK_EXTENSION_LIMIT'
+                else:eligible.append(s);reason='PRICE_STRUCTURE_DEPENDENCIES_AND_3M_READY'
             diagnostics.append({'setup':s,'reason':reason,'age_seconds':age,'dependency_details':dependency_details})
         except (KeyError,ValueError,TypeError):diagnostics.append({'setup':s,'reason':'INVALID_SAVED_WATCH'})
     return eligible,retained[:30],diagnostics
@@ -836,28 +998,34 @@ def contextual_futures_alignment(futures, structure, spot):
             'trade_veto':False,'certainty':'HYPOTHESIS_NOT_PARTICIPANT_INTENT'}
 
 def risk_plan(setup,spot,context,config):
-    """Real structural stop; nearest material obstruction; never clip to eligibility.
+    """Build the actual underlying trade plan without clipping structural risk.
 
-    In a true directional breakout the price must have ALREADY accepted above
-    a barrier before it is excluded. An untested OI wall is a risk flag, not a
-    proof of resistance, yet it cannot silently disappear from target analysis.
+    v118 separates three concepts that v117.1 could conflate:
+      * tactical trade invalidation (the stop used for this entry),
+      * broad protected-thesis invalidation (a setup dependency), and
+      * soft intermediate hurdles versus genuinely hard target barriers.
+
+    Potential OI concentrations and historical pivots remain visible in the
+    plan but do not automatically force a continuation target to stop there.
+    A hard barrier may cap the target; a soft hurdle is audited and monitored.
     """
     d=setup.get('direction')
     if d not in ('BULLISH','BEARISH') or not isfinite(float(spot)) or spot<=0:
         return None,'INVALID_ENTRY'
     sign=1 if d=='BULLISH' else -1
     a=max(1.,float(setup.get('atr_1m') or context.get('atr_1m') or 1))
-    raw=float(setup['invalidation'])
+    raw=float(setup.get('trade_invalidation',setup['invalidation']))
     initial=sign*(spot-raw)
     if not isfinite(initial) or initial<=0:return None,'STOP_ON_WRONG_SIDE'
-    # Volatility floor expands outward; never compress a genuine structural stop.
+    # Volatility floor may expand the local stop outward; it may never compress
+    # a genuine tactical invalidation just to manufacture eligibility.
     stop=spot-sign*max(initial,config.min_stop_atr*a)
     risk=sign*(spot-stop)
     if risk>config.max_risk+1e-8:return None,'STOP_TOO_WIDE'
     if risk<1:return None,'STOP_TOO_TIGHT_FOR_NOISE'
     minimum=risk*config.min_rr
-    levels=context.get('levels') or []
-    # Compatibility for isolated callers that supply the former context fields.
+    levels=list(context.get('levels') or [])
+    # Compatibility for isolated callers that supply former context fields.
     if not levels:
         for name in ('price_resistance','minor_resistance','price_support','minor_support'):
             if context.get(name) is not None:
@@ -874,52 +1042,95 @@ def risk_plan(setup,spot,context,config):
                                'significance':1+float(w.get('relative_to_side_max') or 0),
                                'price_rejection_confirmed':w.get('price_rejection_confirmed',False),
                                'hard_barrier':w.get('hard_barrier',False)})
+
+    setup_kind=str(setup.get('kind') or '')
+    range_setup=setup_kind.startswith('RANGE_')
     obstructions=[]
     for level in levels:
         try:
-            px=float(level['price'])
-            gap=sign*(px-spot)
+            px=float(level['price']);gap=sign*(px-spot)
             if not isfinite(px) or gap<=0.25:continue
-            side=str(level.get('source',''))
-            if level.get('kind')=='OI' and (('CE' not in side and d=='BULLISH') or ('PE' not in side and d=='BEARISH')):
+            source=str(level.get('source',''));kind=str(level.get('kind','PRICE'))
+            if kind=='OI' and (('CE' not in source and d=='BULLISH') or ('PE' not in source and d=='BEARISH')):
                 continue
-            # A strong OI concentration or a confirmed price level is a barrier
-            # candidate. Include potential walls in constraints, with uncertainty
-            # clearly labelled instead of pretending they are unimportant.
             quality=float(level.get('significance') or 1)
-            if level.get('kind')=='OI' and quality<1.5 and not level.get('hard_barrier'):
-                continue
-            if level.get('kind','PRICE')=='PRICE' and quality<1.4:
-                continue
-            obstructions.append({**level,'distance':gap})
+            if kind=='OI' and quality<1.5 and not level.get('hard_barrier'):continue
+            if kind=='PRICE' and quality<1.4:continue
+            hard=False
+            hard_reason=None
+            if range_setup:
+                hard=True;hard_reason='RANGE_OPPOSING_LEVEL'
+            elif kind=='OI' and (bool(level.get('hard_barrier')) or bool(level.get('price_rejection_confirmed'))):
+                hard=True;hard_reason='CONFIRMED_OI_OR_PRICE_REJECTION'
+            elif bool(level.get('hard_barrier')):
+                hard=True;hard_reason='EXPLICIT_HARD_BARRIER'
+            obstructions.append({**level,'distance':gap,'target_role':'HARD_BARRIER' if hard else 'SOFT_HURDLE','hard_reason':hard_reason})
         except (ValueError,TypeError,KeyError):continue
     obstructions.sort(key=lambda x:(x['distance'],-float(x.get('significance') or 0)))
-    target_source='MEASURED_PRICE_SWING_PROJECTION'
-    if obstructions:
+    hard=[x for x in obstructions if x['target_role']=='HARD_BARRIER']
+    soft=[x for x in obstructions if x['target_role']=='SOFT_HURDLE']
+
+    if range_setup and obstructions:
         first=obstructions[0]
         if first['distance']+1e-8<minimum:
             return None,'TARGET_ROOM_INSUFFICIENT_NEAREST_'+str(first.get('kind','LEVEL'))
-        t1=float(first['price']);target_source=str(first.get('source'))
+        t1=float(first['price']);target_source=str(first.get('source'));target_quality='OBSERVED_RANGE_OBSTRUCTION'
     else:
-        # No observed opposing barrier: use bounded continuation projection,
-        # not an arbitrary round-number target or invented resistance level.
+        recent=float(context.get('recent_impulse_height') or 0)
         opening=float(context.get('opening_range_height') or 0)
-        swing=float(context.get('recent_impulse_height') or 0)
-        projection=max(minimum,config.min_intraday_projection_atr*a,
-                       min(max(opening,swing),3*a) if max(opening,swing)>0 else 0)
-        t1=spot+sign*projection
+        thesis_leg=0.0
+        try:
+            protected=setup.get('protected_thesis_boundary')
+            if protected is not None:
+                thesis_leg=abs(float(setup.get('trigger',spot))-float(protected))
+        except (TypeError,ValueError):
+            thesis_leg=0.0
+        measured=max(recent,thesis_leg)
+        bounded_measured=min(measured,config.max_target_projection_atr*a) if measured>0 else 0.0
+        projection=max(minimum,config.min_intraday_projection_atr*a,bounded_measured)
+        raw_target=spot+sign*projection
+        projected=_round_directional_target(raw_target,d,config.strike_step)
+        # Rounding outward must still produce at least the required RR.
+        if sign*(projected-spot)+1e-8<minimum:
+            projected=_round_directional_target(spot+sign*minimum,d,config.strike_step)
+        blocking=next((x for x in hard if x['distance']<sign*(projected-spot)-1e-8),None)
+        if blocking:
+            if blocking['distance']+1e-8<minimum:
+                return None,'TARGET_ROOM_INSUFFICIENT_HARD_BARRIER'
+            t1=float(blocking['price']);target_source=str(blocking.get('source'));target_quality='HARD_OBSERVED_BARRIER'
+        else:
+            t1=float(projected);target_source='CAUSAL_CONTINUATION_PROJECTION';target_quality='PROJECTED_WITH_SOFT_HURDLES'
+
     rr=sign*(t1-spot)/risk
     if rr+1e-8<config.min_rr:return None,'UNDERLYING_RR_BELOW_MINIMUM'
-    next_levels=[x for x in obstructions if sign*(float(x['price'])-t1)>max(0.5,0.05*a)]
-    t2=float(next_levels[0]['price']) if next_levels else t1+sign*max(risk,a)
+    # T2 is the next meaningful forward objective. A hard barrier beyond T1 is
+    # preferred; otherwise move one live strike step farther in the direction.
+    beyond_hard=[x for x in hard if sign*(float(x['price'])-t1)>0.25]
+    if beyond_hard:
+        t2=float(beyond_hard[0]['price'])
+    else:
+        t2=_round_directional_target(t1+sign*max(config.strike_step,a,risk),d,config.strike_step)
+        if sign*(t2-t1)<=0:
+            t2=t1+sign*config.strike_step
+    distance_to_t2=sign*(t2-spot)
+    intermediate=[dict(x) for x in obstructions if x['distance']<=distance_to_t2+0.01]
+    soft_before_t1=[dict(x) for x in soft if x['distance']<sign*(t1-spot)-1e-8]
+    hard_before_t1=[dict(x) for x in hard if x['distance']<=sign*(t1-spot)+1e-8]
     plan={'entry_underlying':spot,'stop_underlying':round(stop,5),'risk_points':round(risk,5),
           't1_underlying':round(t1,5),'t2_underlying':round(t2,5),'underlying_rr':round(rr,5),
-          'target_source':target_source,'target_quality':'OBSERVED_OBSTRUCTION' if obstructions else 'CAUSAL_VOLATILITY_PROJECTION',
-          'fixed_targets':True,'intermediate_barriers':[dict(x) for x in obstructions if x['distance']<=abs(t2-spot)+0.01],
+          'target_source':target_source,'target_quality':target_quality,'fixed_targets':True,
+          'intermediate_barriers':intermediate,'soft_intermediate_hurdles':soft_before_t1,
+          'hard_target_barriers':hard_before_t1,
           'nearest_opposing_level':obstructions[0] if obstructions else None,
           'structural_invalidation_requested':raw,
+          'trade_invalidation_requested':raw,
+          'trade_invalidation_role':setup.get('stop_role','LOCAL_PRICE_STRUCTURE'),
+          'protected_thesis_boundary':setup.get('protected_thesis_boundary'),
+          'thesis_invalidation':setup.get('thesis_invalidation'),
           'volatility_floor_used':risk>initial+1e-8,
-          'projected_target_not_historical_resistance':not bool(obstructions)}
+          'projected_target_not_historical_resistance':target_source=='CAUSAL_CONTINUATION_PROJECTION',
+          'soft_hurdles_do_not_equal_confirmed_rejection':True,
+          'risk_limit_points':config.max_risk}
     return plan,'OK'
 
 
@@ -928,6 +1139,8 @@ def select_contract(chain,quotes,direction,scenario,spot,now,expiry,config,plan=
     """Rank only eligible current-expiry contracts using quote quality and actual plan risk.
 
     Range/reversal uses CE ATM-1/-2 or PE ATM+1/+2. Trend uses ATM or one ITM.
+    Confirmed acceptance continuation prefers one-ITM when its live execution
+    quality is within a bounded tolerance of the best eligible contract.
     When a proposed underlying plan is supplied (the production path), premium
     stress and responsiveness are computed from that plan's actual stop and T1,
     never from a universal 30-point hypothetical move.
@@ -937,7 +1150,12 @@ def select_contract(chain,quotes,direction,scenario,spot,now,expiry,config,plan=
     strikes=sorted({float(r['strike']) for r in relevant})
     if not strikes:return None,[{'reason':'NO_MATCHING_CONTRACTS'}]
     atm=min(strikes,key=lambda x:(abs(x-spot),x))
-    offsets=((-1,-2) if side=='CE' else (1,2)) if scenario in ('RANGE','REVERSAL') else ((0,-1) if side=='CE' else (0,1))
+    if scenario in ('RANGE','REVERSAL'):
+        offsets=(-1,-2) if side=='CE' else (1,2)
+    elif scenario=='TREND_ACCEPTANCE':
+        offsets=(-1,0) if side=='CE' else (1,0)
+    else:
+        offsets=(0,-1) if side=='CE' else (0,1)
     allowed={round(atm+n*config.strike_step,5):n for n in offsets}
     candidate_rows=[r for r in relevant if float(r['strike']) in allowed]
     max_vol=max([float(r.get('volume') or 0) for r in candidate_rows]+[1.0])
@@ -996,7 +1214,11 @@ def select_contract(chain,quotes,direction,scenario,spot,now,expiry,config,plan=
             gamma_score=max(0,1-min(1,abs(gamma)*100))
             iv_score=0.65 if iv is None else max(0,1-abs(iv-16)/max(30,iv))
             vega_score=0.65 if vega is None else max(0,1-min(1,abs(vega)*config.iv_shock_points/max(ask,.01)))
-            moneyness_score=1.0 if allowed[strike] in (-1,1) else 0.96
+            preferred_itm=(-1 if side=='CE' else 1)
+            if scenario=='TREND_ACCEPTANCE':
+                moneyness_score=1.0 if allowed[strike]==preferred_itm else 0.95
+            else:
+                moneyness_score=1.0 if allowed[strike] in (-1,1) else 0.96
             score=(.24*delta_score+.22*spread_score+.11*depth_score+.06*volume_score+.07*decay_score+
                    .05*gamma_score+.06*iv_score+.05*vega_score+.05*moneyness_score+.06*stress_score+.03*depth_imbalance)
             candidate={'instrument_key':key,'strike':strike,'expiry':expiry,'side':side,'lot_size':int(lot),
@@ -1018,10 +1240,22 @@ def select_contract(chain,quotes,direction,scenario,spot,now,expiry,config,plan=
         except (KeyError,ValueError,TypeError,OverflowError):reject('MALFORMED_CANDIDATE')
     if not ranked:return None,diag or [{'reason':'NO_LIQUID_CANDIDATE'}]
     ranked.sort(key=lambda x:(-x[0],x[1]['spread_pct'],-x[1]['depth_lots'],-x[1]['volume'],x[1]['strike']))
-    chosen=ranked[0][1]
-    chosen['selection_rationale']='HIGHEST_ELIGIBLE_EXECUTION_QUALITY_WITH_CURRENT_METADATA_QUOTE_DEPTH_AND_ACTUAL_PLAN_RISK' if plan is not None else 'COMPONENT_RANKING_ONLY_NO_ENTRY_PLAN'
-    for _,row in ranked[1:]:
-        diag.append({'reason':'LOWER_COMPOSITE_EXECUTION_QUALITY','strike':row['strike'],'instrument_key':row['instrument_key'],
+    best_score,best=ranked[0]
+    chosen=best
+    if scenario=='TREND_ACCEPTANCE':
+        preferred_offset=-1 if side=='CE' else 1
+        preferred=next(((score,row) for score,row in ranked if row.get('offset_steps')==preferred_offset),None)
+        if preferred and preferred[0]+config.one_itm_execution_tolerance>=best_score:
+            chosen=preferred[1]
+            chosen['selection_rationale']='PREFERRED_ONE_ITM_FOR_CONFIRMED_DIRECTIONAL_ACCEPTANCE_WITHIN_EXECUTION_TOLERANCE'
+        else:
+            chosen['selection_rationale']='BEST_EXECUTION_SELECTED_BECAUSE_ONE_ITM_WAS_MATERIALLY_INFERIOR_OR_UNAVAILABLE'
+    else:
+        chosen['selection_rationale']='HIGHEST_ELIGIBLE_EXECUTION_QUALITY_WITH_CURRENT_METADATA_QUOTE_DEPTH_AND_ACTUAL_PLAN_RISK' if plan is not None else 'COMPONENT_RANKING_ONLY_NO_ENTRY_PLAN'
+    for score,row in ranked:
+        if row['instrument_key']==chosen['instrument_key']:
+            continue
+        diag.append({'reason':'LOWER_OR_NONPREFERRED_COMPOSITE_EXECUTION_QUALITY','strike':row['strike'],'instrument_key':row['instrument_key'],
                      'execution_score':row['execution_score'],'selected_score':chosen['execution_score'],'spread_pct':row['spread_pct'],
                      'depth_lots':row['depth_lots'],'delta':row['delta'],'iv':row['iv'],'theta':row['theta'],
                      'actual_plan_option_premium_loss_estimate':row.get('actual_plan_option_premium_loss_estimate')})
@@ -1358,83 +1592,98 @@ def validate_position(position):
         raise StateError('Invalid open position; lock requires reconciliation') from None
 
 def migrate_state(source, destination, now):
-    """Import an existing alert state once, without changing its source bytes.
+    """Create v118 state once while preserving operational continuity.
 
-    Operational records are translated. No previous strategy implementation,
-    old setup watch or old directional thesis becomes a v117 trading rule.
+    v117/v117.1 schema-5 state is strategy-compatible at the data layer, so
+    open-position locks, outbox, history and same-session OI history/baseline
+    are preserved. Old setup watches and thesis are deliberately cleared
+    because v118 changes entry semantics. Earlier schemas keep the conservative
+    migration behavior and do not import stale strategy observations.
     """
-    from math import isfinite
     if destination.exists():
         raise StateError('Destination state already exists; refusing to overwrite')
     try:
-        raw = source.read_bytes()
-
+        raw=source.read_bytes()
         def bad_number(value):
             raise ValueError('Non-finite legacy state')
-        legacy = json.loads(raw, parse_constant=bad_number, parse_float=finite_json_float)
-        if not isinstance(legacy, dict):
-            raise ValueError()
-    except (ValueError, OSError):
+        legacy=json.loads(raw,parse_constant=bad_number,parse_float=finite_json_float)
+        if not isinstance(legacy,dict):raise ValueError()
+    except (ValueError,OSError):
         raise StateError('Migration source is unreadable') from None
-    if legacy.get('schema') in (1, 2, 3, 4, 5):
-        state = load(source, allow_legacy=True)
-        state.update(schema=5, engine_version='117.0.0', thesis=None, setup_watches=[], oi_snapshot=None, oi_history=[], session_oi_baseline=None, futures_snapshot=None)
-    elif legacy.get('schema_version') in (107, 109):
+
+    schema=legacy.get('schema')
+    if schema in (1,2,3,4,5,6):
+        state=load(source,allow_legacy=True)
+        preserve_intraday_oi=(schema in (5,6))
+        state.update(schema=6,engine_version='118.0.0',thesis=None,setup_watches=[],futures_snapshot=None)
+        if not preserve_intraday_oi:
+            state.update(oi_snapshot=None,oi_history=[],session_oi_baseline=None)
+        state['strategy_migration']={
+            'from_schema':schema,
+            'entry_engine_reset':True,
+            'operational_position_preserved':state.get('position') is not None,
+            'intraday_oi_preserved':preserve_intraday_oi,
+            'at':now.isoformat(),
+        }
+    elif legacy.get('schema_version') in (107,109):
         if legacy.get('position_reconciliation_required'):
             raise StateError('Legacy state requires reconciliation; it cannot be migrated as flat')
-        state = {'schema': 5, 'engine_version': '117.0.0', 'initialized_at': now.isoformat(), 'session_date': legacy.get('session_date'), 'thesis': None, 'position': None, 'history': [], 'outbox': [], 'last_exit': None, 'oi_snapshot': None, 'oi_history': [], 'session_oi_baseline': None, 'setup_watches': [], 'thesis_history': []}
-        original = legacy.get('active_position')
+        state={'schema':6,'engine_version':'118.0.0','initialized_at':now.isoformat(),'session_date':legacy.get('session_date'),
+               'thesis':None,'position':None,'history':[],'outbox':[],'last_exit':None,'oi_snapshot':None,'oi_history':[],
+               'session_oi_baseline':None,'setup_watches':[],'thesis_history':[]}
+        original=legacy.get('active_position')
         if original is not None:
-            if not isinstance(original, dict) or original.get('status') != 'OPEN':
+            if not isinstance(original,dict) or original.get('status')!='OPEN':
                 raise StateError('Ambiguous legacy active position; reconcile before migrating')
-
             def required(name):
-                value = original.get(name)
-                if value is None:
-                    raise StateError('Legacy active position lacks ' + name)
+                value=original.get(name)
+                if value is None:raise StateError('Legacy active position lacks '+name)
                 return value
-            p = {'id': required('position_id'), 'status': 'OPEN', 'direction': required('direction'), 'instrument_key': required('instrument_key'), 'expiry': required('expiry'), 'side': required('side'), 'strike': required('strike'), 'session_date': required('session_date'), 'opened_at': required('opened_at'), 'last_candle': required('last_monitored_candle'), 'entry_spot': required('entry_spot'), 'entry_ask': required('entry_premium_ask'), 'stop': required('stop_underlying'), 't1': required('t1_underlying'), 't2': required('t2_underlying'), 'best_spot': required('favourable_spot_extreme'), 't1_hit': bool(original.get('t1_hit')), 'remaining_pct': required('remaining_pct'), 'contract': original.get('selected_contract') or {}, 'plan': {'t1_underlying': required('t1_underlying'), 't2_underlying': required('t2_underlying')}, 'last_progress_at': original.get('last_checked_at') or required('opened_at'), 'migrated_legacy_position': True}
+            p={'id':required('position_id'),'status':'OPEN','direction':required('direction'),'instrument_key':required('instrument_key'),
+               'expiry':required('expiry'),'side':required('side'),'strike':required('strike'),'session_date':required('session_date'),
+               'opened_at':required('opened_at'),'last_candle':required('last_monitored_candle'),'entry_spot':required('entry_spot'),
+               'entry_ask':required('entry_premium_ask'),'stop':required('stop_underlying'),'t1':required('t1_underlying'),
+               't2':required('t2_underlying'),'best_spot':required('favourable_spot_extreme'),'t1_hit':bool(original.get('t1_hit')),
+               'remaining_pct':required('remaining_pct'),'contract':original.get('selected_contract') or {},
+               'plan':{'t1_underlying':required('t1_underlying'),'t2_underlying':required('t2_underlying')},
+               'last_progress_at':original.get('last_checked_at') or required('opened_at'),'migrated_legacy_position':True}
             if p['t1_hit']:
-                at = original.get('post_t1_started_at') or original.get('t1_hit_at')
-                if not at:
-                    raise StateError('Legacy T1 runner has no T1 time; reconcile before migrating')
-                p.update(t1_at=at, runner_started_at=at, runner_last_progress_at=original.get('post_t1_last_progress_at') or at, runner_progress_anchor=original.get('post_t1_anchor_spot') or p['t1'], runner_peak_spot=original.get('post_t1_peak_spot') or p['t1'], runner_peak_bid=original.get('post_t1_peak_premium_bid'))
-            validate_position(p)
-            state['position'] = p
-        prior_exit = legacy.get('last_position_exit') or {}
+                at=original.get('post_t1_started_at') or original.get('t1_hit_at')
+                if not at:raise StateError('Legacy T1 runner has no T1 time; reconcile before migrating')
+                p.update(t1_at=at,runner_started_at=at,runner_last_progress_at=original.get('post_t1_last_progress_at') or at,
+                         runner_progress_anchor=original.get('post_t1_anchor_spot') or p['t1'],runner_peak_spot=original.get('post_t1_peak_spot') or p['t1'],
+                         runner_peak_bid=original.get('post_t1_peak_premium_bid'))
+            validate_position(p);state['position']=p
+        prior_exit=legacy.get('last_position_exit') or {}
         if prior_exit.get('closed_at'):
-            closed_at = datetime.fromisoformat(prior_exit['closed_at'])
-            origin = closed_at.replace(hour=9, minute=15, second=0, microsecond=0)
-            elapsed = int((closed_at - origin).total_seconds() // 180)
-            last_completed = origin + timedelta(minutes=3 * (elapsed - 1))
-            state['last_exit'] = {'at': prior_exit['closed_at'], 'direction': prior_exit.get('direction'), 'three': last_completed.isoformat()}
-        state['legacy_position_history'] = legacy.get('position_history') or []
-        state['legacy_notification_history'] = legacy.get('notification_history') or []
+            closed_at=datetime.fromisoformat(prior_exit['closed_at']);origin=closed_at.replace(hour=9,minute=15,second=0,microsecond=0)
+            elapsed=int((closed_at-origin).total_seconds()//180);last_completed=origin+timedelta(minutes=3*(elapsed-1))
+            state['last_exit']={'at':prior_exit['closed_at'],'direction':prior_exit.get('direction'),'three':last_completed.isoformat()}
+        state['legacy_position_history']=legacy.get('position_history') or []
+        state['legacy_notification_history']=legacy.get('notification_history') or []
         for item in legacy.get('pending_notifications') or []:
-            details = {'legacy_notification': item, 'source_version': legacy.get('scanner_version'), 'historical': True}
-            event = queue(state, 'LEGACY_NOTIFICATION_REVIEW_REQUIRED', details, now)
-            entry = next((e for e in state['outbox'] if e['id'] == event))
-            entry.update(status='DELIVERY_UNCERTAIN', delayed_delivery=True)
+            details={'legacy_notification':item,'source_version':legacy.get('scanner_version'),'historical':True}
+            event=queue(state,'LEGACY_NOTIFICATION_REVIEW_REQUIRED',details,now)
+            entry=next((e for e in state['outbox'] if e['id']==event))
+            entry.update(status='DELIVERY_UNCERTAIN',delayed_delivery=True)
     else:
         raise StateError('Unsupported migration schema; no state was created')
-    digest = hashlib.sha256(raw).hexdigest()
-    archive = destination.parent / 'archives_v117' / (source.name + '.' + digest[:16] + '.json')
+
+    digest=hashlib.sha256(raw).hexdigest()
+    archive=destination.parent/'archives_v118'/(source.name+'.'+digest[:16]+'.json')
     if not archive.exists():
-        archive.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=archive.parent, prefix='.migration-')
+        archive.parent.mkdir(parents=True,exist_ok=True)
+        fd,tmp=tempfile.mkstemp(dir=archive.parent,prefix='.migration-')
         try:
-            with os.fdopen(fd, 'wb') as stream:
-                stream.write(raw)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(tmp, archive)
+            with os.fdopen(fd,'wb') as stream:
+                stream.write(raw);stream.flush();os.fsync(stream.fileno())
+            os.replace(tmp,archive)
         finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-    state['migration'] = {'source_file': source.name, 'source_sha256': digest, 'archive': str(archive), 'at': now.isoformat()}
-    save(destination, state)
-    load(destination)
+            if os.path.exists(tmp):os.unlink(tmp)
+    state['migration']={'source_file':source.name,'source_sha256':digest,'archive':str(archive),'at':now.isoformat()}
+    save(destination,state);load(destination)
     return state
+
 
 @contextmanager
 def lock(path: Path):
@@ -1471,46 +1720,40 @@ def load(path: Path, allow_legacy=False):
     if not path.exists():
         raise StateError('STATE_NOT_INITIALIZED: reconcile prior scanner and initialize the new state')
     try:
-
         def invalid_number(value):
             raise ValueError('Non-finite number in state')
         with path.open(encoding='utf-8') as f:
-            s = json.load(f, parse_constant=invalid_number, parse_float=finite_json_float)
-    except (OSError, ValueError) as e:
-        raise StateError('State is unreadable; reconcile before continuing') from e
-    if not isinstance(s, dict) or s.get('schema') not in ((1, 2, 3, 4, 5) if allow_legacy else (5,)) or (not isinstance(s.get('outbox'), list)) or ('position' not in s) or (not isinstance(s.get('history'), list)):
+            state=json.load(f,parse_constant=invalid_number,parse_float=finite_json_float)
+    except (OSError,ValueError) as exc:
+        raise StateError('State is unreadable; reconcile before continuing') from exc
+    allowed=(1,2,3,4,5,6) if allow_legacy else (6,)
+    if not isinstance(state,dict) or state.get('schema') not in allowed or not isinstance(state.get('outbox'),list) or 'position' not in state or not isinstance(state.get('history'),list):
         raise StateError('Unsupported or invalid state; reconcile before continuing')
-    if s['position'] is not None:
-        p = s['position']
-        if not isinstance(p, dict) or p.get('status') != 'OPEN' or p.get('direction') not in ('BULLISH', 'BEARISH') or (not all((k in p for k in ('id', 'instrument_key', 'expiry', 'entry_spot', 'entry_ask', 'stop', 't1', 't2', 'opened_at', 'last_candle')))):
+    if state['position'] is not None:
+        p=state['position']
+        if not isinstance(p,dict) or p.get('status')!='OPEN' or p.get('direction') not in ('BULLISH','BEARISH') or not all(k in p for k in ('id','instrument_key','expiry','entry_spot','entry_ask','stop','t1','t2','opened_at','last_candle')):
             raise StateError('Invalid open position; lock requires reconciliation')
-    seen = set()
-    for e in s['outbox']:
-        if not isinstance(e, dict) or not all((k in e for k in ('id', 'kind', 'details', 'created_at', 'status'))) or e['id'] in seen or (e['status'] not in ('PENDING', 'CLAIMED', 'SENT', 'DELIVERY_UNCERTAIN')):
+    seen=set()
+    for event in state['outbox']:
+        if not isinstance(event,dict) or not all(k in event for k in ('id','kind','details','created_at','status')) or event['id'] in seen or event['status'] not in ('PENDING','CLAIMED','SENT','DELIVERY_UNCERTAIN'):
             raise StateError('Invalid notification outbox')
-        seen.add(e['id'])
-    if s['position'] is not None:
-        validate_position(s['position'])
-    for field in ('setup_watches', 'thesis_history'):
-        if field in s and (not isinstance(s[field], list)):
-            raise StateError('Invalid state collection: ' + field)
-    if s.get('schema') != 5:
-        s['migrated_from_schema'] = s['schema']
-        s['thesis'] = None
-        s['setup_watches'] = []
-        s['oi_snapshot'] = None
-    s['schema'] = 5
-    s['engine_version'] = '117.0.0'
-    s.setdefault('oi_history', [])
-    s.setdefault('session_oi_baseline', None)
-    s.setdefault('setup_watches', [])
-    s.setdefault('thesis_history', [])
-    return s
+        seen.add(event['id'])
+    if state['position'] is not None:validate_position(state['position'])
+    for field in ('setup_watches','thesis_history'):
+        if field in state and not isinstance(state[field],list):
+            raise StateError('Invalid state collection: '+field)
+    state.setdefault('oi_history',[]);state.setdefault('session_oi_baseline',None);state.setdefault('setup_watches',[]);state.setdefault('thesis_history',[])
+    if not allow_legacy:
+        state['schema']=6;state['engine_version']='118.0.0'
+    return state
+
 
 def initialize(path: Path, now: datetime):
-    if path.exists():
-        raise StateError('State already exists; refusing to overwrite')
-    save(path, {'schema': 5, 'engine_version': '117.0.0', 'initialized_at': now.isoformat(), 'initialized_flat': True, 'session_date': None, 'thesis': None, 'position': None, 'history': [], 'outbox': [], 'last_exit': None, 'oi_snapshot': None, 'oi_history': [], 'session_oi_baseline': None, 'setup_watches': [], 'thesis_history': []})
+    if path.exists():raise StateError('State already exists; refusing to overwrite')
+    save(path,{'schema':6,'engine_version':'118.0.0','initialized_at':now.isoformat(),'initialized_flat':True,'session_date':None,
+               'thesis':None,'position':None,'history':[],'outbox':[],'last_exit':None,'oi_snapshot':None,'oi_history':[],
+               'session_oi_baseline':None,'setup_watches':[],'thesis_history':[]})
+
 
 def queue(state: dict, kind: str, details: dict, when: datetime):
     raw = json.dumps([kind, details], sort_keys=True, separators=(',', ':'), allow_nan=False)
@@ -1696,7 +1939,7 @@ def record_and_assess(state, bars, now, forecast, horizon_minutes=15):
 from datetime import datetime, timedelta
 from math import isfinite
 
-# v117 independent, completed-candle chronological position management.
+# v118 independent, completed-candle chronological position management.
 from datetime import datetime, timedelta
 from math import isfinite
 
@@ -2181,7 +2424,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         remember_structure(thesis, now)
         state['last_processed_candle'] = bars[-1].start.isoformat()
         result['structure'] = thesis
-        result['forecast'] = forecast_market(bars, thesis, spot, {})
+        result['forecast'] = forecast_market(bars, thesis, spot, {}, config=config)
         if open_position:
             active_oi = {}
             active_chain = []
@@ -2212,7 +2455,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             state['last_processed_candle'] = bars[-1].start.isoformat()
             evidence.update(candles=[[c.start.isoformat(), c.open, c.high, c.low, c.close, c.volume] for c in bars], quotes=quotes, evaluated_at=now.isoformat())
             result.update(spot=spot, structure=thesis, last_complete_1m=bars[-1].start.isoformat())
-            result['forecast'] = forecast_market(bars, thesis, spot, active_oi)
+            result['forecast'] = forecast_market(bars, thesis, spot, active_oi, config=config)
             future_quote = quotes.get(previous_future.get('instrument_key'))
             if future_quote:
                 try:
@@ -2256,7 +2499,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             if reversal_exit is None:
                 return result
         try:
-            future = api.nearest_nifty_future(now, Path('.cache/nifty_futures_v117_1.json'))
+            future = api.nearest_nifty_future(now, Path('.cache/nifty_futures_v118.json'))
             fq = api.quotes([future['instrument_key']]).get(future['instrument_key'], {})
             ft = tick()
             fp = checked_spot(fq, ft, config.max_quote_age)
@@ -2364,7 +2607,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         result['price_oi_interpretation']=context['price_oi_interpretation']
         result['level_inventory']=context['levels']
         result.update(spot=spot, spot_quote_timestamp=full[INDEX]['timestamp'], oi_levels=context)
-        result['forecast'] = forecast_market(bars, thesis, spot, context, result.get('futures'))
+        result['forecast'] = forecast_market(bars, thesis, spot, context, result.get('futures'), config)
         evidence.update(candles=[[c.start.isoformat(), c.open, c.high, c.low, c.close, c.volume] for c in bars], quotes=full, evaluated_at=now.isoformat())
         fresh_setups = make_setups(bars, thesis, bars[-1].close, config, context)
         last_bar = bars[-1]
@@ -2399,7 +2642,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             if allowed:
                 plan, reason = risk_plan(candidate, spot, context, config)
             if plan:
-                scenario = 'RANGE' if candidate['kind'].startswith('RANGE_') else 'REVERSAL' if candidate['kind'] == 'CONFIRMED_REVERSAL' else 'TREND'
+                scenario = ('RANGE' if candidate['kind'].startswith('RANGE_') else 'REVERSAL' if candidate['kind'] == 'CONFIRMED_REVERSAL' else 'TREND_ACCEPTANCE' if candidate['kind'] in ACCEPTANCE_SETUP_KINDS else 'TREND')
                 contract, rejected = select_contract(chain, full, candidate['direction'], scenario, spot, now, expiry, config, plan=plan)
                 row['rejected_contracts'] = rejected
                 if not contract:
@@ -2425,6 +2668,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             score=float(contract['execution_score'])
             if candidate['kind'].startswith('FALSE_BREAK'):score+=.045
             if candidate['kind']=='CONFIRMED_REVERSAL':score+=.05
+            if candidate['kind'] in ACCEPTANCE_SETUP_KINDS:score+=.05
             if thesis.get('context_15m')==candidate['direction']:score+=.04
             alignment=result.get('futures_alignment',{}).get('alignment')
             if alignment=='SUPPORTIVE_HYPOTHESIS':score+=.03
@@ -2434,7 +2678,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
                 score+=.02
             elif (oi_bias=='BEARISH_RESISTANCE_HYPOTHESIS' and candidate['direction']=='BULLISH') or (oi_bias=='BULLISH_SUPPORT_HYPOTHESIS' and candidate['direction']=='BEARISH'):
                 score-=.02
-            if plan.get('target_quality')=='OBSERVED_OBSTRUCTION':score+=.02
+            if plan.get('target_quality') in ('HARD_OBSERVED_BARRIER','OBSERVED_RANGE_OBSTRUCTION'):score+=.02
             score+=.005*min(plan['underlying_rr'],3)
             return score
         passing.sort(key=lambda x:(-opportunity_quality(x[0],x[1],x[2]),x[0]['confirmed_at'],x[3]))
@@ -2479,11 +2723,11 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         # a qualified reference position or its durable outbox lock. main()
         # still commits state and exits nonzero so the workflow reports failure.
         try:
-            result['input_capture'] = capture_inputs(audit_dir / 'inputs_v117_1' / day, identifier, evidence)
+            result['input_capture'] = capture_inputs(audit_dir / 'inputs_v118' / day, identifier, evidence)
         except (OSError,ValueError,TypeError) as exc:
             result['persistence_error']='INPUT_CAPTURE_FAILED_'+type(exc).__name__
         try:
-            append_audit(audit_dir / ('market_scan_v117_1_' + day + '.jsonl'), result)
+            append_audit(audit_dir / ('market_scan_v118_' + day + '.jsonl'), result)
         except (OSError,ValueError,TypeError) as exc:
             result['persistence_error']='AUDIT_WRITE_FAILED_'+type(exc).__name__
 
@@ -2499,7 +2743,7 @@ from email.message import EmailMessage
 from pathlib import Path
 
 def paths():
-    return (Path(os.environ.get('STATE_FILE', 'state/market_state_v117.json')), Path(os.environ.get('AUDIT_DIR', 'audit')))
+    return (Path(os.environ.get('STATE_FILE', 'state/market_state_v118.json')), Path(os.environ.get('AUDIT_DIR', 'audit')))
 
 def alert_text(event):
     d = event['details']
@@ -2638,7 +2882,7 @@ def main():
                 state['position'] = None
                 state['last_exit'] = {'at': now, 'direction': closed.get('direction'), 'three': (state.get('thesis') or {}).get('last_3m')}
                 save(state_path, state)
-                append_audit(audit_dir / ('market_scan_v117_1_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_RECONCILIATION', 'position_id': args.reconcile_flat, 'at': now, 'fill': 'UNKNOWN'})
+                append_audit(audit_dir / ('market_scan_v118_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_RECONCILIATION', 'position_id': args.reconcile_flat, 'at': now, 'fill': 'UNKNOWN'})
                 print(json.dumps({'status': 'RECONCILED_FLAT', 'position_id': args.reconcile_flat, 'at': now}))
                 return 0
             if args.requeue_alert:
@@ -2647,7 +2891,7 @@ def main():
                     raise StateError('Alert ID is not an uncertain or previously claimed alert')
                 event.update(status='PENDING', claim=None, manually_requeued_at=datetime.now(IST).isoformat())
                 save(state_path, state)
-                append_audit(audit_dir / ('market_scan_v117_1_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_ALERT_REQUEUE', 'alert_id': args.requeue_alert, 'at': datetime.now(IST).isoformat()})
+                append_audit(audit_dir / ('market_scan_v118_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_ALERT_REQUEUE', 'alert_id': args.requeue_alert, 'at': datetime.now(IST).isoformat()})
                 print(json.dumps({'status': 'REQUEUED', 'alert_id': args.requeue_alert}))
                 return 0
             token = os.environ.get('NOTIFICATION_CLAIM_TOKEN', '')
