@@ -125,7 +125,7 @@ jobs:
           fi
       - name: Deliver only durably claimed alerts
         id: deliver
-        if: ${{ always() && steps.persist.outcome == 'success' && (steps.scan.outcome == 'success' || steps.scan.outcome == 'failure') }}
+        if: ${{ always() && steps.persist.outcome == 'success' && steps.scan.outcome == 'success' }}
         env:
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
@@ -140,6 +140,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ ! -f state/market_state_v117.json ]]; then
+            echo 'No v117 state file exists; nothing to persist after delivery.'
+            exit 0
+          fi
           git add -f -- state/market_state_v117.json
           if ! git diff --cached --quiet; then
             git commit -m 'Persist NIFTY v117 delivery outcome'
